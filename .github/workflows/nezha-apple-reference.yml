@@ -49,6 +49,8 @@ jobs:
               archive.extractall(destination, filter='data')
           bundle.unlink()
           PY
+          cp scripts/build-apple-reference.sh "$RUNNER_TEMP/nezha-reference/build.sh"
+          cp scripts/inspect-reference.py scripts/kc_image.py "$RUNNER_TEMP/nezha-reference/"
       - name: Build the actual Apple RELEASE and LTO kernel
         shell: bash
         run: |
@@ -70,3 +72,6 @@ jobs:
             ${{ runner.temp }}/nezha-reference/output/xcode-version.txt
             ${{ runner.temp }}/nezha-reference/output/reference-report.json
             ${{ runner.temp }}/nezha-reference/output/obj/RELEASE_ARM64_NEZHA/mach.release.nezha.unstripped*
+            ${{ runner.temp }}/nezha-reference/output/obj/RELEASE_ARM64_NEZHA/.LDFLAGS
+            ${{ runner.temp }}/nezha-reference/output/obj/RELEASE_ARM64_NEZHA/osfmk/RELEASE/prng_random.o.json
+            ${{ runner.temp }}/nezha-reference/output/obj/RELEASE_ARM64_NEZHA/libkern/RELEASE/OSKext.cpo.json
