@@ -1,0 +1,72 @@
+name: Nezha Apple clang reference
+
+on:
+  push:
+    branches:
+      - 'codex/nezha-apple-reference-*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reference:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Read build inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Reassemble the local Nezha source bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nezha-reference"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import tarfile
+          import os
+          import zlib
+          root = Path('inputs')
+          manifest = json.loads((root / 'parts.json').read_text())
+          destination = Path(os.environ['RUNNER_TEMP']) / 'nezha-reference'
+          bundle = destination / 'input.tar'
+          decoder = zlib.decompressobj(-15)
+          with bundle.open('xb') as output:
+              for part in manifest['parts']:
+                  path = root / part['name']
+                  if path.stat().st_size != part['bytes']:
+                      raise SystemExit('Incomplete source part: '+part['name'])
+                  with path.open('rb') as source:
+                      while data := source.read(1024*1024):
+                          output.write(decoder.decompress(data))
+              output.write(decoder.flush())
+          if not decoder.eof or decoder.unused_data or bundle.stat().st_size != manifest['uncompressed_bytes']:
+              raise SystemExit('Incomplete source bundle')
+          with tarfile.open(bundle) as archive:
+              archive.extractall(destination, filter='data')
+          bundle.unlink()
+          PY
+      - name: Build the actual Apple RELEASE and LTO kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          export NEZHA_REFERENCE_JOBS=4
+          bash "$RUNNER_TEMP/nezha-reference/build.sh"
+      - name: Retain reference and build evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nezha-apple-reference-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 1
+          path: |
+            ${{ runner.temp }}/nezha-reference/output/build.log
+            ${{ runner.temp }}/nezha-reference/output/make-arguments.txt
+            ${{ runner.temp }}/nezha-reference/output/compiler-version.txt
+            ${{ runner.temp }}/nezha-reference/output/xcode-version.txt
+            ${{ runner.temp }}/nezha-reference/output/reference-report.json
+            ${{ runner.temp }}/nezha-reference/output/obj/RELEASE_ARM64_NEZHA/mach.release.nezha.unstripped*

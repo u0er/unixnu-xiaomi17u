@@ -1,0 +1,311 @@
+{
+  "encoding": "raw-deflate (no checksum envelope)",
+  "parts": [
+    {
+      "name": "input.part0000",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0001",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0002",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0003",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0004",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0005",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0006",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0007",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0008",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0009",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0010",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0011",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0012",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0013",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0014",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0015",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0016",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0017",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0018",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0019",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0020",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0021",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0022",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0023",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0024",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0025",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0026",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0027",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0028",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0029",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0030",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0031",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0032",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0033",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0034",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0035",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0036",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0037",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0038",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0039",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0040",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0041",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0042",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0043",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0044",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0045",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0046",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0047",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0048",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0049",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0050",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0051",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0052",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0053",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0054",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0055",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0056",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0057",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0058",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0059",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0060",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0061",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0062",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0063",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0064",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0065",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0066",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0067",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0068",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0069",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0070",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0071",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0072",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0073",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0074",
+      "bytes": 262144
+    },
+    {
+      "name": "input.part0075",
+      "bytes": 54448
+    }
+  ],
+  "bundle_bytes": 19715248,
+  "uncompressed_bytes": 105256960
+}
