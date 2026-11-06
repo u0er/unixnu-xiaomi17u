@@ -33,11 +33,14 @@ arguments=(
     "OBJROOT=$reference_out/obj" "SYMROOT=$reference_out/sym" "DSTROOT=$reference_out/dst"
     "MAKEJOBS=-j$reference_jobs" BUILD_LTO=1 BOUND_CHECKS=0 BUILD_WERROR=0 BUILD_DSYM=0
     XNU_KERNEL_CHAINED_FIXUPS=1
-    # XNU's intermediate PRE_LTO -r link omits DEPLOYMENT_TARGET_FLAGS.
-    # State the iOS platform there too, as the final kernel link already does.
-    'LDFLAGS_KERNEL_LTO=-miphoneos-version-min=17.0 -Wl,-mllvm,-inline-threshold=100'
-    'DEPLOYMENT_TARGET_FLAGS=-miphoneos-version-min=17.0 -DXNU_TARGET_OS_IOS'
-    'DEPLOYMENT_LINKER_FLAGS=-Wl,-ios_version_min,17.0'
+    # The actual Linux owning objects and all three input archives encode
+    # macOS 26 in LC_BUILD_VERSION, while XNU_TARGET_OS_IOS selects the kernel
+    # interface. Match that real object platform in both Apple link stages;
+    # mixing iOS nonlto.o with these macOS objects is rejected by Apple ld.
+    # This is an analysis reference, never a user-space or boot candidate.
+    'LDFLAGS_KERNEL_LTO=-mmacosx-version-min=26.0 -Wl,-mllvm,-inline-threshold=100'
+    'DEPLOYMENT_TARGET_FLAGS=-mmacosx-version-min=26.0 -DXNU_TARGET_OS_IOS'
+    'DEPLOYMENT_LINKER_FLAGS=-Wl,-macosx_version_min,26.0'
     'RC_NONARCH_CFLAGS=-march=armv8.3-a+crypto'
     'prng_random.o_CFLAGS_ADD=-DXNU_SOURCE_CORECRYPTO14=1'
     'OSKext.cpo_CFLAGS_ADD=-DXNU_SOURCE_CORECRYPTO14=1'
