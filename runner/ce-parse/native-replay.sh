@@ -37,12 +37,19 @@ shasum -a 256 "$path"
 git -C "$xnu" apply --check "$path"
 git -C "$xnu" apply "$path"
 tar -xzf "$GITHUB_WORKSPACE/frozen-headers/ci/firehose-apple-clang/candidate-headers.tar.gz" -C "$work"
+test "$(git -C "$GITHUB_WORKSPACE/availability" rev-parse HEAD)" = 149b1777f3e8c2133042d8e188f72e3adf6a7110
+mkdir -p "$work/availability-obj" "$work/.cache/fakeroot"
+make -C "$GITHUB_WORKSPACE/availability" install -j4 \
+  OBJROOT="$work/availability-obj" SYMROOT="$work/availability-obj" \
+  DSTROOT="$work/.cache/fakeroot" CMAKE="$(command -v cmake)" NINJA="$(command -v ninja)"
+export XNU_AVAILABILITY_PL="$work/.cache/fakeroot/usr/local/libexec/availability.pl"
+test -x "$XNU_AVAILABILITY_PL"
 export SRCROOT="$xnu" OBJROOT="$work/obj" SYMROOT="$work/sym" DSTROOT="$work/dst"
 mkdir -p "$OBJROOT" "$SYMROOT" "$DSTROOT"
 for file in config/MASTER config/MASTER.arm64 config/MASTER.arm64.bcm2837 osfmk/conf/files osfmk/conf/files.arm64 bsd/conf/files bsd/conf/files.arm64; do
   shasum -a 256 "$xnu/$file"
 done
-args=(SDKROOT="$sdk" ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=BCM2837 KERNEL_CONFIGS=DEVELOPMENT
+args=(SDKROOT="$sdk" KERNEL_SDKROOT="$work/.cache/fakeroot" ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=BCM2837 KERNEL_CONFIGS=DEVELOPMENT
   ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64e LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY
   ARM64_LINK_ADDR=0xfffffff007004000 ARM64_PLKSEG_ADDR=0xfffffff004004000
   'DEPLOYMENT_TARGET_FLAGS=-miphoneos-version-min=26.0 -DXNU_TARGET_OS_IOS'

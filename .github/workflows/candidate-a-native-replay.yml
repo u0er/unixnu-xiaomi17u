@@ -33,6 +33,12 @@ jobs:
           ref: 49a37562c9c1e57963d558d4c322036602e3280e
           path: frozen-headers
           persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: apple-oss-distributions/AvailabilityVersions
+          ref: 149b1777f3e8c2133042d8e188f72e3adf6a7110
+          path: availability
+          persist-credentials: false
       - name: Generate native configuration and preprocess
         shell: bash
         run: bash runner/ce-parse/native-replay.sh
