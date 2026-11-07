@@ -1,0 +1,35 @@
+name: Candidate A native replacecontents
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/candidate-a-replacecontents
+permissions:
+  contents: read
+jobs:
+  host-tool:
+    runs-on: macos-26
+    timeout-minutes: 15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout exact XNU source
+        uses: actions/checkout@v4
+        with:
+          repository: apple-oss-distributions/xnu
+          ref: ac9718fb1af618d5ce8678d0dc6e8a58f252216f
+          path: xnu-source
+          persist-credentials: false
+      - name: Build only the XNU host helper
+        run: bash scripts/candidate-a-replacecontents.sh
+      - name: Upload host tool and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-a-native-replacecontents
+          path: ${{ runner.temp }}/candidate-a-replacecontents/
+          if-no-files-found: error
+          retention-days: 7
