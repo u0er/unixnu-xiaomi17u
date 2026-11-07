@@ -20,6 +20,9 @@ old_root = '/Users/runner/work/_temp/candidate-a-output/nezha/ipados-26.5-23F77-
 original_sdk = '/Applications/Xcode_26.5.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk'
 
 def remap(value):
+    prefix = '-fsanitize-ignorelist='
+    if value.startswith(prefix):
+        return prefix + remap(value[len(prefix):])
     if value.startswith(old_root + '/.cache/xnu-work'):
         return str(xnu) + value[len(old_root + '/.cache/xnu-work'):]
     if value.startswith(old_root + '/.cache/fakeroot'):

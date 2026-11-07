@@ -31,4 +31,9 @@ for item in arm64/proc_reg.h pexpert/arm64/board_config.h pexpert/arm64/BCM2837.
   echo "frozen candidate header: $item"
 done
 python3 "$GITHUB_WORKSPACE/runner/ce-parse/run-tests.py" "$GITHUB_WORKSPACE/xnu" "$work/headers" "$work" "$evidence" "$sdk" "$clang" "$GITHUB_WORKSPACE/runner/ce-parse/record.json"
+san="$work/missing-candidate-tree/build/xnu/ios-obj/san"
+mkdir -p "$san"
+echo 'Generating sanitizer denylist with XNU san/memory/Makefile rule'
+sed -e 's,^src:\./,src:'"$GITHUB_WORKSPACE/xnu/," "$GITHUB_WORKSPACE/xnu/san/memory/kasan-denylist" "$GITHUB_WORKSPACE/xnu/san/memory/ubsan-denylist" "$GITHUB_WORKSPACE/xnu/san/memory/kasan-denylist-arm64" > "$san/kasan-denylist-arm64"
+"$GITHUB_WORKSPACE/xnu/san/tools/validate_denylist.sh" "$san/kasan-denylist-arm64"
 python3 "$GITHUB_WORKSPACE/runner/ce-parse/preprocess-pmap.py" "$GITHUB_WORKSPACE/xnu" "$work/headers" "$work" "$evidence" "$sdk" "$clang" "$GITHUB_WORKSPACE/runner/ce-parse/pmap-record.json"
