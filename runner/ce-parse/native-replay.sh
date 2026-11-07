@@ -88,7 +88,7 @@ for component in osfmk bsd; do
   make -n -C "$out" -f "$out/Makefile" "$target" "${args[@]}" \
     KDKROOT="$work/kdk" CURRENT_KERNEL_CONFIG=DEVELOPMENT CURRENT_ARCH_CONFIG=ARM64 \
     CURRENT_MACHINE_CONFIG=BCM2837 CURRENT_BUILD_CONFIG='DEVELOPMENT^ARM64^BCM2837' \
-    SOURCE="$xnu/$component/" TARGET="$targetdir/" OBJPATH="$objpath" \
+    COMPONENT="$component" SOURCE="$xnu/$component/" TARGET="$targetdir/" OBJPATH="$objpath" \
     CFLAGS_EXTRA="-DXNU_NATIVE_PAN=1 -DXNU_SOURCE_CORECRYPTO14=1 -DXNU_BOOT_PROGRESS=0 -isysroot $sdk" \
     > "$ev/$component-make-dryrun.log" 2>&1
   rc=$?
