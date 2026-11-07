@@ -1,0 +1,32 @@
+diff --git a/osfmk/arm/machine_routines_common.c b/osfmk/arm/machine_routines_common.c
+--- a/osfmk/arm/machine_routines_common.c
++++ b/osfmk/arm/machine_routines_common.c
+@@ -1542,3 +1542,12 @@ machine_init(void)
+ 	}
+ 	ml_lockdown_init();
+ }
++
++#if !defined(APPLE_ARM64_ARCH_FAMILY)
++/* Intentional non-Apple compatibility policy, not a hardware fuse reading. */
++boolean_t
++ml_device_is_prod_fused(void)
++{
++	return TRUE;
++}
++#endif /* !defined(APPLE_ARM64_ARCH_FAMILY) */
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -15285,3 +15285,12 @@ pmap_test_text_corruption_internal(pmap_paddr_t pa)
+ 	return KERN_SUCCESS;
+ }
+ #endif /* DEVELOPMENT || DEBUG */
++
++#if SCHED_HYGIENE_DEBUG && (DEBUG || DEVELOPMENT)
++/* Public source omits the debug variant; check the urgent AST only. */
++bool
++pmap_pending_preemption(void)
++{
++	return _pmap_pending_preemption_real();
++}
++#endif /* SCHED_HYGIENE_DEBUG && (DEBUG || DEVELOPMENT) */
