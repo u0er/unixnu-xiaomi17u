@@ -1,0 +1,64 @@
+# R1_R3B_MINIMAL.patch
+#
+# 状态：DRAFT / NOT APPLIED TO PRODUCTION / 仅在独立分支 mimo/r1-r3b-minimal 上做过 Host 验证
+# 适用基线：xnu-only runner 的 11 条 series 全部应用之后（run 42399758349 的同款输入）
+# 组成：恰好两个 hunk 组，不整体合并 arm64e profile 的 64 条 series
+#   [R1]  config/MASTER.arm64.bcm2837    CPU_COUNTERS_BASE = [ ]
+#   [R3b] pexpert/pexpert/arm64/apple_arm64_cpu.h  非 Apple 平台条件隔离
+#
+# 明确不含（本轮禁止）：
+#   - 不含 #define CPMU_PMC_COUNT 10（no-apple-cpu-counters.patch 第 2 hunk）
+#   - 不含 #define HAS_APPLE_PAC 1 / HAS_NATIVE_PAC 1（native-pac-keys.patch）
+#   - 不含 ARM64_BOARD_CONFIG_BCM2837 等 Apple 专用宏定义
+#   - 不含任何 AMFI / CA / PPL / 代码签名 / PAC 关闭或降级
+#   - 不含 stub，不含设备参数，不含 CoreEntitlements 相关改动
+#
+# blob 依赖（SOURCE_CONFIRMED，见 PATCH_SERIES_DEPENDENCY_MAP.md）：
+#   MASTER.arm64.bcm2837  : b1674966 (runner-11 之后) -> fa3d43f7
+#   apple_arm64_cpu.h     : e462ede9 (上游原始)       -> f50881e6
+#
+# 应用命令（在已应用 runner-11 的树上）：
+#   git apply R1_R3B_MINIMAL.patch
+#
+# 本补丁应用成功 / 局部编译成功 != Bootstrap 成功。
+# 证据等级：HOST_TESTED（独立分支 git apply + Host newconf 配置生成 + Clang 编译）
+#           MACOS_RUNNER_TESTED = 本轮无新增；DEVICE_TESTED = NONE
+
+diff --git a/config/MASTER.arm64.bcm2837 b/config/MASTER.arm64.bcm2837
+index b1674966..fa3d43f7 100644
+--- a/config/MASTER.arm64.bcm2837
++++ b/config/MASTER.arm64.bcm2837
+@@ -54,11 +54,7 @@
+ #  LIBKERN_DEV =    [ LIBKERN_BASE iotracking ]
+ #  LIBKERN_DEBUG =  [ LIBKERN_BASE iotracking ]
+ 
+-#if SOC_IS_VIRTUALIZED
+ #  CPU_COUNTERS_BASE = [ ]
+-#else /*!SOC_IS_VIRTUALIZED*/
+-#  CPU_COUNTERS_BASE = [ config_cpu_counters config_pervasive_cpi config_pervasive_energy ]
+-#endif /*SOC_IS_VIRTUALIZED*/
+ #  PERF_EXTRAS_BASE = [ ]
+ #  PERF_EXTRAS_DEV = [ kdp_interactive_debugging config_kdp_coredump_encryption ]
+ #  PERF_EXTRAS_DEBUG = [ kdp_interactive_debugging config_kdp_coredump_encryption ]
+diff --git a/pexpert/pexpert/arm64/apple_arm64_cpu.h b/pexpert/pexpert/arm64/apple_arm64_cpu.h
+index e462ede9..f50881e6 100644
+--- a/pexpert/pexpert/arm64/apple_arm64_cpu.h
++++ b/pexpert/pexpert/arm64/apple_arm64_cpu.h
+@@ -32,6 +32,10 @@
+ 
+ #include <stdbool.h>
+ #include <sys/cdefs.h>
++#include <pexpert/arm64/board_config.h>
++
++/* The MPIDR core type field exists only on Apple cores. */
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 
+ /**
+  * Defines the core type of the executing CPU.
+@@ -135,4 +139,6 @@ arm64_core_type_as_string(void)
+ 	return arm64_core_type_to_string(arm64_core_type());
+ }
+ 
++#endif /* defined(APPLE_ARM64_ARCH_FAMILY) */
++
+ #endif /* !defined(__ASSEMBLER__) */

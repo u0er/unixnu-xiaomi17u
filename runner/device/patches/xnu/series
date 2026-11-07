@@ -9,3 +9,4 @@ device:patches/xnu/public-missing-definitions-policy.patch
 arch:../../../patches/xnu-12377/source-corecrypto14-bootstrap.patch
 arch:../../../patches/xnu-12377/source-pthread-bootstrap.patch
 device:patches/xnu/native-arm-pan-independent.patch
+device:patches/xnu/r1-r3b-minimal.patch
