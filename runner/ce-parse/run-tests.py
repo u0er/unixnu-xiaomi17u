@@ -63,6 +63,8 @@ tests = {
     'candidate-order': (prefix + '#include <CoreEntitlements/V2/API.h>\n#include <CoreEntitlements/V2/Kernel.h>\n', ['-fsyntax-only', '-H']),
     'candidate-amfi': ('#include <libkern/amfi/amfi.h>\n', ['-fsyntax-only', '-H']),
     'member-access': (prefix + expr, ['-fsyntax-only']),
+    'member-ir': (prefix + expr, ['-S', '-emit-llvm', '-o', '-']),
+    'member-object': (prefix + expr, ['-c', '-o', str(work / 'member-object.o')]),
     'ast': (prefix + expr, ['-fsyntax-only', '-Xclang', '-ast-dump']),
     'layout-ir': (layout, ['-S', '-emit-llvm', '-o', '-']),
     'record-layout': (prefix + 'CEKernelAPI_t ce_layout_instance;\n', ['-fsyntax-only', '-Xclang', '-fdump-record-layouts-complete']),
@@ -77,6 +79,13 @@ for name, (source, options) in tests.items():
                                           '\nexit: ' + str(result.returncode) + '\n' + result.stdout)
     statuses[name] = result.returncode
     print(name, 'exit', result.returncode, flush=True)
+if statuses['member-object'] == 0:
+    command = ['/usr/bin/xcrun', 'otool', '-hv', '-tvV', str(work / 'member-object.o')]
+    result = subprocess.run(command, cwd=work, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    (evidence / 'member-object-disassembly.log').write_text(
+        'cwd: ' + str(work) + '\ncommand: ' + shlex.join(command) +
+        '\nexit: ' + str(result.returncode) + '\n' + result.stdout)
+    statuses['member-object-disassembly'] = result.returncode
 (evidence / 'status.json').write_text(json.dumps({'statuses': statuses, 'candidate_record': str(record),
                                                   'sdk': str(sdk), 'clang': str(clang),
                                                   'flags': flags, 'include_paths': include}, indent=2))
