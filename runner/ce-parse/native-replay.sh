@@ -71,4 +71,30 @@ for component in osfmk bsd; do
   shasum -a 256 "$out/Makefile" "$out/meta_features.h"
 done
 echo 'Native config generated in fresh component directories.'
-echo 'NOT_RUN: no verified ubc_subr compile command or complete original runner output.' > "$ev/preprocess-status.txt"
+curl -fL --retry 2 -o "$work/kdk.dmg" https://github.com/dortania/KdkSupportPkg/releases/download/25F71/Kernel_Debug_Kit_26.5_build_25F71.dmg
+hdiutil attach -readonly -nobrowse -mountpoint "$work/kdk-mount" "$work/kdk.dmg"
+trap 'hdiutil detach "$work/kdk-mount" || true' EXIT
+pkg="$(find "$work/kdk-mount" -name KernelDebugKit.pkg -type f -print -quit)"
+test -n "$pkg"
+pkgutil --check-signature "$pkg" | tee "$ev/kdk-signature.log"
+xar -xf "$pkg" -C "$work" 'KDK.pkg/Payload' 'KDK_SDK.pkg/Payload'
+python3 "$GITHUB_WORKSPACE/runner/ce-parse/extract-native-kdk.py" "$work/KDK.pkg/Payload" "$work/KDK_SDK.pkg/Payload" "$work/kdk"
+for component in osfmk bsd; do
+  if [ "$component" = osfmk ]; then target=pmap.o; else target=ubc_subr.o; fi
+  out="$work/config-check/$component/DEVELOPMENT"
+  targetdir="$OBJROOT/DEVELOPMENT_ARM64_BCM2837/$component"
+  objpath="$OBJROOT/DEVELOPMENT_ARM64_BCM2837"
+  set +e
+  make -n -C "$out" -f "$out/Makefile" "$target" "${args[@]}" \
+    KDKROOT="$work/kdk" CURRENT_KERNEL_CONFIG=DEVELOPMENT CURRENT_ARCH_CONFIG=ARM64 \
+    CURRENT_MACHINE_CONFIG=BCM2837 CURRENT_BUILD_CONFIG='DEVELOPMENT^ARM64^BCM2837' \
+    SOURCE="$xnu/$component/" TARGET="$targetdir/" OBJPATH="$objpath" \
+    CFLAGS_EXTRA="-DXNU_NATIVE_PAN=1 -DXNU_SOURCE_CORECRYPTO14=1 -DXNU_BOOT_PROGRESS=0 -isysroot $sdk" \
+    > "$ev/$component-make-dryrun.log" 2>&1
+  rc=$?
+  set -e
+  echo "$component native make dry-run exit=$rc"
+  if [ "$rc" -eq 0 ]; then
+    python3 "$GITHUB_WORKSPACE/runner/ce-parse/native-preprocess.py" "$ev/$component-make-dryrun.log" "$out" "$work" "$ev" "$component" "$target"
+  fi
+done
