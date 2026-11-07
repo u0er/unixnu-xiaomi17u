@@ -7,6 +7,19 @@ evidence="$RUNNER_TEMP/candidate-a-evidence"
 output="$RUNNER_TEMP/candidate-a-output"
 mkdir -p "$inputs" "$evidence"
 exec > >(tee "$evidence/runner.log") 2>&1
+finish() {
+  local result=$?
+  local tree="$output/nezha/ipados-26.5-23F77-nezha/nezha/tree"
+  local bundle="$inputs/firehose-repository/ci/firehose-apple-clang/candidate-headers.tar.gz"
+  if [ -d "$tree/.cache/fakeroot" ] && [ -f "$bundle" ]; then
+    if ! python3 -B "$workspace/runner/compare-headers.py" "$bundle" "$tree" "$evidence/header-differences.json"; then
+      echo 'Frozen header diagnostic failed' >&2
+      result=1
+    fi
+  fi
+  exit "$result"
+}
+trap finish EXIT
 
 # The source tree is pinned by the workflow checkout. Only the listed local
 # candidate files are overlaid; no SDK, IPSW or device image is published.
