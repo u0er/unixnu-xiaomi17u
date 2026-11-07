@@ -248,6 +248,12 @@ def build(ctx, modules, *, apple_sdk=None):
         # archive verification; this phase cannot reach the kernel make target.
         run(['bash', script, '--xnu-only-headers'], cwd=ctx.tree, env=env,
             log_file=ctx.logs / 'kernel-headers.log')
+        changes = frozen_firehose.restore_candidate_overlay(
+            prebuilt['headers'], ctx.tree, ctx.work / 'generated-headers-before-frozen')
+        (ctx.work / 'frozen-overlay-changes.json').write_text(json.dumps({
+            'source': str(prebuilt['headers']), 'changes': changes,
+            'scope': 'isolated kernel header overlay; not the Apple SDK',
+        }, indent=2) + '\n')
         from . import xnu_only_sdk
         inspected = xnu_only_sdk.inspect(ctx.tree / '.cache/fakeroot')
         if inspected['sdkroot'] != apple_sdk['sdkroot'] or inspected['clang'] != apple_sdk['clang']:

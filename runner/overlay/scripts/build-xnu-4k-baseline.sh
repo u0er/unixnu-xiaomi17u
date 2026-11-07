@@ -149,6 +149,7 @@ if [ ! -d refer/libplatform/.git ]; then
   git clone --depth 1 --branch "$LIBPLATFORM_TAG" https://github.com/apple-oss-distributions/libplatform.git refer/libplatform
 fi
 export KERNEL_SDKROOT=$ROOT/.cache/fakeroot
+if [ "$XNU_BUILD_MODE" != xnu-only ] || [ "${1:-}" = --xnu-only-headers ]; then
 mkdir -p "$KERNEL_SDKROOT/usr/local/include/kernel" "$ROOT/build/xnu/obj/EXPORT_HDRS/libsa"
 copy_tree() {
   mkdir -p "$2"
@@ -183,6 +184,7 @@ if [ ! -f "$KERNEL_SDKROOT/.xnu-$XNU_VERSION-headers" ]; then
     SYMROOT="$ROOT/build/xnu/sym" DSTROOT="$KERNEL_SDKROOT" \
     ${XNU_HOST_MAKE_ARGS[@]+"${XNU_HOST_MAKE_ARGS[@]}"}
   touch "$KERNEL_SDKROOT/.xnu-$XNU_VERSION-headers"
+fi
 fi
 if [ "${1:-}" = --xnu-only-headers ]; then
   exit 0

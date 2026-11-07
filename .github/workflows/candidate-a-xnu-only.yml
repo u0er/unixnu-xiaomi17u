@@ -43,6 +43,7 @@ jobs:
             ${{ runner.temp }}/candidate-a-evidence/
             ${{ runner.temp }}/candidate-a-output/EXAMPLE_CONFIG_NOT_DEVICE_VALIDATED.json
             ${{ runner.temp }}/candidate-a-output/nezha/ipados-26.5-23F77-nezha/nezha/.config
+            ${{ runner.temp }}/candidate-a-output/nezha/ipados-26.5-23F77-nezha/nezha/frozen-overlay-changes.json
             ${{ runner.temp }}/candidate-a-output/nezha/ipados-26.5-23F77-nezha/nezha/logs/
             ${{ runner.temp }}/candidate-a-output/nezha/ipados-26.5-23F77-nezha/nezha/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped
             ${{ runner.temp }}/candidate-a-output/nezha/ipados-26.5-23F77-nezha/nezha/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/osfmk/DEVELOPMENT/*.o.json
