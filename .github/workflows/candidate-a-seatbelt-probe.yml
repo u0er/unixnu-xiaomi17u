@@ -1,0 +1,26 @@
+name: Candidate A Seatbelt capability probe
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/candidate-a-seatbelt-probe
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify process and write restrictions
+        run: python3 -B scripts/candidate-a-seatbelt-probe.py
+      - name: Save diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-a-seatbelt-diagnostics
+          path: ${{ runner.temp }}/candidate-a-seatbelt-probe/
+          if-no-files-found: error
+          retention-days: 7
