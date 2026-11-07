@@ -60,15 +60,15 @@ make -C "$xnu" setup "${args[@]}"
 make -C "$xnu" exporthdrs "${args[@]}"
 test -x "$OBJROOT/SETUP/config/config"
 for component in osfmk bsd; do
-  out="$OBJROOT/DEVELOPMENT_ARM64_BCM2837/$component/DEVELOPMENT"
+  out="$work/config-check/$component/DEVELOPMENT"
   mkdir -p "$out"
-  "$xnu/SETUP/config/doconf" -c -cpu arm64 -soc bcm2837 -platform iPhoneOS \
-    -d "$out" -s "$xnu/$component/conf" -m "$xnu/config" DEVELOPMENT
+  SOURCE="$xnu/$component/conf/" "$xnu/SETUP/config/doconf" -c -cpu arm64 -soc bcm2837 -platform iPhoneOS \
+    -d "$out" -s "$xnu/$component/conf/" -m "$xnu/config" DEVELOPMENT
   test -s "$out/Makefile"
   test -s "$out/meta_features.h"
   cp "$out/Makefile" "$ev/$component-Makefile.txt"
   cp "$out/meta_features.h" "$ev/$component-meta-features.txt"
   shasum -a 256 "$out/Makefile" "$out/meta_features.h"
 done
-echo 'Native config generated; preprocessing must use actual generated commands and complete KDK/header closure.'
+echo 'Native config generated in fresh component directories.'
 echo 'NOT_RUN: no verified ubc_subr compile command or complete original runner output.' > "$ev/preprocess-status.txt"
