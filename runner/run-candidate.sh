@@ -20,6 +20,7 @@ finish() {
   exit "$result"
 }
 trap finish EXIT
+python3 -B "$workspace/runner/find-coreentitlements.py"
 
 # The source tree is pinned by the workflow checkout. Only the listed local
 # candidate files are overlaid; no SDK, IPSW or device image is published.

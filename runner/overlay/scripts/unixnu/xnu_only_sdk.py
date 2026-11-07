@@ -106,7 +106,12 @@ def verify_make_record(path, sdk, overlay):
         raise Error('XNU-only compile record has a conflicting target triple')
     arch = values('-arch')
     deployment = [a for a in args if a.startswith('-miphoneos-version-min=')]
-    if arch != ['arm64e'] or deployment != ['-miphoneos-version-min=26.0'] or '-mkernel' not in args:
+    # Clang's -MJ normalizes the deployment option into --target, so either
+    # representation must prove iOS 26.0; reject any conflicting declaration.
+    if deployment not in ([], ['-miphoneos-version-min=26.0']):
+        raise Error('XNU-only compile record has a conflicting deployment target')
+    if (arch != ['arm64e'] or (not targets and not deployment)
+            or '-mkernel' not in args):
         raise Error('XNU-only compile record does not use the expected arm64e/iOS kernel flags')
     includes = values('-I') + [a[2:] for a in args if a.startswith('-I') and len(a) > 2]
     required = (Path(overlay) / 'usr/local/include/kernel').resolve()
