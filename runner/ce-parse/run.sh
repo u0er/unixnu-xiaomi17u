@@ -23,4 +23,11 @@ xar -xf "$pkg" -C "$work" 'KDK.pkg/Payload' 'KDK_SDK.pkg/Payload'
 python3 "$GITHUB_WORKSPACE/runner/ce-parse/extract.py" "$work/KDK.pkg/Payload" "$work/KDK_SDK.pkg/Payload" "$work/headers"
 mkdir -p "$work/frozen"
 tar -xzf "$GITHUB_WORKSPACE/frozen-headers/ci/firehose-apple-clang/candidate-headers.tar.gz" -C "$work/frozen"
+frozen="$work/frozen/.cache/fakeroot/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders"
+for item in arm64/proc_reg.h pexpert/arm64/board_config.h pexpert/arm64/BCM2837.h; do
+  test -f "$frozen/$item"
+  mkdir -p "$work/patched/$(dirname "$item")"
+  cp "$frozen/$item" "$work/patched/$item"
+  echo "frozen candidate header: $item"
+done
 python3 "$GITHUB_WORKSPACE/runner/ce-parse/run-tests.py" "$GITHUB_WORKSPACE/xnu" "$work/headers" "$work" "$evidence" "$sdk" "$clang" "$GITHUB_WORKSPACE/runner/ce-parse/record.json"

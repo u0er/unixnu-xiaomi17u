@@ -27,7 +27,7 @@ members = re.findall(r'typeof\((CE\w+)\)\s*\*(\w+)\s*;', kernel)
 if len(members) != 45:
     raise SystemExit(f'unexpected member count: {len(members)}')
 
-include = ['-I', str(headers), '-I', str(xnu / 'EXTERNAL_HEADERS'),
+include = ['-I', str(headers), '-I', str(work / 'patched'), '-I', str(xnu / 'EXTERNAL_HEADERS'),
            '-I', str(xnu / 'libkern'), '-I', str(xnu / 'osfmk'),
            '-I', str(xnu / 'bsd'), '-I', str(xnu / 'iokit'),
            '-I', str(xnu / 'pexpert'), '-I', str(headers / 'platform'),
