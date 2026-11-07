@@ -11,7 +11,11 @@ root.mkdir(parents=True, exist_ok=False)
 guard = root / 'deny-shell'
 guard.write_text('#!/bin/bash\nprintf "guard invoked\\n" >> "${PROBE_ROOT}/guard.log"\nexit 88\n')
 guard.chmod(0o755)
-tools = [Path('/usr/bin/make').resolve(), Path('/bin/bash').resolve(), Path('/usr/bin/touch').resolve(), guard]
+developer = '/Applications/Xcode_26.5.app/Contents/Developer'
+tool_env = dict(os.environ, DEVELOPER_DIR=developer)
+make = Path(subprocess.run(['/usr/bin/xcrun', '--find', 'make'], env=tool_env,
+                           capture_output=True, text=True, check=True).stdout.strip()).resolve()
+tools = [make, Path('/bin/bash').resolve(), Path('/usr/bin/touch').resolve(), guard]
 policy = '(version 1)\n(allow default)\n(deny network*)\n(deny process-exec)\n'
 policy += '(allow process-exec ' + ' '.join(f'(literal "{tool}")' for tool in tools) + ')\n'
 policy += f'(deny file-write*)\n(allow file-write* (subpath "{root}") (literal "/dev/null"))\n'
@@ -28,13 +32,13 @@ report = {'scope': 'harmless GNU Make fixture; no Candidate make or compilation'
 try:
     for tool in tools:
         report['programs'].append({'path': str(tool), 'sha256': hashlib.sha256(tool.read_bytes()).hexdigest()})
-    report['make_version'] = subprocess.run(['/usr/bin/make', '--version'], capture_output=True,
+    report['make_version'] = subprocess.run([str(make), '--version'], capture_output=True,
                                             text=True, check=True).stdout.splitlines()[0]
     for name, text in makefiles.items():
         makefile = root / (name + '.mk')
         makefile.write_text(text)
         env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'TMPDIR': str(root), 'PROBE_ROOT': str(root), 'LC_ALL': 'C'}
-        argv = ['/usr/bin/sandbox-exec', '-f', str(root / 'probe.sb'), '/usr/bin/make',
+        argv = ['/usr/bin/sandbox-exec', '-f', str(root / 'probe.sb'), str(make),
                 '-f', str(makefile), 'SHELL=' + str(guard), 'all']
         result = subprocess.run(argv, cwd=root, env=env, text=True, capture_output=True, check=False)
         (root / (name + '.stdout')).write_text(result.stdout)
