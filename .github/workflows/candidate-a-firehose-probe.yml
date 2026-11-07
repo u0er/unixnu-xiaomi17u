@@ -1,0 +1,30 @@
+name: Candidate A Apple Clang PAC probe
+
+on:
+  push:
+    branches:
+      - codex/firehose-ptrauth-20261107
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apple-clang-probe:
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect Apple Clang and four-argument semantics
+        shell: bash
+        run: bash ci/firehose-apple-clang/run-probe.sh
+      - name: Preserve diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-a-ptrauth-apple-clang
+          path: ci/firehose-apple-clang/out/
+          if-no-files-found: error
+          retention-days: 7
