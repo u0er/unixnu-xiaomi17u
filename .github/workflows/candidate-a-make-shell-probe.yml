@@ -1,0 +1,26 @@
+name: Candidate A make shell boundary probe
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/candidate-a-make-shell-probe
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test make SHELL boundary in Seatbelt
+        run: python3 -B scripts/candidate-a-make-shell-probe.py
+      - name: Save diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-a-make-shell-diagnostics
+          path: ${{ runner.temp }}/candidate-a-make-shell-probe/
+          if-no-files-found: error
+          retention-days: 7
