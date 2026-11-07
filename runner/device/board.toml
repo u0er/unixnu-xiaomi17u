@@ -1,0 +1,31 @@
+schema_version = 2
+
+[board]
+example = true
+name = "nezha"
+soc = "SM8850-AC"
+soc_source = "sm8850-ac"
+os_profile = "ipados-26.5-23F77-nezha"
+
+[components]
+include = ["ArmDTPlatform", "ArmCpu"]
+
+[kernel]
+defconfig = "nezha_defconfig"
+config_fragments = ["arch:configs/common.config"]
+patch_series = ["device:patches/xnu/series"]
+archives = ["build-libpthread-kernel.py", "build-corecrypto-14.py", "build-corecrypto-14.py --namespace", "component:ArmDTPlatform", "component:ArmCpu"]
+
+[kernel.prebuilt_firehose]
+archive = "../frozen/libfirehose_kernel.a"
+manifest = "../frozen/firehose.json"
+headers = "../firehose-repository/ci/firehose-apple-clang/candidate-headers.tar.gz"
+sha256 = "86afb7baa36658fd963b4c57a7f3bb8c9a9e0281e8f45213141eeb932ee64b8d"
+
+[kernel.prebuilt_cc_kext]
+archive = "../frozen/libcc_kext.a"
+manifest = "../frozen/cc-kext.json"
+sha256 = "796625112a6eb7517023a72ea95573c8bf7ce0ef60d62650cade0930a055098b"
+
+[kernel.prelink]
+kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped"

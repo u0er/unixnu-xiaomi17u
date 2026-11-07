@@ -1,0 +1,11 @@
+arch:../../../patches/xnu-12377/bcm2837-machine-config.patch
+arch:../../../patches/xnu-12377/local-availability.patch
+arch:../../../patches/xnu-12377/cxx-flag-dependencies.patch
+arch:../../../patches/xnu-12377/external-archive-dependencies.patch
+arch:../../../patches/xnu-12377/public-entitlements-header.patch
+arch:../../../patches/xnu-12377/kernel-sdk-root.patch
+arch:../../../patches/xnu-12377/source-machine-layer.patch
+device:patches/xnu/public-missing-definitions-policy.patch
+arch:../../../patches/xnu-12377/source-corecrypto14-bootstrap.patch
+arch:../../../patches/xnu-12377/source-pthread-bootstrap.patch
+device:patches/xnu/native-arm-pan-independent.patch

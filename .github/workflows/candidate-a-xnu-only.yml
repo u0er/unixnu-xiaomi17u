@@ -1,0 +1,49 @@
+name: Candidate A XNU-only build
+
+on:
+  push:
+    branches: [codex/candidate-a-xnu-only-20261108]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  xnu-only:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    steps:
+      - name: Checkout build inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Checkout the fixed UniXNU parent
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: UniXNU/UniXNU
+          ref: dc98673cad1d7741ca03cea979c577bb81bc58db
+          path: source
+          persist-credentials: false
+          submodules: false
+      - name: Build Candidate A in an isolated directory
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash runner/run-candidate.sh
+      - name: Preserve build logs and experimental output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: candidate-a-xnu-only-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/candidate-a-evidence/
+            ${{ runner.temp }}/candidate-a-output/EXAMPLE_CONFIG_NOT_DEVICE_VALIDATED.json
+            ${{ runner.temp }}/candidate-a-output/nezha/ipados-26.5-23F77-nezha/nezha/.config
+            ${{ runner.temp }}/candidate-a-output/nezha/ipados-26.5-23F77-nezha/nezha/logs/
+            ${{ runner.temp }}/candidate-a-output/nezha/ipados-26.5-23F77-nezha/nezha/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped
+            ${{ runner.temp }}/candidate-a-output/nezha/ipados-26.5-23F77-nezha/nezha/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/osfmk/DEVELOPMENT/*.o.json
+            ${{ runner.temp }}/candidate-a-output/nezha/ipados-26.5-23F77-nezha/nezha/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/*.cpo.json

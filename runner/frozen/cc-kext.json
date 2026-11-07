@@ -1,0 +1,10 @@
+{
+  "cc_kext_kernel_abi_candidate": {
+    "sha256": "796625112a6eb7517023a72ea95573c8bf7ce0ef60d62650cade0930a055098b",
+    "llvm_commit": "58c46bae21181fb4240cf964461bea738d96d50e",
+    "libc_commit": "899a3b2d52d95d75e05fb286a5e64975ec3de757",
+    "xnu_commit": "ac9718fb1af618d5ce8678d0dc6e8a58f252216f",
+    "target": "arm64e-apple-ios26.0",
+    "sdk_root": "Candidate A generated fakeroot; Mach-O LC_BUILD_VERSION sdk n/a"
+  }
+}

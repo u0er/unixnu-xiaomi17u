@@ -1,0 +1,4 @@
+schema_version = 2
+
+[soc]
+name = "sm8850-ac"
