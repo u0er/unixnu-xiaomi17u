@@ -31,3 +31,4 @@ for item in arm64/proc_reg.h pexpert/arm64/board_config.h pexpert/arm64/BCM2837.
   echo "frozen candidate header: $item"
 done
 python3 "$GITHUB_WORKSPACE/runner/ce-parse/run-tests.py" "$GITHUB_WORKSPACE/xnu" "$work/headers" "$work" "$evidence" "$sdk" "$clang" "$GITHUB_WORKSPACE/runner/ce-parse/record.json"
+python3 "$GITHUB_WORKSPACE/runner/ce-parse/preprocess-pmap.py" "$GITHUB_WORKSPACE/xnu" "$work/headers" "$work" "$evidence" "$sdk" "$clang" "$GITHUB_WORKSPACE/runner/ce-parse/pmap-record.json"
