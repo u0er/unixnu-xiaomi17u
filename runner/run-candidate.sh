@@ -11,6 +11,20 @@ finish() {
   local result=$?
   local tree="$output/nezha/ipados-26.5-23F77-nezha/nezha/tree"
   local bundle="$inputs/firehose-repository/ci/firehose-apple-clang/candidate-headers.tar.gz"
+  local object_root="$tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837"
+  if [ -d "$object_root" ]; then
+    find "$object_root" -type f \( -name '*.o' -o -name '*.cpo' \) -print > "$evidence/compiled-objects.txt"
+    mkdir -p "$evidence/sample-objects"
+    local count=0 object
+    while IFS= read -r object && [ "$count" -lt 8 ]; do
+      count=$((count + 1))
+      cp "$object" "$evidence/sample-objects/$count-$(basename "$object")"
+      if ! /usr/bin/xcrun otool -hv "$object" >> "$evidence/sample-object-headers.txt" 2>&1; then
+        echo "Mach-O inspection failed: $object" >&2
+        result=1
+      fi
+    done < "$evidence/compiled-objects.txt"
+  fi
   if [ -d "$tree/.cache/fakeroot" ] && [ -f "$bundle" ]; then
     if ! python3 -B "$workspace/runner/compare-headers.py" "$bundle" "$tree" "$evidence/header-differences.json"; then
       echo 'Frozen header diagnostic failed' >&2

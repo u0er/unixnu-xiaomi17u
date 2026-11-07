@@ -285,6 +285,9 @@ def build(ctx, modules, *, apple_sdk=None):
         try:
             run_baseline(subprocess_env, ctx.logs / 'kernel-bootstrap.log')
         except Error:
+            if apple_sdk:
+                # A partial -k bootstrap is evidence, not archive readiness.
+                raise
             # A bootstrap compile may stop after producing records, but a frozen
             # input failure must never be converted into permission to continue.
             if prebuilt:

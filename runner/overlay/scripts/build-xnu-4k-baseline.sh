@@ -881,7 +881,12 @@ fi
 if [ -n "${UNIXNU_FROZEN_CC_KEXT:-}" ] && [ "$XNU_BUILD_MODE" != xnu-only ]; then
   python3 "$ROOT/scripts/linux/prepare-xnu.py" libs
 fi
-make -C .cache/xnu-work "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iphoneos}" ARCH_CONFIGS=ARM64 \
+MAKE_FAILURE_MODE=()
+if [ "$XNU_BUILD_MODE" = xnu-only ] && [ "$BOOTSTRAP" = 1 ]; then
+  # Collect independent compiler failures and objects in this experimental pass.
+  MAKE_FAILURE_MODE=(-k)
+fi
+make "${MAKE_FAILURE_MODE[@]}" -C .cache/xnu-work "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iphoneos}" ARCH_CONFIGS=ARM64 \
   MACHINE_CONFIGS=BCM2837 KERNEL_CONFIGS=DEVELOPMENT \
   ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG="$XNU_ARCH_STRING" LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY \
   ARM64_LINK_ADDR=0xfffffff007004000 ARM64_PLKSEG_ADDR=0xfffffff004004000 \
