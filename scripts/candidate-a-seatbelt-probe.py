@@ -13,7 +13,9 @@ root = Path(os.environ['RUNNER_TEMP']).resolve() / 'candidate-a-seatbelt-probe'
 root.mkdir(parents=True, exist_ok=False)
 allowed = root / 'allowed'
 allowed.mkdir()
-sh = Path('/bin/sh').resolve()
+# macOS /bin/sh re-execs /bin/bash; start the actual shell explicitly so the
+# path allowlist covers the program the OS really executes.
+sh = Path('/bin/bash').resolve()
 yes = Path('/usr/bin/true').resolve()
 blocked = Path('/bin/ls').resolve()
 outside = root / 'outside.txt'
