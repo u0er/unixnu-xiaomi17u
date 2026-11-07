@@ -36,7 +36,7 @@ class Reader:
         return out
 
 
-def extract(payload, output, allow):
+def extract(payload, output, allow, extra_prefixes=()):
     stream = Reader(chunks(payload))
     found = []
     while True:
@@ -48,8 +48,14 @@ def extract(payload, output, allow):
         name = stream.read(n)[:-1].decode().removeprefix('./')
         if name == 'TRAILER!!!':
             break
-        selected = name in allow and stat.S_ISREG(mode)
-        dest = (output / pathlib.PurePosixPath(name).name).open('xb') if selected else None
+        selected = (name in allow or any(name.startswith(prefix) and name.endswith('.h')
+                                         for prefix in extra_prefixes)) and stat.S_ISREG(mode)
+        target = None
+        if selected:
+            target = output / pathlib.PurePosixPath(name).name if name in allow else (
+                root / 'platform' / name.split('/PrivateHeaders/platform/', 1)[1])
+            target.parent.mkdir(parents=True, exist_ok=True)
+        dest = target.open('xb') if selected else None
         try:
             while size:
                 block = stream.read(min(size, 1024 * 1024))
@@ -62,7 +68,7 @@ def extract(payload, output, allow):
         if selected:
             found.append(name)
             print(f'extracted {name}', flush=True)
-    if set(found) != set(allow):
+    if not set(allow).issubset(found):
         raise ValueError(f'headers missing: {set(allow) - set(found)}')
 
 
@@ -70,5 +76,7 @@ kernel, sdk, root = map(pathlib.Path, sys.argv[1:])
 out = root / 'CoreEntitlements/V2'
 out.mkdir(parents=True)
 prefix = 'System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform/CoreEntitlements/V2/'
-extract(sdk, out, {prefix + x + '.h' for x in ('API', 'Acceleration', 'Closure', 'Context', 'Return', 'StackProtector')})
+platform = 'System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform/'
+extract(sdk, out, {prefix + x + '.h' for x in ('API', 'Acceleration', 'Closure', 'Context', 'Return', 'StackProtector')},
+        tuple(platform + x + '/' for x in ('TrustCache', 'CodeSignature', 'TrustedExecutionMonitor')))
 extract(kernel, out, {'System/Library/KernelSupport/CoreEntitlements/V2/Kernel.h'})
