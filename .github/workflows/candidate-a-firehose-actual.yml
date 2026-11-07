@@ -1,9 +1,6 @@
 name: Candidate A actual firehose translation unit
 
 on:
-  push:
-    branches:
-      - codex/firehose-ptrauth-20261107
   workflow_dispatch:
 
 permissions:

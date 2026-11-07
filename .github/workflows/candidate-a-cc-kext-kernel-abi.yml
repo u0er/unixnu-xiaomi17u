@@ -1,0 +1,50 @@
+name: Candidate A compiler-rt kernel ABI archive
+
+on:
+  push:
+    branches:
+      - codex/firehose-ptrauth-20261107
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compiler-rt:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: llvm/llvm-project
+          ref: 58c46bae21181fb4240cf964461bea738d96d50e
+          path: ci/cc-kext-abi/llvm
+          sparse-checkout: |
+            compiler-rt/include/profile
+            compiler-rt/lib/profile
+      - uses: actions/checkout@v4
+        with:
+          repository: apple-oss-distributions/Libc
+          ref: 899a3b2d52d95d75e05fb286a5e64975ec3de757
+          path: ci/cc-kext-abi/libc
+          sparse-checkout: include
+      - uses: actions/checkout@v4
+        with:
+          repository: apple-oss-distributions/xnu
+          ref: ac9718fb1af618d5ce8678d0dc6e8a58f252216f
+          path: ci/cc-kext-abi/xnu
+          sparse-checkout: libsyscall/wrappers
+      - name: Build six compiler-rt objects
+        shell: bash
+        run: bash ci/cc-kext-abi/build.sh
+      - name: Preserve archive and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-a-cc-kext-kernel-abi
+          path: ci/cc-kext-abi/out/
+          if-no-files-found: error
+          retention-days: 7
