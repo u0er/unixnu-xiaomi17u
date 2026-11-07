@@ -1,0 +1,46 @@
+name: Candidate A native configuration replay
+on:
+  push:
+    branches: [codex/candidate-a-native-replay-20261108]
+permissions:
+  contents: read
+jobs:
+  native-replay:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: apple-oss-distributions/xnu
+          ref: ac9718fb1af618d5ce8678d0dc6e8a58f252216f
+          path: xnu
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: UniXNU/UniXNU
+          ref: dc98673cad1d7741ca03cea979c577bb81bc58db
+          path: parent
+          persist-credentials: false
+          submodules: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: u0er/unixnu-xiaomi17u
+          ref: 49a37562c9c1e57963d558d4c322036602e3280e
+          path: frozen-headers
+          persist-credentials: false
+      - name: Generate native configuration and preprocess
+        shell: bash
+        run: bash runner/ce-parse/native-replay.sh
+      - name: Save diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: candidate-a-native-replay-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: ${{ runner.temp }}/native-replay-evidence/
