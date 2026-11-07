@@ -63,18 +63,20 @@ try:
     triple, actual_sysroot = parts[parts.index('-triple') + 1], parts[parts.index('-isysroot') + 1]
     if not triple.startswith('arm64e-apple-ios26.0') or Path(actual_sysroot).resolve() != sdk.resolve():
         raise RuntimeError('cc1 triple or sysroot mismatch')
+    if '-fptrauth-kernel-abi-version' not in parts or '-fptrauth-abi-version=0' not in parts:
+        raise RuntimeError('cc1 is not using the expected kernel PAuth ABI version')
     includes = run('clang-includes', [*args, '-E', '-v', '-x', 'c', '-'], '').stderr
     start = '#include <...> search starts here:'
     if start not in includes or 'End of search list.' not in includes:
         raise RuntimeError('clang did not report its include search list')
     paths = [line.strip().removesuffix(' (framework directory)') for line in
              includes.split(start, 1)[1].split('End of search list.', 1)[0].splitlines() if line.strip()]
-    forbidden = [path for path in paths if path.startswith(('/mnt/', '/usr/include', '/usr/local/include', '/opt/'))]
+    forbidden = [path for path in paths if not Path(path).resolve().is_relative_to(DEVELOPER.resolve())]
     if forbidden or not any(Path(path).resolve().is_relative_to(sdk.resolve()) for path in paths):
         raise RuntimeError('SDK search path missing or unexpected host include path')
     report.update(status='PASS_DRIVER_ONLY', sdk_path=str(sdk), sdk_resolved=str(sdk.resolve()),
                   sdk_version=version, sdk_build=build, clang=str(clang), clang_version=clang_version,
-                  cc1_triple=triple, cc1_sysroot=actual_sysroot, include_search_paths=paths)
+                  cc1_triple=triple, cc1_sysroot=actual_sysroot, kernel_ptrauth_abi='0', include_search_paths=paths)
 except (OSError, RuntimeError, ValueError, plistlib.InvalidFileException) as error:
     report['errors'].append(str(error))
 finally:
