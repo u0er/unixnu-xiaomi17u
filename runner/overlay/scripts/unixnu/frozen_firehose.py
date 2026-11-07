@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import struct
 import subprocess
 import tarfile
@@ -151,7 +152,26 @@ def restore_candidate_overlay(bundle, tree, backup):
                 previous = target.read_bytes() if target.exists() else None
                 if previous != data:
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(data)
+                    # installhdrs may create read-only files; replace the owned
+                    # output entry rather than changing its permissions in place.
+                    temp_name = None
+                    original_mode = target.stat().st_mode if target.exists() else None
+                    made_writable = False
+                    try:
+                        with tempfile.NamedTemporaryFile(dir=target.parent, prefix='.frozen-header-', delete=False) as temp:
+                            temp_name = temp.name
+                            temp.write(data)
+                        os.chmod(temp_name, item.mode & 0o777)
+                        if os.name == 'nt' and original_mode is not None and not original_mode & stat.S_IWRITE:
+                            os.chmod(target, original_mode | stat.S_IWRITE)
+                            made_writable = True
+                        os.replace(temp_name, target)
+                        made_writable = False
+                    finally:
+                        if made_writable:
+                            os.chmod(target, original_mode)
+                        if temp_name and os.path.exists(temp_name):
+                            os.unlink(temp_name)
                     changes.append({'path': str(relative),
                                     'generated_sha256': digest(previous) if previous is not None else None,
                                     'frozen_sha256': digest(data)})
