@@ -21,6 +21,12 @@ jobs:
           ref: ac9718fb1af618d5ce8678d0dc6e8a58f252216f
           path: xnu
           persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: u0er/unixnu-xiaomi17u
+          ref: 49a37562c9c1e57963d558d4c322036602e3280e
+          path: frozen-headers
+          persist-credentials: false
       - name: Parse isolated headers
         shell: bash
         run: bash runner/ce-parse/run.sh

@@ -30,7 +30,11 @@ if len(members) != 45:
 include = ['-I', str(headers), '-I', str(xnu / 'EXTERNAL_HEADERS'),
            '-I', str(xnu / 'libkern'), '-I', str(xnu / 'osfmk'),
            '-I', str(xnu / 'bsd'), '-I', str(xnu / 'iokit'),
-           '-I', str(xnu / 'pexpert'), '-isysroot', str(sdk)]
+           '-I', str(xnu / 'pexpert'),
+           '-I', str(work / 'frozen/.cache/fakeroot/usr/local/include/kernel'),
+           '-I', str(work / 'frozen/.cache/fakeroot/usr/local/include'),
+           '-I', str(work / 'frozen/.cache/fakeroot/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders'),
+           '-isysroot', str(sdk)]
 common = [str(clang), '-x', 'c', '-std=gnu11', *flags, *include]
 prefix = '#include <CoreEntitlements/V2/API.h>\n#include <CoreEntitlements/V2/Kernel.h>\n'
 expr = '''

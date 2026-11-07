@@ -21,4 +21,6 @@ test -n "$pkg"
 pkgutil --check-signature "$pkg" | tee "$evidence/pkg-signature.log"
 xar -xf "$pkg" -C "$work" 'KDK.pkg/Payload' 'KDK_SDK.pkg/Payload'
 python3 "$GITHUB_WORKSPACE/runner/ce-parse/extract.py" "$work/KDK.pkg/Payload" "$work/KDK_SDK.pkg/Payload" "$work/headers"
+mkdir -p "$work/frozen"
+tar -xzf "$GITHUB_WORKSPACE/frozen-headers/ci/firehose-apple-clang/candidate-headers.tar.gz" -C "$work/frozen"
 python3 "$GITHUB_WORKSPACE/runner/ce-parse/run-tests.py" "$GITHUB_WORKSPACE/xnu" "$work/headers" "$work" "$evidence" "$sdk" "$clang" "$GITHUB_WORKSPACE/runner/ce-parse/record.json"
