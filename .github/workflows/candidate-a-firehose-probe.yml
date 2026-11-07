@@ -1,9 +1,6 @@
 name: Candidate A Apple Clang PAC probe
 
 on:
-  push:
-    branches:
-      - codex/firehose-ptrauth-20261107
   workflow_dispatch:
 
 permissions:

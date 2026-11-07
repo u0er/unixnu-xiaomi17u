@@ -1,0 +1,35 @@
+name: Candidate A actual firehose translation unit
+
+on:
+  push:
+    branches:
+      - codex/firehose-ptrauth-20261107
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actual-firehose:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: apple-oss-distributions/libdispatch
+          ref: 701f4d1a24ae9c6863901bbbb22624b7d1b87321
+          path: ci/firehose-apple-clang/libdispatch
+      - name: Compile actual Candidate A firehose
+        shell: bash
+        run: bash ci/firehose-apple-clang/run-actual.sh
+      - name: Preserve full diagnostics and any archive
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-a-firehose-actual
+          path: ci/firehose-apple-clang/actual-out/
+          if-no-files-found: error
+          retention-days: 7
