@@ -208,6 +208,8 @@ def build(ctx, modules, *, apple_sdk=None):
         tmp.mkdir(parents=True, exist_ok=True)
         env = {'PATH': os.environ.get('PATH', ''), 'DEVELOPER_DIR': os.environ.get('DEVELOPER_DIR', ''),
                'HOME': str(home), 'TMPDIR': str(tmp), 'LC_ALL': 'C'}
+        if os.environ.get('GITHUB_TOKEN'):
+            env['GITHUB_TOKEN'] = os.environ['GITHUB_TOKEN']
         if os.environ.get('UNIXNU_CC_KEXT_SOURCE_ROOT'):
             env['UNIXNU_CC_KEXT_SOURCE_ROOT'] = os.environ['UNIXNU_CC_KEXT_SOURCE_ROOT']
     else:
@@ -228,7 +230,7 @@ def build(ctx, modules, *, apple_sdk=None):
         env.pop('UNIXNU_FROZEN_FIREHOSE_HEADERS', None)
         env.pop('UNIXNU_FROZEN_CC_KEXT', None)
     if ctx.schema_version == 2:
-        env['UNIXNU_PATCH_LIST'] = str(patches.prepare(ctx, modules))
+        env['UNIXNU_PATCH_LIST'] = str(patches.prepare(ctx, modules, env=env) if apple_sdk else patches.prepare(ctx, modules))
         generated = ctx.tree / 'build/generated'
         generated.mkdir(parents=True, exist_ok=True)
         env['UNIXNU_GENERATED_DIR'] = str(generated)
