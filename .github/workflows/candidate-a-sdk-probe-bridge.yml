@@ -1,0 +1,13 @@
+name: Candidate A SDK probe isolated branch bridge
+
+on:
+  push:
+    branches:
+      - codex/candidate-a-sdk-probe-20261107
+
+permissions:
+  contents: read
+
+jobs:
+  sdk-probe:
+    uses: ./.github/workflows/candidate-a-xcode26-sdk-probe.yml

@@ -1,0 +1,29 @@
+name: Candidate A Xcode 26.5 SDK probe
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  sdk-probe:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Inspect the installed SDK and toolchain
+        run: python3 -B scripts/probe-xcode26-sdk.py --output "$RUNNER_TEMP/candidate-a-sdk-probe"
+      - name: Upload diagnostics only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-a-xcode26-sdk-probe
+          path: ${{ runner.temp }}/candidate-a-sdk-probe/
+          if-no-files-found: error
+          retention-days: 7
