@@ -41,6 +41,20 @@ output = work / f'{component}-preprocessed.i'
 command.extend(['-E', '-H', '-o', str(output)])
 result = subprocess.run(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 log = f'cwd: {cwd}\ncommand: {shlex.join(command)}\nexit: {result.returncode}\n{result.stdout}'
+included = set()
+for line in result.stdout.splitlines():
+    match = re.match(r'^\.+\s+(/.+?)(?: \(framework directory\))?$', line)
+    if match:
+        path = pathlib.Path(match.group(1))
+        if path.is_file():
+            included.add(path)
+source_paths = [pathlib.Path(arg) for arg in original if arg.endswith('/' + source_name)]
+included.update(p for p in source_paths if p.is_file())
+with (evidence / f'{component}-input-sha256.txt').open('w') as hashes:
+    for path in sorted(included):
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        hashes.write(f'{digest}  {path}\n')
+    hashes.write('# Incomplete if preprocessing failed before the full include graph was read.\n')
 if result.returncode == 0:
     data = output.read_bytes()
     text = data.decode(errors='replace')
@@ -48,6 +62,22 @@ if result.returncode == 0:
     log += '\npreprocessed_output_sha256=' + hashlib.sha256(data).hexdigest()
     log += '\nmember_counts=' + json.dumps({n: names.count(n) for n in sorted(set(names))})
     log += '\nRaw output retained only in runner temporary storage; it includes SDK/KDK header text.\n'
+    macro_output = work / f'{component}-macros.txt'
+    macro_command = command[:-4] + ['-E', '-dM', '-o', str(macro_output)]
+    macro_result = subprocess.run(macro_command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    log += '\nmacro_command: ' + shlex.join(macro_command) + '\nmacro_exit: ' + str(macro_result.returncode) + '\n' + macro_result.stdout
+    if macro_result.returncode == 0:
+        macros = macro_output.read_bytes()
+        log += '\nmacro_output_sha256=' + hashlib.sha256(macros).hexdigest()
+        wanted = ('CODE_SIGNING_MONITOR', 'PMAP_CS_INCLUDE_CODE_SIGNING', 'PMAP_CS_PPL_MONITOR',
+                  'PMAP_CS', 'CONFIG_SPTM', 'XNU_MONITOR', 'CONFIG_PMAP_PPL')
+        found = {}
+        for line in macros.decode(errors='replace').splitlines():
+            match = re.match(r'#define\s+(\w+)(?:\s+(.*))?$', line)
+            if match and match.group(1) in wanted:
+                found[match.group(1)] = match.group(2) or ''
+        log += '\nselected_macros=' + json.dumps(found, sort_keys=True) + '\n'
+        log += 'Full macro output retained only in runner temporary storage.\n'
 else:
     log += '\nPreprocessing failed; activation remains unknown.\n'
 (evidence / f'{component}-preprocess.log').write_text(log)
