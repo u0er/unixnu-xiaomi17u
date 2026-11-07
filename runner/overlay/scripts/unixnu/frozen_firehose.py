@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import tarfile
@@ -93,6 +94,70 @@ def verify_bundle(path):
             raise Error('header bundle differs from the frozen source commit')
     except (OSError, subprocess.CalledProcessError) as error:
         raise Error(f'frozen header bundle unavailable: {error}') from error
+
+
+def restore_candidate_overlay(bundle, tree, backup):
+    """Restore the pinned build overlay while retaining macOS-generated headers.
+
+    Only the isolated fakeroot is modified; the frozen archive, Apple SDK and
+    XNU source remain unchanged. Later verify_headers checks the full bundle.
+    """
+    verify_bundle(bundle)
+    tree = Path(tree).resolve()
+    root = tree / '.cache/fakeroot'
+    backup = Path(backup)
+    if not root.is_dir() or root.is_symlink() or backup.exists():
+        raise Error('frozen overlay requires an installed isolated fakeroot and a new backup')
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(root, backup, symlinks=True)
+    changes = []
+    prefix = Path('.cache/fakeroot')
+    with tarfile.open(bundle, 'r:gz') as archive:
+        for item in archive:
+            path = Path(item.name)
+            if path.is_absolute() or '..' in path.parts:
+                raise Error(f'unsafe frozen overlay entry: {item.name}')
+            if not path.is_relative_to(prefix):
+                continue
+            relative = path.relative_to(prefix)
+            if not relative.parts:
+                continue
+            target = root / relative
+            if not target.parent.resolve().is_relative_to(root):
+                raise Error(f'frozen overlay parent escapes fakeroot: {item.name}')
+            if item.isdir():
+                if target.is_symlink() or (target.exists() and not target.is_dir()):
+                    raise Error(f'frozen overlay directory conflict: {target}')
+                target.mkdir(parents=True, exist_ok=True)
+            elif item.issym():
+                if Path(item.linkname).is_absolute() or not (target.parent / item.linkname).resolve().is_relative_to(root):
+                    raise Error(f'frozen overlay symlink escapes fakeroot: {item.name}')
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.is_symlink():
+                    if os.readlink(target) == item.linkname:
+                        continue
+                    target.unlink()
+                elif target.exists():
+                    raise Error(f'frozen overlay symlink conflict: {target}')
+                target.symlink_to(item.linkname)
+                changes.append({'path': str(relative), 'type': 'symlink', 'target': item.linkname})
+            elif item.isfile():
+                if target.is_symlink() or (target.exists() and not target.is_file()):
+                    raise Error(f'frozen overlay file conflict: {target}')
+                source = archive.extractfile(item)
+                if source is None:
+                    raise Error(f'frozen overlay entry unreadable: {item.name}')
+                data = source.read()
+                previous = target.read_bytes() if target.exists() else None
+                if previous != data:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
+                    changes.append({'path': str(relative),
+                                    'generated_sha256': digest(previous) if previous is not None else None,
+                                    'frozen_sha256': digest(data)})
+            else:
+                raise Error(f'unsupported frozen overlay entry: {item.name}')
+    return changes
 
 
 def install_exact(path, data):
