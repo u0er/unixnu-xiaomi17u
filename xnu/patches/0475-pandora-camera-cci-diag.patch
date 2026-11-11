@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..98bb08a
+index 0000000..bfb53e7
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,3396 @@
+@@ -0,0 +1,3434 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1548,22 +1548,30 @@ index 0000000..98bb08a
 +	    pc_rd(pc_camcc, 0x10), pc_rd(pc_camcc, 0x14), pc_rd(pc_camcc, 0x18),
 +	    pc_rd(pc_camcc, 0x20));
 +
-+	/* cam_cc_pll0_config: 1200 MHz, TAYCAN_EKO_T register offsets */
-+	pc_wr(pc_camcc, 0x20, 0x25c400e7u);
-+	pc_wr(pc_camcc, 0x24, 0x0a8062e0u);
-+	pc_wr(pc_camcc, 0x28, 0xf51dea20u);
-+	pc_wr(pc_camcc, 0x10, 0x0044003eu); /* Android running: cal_l<<16 | l=0x3e */
-+	pc_wr(pc_camcc, 0x14, 0x8000u);
-+	pc_wr(pc_camcc, 0x18, 0x840fu);  /* Android running: PLL_OUT_MASK=0x7 */
-+	pc_wr(pc_camcc, 0x1c, 0x2u);
-+	/* w29: TAYCAN exposes PLL_STATUS_00..31; 0x0c is NOT a single lock
-+	 * register, so the w28c BIT(31) poll was reading the wrong object.
-+	 * Upstream trion_pll_is_enabled() = OPMODE.RUN && MODE.OUTCTRL.
-+	 * Android running: MODE low bits = 0x5 (OUTCTRL|RESET_N), OPMODE=1. */
-+	pc_wr(pc_camcc, 0x04, 0x1u);   /* OPMODE: PLL_RUN */
-+	for (i = 0; i < 20; i++)
-+		pc_sleep(1);
-+	pc_wr(pc_camcc, 0x00, pc_rd(pc_camcc, 0x00) | 0x5u);
++	/* cam_cc_pll0_config: 1200 MHz, TAYCAN_EKO_T register offsets.
++	 * Skip entirely if the PLL is already running: rewriting config/L/alpha
++	 * on a live PLL that already feeds CCI0 risks glitching it (w35 suspect),
++	 * and the running values below match what we would write anyway. The
++	 * RCG switch + CBCR enable after this block are still needed because the
++	 * probe rollback parks CMD_RCGR and clears the CCI0 branch enable. */
++	if (!((pc_rd(pc_camcc, 0x04) & 0x1u) &&
++	    ((pc_rd(pc_camcc, 0x00) & 0x5u) == 0x5u))) {
++		pc_wr(pc_camcc, 0x20, 0x25c400e7u);
++		pc_wr(pc_camcc, 0x24, 0x0a8062e0u);
++		pc_wr(pc_camcc, 0x28, 0xf51dea20u);
++		pc_wr(pc_camcc, 0x10, 0x0044003eu); /* Android running: cal_l<<16 | l=0x3e */
++		pc_wr(pc_camcc, 0x14, 0x8000u);
++		pc_wr(pc_camcc, 0x18, 0x840fu);  /* Android running: PLL_OUT_MASK=0x7 */
++		pc_wr(pc_camcc, 0x1c, 0x2u);
++		/* w29: TAYCAN exposes PLL_STATUS_00..31; 0x0c is NOT a single lock
++		 * register, so the w28c BIT(31) poll was reading the wrong object.
++		 * Upstream trion_pll_is_enabled() = OPMODE.RUN && MODE.OUTCTRL.
++		 * Android running: MODE low bits = 0x5 (OUTCTRL|RESET_N), OPMODE=1. */
++		pc_wr(pc_camcc, 0x04, 0x1u);   /* OPMODE: PLL_RUN */
++		for (i = 0; i < 20; i++)
++			pc_sleep(1);
++		pc_wr(pc_camcc, 0x00, pc_rd(pc_camcc, 0x00) | 0x5u);
++	}
 +	st = pc_rd(pc_camcc, 0x0c);
 +	{
 +		uint32_t mode = pc_rd(pc_camcc, 0x00);
@@ -3191,6 +3199,36 @@ index 0000000..98bb08a
 +	/* 1:1 mirror of Android cam_sensor_power_up() on THIS device
 +	 * (docs/CAMERA_C2B_ANDROID_POWER_SEQUENCE.md). reset-first, then rails
 +	 * ~1 ms apart, MCLK 19.2 MHz XO, reset release, CCI0 37.5 MHz. */
++	/* The probe bringup rolls back at the end and powers the TITAN_TOP GDSC
++	 * down (w13/w1 rollback: power_down=yes). CCI0 lives inside that domain:
++	 * with it down, CCI register reads return 0 and writes are dropped
++	 * (w35: rdm Q0 cur=0 irq=0 while the pre-rollback probe reads worked).
++	 * Bring the domain back up exactly like w1: clear SW_COLLAPSE, poll
++	 * POWER_UP_COMPLETE, RETAIN_FF, then CORE_AHB + CAM_TOP_AHB branches. */
++	{
++		uint32_t g = pc_rd(pc_camcc, PC_GDSCR);
++		if (!(pc_rd(pc_camcc, PC_CFG_GDSCR) & PC_CFG_GDSC_PWR_UP)) {
++			pc_wr(pc_camcc, PC_GDSCR, g & ~PC_GDSC_SW_COLLAPSE);
++			if (pc_wait_gdsc_up() == 0) {
++				pc_sleep(1);
++				pc_wr(pc_camcc, PC_GDSCR,
++				    pc_rd(pc_camcc, PC_GDSCR) | PC_GDSC_RETAIN_FF);
++			} else {
++				printf("PANDORA CAMERA: power_up GDSC ERROR "
++				    "(power-up complete never observed)\n");
++			}
++		}
++		pc_wr(pc_camcc, PC_CORE_AHB_CBCR,
++		    pc_rd(pc_camcc, PC_CORE_AHB_CBCR) | PC_CBCR_ENABLE);
++		pc_sleep(1);
++		pc_wr(pc_camcc, PC_CAM_TOP_AHB_CBCR,
++		    pc_rd(pc_camcc, PC_CAM_TOP_AHB_CBCR) | PC_CBCR_ENABLE);
++		(void)pc_wait_branch_on("pu", PC_CAM_TOP_AHB_CBCR);
++		printf("PANDORA CAMERA: power_up gdsc=%#x cfg_gdscr=%#x core_ahb=%#x "
++		    "cam_top_ahb=%#x\n", pc_rd(pc_camcc, PC_GDSCR),
++		    pc_rd(pc_camcc, PC_CFG_GDSCR), pc_rd(pc_camcc, PC_CORE_AHB_CBCR),
++		    pc_rd(pc_camcc, PC_CAM_TOP_AHB_CBCR));
++	}
 +	pc_gpio_set(89, 1, 0, 2, -1);   /* MCLK pins: input, func=cam_mclk */
 +	pc_gpio_set(92, 1, 0, 2, -1);
 +	pc_gpio_set(106, 0, 0, 2, 0);   /* wide reset assert (low) */
