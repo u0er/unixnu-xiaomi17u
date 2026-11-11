@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..797ff28
+index 0000000..a738c69
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,3573 @@
+@@ -0,0 +1,3554 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -184,17 +184,18 @@ index 0000000..797ff28
 + *
 + * Boot args:
 + *   pandora_camera=<level>   default 0 (off).
-+ *     1 = driver self-check (wide/tele power_up + CCI0 chip-ID read).
-+ *     2 = + init-table replay (wide/tele), the verified Android settings.
-+ *     3 = + ultra/front GPIO reset assert/release ONLY (front gpio3,
-+ *         ultra gpio7; no LDO votes). Diagnostic staging, no I2C traffic.
-+ *     4 = + ultra/front PM8010 LDO votes ONLY (no TLMM GPIO writes).
-+ *     5 = + full ultra/front power-up (GPIO reset + all LDO rails), the
-+ *         real power-up-only test. Levels >=3 SKIP the historical read-only
-+ *         probes (w37 proved w26 hangs the kernel there), wait 5 s for
-+ *         RPMh/ADSP/log readiness, then run the driver path; uf runs LAST
-+ *         after the wide/tele self-check with per-step prints. Levels 1/2
-+ *         keep the verified diagnostic path; none of 3+ replay wide/tele.
++ *     1 = full driver bring-up: wide/tele power_up + CCI0 chip-ID read,
++ *         THEN the ultra/front (QUP I2C SE8/SE9) power-up-only sequence
++ *         (front gpio3 / ultra gpio7 reset + PM8010 LDO votes, no I2C).
++ *         This is the verified desktop-boot path.
++ *     2 = + init-table replay (wide/tele), the verified Android settings;
++ *         does NOT run the ultra/front power-up.
++ *     >=3 is clamped to 1 in pandora_camera_init(): those values used to
++ *         select numeric branches of a boot-time diagnostic thread and
++ *         reproducibly froze the kernel ~3 s after that thread started
++ *         (w38 -- the thread was asleep when it froze, so no hardware path
++ *         in this file was implicated). Do not add new numeric branches;
++ *         extend the level-1 driver path instead.
 + *   Nothing else is gated by this file.
 + *   Use the 11-04 user-verified cmdline baseline plus this flag
 + *   (cmdline-good-plus-camera-reboot90.txt, 603/608 B). The older camera-only
@@ -3218,76 +3219,67 @@ index 0000000..797ff28
 + * voted by pc_sensor_power_up() above, so we skip them. MCLK pads are
 + * deliberately NOT muxed: the clock sources are enabled but no signal is driven
 + * to the sensors while they sit in reset, and we do no I2C.
-+ * Diagnostic staging (one build, several boot-arg values): level 3 = GPIO
-+ * reset only, level 4 = LDO votes only, level 5+ = both (the real test).
-+ * Every step prints, so a hang that also kills the log-flush thread still
-+ * leaves a last-known-good marker. Called at the END of pc_sensor_init(). */
++ * This is the full sequence (both reset GPIOs and all LDO rails); every step
++ * prints, so a hang that also kills the log-flush thread still leaves a
++ * last-known-good marker. Called at the END of pc_sensor_init() on the
++ * verified level-1 driver path -- NOT from a numeric pc_level branch. */
 +static void
 +pc_sensor_power_up_uf(void)
 +{
-+	unsigned mode = pc_level;
-+	int do_gpio = (mode == 3u || mode >= 5u);
-+	int do_rails = (mode == 4u || mode >= 5u);
++	printf("PANDORA CAMERA: power_up_uf ENTER (full sequence)\n");
 +
-+	printf("PANDORA CAMERA: power_up_uf ENTER level=%u gpio=%d rails=%d\n",
-+	    mode, do_gpio, do_rails);
++	/* assert both resets (active low) before any rail comes up */
++	printf("PANDORA CAMERA: power_up_uf assert front gpio3\n");
++	pc_gpio_set(3, 0, 0, 2, 0);
++	printf("PANDORA CAMERA: power_up_uf assert ultra gpio7\n");
++	pc_gpio_set(7, 0, 0, 2, 0);
++	pc_sleep(1);
 +
-+	if (do_gpio) {
-+		printf("PANDORA CAMERA: power_up_uf assert front gpio3\n");
-+		pc_gpio_set(3, 0, 0, 2, 0);
-+		printf("PANDORA CAMERA: power_up_uf assert ultra gpio7\n");
-+		pc_gpio_set(7, 0, 0, 2, 0);
-+		pc_sleep(1);
-+	}
++	/* front rails (regulator-names order: vio vdig vana vaf bob bob2) */
++	printf("PANDORA CAMERA: power_up_uf rail front vio L5M_E1 1800\n");
++	(void)pandora_rpmh_resource("L5M_E1", 0, 1800);
++	(void)pandora_rpmh_resource("L5M_E1", 4, 1);
++	pc_sleep(1);
++	printf("PANDORA CAMERA: power_up_uf rail front vdig L1N_E1 1200\n");
++	(void)pandora_rpmh_resource("L1N_E1", 0, 1200);
++	(void)pandora_rpmh_resource("L1N_E1", 4, 1);
++	pc_sleep(1);
++	printf("PANDORA CAMERA: power_up_uf rail front vana L6N_E1 2800\n");
++	(void)pandora_rpmh_resource("L6N_E1", 0, 2800);
++	(void)pandora_rpmh_resource("L6N_E1", 4, 1);
++	pc_sleep(1);
++	printf("PANDORA CAMERA: power_up_uf rail front vaf L4N_E1 1800\n");
++	(void)pandora_rpmh_resource("L4N_E1", 0, 1800);
++	(void)pandora_rpmh_resource("L4N_E1", 4, 1);
++	pc_sleep(1);
++	printf("PANDORA CAMERA: power_up_uf rail ultra vio L5M_E1 1800\n");
++	(void)pandora_rpmh_resource("L5M_E1", 0, 1800);
++	(void)pandora_rpmh_resource("L5M_E1", 4, 1);
++	pc_sleep(1);
++	printf("PANDORA CAMERA: power_up_uf rail ultra vdig L2M_E1 1104\n");
++	(void)pandora_rpmh_resource("L2M_E1", 0, 1104);
++	(void)pandora_rpmh_resource("L2M_E1", 4, 1);
++	pc_sleep(1);
++	printf("PANDORA CAMERA: power_up_uf rail ultra vana L4M_E1 2200\n");
++	(void)pandora_rpmh_resource("L4M_E1", 0, 2200);
++	(void)pandora_rpmh_resource("L4M_E1", 4, 1);
++	pc_sleep(1);
++	printf("PANDORA CAMERA: power_up_uf rail ultra vaf L3M_E1 2900\n");
++	(void)pandora_rpmh_resource("L3M_E1", 0, 2900);
++	(void)pandora_rpmh_resource("L3M_E1", 4, 1);
++	pc_sleep(1);
++	printf("PANDORA CAMERA: power_up_uf rail ultra custom2 L6M_E1 2800\n");
++	(void)pandora_rpmh_resource("L6M_E1", 0, 2800);
++	(void)pandora_rpmh_resource("L6M_E1", 4, 1);
++	pc_sleep(1);
 +
-+	if (do_rails) {
-+		printf("PANDORA CAMERA: power_up_uf rail front vio L5M_E1 1800\n");
-+		(void)pandora_rpmh_resource("L5M_E1", 0, 1800);
-+		(void)pandora_rpmh_resource("L5M_E1", 4, 1);
-+		pc_sleep(1);
-+		printf("PANDORA CAMERA: power_up_uf rail front vdig L1N_E1 1200\n");
-+		(void)pandora_rpmh_resource("L1N_E1", 0, 1200);
-+		(void)pandora_rpmh_resource("L1N_E1", 4, 1);
-+		pc_sleep(1);
-+		printf("PANDORA CAMERA: power_up_uf rail front vana L6N_E1 2800\n");
-+		(void)pandora_rpmh_resource("L6N_E1", 0, 2800);
-+		(void)pandora_rpmh_resource("L6N_E1", 4, 1);
-+		pc_sleep(1);
-+		printf("PANDORA CAMERA: power_up_uf rail front vaf L4N_E1 1800\n");
-+		(void)pandora_rpmh_resource("L4N_E1", 0, 1800);
-+		(void)pandora_rpmh_resource("L4N_E1", 4, 1);
-+		pc_sleep(1);
-+		printf("PANDORA CAMERA: power_up_uf rail ultra vio L5M_E1 1800\n");
-+		(void)pandora_rpmh_resource("L5M_E1", 0, 1800);
-+		(void)pandora_rpmh_resource("L5M_E1", 4, 1);
-+		pc_sleep(1);
-+		printf("PANDORA CAMERA: power_up_uf rail ultra vdig L2M_E1 1104\n");
-+		(void)pandora_rpmh_resource("L2M_E1", 0, 1104);
-+		(void)pandora_rpmh_resource("L2M_E1", 4, 1);
-+		pc_sleep(1);
-+		printf("PANDORA CAMERA: power_up_uf rail ultra vana L4M_E1 2200\n");
-+		(void)pandora_rpmh_resource("L4M_E1", 0, 2200);
-+		(void)pandora_rpmh_resource("L4M_E1", 4, 1);
-+		pc_sleep(1);
-+		printf("PANDORA CAMERA: power_up_uf rail ultra vaf L3M_E1 2900\n");
-+		(void)pandora_rpmh_resource("L3M_E1", 0, 2900);
-+		(void)pandora_rpmh_resource("L3M_E1", 4, 1);
-+		pc_sleep(1);
-+		printf("PANDORA CAMERA: power_up_uf rail ultra custom2 L6M_E1 2800\n");
-+		(void)pandora_rpmh_resource("L6M_E1", 0, 2800);
-+		(void)pandora_rpmh_resource("L6M_E1", 4, 1);
-+		pc_sleep(1);
-+	}
-+
-+	if (do_gpio) {
-+		printf("PANDORA CAMERA: power_up_uf release front gpio3\n");
-+		pc_gpio_set(3, 0, 0, 2, 1);
-+		pc_sleep(1);
-+		printf("PANDORA CAMERA: power_up_uf release ultra gpio7\n");
-+		pc_gpio_set(7, 0, 0, 2, 1);
-+		pc_sleep(3);
-+	}
-+	printf("PANDORA CAMERA: power_up_uf DONE level=%u\n", mode);
++	printf("PANDORA CAMERA: power_up_uf release front gpio3\n");
++	pc_gpio_set(3, 0, 0, 2, 1);
++	pc_sleep(1);
++	printf("PANDORA CAMERA: power_up_uf release ultra gpio7\n");
++	pc_gpio_set(7, 0, 0, 2, 1);
++	pc_sleep(3);
++	printf("PANDORA CAMERA: power_up_uf DONE (full sequence)\n");
 +}
 +
 +/* Stage D driver bring-up. Unlike the C-2b probes this does NOT roll the
@@ -3496,13 +3488,14 @@ index 0000000..797ff28
 +	ret = pc_cci_read_reg16_timed(pc_cci[0], 0, 0x2du, 0x0000u, &id);
 +	printf("PANDORA CAMERA: driver self-check tele chip_id=%#x ret=%d\n", id, ret);
 +
-+	/* ultra/front (QUP I2C SE8/SE9) power-up runs LAST, after the verified
-+	 * wide/tele driver path has completed. If the kernel hangs in here, the
-+	 * per-step prints above/below bracket the offending action. */
-+	if (pc_level >= 3u) {
-+		printf("PANDORA CAMERA: calling power_up_uf level=%u\n", pc_level);
++	/* ultra/front (QUP I2C SE8/SE9) power-up runs LAST on the verified
++	 * level-1 driver path, after the wide/tele self-check. Per-step prints
++	 * bracket every action if anything hangs. Level 2 (replay) keeps its
++	 * already-verified behaviour and does not run this. */
++	if (pc_level == 1u) {
++		printf("PANDORA CAMERA: calling power_up_uf (level-1 driver path)\n");
 +		pc_sensor_power_up_uf();
-+		printf("PANDORA CAMERA: power_up_uf RETURNED level=%u\n", pc_level);
++		printf("PANDORA CAMERA: power_up_uf RETURNED\n");
 +	}
 +}
 +
@@ -3543,24 +3536,6 @@ index 0000000..797ff28
 +	}
 +	pc_camcc_dump();
 +	pc_tlmm_dump();
-+	/* w37 proved the historical read-only diagnostics hang the kernel at
-+	 * "w26 CCI0_M1 round 2 done" whenever pc_level>=3 (identical freeze
-+	 * point at 3.14s with no delay and at 15.16s with a 12s camera delay).
-+	 * The driver bring-up is self-contained -- it re-raises TITAN_TOP GDSC
-+	 * and reconfigures CCI0 itself -- so for level>=3 skip those probes
-+	 * entirely. Give RPMh/ADSP/log-flush a few seconds to become ready
-+	 * first; skipping without that window would let uf vote before ADSP is
-+	 * up and manufacture a false hang. Levels 0/1/2 keep their verified
-+	 * diagnostic path unchanged. */
-+	if (pc_level >= 3u) {
-+		printf("PANDORA CAMERA: level%u fast path: skipping read-only diagnostics\n",
-+		    pc_level);
-+		pc_sleep(5000);
-+		printf("PANDORA CAMERA: level%u fast path: entering driver init\n",
-+		    pc_level);
-+		pc_sensor_init();
-+		goto out;
-+	}
 +	/* DT strap dump (not MMIO): which sensor would be read first, and what
 +	 * its rails cost. Values are the live DT's, already cross-checked by
 +	 * resolving each *-supply phandle to its regulator node. */
@@ -3595,6 +3570,12 @@ index 0000000..797ff28
 +	(void)PE_parse_boot_argn("pandora_camera", &pc_level, sizeof(pc_level));
 +	if (!pc_level) {
 +		return;
++	}
++	/* Collapse the retired numeric branches onto the verified level-1
++	 * driver path. Levels >=3 reproducibly froze the kernel ~3 s after
++	 * this thread started (w38), so no new numeric branch belongs here. */
++	if (pc_level > 2u) {
++		pc_level = 1u;
 +	}
 +	if (pc_started) {
 +		return;
