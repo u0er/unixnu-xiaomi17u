@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..a812aa7
+index 0000000..797ff28
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,3553 @@
+@@ -0,0 +1,3573 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -190,9 +190,11 @@ index 0000000..a812aa7
 + *         ultra gpio7; no LDO votes). Diagnostic staging, no I2C traffic.
 + *     4 = + ultra/front PM8010 LDO votes ONLY (no TLMM GPIO writes).
 + *     5 = + full ultra/front power-up (GPIO reset + all LDO rails), the
-+ *         real power-up-only test. Levels >=3 run LAST, after the wide/tele
-+ *         self-check, with per-step prints. Levels 1/2 keep verified
-+ *         behaviour; none of 3+ replay wide/tele.
++ *         real power-up-only test. Levels >=3 SKIP the historical read-only
++ *         probes (w37 proved w26 hangs the kernel there), wait 5 s for
++ *         RPMh/ADSP/log readiness, then run the driver path; uf runs LAST
++ *         after the wide/tele self-check with per-step prints. Levels 1/2
++ *         keep the verified diagnostic path; none of 3+ replay wide/tele.
 + *   Nothing else is gated by this file.
 + *   Use the 11-04 user-verified cmdline baseline plus this flag
 + *   (cmdline-good-plus-camera-reboot90.txt, 603/608 B). The older camera-only
@@ -3541,6 +3543,24 @@ index 0000000..a812aa7
 +	}
 +	pc_camcc_dump();
 +	pc_tlmm_dump();
++	/* w37 proved the historical read-only diagnostics hang the kernel at
++	 * "w26 CCI0_M1 round 2 done" whenever pc_level>=3 (identical freeze
++	 * point at 3.14s with no delay and at 15.16s with a 12s camera delay).
++	 * The driver bring-up is self-contained -- it re-raises TITAN_TOP GDSC
++	 * and reconfigures CCI0 itself -- so for level>=3 skip those probes
++	 * entirely. Give RPMh/ADSP/log-flush a few seconds to become ready
++	 * first; skipping without that window would let uf vote before ADSP is
++	 * up and manufacture a false hang. Levels 0/1/2 keep their verified
++	 * diagnostic path unchanged. */
++	if (pc_level >= 3u) {
++		printf("PANDORA CAMERA: level%u fast path: skipping read-only diagnostics\n",
++		    pc_level);
++		pc_sleep(5000);
++		printf("PANDORA CAMERA: level%u fast path: entering driver init\n",
++		    pc_level);
++		pc_sensor_init();
++		goto out;
++	}
 +	/* DT strap dump (not MMIO): which sensor would be read first, and what
 +	 * its rails cost. Values are the live DT's, already cross-checked by
 +	 * resolving each *-supply phandle to its regulator node. */
