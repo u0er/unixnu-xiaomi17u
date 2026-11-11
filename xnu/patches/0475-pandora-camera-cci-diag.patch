@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..2f2fd19
+index 0000000..66567dc
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2978 @@
+@@ -0,0 +1,2989 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1707,7 +1707,7 @@ index 0000000..2f2fd19
 +}
 +
 +static void
-+pc_cci_shape_matrix(unsigned m, uint8_t slave, int clk37)
++pc_cci_shape_matrix(unsigned m, uint8_t slave, uint16_t reg, int clk37)
 +{
 +	unsigned shape;
 +
@@ -1726,8 +1726,11 @@ index 0000000..2f2fd19
 +			pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, q), PC_CCI_I2C_LOCK);
 +		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, q),
 +		    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave << 4));
++		/* w32: real 16-bit register address. Samsung-family chip-ID is at
++		 * 0x0000; OmniVision-family is conventionally at 0x300a. */
 +		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, q),
-+		    pc_cci_load_word(PC_CCI_I2C_WRITE | (2u << 4), 0x00u, 0x00u, 0x00u));
++		    pc_cci_load_word(PC_CCI_I2C_WRITE | (2u << 4),
++		        ((uint32_t)reg >> 8) & 0xffu, (uint32_t)reg & 0xffu, 0x00u));
 +		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, q),
 +		    PC_CCI_I2C_READ | (2u << 4));
 +		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, q),
@@ -1752,9 +1755,9 @@ index 0000000..2f2fd19
 +		rst = pc_rd(pc_cci[0], PC_CCI_Qn_REPORT_STATUS(m, q));
 +		level = pc_rd(pc_cci[0], PC_CCI_READ_BUF_LEVEL(m));
 +		rd = level ? pc_rd(pc_cci[0], PC_CCI_READ_DATA(m)) : 0;
-+		printf("PANDORA CAMERA: w31 S%u M%u Q%u lock=%d addr=%#x words=%u "
-+		    "polls=%u irq=%#x report=%#x buf=%u data=%#x -> %s\n",
-+		    shape, m, q, locked, slave, words, i, irq, rst, level, rd,
++		printf("PANDORA CAMERA: w32 S%u M%u Q%u lock=%d addr=%#x reg=%#x "
++		    "words=%u polls=%u irq=%#x report=%#x buf=%u data=%#x -> %s\n",
++		    shape, m, q, locked, slave, reg, words, i, irq, rst, level, rd,
 +		    (irq & nack) ? "NACK" : ((irq & rep) ? "DONE_NO_NACK" : "TIMEOUT"));
 +		pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
 +		pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
@@ -2427,8 +2430,13 @@ index 0000000..2f2fd19
 +	/* w31: discriminate the CCI queue shape BEFORE the legacy sweep.
 +	 * Both pairs use the Android-confirmed 7-bit sid; the 8-bit forms are
 +	 * still covered by the scan loop below as controls. */
-+	pc_cci_shape_matrix(1u, 0x10u, clk37);  /* wide, M1, chip-ID 0x5058 */
-+	pc_cci_shape_matrix(0u, 0x2du, clk37);  /* tele, M0, chip-ID 0x1b7e */
++	pc_cci_shape_matrix(1u, 0x10u, 0x300au, clk37); /* wide M1, OV chip-ID 0x5058 */
++	pc_cci_shape_matrix(0u, 0x2du, 0x0000u, clk37); /* tele M0, chip-ID 0x1b7e */
++	/* NEGATIVE CONTROLS: addresses with no device on either master.
++	 * If these return the SAME data as 0x10/0x2d, the w31 "read data" was
++	 * CCI FIFO residue and the whole conclusion must be withdrawn. */
++	pc_cci_shape_matrix(1u, 0x08u, 0x300au, clk37); /* no device on M1 */
++	pc_cci_shape_matrix(0u, 0x77u, 0x0000u, clk37); /* no device on M0 */
 +
 +	/* w27: one A/B control, then a full address sweep with a clean engine
 +	 * before EVERY transaction. First reliable address-layer measurement
@@ -2460,6 +2468,9 @@ index 0000000..2f2fd19
 +	};
 +	for (unsigned ai = 0; ai < sizeof(scan_addrs); ai++) {
 +		uint8_t slave = scan_addrs[ai];
++		/* w32: the shape matrix proved per-transaction timing refresh is the
++		 * strongest candidate; apply it to the legacy sweep too. */
++		pc_cci_refresh_timing(clk37);
 +		printf("PANDORA CAMERA: w13 SCAN addr=%#x on M1\n", slave);
 +		pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
 +		pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
