@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..c193bb1
+index 0000000..3c9a633
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,3358 @@
+@@ -0,0 +1,3359 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -3310,6 +3310,7 @@ index 0000000..c193bb1
 +	printf("PANDORA CAMERA: driver self-check tele chip_id=%#x ret=%d\n", id, ret);
 +}
 +
++static void
 +pc_thread(void *arg, wait_result_t result)
 +{
 +	(void)arg;
