@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..3c9a633
+index 0000000..fbed8dd
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,3359 @@
+@@ -0,0 +1,3380 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1771,57 +1771,78 @@ index 0000000..3c9a633
 +pc_cci_read_reg16_timed(vm_offset_t cci, unsigned master, uint8_t slave,
 +    uint16_t reg, uint16_t *out)
 +{
-+	uint32_t v, cur, buf;
-+	int ret;
-+	unsigned words;
++	uint32_t rep0 = 1u << (4u + master * 12u);
++	uint32_t nack0 = 1u << (27u + master * 2u);
++	uint32_t rep1 = 1u << (8u + master * 12u);
++	uint32_t nack1 = 1u << (28u + master * 2u);
++	uint32_t cur, irq, rd, level;
++	unsigned i;
++	int attempt;
 +
-+	pc_cci_reset_engine();
-+	pc_cci_refresh_timing(1);	/* 37.5 MHz, verified talking to sensors */
-+	pc_wr(cci, PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
-+	pc_wr(cci, PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++	/* Mirror the proven w33 chip-id read: per-transaction reset+timing,
++	 * poll IRQ for REPORT/NACK, lenient cur (diagnose, never bail), 1-byte read.
++	 * The strict cur==0 EINVAL bail was the ret=22 bug after power_up. */
++	for (attempt = 0; attempt < 2; attempt++) {
++		pc_cci_reset_engine();
++		pc_cci_refresh_timing(1);	/* 37.5 MHz, verified talking to sensors */
++		pc_wr(cci, PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++		pc_wr(cci, PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
 +
-+	/* write: set the target register address (2 bytes) */
-+	pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 0),
-+	    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave & 0x7fu) << 4);
-+	pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 0),
-+	    pc_cci_load_word(PC_CCI_I2C_WRITE | (2u << 4),
-+	        (uint32_t)(reg >> 8) & 0xffu, (uint32_t)reg & 0xffu, 0x00u));
-+	pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 0),
-+	    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
-+	cur = pc_rd(cci, PC_CCI_Qn_CUR_WORD_CNT(master, 0));
-+	if (cur == 0 || cur > 32u)
-+		return EINVAL;
-+	pc_wr(cci, PC_CCI_Qn_EXEC_WORD_CNT(master, 0), cur);
-+	pc_wr(cci, PC_CCI_QUEUE_START, 1u << (master * 2u + 0u));
-+	ret = pc_cci_wait_irq(cci, 1u << (4u + master * 12u));
-+	if (ret != 0)
-+		return ret;
++		/* Q0: set 16-bit register address pointer */
++		pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 0),
++		    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave & 0x7fu) << 4);
++		pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 0),
++		    pc_cci_load_word(PC_CCI_I2C_WRITE | (2u << 4),
++		        (uint32_t)(reg >> 8) & 0xffu, (uint32_t)reg & 0xffu, 0x00u));
++		pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 0),
++		    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
++		cur = pc_rd(cci, PC_CCI_Qn_CUR_WORD_CNT(master, 0));
++		printf("PANDORA CAMERA: rdm M%u reg=%#x Q0 cur=%u try=%d
++",
++		    master, reg, cur, attempt);
++		pc_wr(cci, PC_CCI_Qn_EXEC_WORD_CNT(master, 0), cur);
++		pc_wr(cci, PC_CCI_QUEUE_START, 1u << (master * 2u + 0u));
++		for (i = 0; i < 100; i++) {
++			irq = pc_rd(cci, PC_CCI_IRQ_STATUS_0);
++			if (irq & (rep0 | nack0)) break;
++			pc_sleep(1);
++		}
++		if (!(irq & rep0) || (irq & nack0)) {
++			printf("PANDORA CAMERA: rdm M%u reg=%#x Q0 irq=%#x retry
++",
++			    master, reg, irq);
++			continue;
++		}
 +
-+	/* read: 2 bytes from current register pointer */
-+	pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 1),
-+	    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave & 0x7fu) << 4);
-+	pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 1),
-+	    PC_CCI_I2C_READ | (2u << 4));
-+	pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 1),
-+	    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
-+	pc_wr(cci, PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
-+	pc_wr(cci, PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
-+	cur = pc_rd(cci, PC_CCI_Qn_CUR_WORD_CNT(master, 1));
-+	if (cur == 0 || cur > 32u)
-+		return EINVAL;
-+	pc_wr(cci, PC_CCI_Qn_EXEC_WORD_CNT(master, 1), cur);
-+	pc_wr(cci, PC_CCI_QUEUE_START, 1u << (master * 2u + 1u));
-+	ret = pc_cci_wait_irq(cci, 1u << (8u + master * 12u));
-+	if (ret != 0)
-+		return ret;
-+	v = pc_rd(cci, PC_CCI_Qn_REPORT_STATUS(master, 1));
-+	words = pc_rd(cci, PC_CCI_READ_BUF_LEVEL(master));
-+	buf = words ? pc_rd(cci, PC_CCI_READ_DATA(master)) : 0;
-+	if (words >= 1) {
-+		/* byte[1]=first data, byte[2]=second data (status prefix in byte[0]) */
-+		*out = (uint16_t)((buf >> 8) & 0xffu) |
-+		    (uint16_t)(((buf >> 16) & 0xffu) << 8);
-+		return 0;
++		/* Q1: read 1 byte from current register pointer */
++		pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 1),
++		    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave & 0x7fu) << 4);
++		pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 1),
++		    PC_CCI_I2C_READ | (1u << 4));
++		pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 1),
++		    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
++		pc_wr(cci, PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++		pc_wr(cci, PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++		cur = pc_rd(cci, PC_CCI_Qn_CUR_WORD_CNT(master, 1));
++		pc_wr(cci, PC_CCI_Qn_EXEC_WORD_CNT(master, 1), cur);
++		pc_wr(cci, PC_CCI_QUEUE_START, 1u << (master * 2u + 1u));
++		for (i = 0; i < 100; i++) {
++			irq = pc_rd(cci, PC_CCI_IRQ_STATUS_0);
++			if (irq & (rep1 | nack1)) break;
++			pc_sleep(1);
++		}
++		level = pc_rd(cci, PC_CCI_READ_BUF_LEVEL(master));
++		rd = level ? pc_rd(cci, PC_CCI_READ_DATA(master)) : 0;
++		printf("PANDORA CAMERA: rdm M%u reg=%#x raw=%#x buf=%u
++",
++		    master, reg, rd, level);
++		pc_wr(cci, PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++		pc_wr(cci, PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++		if (level >= 1) {
++			/* byte[1] is the data (status prefix in byte[0]) */
++			*out = (uint16_t)((rd >> 8) & 0xffu);
++			return 0;
++		}
 +	}
 +	return EIO;
 +}
