@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..31e4733
+index 0000000..130ebc3
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,3445 @@
+@@ -0,0 +1,3511 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -3193,6 +3193,69 @@ index 0000000..31e4733
 +	}
 +}
 +
++/* Power up the front (ov50m) and ultra (s5kjn5) sensors that live on the QUP
++ * I2C bus (SE9 @0x884000 / SE8 @0x880000). They are reachable ONLY through a
++ * QUP GENI I2C master, which the driver does not implement yet, so this helper
++ * does the SAFE half only: rails + reset sequencing, no I2C traffic. DT
++ * authority (Android DTBO overlay, resolved via __fixups__ -> __symbols__):
++ *   front  cam-sensor1: MCLK2 pad=TLMM 91, reset=TLMM 3,  7-bit reg=0x10,
++ *           vio=L5M_E1 vdig=L1N_E1 vana=L6N_E1 vaf=L4N_E1,
++ *           bob1=B1B_E0 bob2=B2B_E0 (shared with wide/tele, not re-voted)
++ *   ultra  cam-sensor2: MCLK4 pad=TLMM 93, reset=TLMM 7,  7-bit reg=0x36,
++ *           vio=L5M_E1 vdig=L2M_E1 vana=L4M_E1 vaf=L3M_E1 v_custom2=L6M_E1,
++ *           bob2=B2B_E0 (shared, not re-voted)
++ * reset is active-low (gpios flags=0), same as wide/tele. BOB1/BOB2 are already
++ * voted by pc_sensor_power_up() above, so we skip them. MCLK pads are
++ * deliberately NOT muxed: the clock sources are enabled but no signal is driven
++ * to the sensors while they sit in reset, and we do no I2C. Opt-in via
++ * pandora_camera=3 (pc_level >= 3). */
++static void
++pc_sensor_power_up_uf(void)
++{
++	/* assert both resets (active low) before any rail comes up */
++	pc_gpio_set(3, 0, 0, 2, 0);   /* front reset assert (low) */
++	pc_gpio_set(7, 0, 0, 2, 0);   /* ultra reset assert (low) */
++	pc_sleep(1);
++
++	/* front rails (regulator-names order: vio vdig vana vaf bob bob2) */
++	(void)pandora_rpmh_resource("L5M_E1", 0, 1800);   /* vio  (shared, idempotent) */
++	(void)pandora_rpmh_resource("L5M_E1", 4, 1);
++	pc_sleep(1);
++	(void)pandora_rpmh_resource("L1N_E1", 0, 1200);   /* vdig */
++	(void)pandora_rpmh_resource("L1N_E1", 4, 1);
++	pc_sleep(1);
++	(void)pandora_rpmh_resource("L6N_E1", 0, 2800);   /* vana */
++	(void)pandora_rpmh_resource("L6N_E1", 4, 1);
++	pc_sleep(1);
++	(void)pandora_rpmh_resource("L4N_E1", 0, 1800);   /* vaf  */
++	(void)pandora_rpmh_resource("L4N_E1", 4, 1);
++	pc_sleep(1);
++
++	/* ultra rails (regulator-names order: vio vdig vana vaf v_custom2 bob2) */
++	(void)pandora_rpmh_resource("L5M_E1", 0, 1800);   /* vio  (shared, idempotent) */
++	(void)pandora_rpmh_resource("L5M_E1", 4, 1);
++	pc_sleep(1);
++	(void)pandora_rpmh_resource("L2M_E1", 0, 1104);   /* vdig */
++	(void)pandora_rpmh_resource("L2M_E1", 4, 1);
++	pc_sleep(1);
++	(void)pandora_rpmh_resource("L4M_E1", 0, 2200);   /* vana */
++	(void)pandora_rpmh_resource("L4M_E1", 4, 1);
++	pc_sleep(1);
++	(void)pandora_rpmh_resource("L3M_E1", 0, 2900);   /* vaf  */
++	(void)pandora_rpmh_resource("L3M_E1", 4, 1);
++	pc_sleep(1);
++	(void)pandora_rpmh_resource("L6M_E1", 0, 2800);   /* v_custom2 */
++	(void)pandora_rpmh_resource("L6M_E1", 4, 1);
++	pc_sleep(1);
++
++	/* release resets (active low -> high) */
++	pc_gpio_set(3, 0, 0, 2, 1);   /* front reset release */
++	pc_sleep(1);
++	pc_gpio_set(7, 0, 0, 2, 1);   /* ultra reset release */
++	pc_sleep(3);
++	printf("PANDORA CAMERA: power_up_uf done (front gpio3 / ultra gpio7)\n");
++}
++
 +/* Stage D driver bring-up. Unlike the C-2b probes this does NOT roll the
 + * sensor back off: it leaves wide+tele powered and CCI0 configured so the
 + * driver read/write helpers (or a later init-table pass) can use them. The
@@ -3316,6 +3379,9 @@ index 0000000..31e4733
 +	    0x1u | 0x10u | 0x100u | 0x1000u | 0x10000u | 0x100000u
 +	    | PC_BIT(24) | 0x18000ee6u | 0x60ee6000u);
 +	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++	if (pc_level >= 3u) {
++		pc_sensor_power_up_uf();
++	}
 +	printf("PANDORA CAMERA: driver power_up done clk37=%d\n", clk37);
 +	return (unsigned)(clk37 > 0);
 +}
