@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..66567dc
+index 0000000..2653e60
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2989 @@
+@@ -0,0 +1,3068 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -2437,6 +2437,85 @@ index 0000000..66567dc
 +	 * CCI FIFO residue and the whole conclusion must be withdrawn. */
 +	pc_cci_shape_matrix(1u, 0x08u, 0x300au, clk37); /* no device on M1 */
 +	pc_cci_shape_matrix(0u, 0x77u, 0x0000u, clk37); /* no device on M0 */
++	/* w33: clean single-byte ID read to nail the exact chip-ID bytes.
++	 * w32 negative controls proved the sensor responds; here we read the ID
++	 * registers ONE BYTE AT A TIME (separate Q0 address-write + Q1 data-read
++	 * transactions) and dump the raw 32-bit READ_DATA so the byte layout
++	 * (status prefix vs payload) is unambiguous. CCI0 core is always 37.5MHz. */
++	{
++		struct { unsigned m; uint8_t slave; const char *name; uint16_t regs[2]; } devs[] = {
++			{ 1u, 0x10u, "wide", { 0x300au, 0x300bu } },
++			{ 0u, 0x2du, "tele", { 0x0000u, 0x0001u } },
++		};
++		for (unsigned d = 0; d < 2; d++) {
++			unsigned m = devs[d].m;
++			uint8_t slave = devs[d].slave;
++			uint32_t rep0  = 1u << (4u  + m * 12u);   /* Q0 REPORT */
++			uint32_t nack0 = 1u << (27u + m * 2u);    /* Q0 NACK  */
++			uint32_t rep1  = 1u << (8u  + m * 12u);   /* Q1 REPORT */
++			uint32_t nack1 = 1u << (28u + m * 2u);    /* Q1 NACK  */
++			for (unsigned b = 0; b < 2; b++) {
++				uint16_t reg = devs[d].regs[b];
++				uint32_t cur, irq, rd, level;
++				unsigned i;
++				pc_cci_reset_engine();
++				pc_cci_refresh_timing(1);
++				pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++				pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++				/* Q0: set 16-bit register address pointer */
++				pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++				    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave << 4));
++				pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++				    pc_cci_load_word(PC_CCI_I2C_WRITE | (2u << 4),
++				        ((uint32_t)reg >> 8) & 0xffu,
++				        (uint32_t)reg & 0xffu, 0x00u));
++				pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
++				    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
++				cur = pc_rd(pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(m, 0));
++				pc_wr(pc_cci[0], PC_CCI_Qn_EXEC_WORD_CNT(m, 0), cur);
++				pc_wr(pc_cci[0], PC_CCI_QUEUE_START, 1u << (m * 2u + 0u));
++				for (i = 0; i < 100; i++) {
++					irq = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++					if (irq & (rep0 | nack0)) break;
++					pc_sleep(1);
++				}
++				if (irq & nack0) {
++					printf("PANDORA CAMERA: w33 %s reg=%#x addr-write NACK\n",
++					    devs[d].name, reg);
++					pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++					pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++					continue;
++				}
++				/* Q1: read exactly 1 byte */
++				pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 1),
++				    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave << 4));
++				pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 1),
++				    PC_CCI_I2C_READ | (1u << 4));
++				pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 1),
++				    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
++				pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++				pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++				cur = pc_rd(pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(m, 1));
++				pc_wr(pc_cci[0], PC_CCI_Qn_EXEC_WORD_CNT(m, 1), cur);
++				pc_wr(pc_cci[0], PC_CCI_QUEUE_START, 1u << (m * 2u + 1u));
++				for (i = 0; i < 100; i++) {
++					irq = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++					if (irq & (rep1 | nack1)) break;
++					pc_sleep(1);
++				}
++				level = pc_rd(pc_cci[0], PC_CCI_READ_BUF_LEVEL(m));
++				rd = level ? pc_rd(pc_cci[0], PC_CCI_READ_DATA(m)) : 0;
++				printf("PANDORA CAMERA: w33 %s reg=%#x raw=%#x buf=%u "
++				    "b0=%#x b1=%#x b2=%#x b3=%#x\n",
++				    devs[d].name, reg, rd, level,
++				    (rd & 0xffu), ((rd >> 8) & 0xffu),
++				    ((rd >> 16) & 0xffu), ((rd >> 24) & 0xffu));
++				pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++				pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++			}
++		}
++	}
++
 +
 +	/* w27: one A/B control, then a full address sweep with a clean engine
 +	 * before EVERY transaction. First reliable address-layer measurement
