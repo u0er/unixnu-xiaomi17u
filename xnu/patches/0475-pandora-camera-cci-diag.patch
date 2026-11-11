@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..0581a09
+index 0000000..db055c3
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2871 @@
+@@ -0,0 +1,2884 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -2342,8 +2342,8 @@ index 0000000..0581a09
 +	pc_cci_txn_ab(m, 0x10u);
 +	{
 +		unsigned acks = 0;
-+		printf("PANDORA CAMERA: w27 WRITE-PROBE sweep 0x08..0x77 on M%u "
-+		    "(DT wide=0x20 tele=0x5a)\n", m);
++		printf("PANDORA CAMERA: w30 WRITE-PROBE sweep 0x08..0x77 on M%u "
++		    "(android sid wide=0x10 tele=0x2d; 8-bit form 0x20/0x5a)\n", m);
 +		for (unsigned a = 0x08u; a <= 0x77u; a++)
 +			acks += pc_cci_write_probe(m, (uint8_t)a);
 +		printf("PANDORA CAMERA: w27 WRITE-PROBE total=%u ACK addresses "
@@ -2351,7 +2351,19 @@ index 0000000..0581a09
 +	}
 +	pc_cci_reset_engine();
 +
-+	static const uint8_t scan_addrs[] = { 0x20u, 0x34u, 0x36u, 0x1au, 0x10u, 0x3au, 0x6au, 0x7au };
++	/* w30: Android cam_cci_burst tracepoint shows "CCI0_M1_Q0 ... sid : 0x10"
++	 * while vendor dmesg logs "slave_addr:0x20". The vendor value is the
++	 * 8-bit form; CCI SET_PARAM needs the 7-bit address (0x20 >> 1 = 0x10).
++	 * Same for tele 0x5a -> 0x2d and ultra 0x7a -> 0x3d. w16..w29 wrote the
++	 * 8-bit values straight into SET_PARAM, so the controller sent 0x40/0xb4.
++	 * This also explains the w23/w24/w26 bit-bang hit sets: M1 hit 0x10 and
++	 * M0 hit 0x2d, while the DT/vendor 8-bit values 0x20/0x5a never hit.
++	 * Keep both forms so a single boot discriminates the encoding. */
++	static const uint8_t scan_addrs[] = {
++		0x10u, 0x2du, 0x3du,   /* 7-bit Android sid: wide, tele, ultra */
++		0x20u, 0x5au, 0x7au,   /* 8-bit vendor log form (control) */
++		0x34u, 0x36u, 0x1au, 0x3au, 0x6au
++	};
 +	for (unsigned ai = 0; ai < sizeof(scan_addrs); ai++) {
 +		uint8_t slave = scan_addrs[ai];
 +		printf("PANDORA CAMERA: w13 SCAN addr=%#x on M1\n", slave);
@@ -2398,13 +2410,14 @@ index 0000000..0581a09
 +	/* w30: tele (sensor3) power/reset/MCLK is now part of the unified
 +	 * Android-mirrored power-up above (steps 0/4/8), BEFORE any M0 xfer. */
 +
-+	/* Also try M0 (tele, slave 0x5a, expect 0x1b7e) with combined transaction */
-+	printf("PANDORA CAMERA: w17 TEST: combined SET_PARAM+WRITE+READ+REPORT on M0 (tele)\n");
++	/* Also try M0 (tele, Android sid 0x2d = vendor 8-bit 0x5a>>1, chip-ID
++	 * 0x1b7e) with combined transaction. */
++	printf("PANDORA CAMERA: w30 TEST: combined SET_PARAM+WRITE+READ+REPORT on M0 (tele sid=0x2d)\n");
 +	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
 +	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
 +	m = 0;
 +	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
-+	    PC_CCI_I2C_SET_PARAM | ((uint32_t)0x5au << 4));
++	    PC_CCI_I2C_SET_PARAM | ((uint32_t)0x2du << 4));
 +	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
 +	    pc_cci_load_word(PC_CCI_I2C_WRITE | (2u << 4), 0x00u, 0x00u, 0x00u));
 +	pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, 0),
