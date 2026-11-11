@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..db055c3
+index 0000000..2f2fd19
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2884 @@
+@@ -0,0 +1,2978 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1093,6 +1093,9 @@ index 0000000..db055c3
 +#define PC_CCI_I2C_WRITE        9u
 +#define PC_CCI_I2C_READ         10u
 +#define PC_CCI_I2C_REPORT_IRQ_EN 0x100u
++#define PC_CCI_I2C_LOCK         6u   /* vendor cam_cci: queue LOCK  (seen 0x510:0x6) */
++#define PC_CCI_I2C_UNLOCK       7u   /* vendor cam_cci: queue UNLOCK(seen 0x510:0x7) */
++
 +
 +/* 19.2 MHz Standard-mode timing (i2c-qcom-cci.c cci_hw_params[19.2][STD]). */
 +#define PC_T_THIGH   78u
@@ -1672,6 +1675,91 @@ index 0000000..db055c3
 +	}
 +	pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
 +	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++}
++
++/* w31: vendor CCI queue shape matrix.
++ * Android cam_cci debug log (CAMERA_C2B_ANDROID_CCI_QUEUE.md) shows EVERY
++ * transaction is a 5-word queue wrapped in LOCK(0x6)/UNLOCK(0x7): pure writes
++ * on Q0, read-with-address on Q1, and cam_cci_set_clk_param() rewrites the
++ * timing registers before EACH transaction. w1..w30 had neither the
++ * LOCK/UNLOCK words nor per-transaction timing refresh.
++ * One boot runs Q0/Q1 x lock/no-lock so we discriminate a whole shape class
++ * instead of betting on a single guess. */
++static void
++pc_cci_refresh_timing(int clk37)
++{
++	static const uint32_t tim_19[5] = {
++		78u << 16 | 114u, 28u << 16 | 28u, 10u << 16 | 77u, 118u, 0x161u
++	};
++	static const uint32_t tim_37[5] = {
++		201u << 16 | 174u, 204u << 16 | 231u, 22u << 16 | 162u, 227u, 0x163u
++	};
++	const uint32_t *t = clk37 ? tim_37 : tim_19;
++	unsigned mm;
++
++	for (mm = 0; mm < 2; mm++) {
++		pc_wr(pc_cci[0], PC_CCI_SCL_CTL(mm), t[0]);
++		pc_wr(pc_cci[0], PC_CCI_SDA_CTL_0(mm), t[1]);
++		pc_wr(pc_cci[0], PC_CCI_SDA_CTL_1(mm), t[2]);
++		pc_wr(pc_cci[0], PC_CCI_SDA_CTL_2(mm), t[3]);
++		pc_wr(pc_cci[0], PC_CCI_MISC_CTL(mm), t[4]);
++	}
++}
++
++static void
++pc_cci_shape_matrix(unsigned m, uint8_t slave, int clk37)
++{
++	unsigned shape;
++
++	for (shape = 0; shape < 4; shape++) {
++		unsigned q = (shape & 1u) ? 1u : 0u;
++		int locked = (shape & 2u) ? 1 : 0;
++		uint32_t rep, nack, irq = 0, words, rst, rd, level;
++		unsigned i;
++
++		pc_cci_reset_engine();
++		pc_cci_refresh_timing(clk37);
++		pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++		pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++
++		if (locked)
++			pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, q), PC_CCI_I2C_LOCK);
++		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, q),
++		    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave << 4));
++		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, q),
++		    pc_cci_load_word(PC_CCI_I2C_WRITE | (2u << 4), 0x00u, 0x00u, 0x00u));
++		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, q),
++		    PC_CCI_I2C_READ | (2u << 4));
++		pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, q),
++		    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
++		if (locked)
++			pc_wr(pc_cci[0], PC_CCI_Qn_LOAD_DATA(m, q), PC_CCI_I2C_UNLOCK);
++
++		words = pc_rd(pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(m, q));
++		pc_wr(pc_cci[0], PC_CCI_Qn_EXEC_WORD_CNT(m, q), words);
++		pc_wr(pc_cci[0], PC_CCI_QUEUE_START, 1u << (m * 2u + q));
++
++		/* Q0: M0 BIT(4)/M1 BIT(16); Q1: M0 BIT(8)/M1 BIT(20).
++		 * NACK: M0_Q0 BIT(27), M0_Q1 BIT(28), M1_Q0 BIT(29), M1_Q1 BIT(30). */
++		rep  = 1u << (4u + m * 12u + q * 4u);
++		nack = 1u << (27u + m * 2u + q);
++		for (i = 0; i < 100; i++) {
++			irq = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++			if (irq & (rep | nack))
++				break;
++			pc_sleep(1);
++		}
++		rst = pc_rd(pc_cci[0], PC_CCI_Qn_REPORT_STATUS(m, q));
++		level = pc_rd(pc_cci[0], PC_CCI_READ_BUF_LEVEL(m));
++		rd = level ? pc_rd(pc_cci[0], PC_CCI_READ_DATA(m)) : 0;
++		printf("PANDORA CAMERA: w31 S%u M%u Q%u lock=%d addr=%#x words=%u "
++		    "polls=%u irq=%#x report=%#x buf=%u data=%#x -> %s\n",
++		    shape, m, q, locked, slave, words, i, irq, rst, level, rd,
++		    (irq & nack) ? "NACK" : ((irq & rep) ? "DONE_NO_NACK" : "TIMEOUT"));
++		pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++		pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++	}
++	pc_cci_reset_engine();
 +}
 +
 +/* Pure 1-byte WRITE address probe. No READ, so it cannot be polluted by
@@ -2335,6 +2423,12 @@ index 0000000..db055c3
 +	printf("PANDORA CAMERA: w13 extra settle delay 100ms\n");
 +
 +	pc_sleep(100);
++
++	/* w31: discriminate the CCI queue shape BEFORE the legacy sweep.
++	 * Both pairs use the Android-confirmed 7-bit sid; the 8-bit forms are
++	 * still covered by the scan loop below as controls. */
++	pc_cci_shape_matrix(1u, 0x10u, clk37);  /* wide, M1, chip-ID 0x5058 */
++	pc_cci_shape_matrix(0u, 0x2du, clk37);  /* tele, M0, chip-ID 0x1b7e */
 +
 +	/* w27: one A/B control, then a full address sweep with a clean engine
 +	 * before EVERY transaction. First reliable address-layer measurement
