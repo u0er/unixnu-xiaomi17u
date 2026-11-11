@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..ea68f37
+index 0000000..0581a09
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,2880 @@
+@@ -0,0 +1,2871 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -2130,128 +2130,137 @@ index 0000000..ea68f37
 +		pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
 +	}
 +
-+	/* 3. Power up sensor (same as w12/w9) */
++	/* 3. Power up sensor - w30: 1:1 mirror of the Android
++	 * cam_sensor_power_up() sequence measured on THIS device with tracefs
++	 * (docs/CAMERA_C2B_ANDROID_POWER_SEQUENCE.md).
++	 *
++	 * Android order: assert resets + park MCLK pins as input -> B2B_E0
++	 *   -> afvdd(116) -> VIO(L5M_E1) -> tele(113 + L3N/L5N)
++	 *   -> MCLK 19.2MHz from XO -> wide(107) -> wide reset release
++	 *   -> tele reset release -> CCI0 37.5MHz -> settle -> I2C.
++	 * Each rail is separated by ~1 ms. MCLK is XO/19.2 MHz with
++	 * CFG_RCGR=0x00100001 / CBCR=0x08000001; Android never enables a
++	 * BDISTM PLL0 (w21..w29 wrongly used 960 MHz / 24 MHz).
++	 */
 +	{
-+		/* RPMh rails — w22: check return values */
++		/* step0: Android drives gpio89/92 as INPUT (OE=0, func=cam_mclk,
++		 * 2 mA, bias-disable) and asserts BOTH resets BEFORE any rail.
++		 * w21..w29 drove them as GPIO outputs (OE=1, 8 mA), which can
++		 * override the clock controller's MCLK output entirely. */
++		/* out=-1 is required: pc_gpio_set() sets CTL OE bit (0x200) for ANY
++		 * out >= 0, including 0. Only -1 leaves OE=0 (input direction). */
++		pc_gpio_set(89, 1, 0, 2, -1);
++		pc_gpio_set(92, 1, 0, 2, -1);
++		pc_gpio_set(106, 0, 0, 2, 0);  /* wide reset assert (low) */
++		pc_gpio_set(105, 0, 0, 2, 0);  /* tele reset assert (low) */
++		printf("PANDORA CAMERA: w30 step0 reset-first: 89ctl=%#x 92ctl=%#x "
++		    "106ctl=%#x 105ctl=%#x\n",
++		    pc_rd(pc_tlmm, PC_GPIO(89)), pc_rd(pc_tlmm, PC_GPIO(92)),
++		    pc_rd(pc_tlmm, PC_GPIO(106)), pc_rd(pc_tlmm, PC_GPIO(105)));
++		pc_sleep(1);
++
++		/* step1: B2B_E0 (bob2) 2704 mV - first rail in Android trace.
++		 * B1B_E0 3400 mV is kept from w22 (already verified healthy). */
 +		{
-+			int r1 = pandora_rpmh_resource("L5M_E1", 0, 1800);
-+			int r2 = pandora_rpmh_resource("L5M_E1", 4, 1);
-+			int r3 = pandora_rpmh_resource("B1B_E0", 0, 3400);
-+			int r4 = pandora_rpmh_resource("B1B_E0", 4, 1);
-+			int r5 = pandora_rpmh_resource("B2B_E0", 0, 2704);
-+			int r6 = pandora_rpmh_resource("B2B_E0", 4, 1);
-+			printf("PANDORA CAMERA: w22 RPMh ret: L5M(%d,%d) B1B(%d,%d) B2B(%d,%d)\n",
-+			    r1, r2, r3, r4, r5, r6);
++			int a = pandora_rpmh_resource("B1B_E0", 0, 3400);
++			int b = pandora_rpmh_resource("B1B_E0", 4, 1);
++			int c = pandora_rpmh_resource("B2B_E0", 0, 2704);
++			int d = pandora_rpmh_resource("B2B_E0", 4, 1);
++			printf("PANDORA CAMERA: w30 step1 B1B(%d,%d) B2B(%d,%d)\n",
++			    a, b, c, d);
 +		}
-+		/* w28: RPMh MODE vote (offset 8). Android debugfs: bob1 mode=8
-+		 * (REGULATOR_MODE_FAST -> PMIC5 BOB PWM=7); LDO HPM=7. */
++		/* w28/w29 MODE vote kept verbatim (w29 healthy). */
 +		{
 +			int m1 = pandora_rpmh_resource("L5M_E1", 8, 7);
 +			int m2 = pandora_rpmh_resource("B1B_E0", 8, 7);
 +			int m3 = pandora_rpmh_resource("B2B_E0", 8, 7);
-+			printf("PANDORA CAMERA: w28 RPMh MODE ret: L5M=%d B1B=%d B2B=%d\n",
++			printf("PANDORA CAMERA: w30 step1 MODE ret: L5M=%d B1B=%d B2B=%d\n",
 +			    m1, m2, m3);
 +		}
-+		printf("PANDORA CAMERA: w13 RPMh: L5M_E1 1800mV, B1B_E0 3400mV, B2B_E0 2704mV\n");
++		pc_sleep(1);
 +
-+		/* GPIO power enables */
-+		pc_gpio_set(107, 0, 0, 8, 1); /* wide pwr, func=0 GPIO */
-+		pc_gpio_set(116, 0, 0, 8, 1); /* afvdd, func=0 GPIO */
-+		/* w22: readback verify */
-+		printf("PANDORA CAMERA: w22 GPIO readback: 107 ctl=%#x in=%#x  116 ctl=%#x in=%#x\n",
-+		    pc_rd(pc_tlmm, PC_GPIO(107)), pc_rd(pc_tlmm, PC_GPIO(107) + 0x4),
++		/* step2: wide afvdd gpio116 */
++		pc_gpio_set(116, 0, 0, 2, 1);
++		printf("PANDORA CAMERA: w30 step2 afvdd gpio116 ctl=%#x in=%#x\n",
 +		    pc_rd(pc_tlmm, PC_GPIO(116)), pc_rd(pc_tlmm, PC_GPIO(116) + 0x4));
-+		printf("PANDORA CAMERA: w13 GPIO: 107=high (wide pwr), 116=high (afvdd)\n");
++		pc_sleep(1);
 +
-+		/* w21: MCLK BEFORE reset — enable BDISTMCLKCC PLL0 + 24MHz */
-+		pc_gpio_set(89, 1, 0, 8, 1); /* cam_mclk func=1 */
-+		printf("PANDORA CAMERA: w21 GPIO 89=cam_mclk (func=1, 8mA)\n");
-+
-+		/* w21: Enable BDISTMCLKCC PLL0 (960MHz) then MCLK at 24MHz */
-+		printf("PANDORA CAMERA: w21 MCLK: enable BDISTMCLKCC PLL0 + 24MHz\n");
++		/* step3: VIO L5M_E1 1800 mV */
 +		{
-+			/* PLL0 registers at BDISTM base + 0x0 */
-+			/* w21 FIX: use pc_bdistm directly (vm_offset_t), NOT uint32_t truncation */
-+			/* Dump PLL0 state before */
-+			printf("PANDORA CAMERA: w21 PLL0 BEFORE mode=%#x opmode=%#x state=%#x status=%#x\n",
-+			    pc_rd(pc_bdistm, 0x00), pc_rd(pc_bdistm, 0x04), pc_rd(pc_bdistm, 0x08), pc_rd(pc_bdistm, 0x0c));
++			int a = pandora_rpmh_resource("L5M_E1", 0, 1800);
++			int b = pandora_rpmh_resource("L5M_E1", 4, 1);
++			printf("PANDORA CAMERA: w30 step3 VIO L5M_E1 1800mV ret(%d,%d)\n", a, b);
++		}
++		pc_sleep(1);
 +
-+			/* Step 1: CONFIG_CTL registers */
-+			pc_wr(pc_bdistm, 0x20, 0x12000000u);
-+			pc_wr(pc_bdistm, 0x24, 0x00890263u);
-+			pc_wr(pc_bdistm, 0x28, 0x1af04237u);
-+			pc_wr(pc_bdistm, 0x2c, 0x00000000u);
++		/* step4: tele rails + gpio113 (Android enables n_l3/n_l5 here) */
++		{
++			int a = pandora_rpmh_resource("L3N_E1", 0, 1800);
++			int b = pandora_rpmh_resource("L3N_E1", 4, 1);
++			int c = pandora_rpmh_resource("L5N_E1", 0, 3300);
++			int d = pandora_rpmh_resource("L5N_E1", 4, 1);
++			printf("PANDORA CAMERA: w30 step4 tele RPMh L3N(%d,%d) L5N(%d,%d)\n",
++			    a, b, c, d);
++		}
++		pc_gpio_set(113, 0, 0, 2, 1);
++		printf("PANDORA CAMERA: w30 step4 tele vana/vdig gpio113 ctl=%#x\n",
++		    pc_rd(pc_tlmm, PC_GPIO(113)));
++		pc_sleep(1);
 +
-+			/* Step 2: L = 0x32 (VCO = 50 * 19.2 = 960MHz) */
-+			pc_wr(pc_bdistm, 0x10, 0x32u);
-+			/* Step 3: ALPHA = 0 */
-+			pc_wr(pc_bdistm, 0x14, 0x0u);
-+
-+			/* Step 4: USER_CTL — enable ALL outputs (OUT_EVEN|OUT_ODD|OUT_MAIN) */
-+			/* w22 FIX: was 0x2 (only BIT(1)=OUT_ODD), OUT_EVEN was gated! */
-+			pc_wr(pc_bdistm, 0x18, 0x7u);
-+
-+			/* Step 5: MODE — set PLL_OUTCTRL (bit 0) */
-+			pc_wr(pc_bdistm, 0x00, 0x1u);
-+			pc_sleep(1);
-+
-+			/* Step 6: OPMODE — set PLL_RUN (bit 0) */
-+			pc_wr(pc_bdistm, 0x04, 0x1u);
-+
-+			/* Step 7: Wait for lock */
-+			/* w22 FIX: lock bit is BIT(31) (PLL_LOCK_DET), not BIT(0) */
-+			{
-+				unsigned li;
-+				for (li = 0; li < 100; li++) {
-+					uint32_t st = pc_rd(pc_bdistm, 0x0c);
-+					if (st & 0x80000000u) /* PLL_LOCK_DET BIT(31) */
-+						break;
-+					pc_sleep(1);
-+				}
-+				printf("PANDORA CAMERA: w22 PLL0 lock wait %u, status=%#x\n",
-+				    li, pc_rd(pc_bdistm, 0x0c));
-+			}
-+			printf("PANDORA CAMERA: w22 PLL0 AFTER  mode=%#x opmode=%#x state=%#x status=%#x\n",
-+			    pc_rd(pc_bdistm, 0x00), pc_rd(pc_bdistm, 0x04), pc_rd(pc_bdistm, 0x08), pc_rd(pc_bdistm, 0x0c));
-+			printf("PANDORA CAMERA: w22 PLL0 l=%#x alpha=%#x user_ctl=%#x\n",
-+			    pc_rd(pc_bdistm, 0x10), pc_rd(pc_bdistm, 0x14), pc_rd(pc_bdistm, 0x18));
-+
-+			/* Configure MCLK RCG for 24MHz from PLL0_OUT_EVEN */
-+			/* Integer mode: SRC_SEL=3 (PLL0_OUT_EVEN), SRC_DIV=20 (480/20=24 or 960/20=48) */
-+			static const uint32_t mclk_rcg[] = { 0x4000, 0x401c, 0x4038, 0x4054 };
++		/* step5: MCLK - copy the Android running register values.
++		 * CFG_RCGR=0x00100001 = SRC_SEL 0 (bi_tcxo/XO), SRC_DIV 1,
++		 * HW_CLK_CTRL; CBCR BIT(0) only (upper bits are read-only).
++		 * Offsets from pc_clock_probe(): cmd 4000/4038/4054/4070,
++		 * cbcr 4018/4050/406c/4088. w21's 0x401c was NOT a cmd_rcgr. */
++		{
++			static const uint32_t mclk_cmd[] = { 0x4000u, 0x4038u, 0x4054u, 0x4070u };
++			static const uint32_t mclk_cbcr[] = { 0x4018u, 0x4050u, 0x406cu, 0x4088u };
 +			for (unsigned mi = 0; mi < 4; mi++) {
-+				uint32_t rcg = mclk_rcg[mi];
-+				/* CFG_RCGR: SRC_SEL=3 (PLL0_OUT_EVEN), SRC_DIV=20, MODE=0, HW_CLK_CTRL */
-+				pc_wr(pc_bdistm, rcg + 4, (3u << 8) | 20u | (1u << 20));
-+				/* CMD_RCGR: clear ROOT_OFF, set ROOT_EN|UPDATE */
-+				pc_wr(pc_bdistm, rcg, 0x3u);
++				uint32_t cmd = mclk_cmd[mi];
++				uint32_t cbcr = mclk_cbcr[mi];
++				printf("PANDORA CAMERA: w30 step5 mclk%u BEFORE cfg=%#x cmd=%#x cbcr=%#x\n",
++				    mi, pc_rd(pc_bdistm, cmd + 4), pc_rd(pc_bdistm, cmd),
++				    pc_rd(pc_bdistm, cbcr));
++				pc_wr(pc_bdistm, cmd + 4, 0x00100001u);
++				/* shared RCG: clear CMD_ROOT_OFF(bit31), then UPDATE(bit0).
++				 * Android running state reads CMD_RCGR=0, so do NOT leave
++				 * ROOT_EN(bit1) set like w21's 0x3 did. */
++				pc_wr(pc_bdistm, cmd, (pc_rd(pc_bdistm, cmd) & ~0x80000000u) | 0x1u);
 +				for (unsigned pi = 0; pi < 50; pi++) {
-+					if (!(pc_rd(pc_bdistm, rcg) & 0x2u))
++					if (!(pc_rd(pc_bdistm, cmd) & 0x1u))
 +						break;
 +					pc_sleep(1);
 +				}
-+				/* Branch CBCR: enable BIT(0) */
-+				pc_wr(pc_bdistm, rcg + 0x18, 0x1u);
-+				pc_sleep(1);
-+				printf("PANDORA CAMERA: w22 mclk%u cfg=%#x cmd=%#x cbcr=%#x\n",
-+				    mi, pc_rd(pc_bdistm, rcg + 4), pc_rd(pc_bdistm, rcg),
-+				    pc_rd(pc_bdistm, rcg + 0x18));
++				pc_wr(pc_bdistm, cbcr, pc_rd(pc_bdistm, cbcr) | 0x1u);
++				printf("PANDORA CAMERA: w30 step5 mclk%u AFTER cfg=%#x cmd=%#x "
++				    "cbcr=%#x target cfg=0x100001 cbcr=0x8000001\n",
++				    mi, pc_rd(pc_bdistm, cmd + 4), pc_rd(pc_bdistm, cmd),
++				    pc_rd(pc_bdistm, cbcr));
 +			}
 +		}
++		pc_sleep(1);
 +
-+		/* Reset assert (MCLK already running) */
-+		pc_gpio_set(106, 0, 0, 2, 0);
-+		printf("PANDORA CAMERA: w21 GPIO 106=low (reset assert, MCLK already on)\n");
-+		pc_sleep(10);
++		/* step6: wide avdd/dvdd/avdd1 gpio107 */
++		pc_gpio_set(107, 0, 0, 2, 1);
++		printf("PANDORA CAMERA: w30 step6 wide pwr gpio107 ctl=%#x in=%#x\n",
++		    pc_rd(pc_tlmm, PC_GPIO(107)), pc_rd(pc_tlmm, PC_GPIO(107) + 0x4));
++		pc_sleep(1);
 +
-+		/* Reset release - sensor boots with MCLK running */
++		/* step7: wide reset RELEASE (Android holds assert ~17 ms) */
 +		pc_gpio_set(106, 0, 0, 2, 1);
-+		printf("PANDORA CAMERA: w21 GPIO 106=high (reset release)\n");
-+		pc_sleep(50);
++		printf("PANDORA CAMERA: w30 step7 wide reset 106 RELEASE\n");
++		pc_sleep(18);
++
++		/* step8: tele reset RELEASE */
++		pc_gpio_set(105, 0, 0, 2, 1);
++		printf("PANDORA CAMERA: w30 step8 tele reset 105 RELEASE\n");
++		pc_sleep(3);
 +	}
 +
-+	/* w28c: align CCI core clock AND the I2C timing with the working
-+	 * Android configuration (both must match or SCL/tsu/thd go wrong). */
++	/* w29: align CCI core clock AND the I2C timing with the working
++	 * Android configuration (both must match or SCL/tsu/thd go wrong).
++	 * w30: now runs AFTER the sensor reset releases, matching Android
++	 * where cam_cc_cci_0_clk is enabled LAST, just before the first I2C. */
 +	clk37 = pc_cci_clk_37mhz();
 +
 +	/* 4. PINMUX FIX: configure CCI0 I2C pins to CCI I2C function */
@@ -2386,26 +2395,8 @@ index 0000000..ea68f37
 +		pc_wr(pc_cci[0], PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
 +		pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
 +	}
-+	/* w22: Tele sensor (sensor3) has DIFFERENT GPIOs than wide!
-+	 * DT: mclk=gpio92 rst=gpio105 vana=GPIO113 vdig=GPIO113
-+	 *     vio=L5M_E1 vaf=L5N_E1 3.3V custom1=L3N_E1 */
-+	printf("PANDORA CAMERA: w22 TELE: powering sensor3 (mclk=gpio92, rst=gpio105, vana=GPIO113)\n");
-+	pandora_rpmh_resource("L5N_E1", 0, 3300); /* tele vaf 3.3V */
-+	pandora_rpmh_resource("L5N_E1", 4, 1);
-+	pandora_rpmh_resource("L3N_E1", 0, 1800); /* tele custom1 */
-+	pandora_rpmh_resource("L3N_E1", 4, 1);
-+	pc_gpio_set(113, 0, 0, 8, 1); /* tele vana+vdig */
-+	printf("PANDORA CAMERA: w22 TELE: GPIO 113=high (vana+vdig), RPMh L5N_E1 3300mV, L3N_E1 1800mV\n");
-+	/* tele MCLK on gpio92 */
-+	pc_gpio_set(92, 1, 0, 8, 1); /* cam_mclk func=1 */
-+	printf("PANDORA CAMERA: w22 TELE: GPIO 92=cam_mclk (func=1, 8mA)\n");
-+	/* tele reset: gpio105 */
-+	pc_gpio_set(105, 0, 0, 2, 0); /* reset assert */
-+	printf("PANDORA CAMERA: w22 TELE: GPIO 105=low (reset assert)\n");
-+	pc_sleep(10);
-+	pc_gpio_set(105, 0, 0, 2, 1); /* reset release */
-+	printf("PANDORA CAMERA: w22 TELE: GPIO 105=high (reset release)\n");
-+	pc_sleep(50);
++	/* w30: tele (sensor3) power/reset/MCLK is now part of the unified
++	 * Android-mirrored power-up above (steps 0/4/8), BEFORE any M0 xfer. */
 +
 +	/* Also try M0 (tele, slave 0x5a, expect 0x1b7e) with combined transaction */
 +	printf("PANDORA CAMERA: w17 TEST: combined SET_PARAM+WRITE+READ+REPORT on M0 (tele)\n");
