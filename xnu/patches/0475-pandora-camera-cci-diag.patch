@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..130ebc3
+index 0000000..cc65bc2
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,3511 @@
+@@ -0,0 +1,3518 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -183,8 +183,12 @@ index 0000000..130ebc3
 + *   handshake and the real sensor chip-ID registers are still unresolved.
 + *
 + * Boot args:
-+ *   pandora_camera=<level>   default 0 (off). 1 or 2 = run the diagnostics
-+ *   in a short-lived thread, including the C-2b-w1 write/rollback probe.
++ *   pandora_camera=<level>   default 0 (off).
++ *     1 = driver self-check (wide/tele power_up + CCI0 chip-ID read).
++ *     2 = + init-table replay (wide/tele), the verified Android settings.
++ *     3 = + QUP I2C power-up-only sequence for ultra/front (front gpio3,
++ *         ultra gpio7 reset; PM8010 LDO votes; no I2C traffic). This stays a
++ *         pure uf power-up test -- it does NOT also replay wide/tele.
 + *   Nothing else is gated by this file.
 + *   Use the 11-04 user-verified cmdline baseline plus this flag
 + *   (cmdline-good-plus-camera-reboot90.txt, 603/608 B). The older camera-only
@@ -3440,12 +3444,15 @@ index 0000000..130ebc3
 +	 *   pandora_camera=2
 +	 * on the boot cmdline to actually write the Android-dumped settings.
 +	 * wide = CCI0 M1 sid 0x10 (8-bit data); tele = CCI0 M0 sid 0x2d (16-bit).
-+	 * ultra is on master2/QUP and is NOT replayed here yet. */
++	 * ultra/front are on QUP I2C (SE8/SE9) and are NOT replayed here -- they
++	 * only get a power-up-only sequence at pandora_camera=3 (pc_level==3),
++	 * gated separately in pc_sensor_power_up(). Use == 2 so that level 3
++	 * stays a pure uf power-up test and does not also replay wide/tele. */
 +	{
 +		unsigned apply = 0;
 +		(void)PE_parse_boot_argn("pandora_camera_apply", &apply,
 +		    sizeof(apply));
-+		if (pc_level >= 2u) {
++		if (pc_level == 2u) {
 +			apply = 1;
 +		}
 +		if (apply) {
@@ -3480,6 +3487,72 @@ index 0000000..130ebc3
 +	pc_camcc = ml_io_map_unmappable(PC_CAMCC_PA, 0x80000, VM_WIMG_IO);
 +	pc_step("BDISTMCLKCC", PC_BDISTM_PA);
 +	pc_bdistm = ml_io_map_unmappable(PC_BDISTM_PA, 0x6000, VM_WIMG_IO);
++	pc_step("TLMM", PC_TLMM_PA);
++	pc_tlmm = ml_io_map_unmappable(PC_TLMM_PA, 0xb0000, VM_WIMG_IO);
++	if (!pc_camcc || !pc_bdistm || !pc_tlmm) {
++		printf("PANDORA CAMERA: mapping failed camcc=%#llx bdistm=%#llx tlmm=%#llx\n",
++		    (unsigned long long)pc_camcc,
++		    (unsigned long long)pc_bdistm, (unsigned long long)pc_tlmm);
++		goto out;
++	}
++	for (unsigned n = 0; n < 3; n++) {
++		pc_step("CCI", PC_CCI_PA(n));
++		pc_cci[n] = ml_io_map_unmappable(PC_CCI_PA(n), 0x1000, VM_WIMG_IO);
++		if (!pc_cci[n]) {
++			printf("PANDORA CAMERA: CCI%u mapping failed\n", n);
++			continue;
++		}
++		pc_cci_dump(n);
++	}
++	pc_camcc_dump();
++	pc_tlmm_dump();
++	/* DT strap dump (not MMIO): which sensor would be read first, and what
++	 * its rails cost. Values are the live DT's, already cross-checked by
++	 * resolving each *-supply phandle to its regulator node. */
++	printf("PANDORA CAMERA: sensor0 (wide, ovx10500u 0x20) CCI0 master1 csiphy0 mclk=gpio89 rst=gpio106 "
++	    "vana=GPIO107 2.8V vdig=GPIO107 0.95V vaf=GPIO116 3.3V vio=L5M_E1 1.8V bob=B1B_E0 bob2=B2B_E0\n");
++	printf("PANDORA CAMERA: sensor3 (tele, s5khpe 0x5a) CCI0 master0 csiphy3 mclk=gpio92 rst=gpio105 "
++	    "vana=GPIO113 2.2V vdig=GPIO113 0.95V vio=L5M_E1 vaf=L5N_E1 3.3V custom1=L3N_E1\n");
++	printf("PANDORA CAMERA: sensor (ultra, s5kjn5 0x7a) no live-DT node; front (ov50m) not in this run\n");
++	printf("PANDORA CAMERA: C-2a diag done (read-only), 3 rear sensors recorded; vendor config not downloaded; "
++	    "C-2a issued no rail vote and no write\n");
++	/* All read-only evidence (C-2a, C-2b-p, C-2b-w0) is printed before the
++	 * first write, so a restart can be attributed to a named w1 step. */
++	pc_clock_probe();
++	pc_w0_dump();
++	pc_w4_pll_snapshot();
++	pc_w1_bringup();
++	printf("PANDORA CAMERA: C-2b-w1 thread done\n");
++	/* Stage D: real driver bring-up (power + driver read/write path), distinct
++	 * from the read-only diagnostics above. Leaves sensors powered for use. */
++	pc_sensor_init();
++out:
++	/* Deliberately no unmaps anywhere in this file: a one-shot boot diagnostic shares
++	 * the TLMM/CCI apertures with the worker threads (and the GCC aperture already taught
++	 * the lesson), so the maps stay for the whole boot, like the other pandora drivers. */
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++pandora_camera_init(void)
++{
++	(void)PE_parse_boot_argn("pandora_camera", &pc_level, sizeof(pc_level));
++	if (!pc_level) {
++		return;
++	}
++	if (pc_started) {
++		return;
++	}
++	pc_started = true;
++	thread_t thread;
++	if (kernel_thread_start(pc_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("PANDORA CAMERA: diag thread allocation failed\n");
++	}
++}
++#endif /* PANDORA */
 +	pc_step("TLMM", PC_TLMM_PA);
 +	pc_tlmm = ml_io_map_unmappable(PC_TLMM_PA, 0xb0000, VM_WIMG_IO);
 +	if (!pc_camcc || !pc_bdistm || !pc_tlmm) {
