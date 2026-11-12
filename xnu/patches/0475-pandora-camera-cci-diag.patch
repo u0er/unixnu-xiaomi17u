@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..e6e0c02
+index 0000000..bf74bea
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,4322 @@
+@@ -0,0 +1,4333 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -3921,6 +3921,11 @@ index 0000000..e6e0c02
 +	printf("PANDORA TPG: P3 TPG started ctrl=%#x ctrl_cmd=%#x hw_status=%#x\n",
 +	    pc_rd(tpg2, 0x64), pc_rd(tpg2, 0x1f4), pc_rd(tpg2, 0x4));
 +	(void)pandora_log_sync();
++	pc_sleep(5);
++	printf("PANDORA TPG: P3 TPG cfg vc0=%#x dt0_cfg0=%#x dt0_cfg1=%#x dt0_cfg2=%#x hbi=%#x vbi=%#x bars=%#x hw_status=%#x\n",
++	    pc_rd(tpg2, 0x68), pc_rd(tpg2, 0x7c), pc_rd(tpg2, 0x80), pc_rd(tpg2, 0x84),
++	    pc_rd(tpg2, 0x70), pc_rd(tpg2, 0x74), pc_rd(tpg2, 0x78), pc_rd(tpg2, 0x4));
++	(void)pandora_log_sync();
 +
 +	/* ---- P4: CSID RX mux + RDI0 (§3.2/§3.3), adaptive RDI page ---- */
 +	pc_tpg_mark("P4: CSID RX/RDI begin");
@@ -3994,6 +3999,12 @@ index 0000000..e6e0c02
 +	    pc_rd(vfe0, 0x2c00), pc_rd(vfe0, 0x2c04), pc_rd(vfe0, 0x2c08));
 +	(void)pandora_log_sync();
 +
++	/* Unmask + clear CSID RX/RDI IRQs so polled status reflects fresh events. */
++	pc_wr(csid0, 0x1b4, 0xffffffffu);  /* CSI2_RX_IRQ_MASK: all */
++	pc_wr(csid0, 0x228, 0xffffffffu);  /* CSI2_RDIN_IRQ_MASK(0): all */
++	pc_wr(csid0, 0x1b8, 0xffffffffu);  /* CSI2_RX_IRQ_CLEAR */
++	pc_wr(csid0, 0x22c, 0xffffffffu);  /* CSI2_RDIN_IRQ_CLEAR(0) */
++	pc_wr(csid0, 0x1a8, 0x10000u);     /* BUF_DONE_IRQ_CLEAR: VC0 */
 +	/* ---- Observe: bounded poll of BUF_DONE / RX / RDI-wrapper IRQ ---- */
 +	pc_tpg_mark("P5: polling CSID BUF_DONE/RX/RDI IRQ for frame events");
 +	uint32_t buf_done = 0, rx_irq = 0, rdi_irq = 0;
