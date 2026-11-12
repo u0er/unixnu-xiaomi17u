@@ -1,0 +1,97 @@
+diff --git a/bsd/dev/apple_usbmux.c b/bsd/dev/apple_usbmux.c
+--- a/bsd/dev/apple_usbmux.c
++++ b/bsd/dev/apple_usbmux.c
+@@ -41,6 +41,18 @@
+ #define MUX_PROTO_TCP     6
+ #define MUX_MAGIC         0xfeedfaceu
+ 
++/*
++ * The mux version declared in version_reply().  Apple's AMDS probes with
++ * major=1 and abandons a device that answers v2, while every v2-capable host
++ * (libimobiledevice, mux_client.py) adapts to whatever we declare.  v2 is the
++ * documented wire format (docs/usb/APPLE_USB_PROTOCOL_RESEARCH.md section 3),
++ * so we keep declaring it; real AMDS support would mean replying 1 to a
++ * major=1 probe and switching every frame to the 8-byte v1 header.
++ * (The "0471 mux-v1" patch only renamed a log string -- the protocol never
++ * changed, which is why the AMDS probes in the 0470/0471 runs went silent.)
++ */
++#define AMUX_VERSION_MAJOR 2
++
+ #define TH_FIN 0x01
+ #define TH_SYN 0x02
+ #define TH_RST 0x04
+@@ -226,7 +238,7 @@
+ 
+ 	apple_put_be32(buf, MUX_PROTO_VERSION);
+ 	apple_put_be32(buf + 4, sizeof(buf));
+-	apple_put_be32(buf + 8, 2);             /* major */
++	apple_put_be32(buf + 8, AMUX_VERSION_MAJOR);    /* major */
+ 	apple_put_be32(buf + 12, 0);            /* minor */
+ 	apple_put_be32(buf + 16, 0);            /* padding */
+ 	ctrl_push(buf, sizeof(buf));
+@@ -423,8 +435,8 @@
+ 		version_reply();
+ 		am.neg = true;
+ 		am.active = false;
+-		printf("APPLE MUX: host asked v%u.%u, replied v1.0\n", major,
+-		    apple_be32(pkt + hdr + 4));
++		printf("APPLE MUX: host probed v%u.%u, device replies v%u\n",
++		    major, apple_be32(pkt + hdr + 4), AMUX_VERSION_MAJOR);
+ 		break;
+ 	}
+ 	case MUX_PROTO_SETUP:
+diff --git a/bsd/dev/apple_services.c b/bsd/dev/apple_services.c
+--- a/bsd/dev/apple_services.c
++++ b/bsd/dev/apple_services.c
+@@ -307,6 +307,12 @@
+ 		printf("APPLE LOCKDOWN: response truncated\n");
+ 		return;
+ 	}
++	/*
++	 * Every request and reply is logged because the host side keeps no
++	 * console history: when a client stops mid-session, the device log is
++	 * the only record of how far the lockdown conversation got.
++	 */
++	printf("APPLE LOCKDOWN: reply %u bytes\n", b->len);
+ 	(void)apple_mux_send(conn, b->p, b->len);
+ }
+ 
+@@ -372,6 +378,23 @@
+ 	return NULL;
+ }
+ 
++/*
++ * Bounded printable dump of a request body that carried no parsable Request
++ * key.  Non-printable bytes become '.' so the log line stays one line.
++ */
++static void
++lock_dump_body(const char *buf, uint32_t len)
++{
++	char out[49];
++	uint32_t n = len < 48 ? len : 48;
++
++	for (uint32_t i = 0; i < n; i++) {
++		out[i] = (buf[i] >= 0x20 && buf[i] < 0x7f) ? buf[i] : '.';
++	}
++	out[n] = '\0';
++	printf("APPLE LOCKDOWN: body %s\n", out);
++}
++
+ static void
+ lock_request(void *conn, struct lock_ctx *c)
+ {
+@@ -382,9 +405,14 @@
+ 
+ 	if (!plist_get(c->buf, c->len, "Request", req, sizeof(req))) {
+ 		printf("APPLE LOCKDOWN: request without Request key\n");
++		lock_dump_body(c->buf, c->len);
+ 		lock_empty(conn);
+ 		return;
+ 	}
++	key[0] = '\0';
++	(void)plist_get(c->buf, c->len, "Key", key, sizeof(key));
++	printf("APPLE LOCKDOWN: request %s%s%s\n", req,
++	    key[0] != '\0' ? " key " : "", key);
+ 
+ 	if (strcmp(req, "QueryType") == 0) {
+ 		ab_init(&b, lock_out, sizeof(lock_out));
