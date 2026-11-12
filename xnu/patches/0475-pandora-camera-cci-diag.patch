@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..cc65bc2
+index 0000000..3f88c50
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,3518 @@
+@@ -0,0 +1,3522 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -184,12 +184,14 @@ index 0000000..cc65bc2
 + *
 + * Boot args:
 + *   pandora_camera=<level>   default 0 (off).
-+ *     1 = driver self-check (wide/tele power_up + CCI0 chip-ID read).
++ *     1 = driver self-check (wide/tele power_up + CCI0 chip-ID read) AND
++ *         the ultra/front power-up-only sequence (front gpio3 / ultra gpio7
++ *         reset + PM8010 LDO votes; no I2C traffic). This is the verified
++ *         desktop path, so uf runs on a boot we can actually validate.
 + *     2 = + init-table replay (wide/tele), the verified Android settings.
-+ *     3 = + QUP I2C power-up-only sequence for ultra/front (front gpio3,
-+ *         ultra gpio7 reset; PM8010 LDO votes; no I2C traffic). This stays a
-+ *         pure uf power-up test -- it does NOT also replay wide/tele.
-+ *   Nothing else is gated by this file.
++ *         Level 2 keeps its original behaviour: it does NOT run uf.
++ *   Nothing else is gated by this file. Do NOT add new numeric levels --
++ *   extend level 1 instead (see w36-w39).
 + *   Use the 11-04 user-verified cmdline baseline plus this flag
 + *   (cmdline-good-plus-camera-reboot90.txt, 603/608 B). The older camera-only
 + *   cmdline (cmdline-camera-reboot90.txt) crash-loops SpringBoard at 49 s for
@@ -3212,7 +3214,7 @@ index 0000000..cc65bc2
 + * voted by pc_sensor_power_up() above, so we skip them. MCLK pads are
 + * deliberately NOT muxed: the clock sources are enabled but no signal is driven
 + * to the sensors while they sit in reset, and we do no I2C. Opt-in via
-+ * pandora_camera=3 (pc_level >= 3). */
++ * Runs on the verified level-1 driver path (pc_level == 1). */
 +static void
 +pc_sensor_power_up_uf(void)
 +{
@@ -3383,7 +3385,9 @@ index 0000000..cc65bc2
 +	    0x1u | 0x10u | 0x100u | 0x1000u | 0x10000u | 0x100000u
 +	    | PC_BIT(24) | 0x18000ee6u | 0x60ee6000u);
 +	pc_wr(pc_cci[0], PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
-+	if (pc_level >= 3u) {
++	/* Single-variable step 2: uf runs on the verified level-1 desktop path.
++	 * Level 2 (init-table replay) is deliberately left untouched. */
++	if (pc_level == 1u) {
 +		pc_sensor_power_up_uf();
 +	}
 +	printf("PANDORA CAMERA: driver power_up done clk37=%d\n", clk37);
@@ -3445,9 +3449,9 @@ index 0000000..cc65bc2
 +	 * on the boot cmdline to actually write the Android-dumped settings.
 +	 * wide = CCI0 M1 sid 0x10 (8-bit data); tele = CCI0 M0 sid 0x2d (16-bit).
 +	 * ultra/front are on QUP I2C (SE8/SE9) and are NOT replayed here -- they
-+	 * only get a power-up-only sequence at pandora_camera=3 (pc_level==3),
-+	 * gated separately in pc_sensor_power_up(). Use == 2 so that level 3
-+	 * stays a pure uf power-up test and does not also replay wide/tele. */
++	 * only get a power-up-only sequence on level 1, gated in
++	 * pc_sensor_power_up(). Use == 2 so that the replay stays exclusive
++	 * to level 2 and never combines with the uf power-up. */
 +	{
 +		unsigned apply = 0;
 +		(void)PE_parse_boot_argn("pandora_camera_apply", &apply,
