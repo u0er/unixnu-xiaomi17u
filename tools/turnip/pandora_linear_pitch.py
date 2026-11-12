@@ -30,6 +30,10 @@ import sys
 def patch(rel, old, new):
     p = pathlib.Path(sys.argv[1]) / rel
     s = p.read_text()
+    # read_text() universal-newlines the file to \n; normalize the anchors too so
+    # the match holds whether this script or the mesa tree is checked out LF/CRLF.
+    old = old.replace('\r\n', '\n')
+    new = new.replace('\r\n', '\n')
     if old not in s:
         raise SystemExit(f'pandora_linear_pitch: anchor not found in {rel}:\n{old[:160]}')
     if s.count(old) != 1:
