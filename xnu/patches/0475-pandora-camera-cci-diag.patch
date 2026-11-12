@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..c5b2eec
+index 0000000..c1c6032
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,3933 @@
+@@ -0,0 +1,4146 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -227,10 +227,14 @@ index 0000000..c5b2eec
 +#include <pexpert/pexpert.h>
 +#include <vm/vm_kern.h>
 +#include <vm/pmap.h>
++#include <arm/caches_internal.h>	/* clean_dcache64 for SMMU table publication */
 +#include "pandora_camera_init_tables.h"	/* AUTO-GEN Android init tables */
++#include "adreno/ArmSmmu4KStreams.h"	/* SMMUv2 native-4K lease (MIT), as WiFi */
 +
 +extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
 +extern kern_return_t thread_terminate(thread_t);
++extern void pandora_apps_smmu_lock(void);
++extern void pandora_apps_smmu_unlock(void);
 +void pandora_camera_init(void);
 +
 +/* PC_GCC_PA removed: GCC must not be mapped here (see header note). */
@@ -251,6 +255,17 @@ index 0000000..c5b2eec
 +#define PC_GCC_CAM_AXI_PA  0x00126000u
 +#define PC_GCC_HF_AXI_OFF  0x14u
 +#define PC_GCC_SF_AXI_OFF  0x28u
++/* Camera frame-buffer SMMU = apps-smmu@15000000 (REGFACTS §2; the SAME instance
++ * WiFi/touch/DPU use, NOT the GPU kgsl-smmu@3da0000). IFE write-master SID
++ * 0x1c00 (EXIDS), IOVA window 0x100000..+0xffe00000, both confirmed by live
++ * base.dtb and mainline v24. Lease a free bank via the WiFi template. */
++#define PC_CAM_SMMU_PA     0x15000000u
++#define PC_CAM_SMMU_BYTES  0x00100000u
++#define PC_CAM_SID         0x1c00u
++#define PC_CAM_IOVA        0x00100000ull
++#define PC_CAM_IOVA_LIMIT  0xfff00000ull
++#define PC_CAM_FRAME_BYTES 0x00060000u   /* 640x480 RAW10 = 384000 B, page-rounded */
++#define PC_CAM_TABLE_BYTES 0x00010000u   /* 3-level native-4K pool for one frame */
 +#define PC_PRIORITY   92               /* as pandora_touch */
 +#define PC_BIT(n)     (1u << (n))
 +
@@ -3660,6 +3675,196 @@ index 0000000..c5b2eec
 +	return ret;
 +}
 +
++/* ---- Camera frame-buffer SMMU lease (apps-smmu@15000000, SID 0x1c00) ----
++ * Adapted from the verified pandora_wifi.c:wifi_dma_locked(): scan a free exact
++ * stream slot + a disabled unreferenced stage-1 bank + a free ASID, build a
++ * native-4K stage-1 table mapping one frame buffer to IOVA 0x100000, program the
++ * disabled context and attach the stream. Never touches the GPU kgsl-smmu or
++ * another agent's bank (the suite refuses any conflict). Held under the shared
++ * pandora_apps_smmu_lock. The mapping is kept alive (no unmap), like WiFi. */
++static vm_offset_t pc_smmu_base;
++static unsigned pc_smmu_bank, pc_smmu_slot, pc_smmu_asid;
++static uint64_t pc_smmu_ctx_off;
++static uint32_t pc_smmu_sctlr;
++static vm_offset_t pc_frame_va, pc_tables_va;
++static uint64_t pc_frame_pa, pc_tables_pa;
++static ArmSmmu4KConfig pc_table_config;
++static ArmSmmu4KResult pc_table_result;
++static ArmSmmu4KContextConfig pc_context;
++static ArmSmmu4KStreamState pc_stream_state;
++static ArmSmmu4KStreamResult pc_stream_result;
++static ArmSmmu4KProgramResult pc_prog_result;
++
++static int pc_smmu_rd32(void *c, size_t o, uint32_t *v)
++{ *v = pc_rd((vm_offset_t)c, (uint32_t)o); return 0; }
++static int pc_smmu_wr32(void *c, size_t o, uint32_t v)
++{ pc_wr((vm_offset_t)c, (uint32_t)o, v); return 0; }
++static int pc_smmu_rd64(void *c, size_t o, uint64_t *v)
++{
++	uint32_t lo = pc_rd((vm_offset_t)c, (uint32_t)o);
++	uint32_t hi = pc_rd((vm_offset_t)c, (uint32_t)o + 4);
++	*v = ((uint64_t)hi << 32) | lo;
++	return 0;
++}
++static int pc_smmu_wr64(void *c, size_t o, uint64_t v)
++{
++	pc_wr((vm_offset_t)c, (uint32_t)o, (uint32_t)v);
++	pc_wr((vm_offset_t)c, (uint32_t)o + 4, (uint32_t)(v >> 32));
++	return 0;
++}
++static int pc_smmu_barrier(void *c)
++{ (void)c; __asm__ volatile("dsb sy" ::: "memory"); return 0; }
++
++static vm_offset_t pc_contig(size_t bytes, uint64_t *pa)
++{
++	vm_offset_t va = 0;
++	if (kmem_alloc_contig(kernel_map, &va, bytes, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
++		return 0;
++	*pa = ptoa_64(pmap_find_phys(kernel_pmap, va));
++	return va;
++}
++
++static void pc_nocache(vm_offset_t va, size_t bytes)
++{
++	for (size_t off = 0; off < bytes; off += PAGE_SIZE)
++		pmap_set_cache_attributes(pmap_find_phys(kernel_pmap, va + off), VM_WIMG_WCOMB);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int
++pc_tpg_smmu_map(void)
++{
++	pandora_apps_smmu_lock();
++	pc_smmu_base = ml_io_map_unmappable(PC_CAM_SMMU_PA, PC_CAM_SMMU_BYTES, VM_WIMG_IO);
++	if (!pc_smmu_base) {
++		pandora_apps_smmu_unlock();
++		printf("PANDORA TPG: SMMU map FAILED\n");
++		return ENOMEM;
++	}
++	uint32_t id0 = pc_rd(pc_smmu_base, 0x20);
++	uint32_t id1 = pc_rd(pc_smmu_base, 0x24);
++	uint32_t id2 = pc_rd(pc_smmu_base, 0x28);
++	unsigned slots = id0 & 255, banks = id1 & 255, s2banks = (id1 >> 16) & 255;
++	uint64_t page = (id1 & (1u << 31)) ? 0x10000 : 0x1000;
++	uint64_t cbbase = page << (((id1 >> 28) & 7) + 1);
++	printf("PANDORA TPG: SMMU id0=%#x id1=%#x id2=%#x slots=%u banks=%u s2=%u page=%#llx cbbase=%#llx\n",
++	    id0, id1, id2, slots, banks, s2banks,
++	    (unsigned long long)page, (unsigned long long)cbbase);
++	(void)pandora_log_sync();
++	if (!(id0 & (1u << 27)) || !slots || !banks || banks > 128 || s2banks >= banks ||
++	    cbbase + banks * page > PC_CAM_SMMU_BYTES || (id0 & (1u << 8))) {
++		pandora_apps_smmu_unlock();
++		printf("PANDORA TPG: SMMU unsupported layout\n");
++		return ENOTSUP;
++	}
++	bool used[128] = {false}, asid_used[256] = {false};
++	pc_smmu_slot = ~0u;
++	for (unsigned s = 0; s < slots; s++) {
++		uint32_t smr = pc_rd(pc_smmu_base, 0x800 + s * 4);
++		uint32_t s2cr = pc_rd(pc_smmu_base, 0xc00 + s * 4);
++		if (!(smr & (1u << 31))) { if (pc_smmu_slot == ~0u) pc_smmu_slot = s; continue; }
++		if (((PC_CAM_SID ^ smr) & ~(smr >> 16) & 0x7fff) == 0) {
++			pandora_apps_smmu_unlock();
++			printf("PANDORA TPG: SMMU SID %#x already owned by slot %u\n", PC_CAM_SID, s);
++			return EBUSY;
++		}
++		if (((s2cr >> 16) & 3) == 0 && (s2cr & 255) < banks) used[s2cr & 255] = true;
++	}
++	pc_smmu_bank = ~0u;
++	for (unsigned b = s2banks; b < banks; b++) {
++		uint32_t ctl = pc_rd(pc_smmu_base, (uint32_t)(cbbase + b * page));
++		if (!(ctl & 1) && !used[b]) { if (pc_smmu_bank == ~0u) pc_smmu_bank = b; continue; }
++		if (ctl & 1) {
++			uint64_t ttbr = 0;
++			pc_smmu_rd64((void *)pc_smmu_base, cbbase + b * page + 0x20, &ttbr);
++			if ((ttbr >> 48) < 256) asid_used[ttbr >> 48] = true;
++		}
++	}
++	unsigned asid = 1;
++	while (asid < 256 && asid_used[asid]) asid++;
++	if (pc_smmu_slot == ~0u || pc_smmu_bank == ~0u || asid == 256) {
++		pandora_apps_smmu_unlock();
++		printf("PANDORA TPG: SMMU no free slot/bank/asid (slot=%u bank=%u asid=%u)\n",
++		    pc_smmu_slot, pc_smmu_bank, asid);
++		return EBUSY;
++	}
++	pc_smmu_asid = asid;
++	ArmSmmu4KIo io = {(void *)pc_smmu_base, PC_CAM_SMMU_BYTES,
++	    pc_smmu_rd32, pc_smmu_rd64, pc_smmu_wr32, pc_smmu_wr64, pc_smmu_barrier};
++	pc_wr(pc_smmu_base, 0xc00 + pc_smmu_slot * 4, 2u << 16);   /* S2CR -> fault */
++	ArmSmmu4KStream route = {pc_smmu_slot, PC_CAM_SID};
++	if (ArmSmmu4KCheckFaultedStreams(&io, &route, 1, pc_smmu_bank, &pc_stream_result) != ArmSmmu4KSuccess) {
++		pandora_apps_smmu_unlock();
++		printf("PANDORA TPG: SMMU CheckFaultedStreams refused\n");
++		return EBUSY;
++	}
++	pc_frame_va = pc_contig(PC_CAM_FRAME_BYTES, &pc_frame_pa);
++	pc_tables_va = pc_contig(PC_CAM_TABLE_BYTES, &pc_tables_pa);
++	if (!pc_frame_va || !pc_tables_va) {
++		pandora_apps_smmu_unlock();
++		printf("PANDORA TPG: SMMU contig alloc FAILED\n");
++		return ENOMEM;
++	}
++	pc_nocache(pc_frame_va, PC_CAM_FRAME_BYTES);
++	static const uint8_t widths[] = {32, 36, 40, 42, 44, 48};
++	unsigned encoding = (id2 >> 4) & 15;
++	if (encoding >= sizeof(widths) ||
++	    (pc_frame_pa + PC_CAM_FRAME_BYTES) >> widths[encoding] ||
++	    (pc_tables_pa + PC_CAM_TABLE_BYTES) >> widths[encoding]) {
++		pandora_apps_smmu_unlock();
++		printf("PANDORA TPG: SMMU output width unsupported\n");
++		return ENOTSUP;
++	}
++	pc_table_config = (ArmSmmu4KConfig){32, widths[encoding], pc_tables_pa,
++	    (PC_CAM_IOVA_LIMIT - PC_CAM_IOVA) / 0x1000};
++	ArmSmmu4KRange range = {PC_CAM_IOVA, pc_frame_pa, PC_CAM_FRAME_BYTES,
++	    ArmSmmu4KRead | ArmSmmu4KWrite, 0, 2};
++	if (ArmSmmu4KBuild(&pc_table_config, &range, 1, (uint64_t *)pc_tables_va,
++	    PC_CAM_TABLE_BYTES / 0x1000, &pc_table_result) != ArmSmmu4KSuccess) {
++		pandora_apps_smmu_unlock();
++		printf("PANDORA TPG: SMMU Build refused\n");
++		return ENOTSUP;
++	}
++	clean_dcache64(pc_tables_pa, PC_CAM_TABLE_BYTES, TRUE);
++	pc_context = (ArmSmmu4KContextConfig){&pc_table_config, NULL, &pc_table_result,
++	    NULL, id0, id2, asid, 0, 0, 0};
++	pc_wr(pc_smmu_base, (uint32_t)(cbbase + pc_smmu_bank * page + 4), 0);  /* ACTLR */
++	if (pc_rd(pc_smmu_base, (uint32_t)(cbbase + pc_smmu_bank * page + 4))) {
++		pandora_apps_smmu_unlock();
++		printf("PANDORA TPG: SMMU ACTLR not zero\n");
++		return EIO;
++	}
++	if (ArmSmmu4KProgramDisabledContext(&io, pc_smmu_bank, &pc_context, 1000, &pc_prog_result) != ArmSmmu4KSuccess) {
++		pandora_apps_smmu_unlock();
++		printf("PANDORA TPG: SMMU ProgramDisabledContext refused phase=%u fault=%#x\n",
++		    pc_prog_result.phase, pc_prog_result.fault_status);
++		return EIO;
++	}
++	if (ArmSmmu4KAttachStreams(&io, &pc_stream_state, &route, 1, pc_smmu_bank,
++	    &pc_context, &pc_stream_result) != ArmSmmu4KSuccess) {
++		pandora_apps_smmu_unlock();
++		printf("PANDORA TPG: SMMU AttachStreams refused phase=%u\n", pc_stream_result.phase);
++		return EIO;
++	}
++	pc_smmu_ctx_off = cbbase + pc_smmu_bank * page;
++	uint32_t ctl = pc_rd(pc_smmu_base, (uint32_t)pc_smmu_ctx_off);
++	ctl &= ~(1u << 6);   /* CFIE clear: this port has no fault IRQ dispatcher */
++	pc_wr(pc_smmu_base, (uint32_t)pc_smmu_ctx_off, ctl);
++	pc_smmu_sctlr = pc_rd(pc_smmu_base, (uint32_t)pc_smmu_ctx_off);
++	uint32_t smr = pc_rd(pc_smmu_base, 0x800 + pc_smmu_slot * 4);
++	uint32_t s2cr = pc_rd(pc_smmu_base, 0xc00 + pc_smmu_slot * 4);
++	uint32_t fsr = pc_rd(pc_smmu_base, (uint32_t)(pc_smmu_ctx_off + 0x58));
++	printf("PANDORA TPG: SMMU SID %#x -> bank %u slot %u ASID %u IOVA %#llx pa %#llx bytes %#x\n",
++	    PC_CAM_SID, pc_smmu_bank, pc_smmu_slot, pc_smmu_asid,
++	    (unsigned long long)PC_CAM_IOVA, (unsigned long long)pc_frame_pa, PC_CAM_FRAME_BYTES);
++	printf("PANDORA TPG: SMMU readback SMR=%#x S2CR=%#x SCTLR=%#x FSR=%#x frame_va=%#llx\n",
++	    smr, s2cr, pc_smmu_sctlr, fsr, (unsigned long long)pc_frame_va);
++	(void)pandora_log_sync();
++	pandora_apps_smmu_unlock();
++	return 0;
++}
++
 +static void
 +pc_tpg_p0_bringup(void)
 +{
@@ -3827,6 +4032,14 @@ index 0000000..c5b2eec
 +	} else {
 +		pc_tpg_mark("vfe0 version SKIPPED");
 +	}
++
++	/* P1: lease a camera SMMU bank and map the frame buffer to IOVA 0x100000
++	 * (SID 0x1c00). Independent of camera power (apps-smmu is always on); the
++	 * mapping is kept alive for the VFE DMA in the next increment. */
++	pc_tpg_mark("diag: about to map camera SMMU frame buffer");
++	int smmu_err = pc_tpg_smmu_map();
++	printf("PANDORA TPG: camera SMMU map result=%d\n", smmu_err);
++	(void)pandora_log_sync();
 +
 +	/* Reverse-order power-down: branches off, RCG/PLL state restored, GDSCs
 +	 * collapsed child-first. Restoring exact before-values leaves no camera
