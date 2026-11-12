@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..4d66792
+index 0000000..110d114
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,3832 @@
+@@ -0,0 +1,3874 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -3522,6 +3522,18 @@ index 0000000..4d66792
 +};
 +#define PC_TPG_NRCG  (sizeof(pc_tpg_rcgs) / sizeof(pc_tpg_rcgs[0]))
 +
++/* Diagnostic: the first TPG boots froze before the 3 s log flush, leaving a
++ * stale log. pandora_log_sync() (sweet_ufs.c) forces a thread-safe flush, so
++ * printing + syncing before each step keeps the last completed step on disk
++ * even if the next step freezes the kernel. */
++extern bool pandora_log_sync(void);
++static void
++pc_tpg_mark(const char *msg)
++{
++	printf("PANDORA TPG: %s\n", msg);
++	(void)pandora_log_sync();
++}
++
 +static int
 +pc_tpg_gdsc_up(uint32_t gdscr, const char *name)
 +{
@@ -3655,18 +3667,26 @@ index 0000000..4d66792
 +
 +	printf("PANDORA TPG: P0 bring-up starts (CAMSS TPG clock/power tree; "
 +	    "no rail/GPIO/CCI; GCC hf/sf deliberately skipped, direction C)\n");
++	/* Let the log file come up and flush the early boot before touching any
++	 * camera MMIO, so a freeze leaves the preceding steps on disk. */
++	pc_sleep(4000);
++	pc_tpg_mark("diag: log ready, about to map CAMCC");
 +
 +	/* S1: map CAMCC + the three block apertures. Mapping a powered-off
 +	 * aperture is safe; only the later reads need the clocks up. No unmap. */
-+	pc_step("TPG CAMCC", PC_CAMCC_PA);
 +	pc_camcc = ml_io_map_unmappable(PC_CAMCC_PA, 0x80000, VM_WIMG_IO);
++	pc_tpg_mark("diag: CAMCC mapped");
 +	tpg2 = ml_io_map_unmappable(PC_TPG2_PA, 0x400, VM_WIMG_IO);
++	pc_tpg_mark("diag: tpg2 mapped");
 +	csid0 = ml_io_map_unmappable(PC_CSID0_PA, 0x1000, VM_WIMG_IO);
++	pc_tpg_mark("diag: csid0 mapped");
 +	vfe0 = ml_io_map_unmappable(PC_VFE0_PA, 0x4000, VM_WIMG_IO);
++	pc_tpg_mark("diag: vfe0 mapped");
 +	if (!pc_camcc || !tpg2 || !csid0 || !vfe0) {
 +		printf("PANDORA TPG: mapping failed camcc=%#llx tpg2=%#llx csid0=%#llx vfe0=%#llx\n",
 +		    (unsigned long long)pc_camcc, (unsigned long long)tpg2,
 +		    (unsigned long long)csid0, (unsigned long long)vfe0);
++		(void)pandora_log_sync();
 +		return;
 +	}
 +
@@ -3674,8 +3694,10 @@ index 0000000..4d66792
 +	static const uint32_t gdscs[4] = {
 +		PC_GDSCR, PC_TFE0_GDSCR, PC_TFE1_GDSCR, PC_TFE2_GDSCR };
 +	static const char *gdsc_names[4] = { "titan_top", "tfe_0", "tfe_1", "tfe_2" };
++	pc_tpg_mark("diag: about to read CAMCC gdscr snapshot");
 +	for (unsigned i = 0; i < 4; i++)
 +		gdscr_before[i] = pc_rd(pc_camcc, gdscs[i]);
++	pc_tpg_mark("diag: gdscr snapshot done");
 +	for (unsigned i = 0; i < PC_TPG_NBRANCH; i++)
 +		branch_before[i] = pc_rd(pc_camcc, pc_tpg_branches[i]);
 +	core_before = pc_rd(pc_camcc, PC_CORE_AHB_CBCR);
@@ -3683,48 +3705,62 @@ index 0000000..4d66792
 +		rcg_cmd_before[i] = pc_rd(pc_camcc, pc_tpg_rcgs[i].cmd);
 +		rcg_cfg_before[i] = pc_rd(pc_camcc, pc_tpg_rcgs[i].cmd + 4);
 +	}
++	pc_tpg_mark("diag: branch/rcg snapshot done");
 +	pll0_mode0 = pc_rd(pc_camcc, 0x00); pll0_op0 = pc_rd(pc_camcc, 0x04);
++	pc_tpg_mark("diag: pll0 snapshot done");
 +	pll3_mode0 = pc_rd(pc_camcc, 0x3000); pll3_op0 = pc_rd(pc_camcc, 0x3004);
++	pc_tpg_mark("diag: pll3 snapshot done");
 +
 +	/* S2/S3: GDSCs in dependency order (TITAN_TOP is the parent). */
 +	for (unsigned i = 0; i < 4; i++) {
-+		pc_step("TPG GDSC", PC_CAMCC_PA + gdscs[i]);
++		pc_tpg_mark(gdsc_names[i]);
 +		if (pc_tpg_gdsc_up(gdscs[i], gdsc_names[i]) == 0) {
 +			gdsc_ok++;
 +			gdsc_up_mask |= (1u << i);
 +		}
++		(void)pandora_log_sync();
 +	}
 +	if (gdsc_ok < 4)
 +		printf("PANDORA TPG: only %u/4 gdsc up; continuing to read what we can\n", gdsc_ok);
 +
 +	/* S4/S5: PLL0 (csid/cphy_rx/camnoc/AHB) + PLL3 (tfe_0). Enable only;
 +	 * skip config rewrite when already running. PLL0 1200 MHz, PLL3 720.56. */
++	pc_tpg_mark("diag: about to enable pll0");
 +	if (pc_tpg_pll_enable(0x0000u, 0x0044003eu, 0x8000u, 0x840fu, "pll0") == 0)
 +		pll_ok++;
++	(void)pandora_log_sync();
++	pc_tpg_mark("diag: about to enable pll3");
 +	if (pc_tpg_pll_enable(0x3000u, 0x00480025u, 0x8777u, 0x40fu, "pll3") == 0)
 +		pll_ok++;
++	(void)pandora_log_sync();
 +
 +	/* S6: RCG rates before enabling the branches (§12 discipline). */
 +	for (unsigned i = 0; i < PC_TPG_NRCG; i++) {
-+		pc_step("TPG RCG", PC_CAMCC_PA + pc_tpg_rcgs[i].cmd);
++		pc_tpg_mark(pc_tpg_rcgs[i].name);
 +		if (pc_tpg_rcg_set(&pc_tpg_rcgs[i]) == 0)
 +			rcg_ok++;
++		(void)pandora_log_sync();
 +	}
 +
 +	/* S7: CORE_AHB (BRANCH_HALT_DELAY: enable+delay, no halt poll) then the
 +	 * AHB/AXI/qdss branches. S8: TPG/CSID/VFE + all three cpas_vfe. */
++	pc_tpg_mark("diag: about to enable core_ahb");
 +	pc_wr(pc_camcc, PC_CORE_AHB_CBCR, core_before | PC_CBCR_ENABLE);
 +	pc_sleep(1);
++	(void)pandora_log_sync();
 +	for (unsigned i = 0; i < PC_TPG_NBRANCH; i++) {
-+		pc_step("TPG branch", PC_CAMCC_PA + pc_tpg_branches[i]);
++		printf("PANDORA TPG: branch[%u] +%#x\n", i, pc_tpg_branches[i]);
++		(void)pandora_log_sync();
 +		pc_wr(pc_camcc, pc_tpg_branches[i],
 +		    branch_before[i] | PC_CBCR_ENABLE);
 +		br_up[i] = (pc_wait_branch_on("tpg", pc_tpg_branches[i]) == 0);
 +		if (br_up[i])
 +			br_ok++;
++		(void)pandora_log_sync();
 +	}
 +	printf("PANDORA TPG: resources gdsc=%u/4 pll=%u/2 rcg=%u/%u branch=%u/%u\n",
 +	    gdsc_ok, pll_ok, rcg_ok, (unsigned)PC_TPG_NRCG, br_ok, (unsigned)PC_TPG_NBRANCH);
++	(void)pandora_log_sync();
 +
 +	/* S11: read HW versions only for blocks whose GDSC + clock branches are
 +	 * confirmed up. A read into a still-powered-off block is a Synchronous
@@ -3735,16 +3771,22 @@ index 0000000..4d66792
 +	bool tv_read = false, cv_read = false, vv_read = false;
 +	/* branch idx: 0=cpas_ahb 5=csiphy_rx 6=csid 7=vfe0; gdsc bit0=top bit1=tfe_0 */
 +	if ((gdsc_up_mask & 0x1u) && br_up[0] && br_up[5]) {
++		pc_tpg_mark("diag: about to read tpg2 version");
 +		tv = pc_rd(tpg2, 0x0);
 +		tv_read = true;
++		(void)pandora_log_sync();
 +	}
 +	if ((gdsc_up_mask & 0x1u) && br_up[6] && br_up[5]) {
++		pc_tpg_mark("diag: about to read csid0 version");
 +		cv = pc_rd(csid0, 0x0);
 +		cv_read = true;
++		(void)pandora_log_sync();
 +	}
 +	if ((gdsc_up_mask & 0x2u) && br_up[7]) {
++		pc_tpg_mark("diag: about to read vfe0 version");
 +		vv = pc_rd(vfe0, 0x0);
 +		vv_read = true;
++		(void)pandora_log_sync();
 +	}
 +	if (tv_read)
 +		printf("PANDORA TPG: tpg2@%#x HW_VERSION=%#x (gen=%u rev=%u step=%u) -> %s\n",
