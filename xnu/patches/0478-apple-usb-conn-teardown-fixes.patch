@@ -1,0 +1,67 @@
+diff --git a/bsd/dev/apple_usbmux.c b/bsd/dev/apple_usbmux.c
+--- a/bsd/dev/apple_usbmux.c
++++ b/bsd/dev/apple_usbmux.c
+@@ -69,6 +69,7 @@
+ 
+ struct amux_conn {
+ 	bool     used;
++	bool     fin_seen;      /* host half-closed; release once out drains */
+ 	uint16_t sport;         /* device-side port (host's destination port) */
+ 	uint16_t dport;         /* host-side port */
+ 	uint32_t tx_seq;
+@@ -111,8 +112,15 @@
+ 	if (r->buf != NULL) {
+ 		return 0;
+ 	}
++	/*
++	 * Plain KMA_DATA: conn_release() frees these rings with kmem_free().
++	 * KMA_PERMANENT here made vm_map_delete refuse the removal and the
++	 * kernel restart (seen live: the first AFC connection close took the
++	 * whole kernel down with "Attempting to remove permanent VM map
++	 * entry" right before "PANDORA: restart type 4").
++	 */
+ 	if (kmem_alloc(kernel_map, &va, bytes,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    KMA_DATA | KMA_ZERO,
+ 	    VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
+ 		return ENOMEM;
+ 	}
+@@ -405,9 +413,16 @@
+ 		}
+ 	}
+ 	if (flags & TH_FIN) {
++		/*
++		 * Replies queued in c->out (e.g. the error STATUS for the request
++		 * that preceded this FIN) must reach the host before the connection
++		 * disappears, so only record the half-close here; the FIN|ACK and
++		 * the teardown happen in apple_usbmux_next_tx once the ring drains.
++		 * Releasing immediately dropped those replies AND panicked the
++		 * kernel on the first kmem_free of a conn ring (KMA_PERMANENT).
++		 */
+ 		c->rx_seq = seq + plen + 1;
+-		mux_send_small(c->sport, c->dport, c->tx_seq, c->rx_seq, TH_FIN | TH_ACK);
+-		conn_release(c);
++		c->fin_seen = true;
+ 	}
+ }
+ 
+@@ -518,7 +533,18 @@
+ 		uint32_t maxpay, n;
+ 		uint8_t *span = NULL;
+ 
+-		if (!c->used || c->out.count == 0) {
++		if (!c->used) {
++			continue;
++		}
++		if (c->fin_seen && c->out.count == 0) {
++			/* host half-closed and every queued reply has been pumped:
++			 * say goodbye and tear the connection down */
++			mux_send_small(c->sport, c->dport, c->tx_seq++, c->rx_seq,
++			    TH_FIN | TH_ACK);
++			conn_release(c);
++			continue;
++		}
++		if (c->out.count == 0) {
+ 			continue;
+ 		}
+ 		maxpay = maxlen - (AMUX_MUX_HDR + AMUX_TCP_HDR);
