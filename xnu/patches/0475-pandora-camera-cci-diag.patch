@@ -31,7 +31,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..ecfbd1a
+index 0000000..bba09a5
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
 @@ -0,0 +1,4327 @@
@@ -3929,7 +3929,7 @@ index 0000000..ecfbd1a
 +
 +	/* ---- P4: CSID RX mux + RDI0 (§3.2/§3.3), adaptive RDI page ---- */
 +	pc_tpg_mark("P4: CSID RX/RDI begin");
-+	pc_wr(csid0, 0x880, 0x38000003u); /* RX_CFG0: tpg2 mux_sel=3, 4 lane */
++	pc_wr(csid0, 0x880, 0x38032103u); /* RX_CFG0: tpg2 mux_en+sel=3, lane_assign=0x3210<<4, 4 lane */
 +	pc_wr(csid0, 0x884, 0x1u);        /* RX_CFG1: ECC_CORRECTION_EN */
 +	/* RDI_CFG0 writes intermittently read back 0 (2a/2b) yet latched in the
 +	 * probe trial: a race against CSID reset settling, not an offset error.
