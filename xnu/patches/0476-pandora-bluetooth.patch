@@ -1,0 +1,561 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -143,8 +143,9 @@
+ bsd/dev/qcom/PeachStation.c			standard
+ bsd/dev/qcom/PeachRsn.c			standard
+ bsd/dev/qcom/PeachNet.c			standard
+ bsd/dev/qcom/PeachApple80211.c		standard
+ bsd/dev/pandora_wifi.c			standard
++bsd/dev/pandora_bt.c			standard
+ bsd/dev/pandora_files.c			standard
+ bsd/dev/pandora_gpu.c			standard
+ bsd/dev/pandora_cpu.c			standard
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+--- /dev/null
++++ b/bsd/dev/pandora_bt.c
+@@ -0,0 +1,524 @@
++/*
++ * PANDORA Bluetooth: the WCN786x BT core on QUPv3 wrapper 3 SE5 (0x01994000).
++ *
++ * The combo chip's WLAN side is PCIe (pandora_wifi.c); Bluetooth is a plain
++ * 4-wire HS-UART on this serial engine (live.dts qup_uart@1994000, pins
++ * gpio24..27 function qup3_se5_l0..l3, wakeup byte 0xfd). Android's
++ * android.hardware.bluetooth@aidl-service-qti opens /dev/ttyHS0 and downloads
++ * /vendor/bt_firmware/image/hmtbtfw20.tlv + hmtnv20.bin itself; the ROM answers
++ * HCI at 115200 before that.
++ *
++ * Boot-arg pandora_bt=1, read only: the wrapper votes and branch halts, the SE5
++ * RCG, the SE identity and its pins. =2 also votes the BT rails from the DT's
++ * bt-vdd-* supplies, drives the four UART pins, enables the wrapper and SE5
++ * clocks and sends HCI Reset at 115200, printing whatever comes back.
++ * BT_EN is the PMH0104's SPMI GPIO5 (live.dts qcom,bt-reset-gpio); it is not
++ * touched here: with WLAN on, the boot state already holds it high, and an
++ * SPMI write needs its own single-variable test.
++ *
++ * Register map: Linux drivers/soc/qcom/qcom-geni-se.c, drivers/tty/serial/
++ * msm_geni_serial.c and u-boot's drivers/serial/serial_msm_geni.c (GPL-2.0+,
++ * same register facts), plus the captured DT.
++ * All mappings stay for the life of the kernel, including on failure.
++ */
++#if defined(PANDORA)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
++
++extern kern_return_t thread_terminate(thread_t);
++extern int pandora_rpmh_resource(const char *, uint32_t, uint32_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++void pandora_bt_init(void);
++
++/* Physical windows. One page each: the vote register, the RCG and branch
++ * halt, and the wrapper branch halt registers. */
++#define BT_GCC_VOTE_PA   0x00152000u   /* GCC 0x52018, QUPV3 wrapper 3 enable */
++#define BT_GCC_RCG_PA    0x001a8000u   /* SE5 RCG 0xa8640, branch halt 0xa8630 */
++#define BT_GCC_HALT_PA   0x00123000u   /* m_ahb 0x233f0, s_ahb 0x233f4, core 0x233f8, core_2x 0x2340c */
++#define BT_SE_PA         0x01994000u   /* QUPV3_3 SE5: the BT UART */
++#define BT_TLMM_SW_PA    0x00f12000u   /* TLMM gpio18 (wcn_sw_ctrl) */
++#define BT_TLMM_UART_PA  0x00f18000u   /* TLMM gpio24..27 (CTS, RTS, TX, RX) */
++
++/* GCC */
++#define BT_VOTE          0x18u         /* 0x52018 - BT_GCC_VOTE_PA */
++#define BT_VOTE_BITS     ((1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 17))
++#define BT_HALT_M_AHB    0x3f0u         /* 0x233f0 - BT_GCC_HALT_PA */
++#define BT_HALT_S_AHB    0x3f4u
++#define BT_HALT_CORE     0x3f8u
++#define BT_HALT_CORE2X   0x40cu
++#define BT_RCG           0x640u        /* 0xa8640 - BT_GCC_RCG_PA */
++#define BT_SE5_HALT      0x630u        /* 0xa8630 */
++#define BT_RCG_CMD       0x00u         /* +0: bit 0 update */
++#define BT_RCG_CFG       0x04u         /* +4: [10:8] src, [13:12] mode, [4:0] pre-divider */
++#define BT_RCG_M         0x08u
++#define BT_RCG_N         0x0cu
++#define BT_RCG_D         0x10u
++#define BT_CBCR_OFF      (1u << 31)
++
++/* GENI serial engine (0x01994000). Offsets shared with the SPI/I2C protocol
++ * block are named as geni-se.h does. */
++#define SE_STATUS        0x040u
++#define SE_SER_M_CLK     0x048u
++#define SE_SER_S_CLK     0x04cu
++#define SE_IF_DISABLE    0x064u
++#define SE_FW_REV        0x068u
++#define SE_CLK_SEL       0x07cu
++#define SE_TX_TRANS_CFG  0x25cu
++#define SE_TX_PACK0      0x260u
++#define SE_TX_PACK1      0x264u
++#define SE_TX_WORD_LEN   0x268u
++#define SE_TX_STOP_LEN   0x26cu
++#define SE_TX_TRANS_LEN  0x270u
++#define SE_RX_TRANS_CFG  0x280u
++#define SE_RX_PACK0      0x284u
++#define SE_RX_PACK1      0x288u
++#define SE_RX_WORD_LEN   0x28cu
++#define SE_RX_STALE      0x294u
++#define SE_TX_PARITY     0x2a4u
++#define SE_RX_PARITY     0x2a8u
++#define SE_DMA_MODE      0x258u
++#define SE_M_CMD0        0x600u
++#define SE_M_CMD_CTRL    0x604u
++#define SE_M_IRQ         0x610u
++#define SE_M_IRQ_EN      0x614u
++#define SE_M_IRQ_CLR     0x618u
++#define SE_S_CMD0        0x630u
++#define SE_S_IRQ         0x640u
++#define SE_S_IRQ_EN      0x644u
++#define SE_S_IRQ_CLR     0x648u
++#define SE_TX_FIFO       0x700u
++#define SE_RX_FIFO       0x780u
++#define SE_TX_FIFO_ST    0x800u
++#define SE_RX_FIFO_ST    0x804u
++#define SE_TX_WM         0x80cu
++#define SE_RX_WM         0x810u
++#define SE_RX_RFR_WM     0x814u
++#define SE_GSI_EVENT_EN  0xe18u
++#define SE_IRQ_EN        0xe1cu
++#define SE_HW_PARAM0     0xe24u
++#define SE_DMA_GENERAL   0xe30u
++
++#define GENI_FORCE_DEFAULT 0x020u
++#define GENI_OUTPUT_CTRL   0x024u
++#define GENI_CGC_CTRL      0x028u
++
++/* GENI status and interrupt bits (geni-se.h, msm_geni_serial.c). */
++#define GENI_STATUS_M_ACTIVE (1u << 0)
++#define M_CMD_DONE           (1u << 0)
++#define M_CMD_ABORT          (1u << 5)
++#define M_CMD_CANCEL         (1u << 4)
++#define M_TX_WM              (1u << 30)
++#define M_RX_WM              (1u << 26)
++#define M_RX_LAST            (1u << 27)
++#define M_SEC_IRQ            (1u << 31)
++#define S_RX_WM              (1u << 26)
++#define S_RX_LAST            (1u << 27)
++#define SER_CLK_EN           (1u << 0)
++
++/* HCI: packet type 0x01 command, opcode HCI_OP_RESET 0x0c03 (little endian). */
++#define HCI_RESET_LEN 4u
++static const uint8_t bt_hci_reset[HCI_RESET_LEN] = {0x01, 0x03, 0x0c, 0x00};
++
++/* TLMM: pull 0 none, 1 down, 3 up; drive in mA even (2, 4, ...); bit 9 output. */
++#define BT_PIN_DRIVE(ma) ((((ma) / 2) - 1) << 6)
++#define BT_PIN_OUT       (1u << 9)
++#define BT_PIN_MUX(f)    ((f) << 2)
++
++struct bt_win { uint32_t pa, bytes; vm_offset_t va; };
++static struct bt_win bt_wins[] = {
++	{BT_GCC_VOTE_PA, 0x1000, 0}, {BT_GCC_RCG_PA, 0x1000, 0}, {BT_GCC_HALT_PA, 0x1000, 0},
++	{BT_SE_PA, 0x4000, 0}, {BT_TLMM_SW_PA, 0x1000, 0}, {BT_TLMM_UART_PA, 0x4000, 0},
++};
++enum { BT_W_VOTE, BT_W_RCG, BT_W_HALT, BT_W_SE, BT_W_SWCTRL, BT_W_UART, BT_W_COUNT };
++
++static int bt_level, bt_wait;
++static unsigned bt_rate;
++
++static uint32_t
++bt_rd(unsigned w, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(bt_wins[w].va + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++bt_wr(unsigned w, uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(bt_wins[w].va + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++bt_sleep(unsigned us)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
++	(void)assert_wait_deadline(&bt_wait, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Map once, never unmap: a duplicate window that is unmapped can take the
++ * shared mappings of the GPU/touch drivers with it (pandora_camera.c notes). */
++static int
++bt_map(unsigned w)
++{
++	struct bt_win *b = &bt_wins[w];
++	if (b->va) {
++		return 0;
++	}
++	b->va = ml_io_map_unmappable(b->pa, b->bytes, VM_WIMG_IO);
++	return b->va ? 0 : ENOMEM;
++}
++
++static int
++bt_map_all(void)
++{
++	for (unsigned i = 0; i < BT_W_COUNT; i++) {
++		int err = bt_map(i);
++		if (err) {
++			printf("PANDORA BT: window %u (%#x) not mapped\n", i, bt_wins[i].pa);
++			return err;
++		}
++	}
++	return 0;
++}
++
++static uint32_t
++bt_pin_ctl(unsigned pin)
++{
++	/* GPIO_24 is the first page of the UART window */
++	return bt_rd(BT_W_UART, (pin - 24) * 0x1000u);
++}
++
++static void
++bt_pin(unsigned pin, unsigned func, unsigned pull, unsigned ma, int out)
++{
++	uint32_t off = (pin - 24) * 0x1000u;
++	if (out >= 0) {
++		bt_wr(BT_W_UART, off + 4, out ? 2u : 0u);
++	}
++	uint32_t ctl = bt_rd(BT_W_UART, off) & ~0x3ffu;
++	ctl |= pull | BT_PIN_MUX(func) | BT_PIN_DRIVE(ma) | (out >= 0 ? BT_PIN_OUT : 0);
++	if (ctl & (1u << 11)) {
++		ctl |= 1u << 12;
++	}
++	bt_wr(BT_W_UART, off, ctl);
++}
++
++/* GPLL0 out even is 300 MHz; the QUP RCGs take it (or TCXO) as parent. */
++static unsigned
++bt_rcg_rate(void)
++{
++	uint32_t cfg = bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CFG);
++	uint32_t m = bt_rd(BT_W_RCG, BT_RCG + BT_RCG_M);
++	uint32_t n = bt_rd(BT_W_RCG, BT_RCG + BT_RCG_N);
++	uint32_t d = bt_rd(BT_W_RCG, BT_RCG + BT_RCG_D);
++	unsigned pre = (cfg & 0x1fu) + 1u;
++	unsigned src = (cfg >> 8) & 7u, mode = (cfg >> 12) & 3u;
++	uint64_t rate = 0;
++
++	if (mode == 0 && n && m) {
++		rate = 300000000ull * m / n / pre;
++	} else if (mode == 0 && m == 0) {
++		rate = 19200000ull / pre;
++	}
++	printf("PANDORA BT: SE5 RCG cfg %#x m %u n %u d %u (src %u mode %u pre %u) -> %llu Hz\n",
++	    cfg, m, n, d, src, mode, pre, rate);
++	return (unsigned)rate;
++}
++
++/* Wrapper clocks: on, or an error with the halt register's value in the log. */
++static int
++bt_wait_on(unsigned w, uint32_t off, const char *what)
++{
++	for (unsigned i = 0; i < 10000; i++) {
++		uint32_t v = bt_rd(w, off);
++		if (!(v & BT_CBCR_OFF)) {
++			return 0;
++		}
++		delay(1);
++	}
++	printf("PANDORA BT: %s clock stays off (%#x)\n", what, bt_rd(w, off));
++	return ETIMEDOUT;
++}
++
++static bool
++bt_se_clocked(void)
++{
++	return !(bt_rd(BT_W_HALT, BT_HALT_M_AHB) & BT_CBCR_OFF) &&
++	    !(bt_rd(BT_W_HALT, BT_HALT_S_AHB) & BT_CBCR_OFF) &&
++	    !(bt_rd(BT_W_HALT, BT_HALT_CORE) & BT_CBCR_OFF) &&
++	    !(bt_rd(BT_W_HALT, BT_HALT_CORE2X) & BT_CBCR_OFF) &&
++	    !(bt_rd(BT_W_RCG, BT_SE5_HALT) & BT_CBCR_OFF);
++}
++
++static void
++bt_report(void)
++{
++	uint32_t vote = bt_rd(BT_W_VOTE, BT_VOTE);
++	printf("PANDORA BT: wrapper3 vote %#x (want %#x); halts m_ahb %#x s_ahb %#x core %#x core2x %#x se5 %#x\n",
++	    vote, BT_VOTE_BITS, bt_rd(BT_W_HALT, BT_HALT_M_AHB), bt_rd(BT_W_HALT, BT_HALT_S_AHB),
++	    bt_rd(BT_W_HALT, BT_HALT_CORE), bt_rd(BT_W_HALT, BT_HALT_CORE2X), bt_rd(BT_W_RCG, BT_SE5_HALT));
++	printf("PANDORA BT: RCG cmd %#x; SE5 rate %u Hz\n", bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CMD), bt_rate);
++	printf("PANDORA BT: pins 18 %#x, cts %#x rts %#x tx %#x rx %#x\n",
++	    bt_rd(BT_W_SWCTRL, 0), bt_pin_ctl(24), bt_pin_ctl(25), bt_pin_ctl(26), bt_pin_ctl(27));
++	if (!bt_se_clocked()) {
++		printf("PANDORA BT: SE5 unclocked at this point; its registers are not read\n");
++		return;
++	}
++	printf("PANDORA BT: SE status %#x fw %#x if_disable %#x clk_sel %#x hw_param0 %#x dma %#x\n",
++	    bt_rd(BT_W_SE, SE_STATUS), bt_rd(BT_W_SE, SE_FW_REV), bt_rd(BT_W_SE, SE_IF_DISABLE),
++	    bt_rd(BT_W_SE, SE_CLK_SEL), bt_rd(BT_W_SE, SE_HW_PARAM0), bt_rd(BT_W_SE, SE_DMA_MODE));
++	printf("PANDORA BT: SE M_CMD0 %#x M_IRQ %#x S_CMD0 %#x S_IRQ %#x tx_fifo %#x rx_fifo %#x\n",
++	    bt_rd(BT_W_SE, SE_M_CMD0), bt_rd(BT_W_SE, SE_M_IRQ), bt_rd(BT_W_SE, SE_S_CMD0),
++	    bt_rd(BT_W_SE, SE_S_IRQ), bt_rd(BT_W_SE, SE_TX_FIFO_ST), bt_rd(BT_W_SE, SE_RX_FIFO_ST));
++}
++
++/* The DT's bt-vdd-* supplies, in the vendor btpower table's order. */
++static int
++bt_power(void)
++{
++	static const struct { const char *name; uint16_t mv; } rails[] = {
++		{"L2G_E0", 1800}, {"L3G_E0", 1200}, {"S2J_E1", 892}, {"S7F_E0", 1328},
++		{"S8F_E0", 1876}, {"S1J_E1", 892}, {"L6K_E1", 1800},
++	};
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		int err = pandora_rpmh_resource(rails[i].name, 0, rails[i].mv);
++		if (!err) {
++			err = pandora_rpmh_resource(rails[i].name, 4, 1);
++		}
++		if (err) {
++			printf("PANDORA BT: rail %s at %u mV failed (%d)\n", rails[i].name, rails[i].mv, err);
++			return err;
++		}
++	}
++	printf("PANDORA BT: BT rails voted\n");
++	return 0;
++}
++
++static int
++bt_clocks(void)
++{
++	uint32_t vote = bt_rd(BT_W_VOTE, BT_VOTE);
++	if ((vote & BT_VOTE_BITS) != BT_VOTE_BITS) {
++		bt_wr(BT_W_VOTE, BT_VOTE, vote | BT_VOTE_BITS);
++	}
++	if (bt_wait_on(BT_W_HALT, BT_HALT_M_AHB, "m_ahb") || bt_wait_on(BT_W_HALT, BT_HALT_S_AHB, "s_ahb") ||
++	    bt_wait_on(BT_W_HALT, BT_HALT_CORE, "core") || bt_wait_on(BT_W_HALT, BT_HALT_CORE2X, "core_2x") ||
++	    bt_wait_on(BT_W_RCG, BT_SE5_HALT, "se5")) {
++		return ETIMEDOUT;
++	}
++	bt_rate = bt_rcg_rate();
++	return 0;
++}
++
++/* FIFO-mode UART, as Linux msm_geni_serial.c / u-boot serial_msm_geni.c. */
++static int
++bt_uart_init(unsigned baud)
++{
++	uint32_t fw = bt_rd(BT_W_SE, SE_FW_REV);
++	if (bt_rate < 1000000u) {
++		printf("PANDORA BT: SE5 clock is %u Hz; the UART is not configured\n", bt_rate);
++		return EIO;
++	}
++	if (bt_rd(BT_W_SE, SE_IF_DISABLE) & 1u) {
++		printf("PANDORA BT: SE5 FIFO interface is disabled (fw %#x); no UART\n", fw);
++		return ENOTSUP;
++	}
++	printf("PANDORA BT: SE5 protocol %u (fw %#x), FIFO interface\n", (fw >> 8) & 0xffu, fw);
++	unsigned div = bt_rate / (baud * 32u);
++	if (div < 1) {
++		div = 1;
++	}
++	if (div > 0xfff) {
++		div = 0xfff;
++	}
++	printf("PANDORA BT: UART %u baud from %u Hz: divider %u (actual %u)\n",
++	    baud, bt_rate, div, bt_rate / (div * 32u));
++
++	bt_wr(BT_W_SE, SE_GSI_EVENT_EN, 0);
++	bt_wr(BT_W_SE, SE_M_IRQ_CLR, 0xffffffffu);
++	bt_wr(BT_W_SE, SE_S_IRQ_CLR, 0xffffffffu);
++	bt_wr(BT_W_SE, GENI_FORCE_DEFAULT, 1);
++	bt_wr(BT_W_SE, GENI_OUTPUT_CTRL, 0x7fu);
++	bt_wr(BT_W_SE, GENI_CGC_CTRL, bt_rd(BT_W_SE, GENI_CGC_CTRL) | 0x7fu);
++	bt_wr(BT_W_SE, SE_DMA_MODE, bt_rd(BT_W_SE, SE_DMA_MODE) & ~1u);
++
++	/* 8 data bits, one byte per FIFO word (u-boot serial_msm_geni.c's proven
++	 * FIFO layout), no parity, one stop bit. */
++	bt_wr(BT_W_SE, SE_RX_PACK0, 0xfu);
++	bt_wr(BT_W_SE, SE_RX_PACK1, 0);
++	bt_wr(BT_W_SE, SE_TX_WORD_LEN, 8);
++	bt_wr(BT_W_SE, SE_RX_WORD_LEN, 8);
++	bt_wr(BT_W_SE, SE_TX_STOP_LEN, 0);
++	bt_wr(BT_W_SE, SE_TX_PARITY, 0);
++	bt_wr(BT_W_SE, SE_RX_PARITY, 0);
++	bt_wr(BT_W_SE, SE_RX_STALE, 0xf);
++	bt_wr(BT_W_SE, SE_TX_TRANS_CFG, bt_rd(BT_W_SE, SE_TX_TRANS_CFG) | (1u << 1)); /* CTS */
++	bt_wr(BT_W_SE, SE_RX_TRANS_CFG, bt_rd(BT_W_SE, SE_RX_TRANS_CFG) | (1u << 1));
++
++	bt_wr(BT_W_SE, SE_TX_WM, 2);
++	bt_wr(BT_W_SE, SE_RX_WM, 2);
++	bt_wr(BT_W_SE, SE_RX_RFR_WM, 1);
++	bt_wr(BT_W_SE, SE_IRQ_EN, bt_rd(BT_W_SE, SE_IRQ_EN) | 0xfu);
++	bt_wr(BT_W_SE, SE_M_IRQ_EN, M_CMD_DONE | M_TX_WM | M_RX_WM | M_RX_LAST | M_SEC_IRQ);
++	bt_wr(BT_W_SE, SE_S_IRQ_EN, S_RX_WM | S_RX_LAST);
++
++	/* The serial engine clock divider sets the baud rate on both sequencers. */
++	bt_wr(BT_W_SE, SE_SER_M_CLK, (div << 4) | SER_CLK_EN);
++	bt_wr(BT_W_SE, SE_SER_S_CLK, (div << 4) | SER_CLK_EN);
++
++	/* The secondary sequencer listens for the first byte. */
++	bt_wr(BT_W_SE, SE_S_CMD0, 1u << 27);
++	return 0;
++}
++
++/* Wait for up to MS, collecting RX FIFO words; returns bytes in OUT. */
++static unsigned
++bt_rx_poll(uint8_t *out, unsigned cap, unsigned ms)
++{
++	uint64_t deadline;
++	unsigned got = 0;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		uint32_t st = bt_rd(BT_W_SE, SE_RX_FIFO_ST);
++		unsigned words = st & 0x1ffffffu;
++		while (words-- && got < cap) {
++			out[got++] = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++		}
++		/* One HCI event: type, event code, length, then that many bytes. */
++		if (got >= 3 && out[0] == 0x04 && got >= 3u + out[2]) {
++			break;
++		}
++		bt_sleep(1000);
++	}
++	return got;
++}
++
++static int
++bt_hci(const uint8_t *pkt, unsigned len, const char *what)
++{
++	unsigned i;
++
++	for (i = 0; i < 5000 && (bt_rd(BT_W_SE, SE_STATUS) & GENI_STATUS_M_ACTIVE); i++) {
++		delay(1);
++	}
++	bt_wr(BT_W_SE, SE_M_IRQ_CLR, 0xffffffffu);
++	bt_wr(BT_W_SE, SE_TX_WM, 2);
++	bt_wr(BT_W_SE, SE_TX_TRANS_LEN, len);
++	bt_wr(BT_W_SE, SE_M_CMD0, 1u << 27);   /* UART_START_TX */
++
++	for (i = 0; i < 1000 && !(bt_rd(BT_W_SE, SE_M_IRQ) & M_TX_WM); i++) {
++		delay(1);
++	}
++	if (!(bt_rd(BT_W_SE, SE_M_IRQ) & M_TX_WM)) {
++		printf("PANDORA BT: %s: TX FIFO never opened (irq %#x)\n", what, bt_rd(BT_W_SE, SE_M_IRQ));
++		bt_wr(BT_W_SE, SE_M_CMD_CTRL, M_CMD_ABORT);
++		return ETIMEDOUT;
++	}
++	for (i = 0; i < len; i++) {
++		bt_wr(BT_W_SE, SE_TX_FIFO, pkt[i]);   /* one byte per word */
++	}
++	bt_wr(BT_W_SE, SE_M_IRQ_CLR, M_TX_WM);
++	for (i = 0; i < 2000 && !(bt_rd(BT_W_SE, SE_M_IRQ) & M_CMD_DONE); i++) {
++		delay(1);
++	}
++	uint32_t irq = bt_rd(BT_W_SE, SE_M_IRQ);
++	if (!(irq & M_CMD_DONE)) {
++		printf("PANDORA BT: %s: command not done (irq %#x status %#x)\n", what, irq, bt_rd(BT_W_SE, SE_STATUS));
++		bt_wr(BT_W_SE, SE_M_CMD_CTRL, M_CMD_ABORT);
++		bt_wr(BT_W_SE, SE_M_IRQ_CLR, 0xffffffffu);
++		return ETIMEDOUT;
++	}
++	bt_wr(BT_W_SE, SE_M_IRQ_CLR, M_CMD_DONE);
++	printf("PANDORA BT: %s sent (%u bytes)\n", what, len);
++	return 0;
++}
++
++static void
++bt_dump(const char *what, const uint8_t *buf, unsigned n)
++{
++	printf("PANDORA BT: %s: %u bytes", what, n);
++	for (unsigned i = 0; i < n && i < 32; i++) {
++		printf(" %02x", buf[i]);
++	}
++	printf("\n");
++}
++
++static void
++bt_try_hci_reset(void)
++{
++	uint8_t rx[96];
++
++	if (bt_hci(bt_hci_reset, HCI_RESET_LEN, "HCI Reset")) {
++		return;
++	}
++	unsigned got = bt_rx_poll(rx, sizeof(rx), 200);
++	if (!got) {
++		printf("PANDORA BT: no HCI event within 200 ms\n");
++		return;
++	}
++	bt_dump("HCI event", rx, got);
++	if (got >= 7 && rx[0] == 0x04 && rx[1] == 0x0e && rx[2] >= 4) {
++		printf("PANDORA BT: Command Complete opcode %#x status %u\n",
++		    (unsigned)rx[4] | (unsigned)rx[5] << 8, rx[6]);
++	}
++}
++
++static void
++bt_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	if (bt_map_all()) {
++		goto out;
++	}
++	if (bt_level >= 2) {
++		if (bt_power()) {
++			bt_report();
++			goto out;
++		}
++		/* CTS in, RTS out high, TX out high, RX in; the UART mux is function 1. */
++		bt_pin(24, 1, 0, 2, 0);
++		bt_pin(25, 1, 1, 2, 1);
++		bt_pin(26, 1, 3, 2, 1);
++		bt_pin(27, 1, 0, 2, 0);
++		if (bt_clocks()) {
++			bt_report();
++			goto out;
++		}
++		if (bt_uart_init(115200) == 0) {
++			bt_try_hci_reset();
++		}
++	} else {
++		bt_rate = bt_rcg_rate();
++	}
++	bt_report();
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++pandora_bt_init(void)
++{
++	(void)PE_parse_boot_argn("pandora_bt", &bt_level, sizeof(bt_level));
++	if (!bt_level) {
++		return;
++	}
++	thread_t thread;
++	if (kernel_thread_start(bt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* PANDORA */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -68,6 +68,7 @@
+ extern void pandora_gpu_init(void);
+ extern void pandora_cpu_init(void);
+ extern void pandora_therm_init(void);
+ extern void pandora_usb_init(void);
++extern void pandora_bt_init(void);
+ extern void pandora_camera_init(void);
+ #endif
+@@ -1589,6 +1589,8 @@
+ 	/* USB controller handover state, read only, boot-arg pandora_usb (bsd/dev/pandora_usb.c). */
+ 	pandora_usb_init();
++	/* Bluetooth UART probe / HCI Reset, boot-arg pandora_bt (bsd/dev/pandora_bt.c). */
++	pandora_bt_init();
+ 	/* Camera Stage C-1 read-only CCI diag, boot-arg pandora_camera (bsd/dev/pandora_camera.c). */
+ 	pandora_camera_init();
+ 	/* USB gadget probe / start, boot-arg sweetusb (bsd/dev/sweet_usb.c).
+ 	 * Previously only called on non-FUXI boards; Nezha needs it too for device-mode USB. */
