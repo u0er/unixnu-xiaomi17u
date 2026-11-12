@@ -20,8 +20,9 @@ Two exact edits (tiled paths keep the strict checks):
   pandora_linear_pitch.py MESA_DIR
 
 Exact text edits, asserted; run once on a patched tree (CI: turnip.yml Sources step,
-after the UniXNU patches and the other pandora_*.py scripts). Anchors verified against
-mesa 85fda3b36405bcaea8bffc64aa4f2651dc90770d.
+after the UniXNU patches and the other pandora_*.py scripts). fd6_layout.c anchor is
+mesa 85fda3b upstream; tu_image.cc anchor is the UniXNU turnip-host-import-images.patch
+version (& ~host_types), composed with the tiling exemption so both relaxations hold.
 """
 import pathlib
 import sys
@@ -30,10 +31,6 @@ import sys
 def patch(rel, old, new):
     p = pathlib.Path(sys.argv[1]) / rel
     s = p.read_text()
-    # read_text() universal-newlines the file to \n; normalize the anchors too so
-    # the match holds whether this script or the mesa tree is checked out LF/CRLF.
-    old = old.replace('\r\n', '\n')
-    new = new.replace('\r\n', '\n')
     if old not in s:
         raise SystemExit(f'pandora_linear_pitch: anchor not found in {rel}:\n{old[:160]}')
     if s.count(old) != 1:
@@ -84,8 +81,14 @@ patch('src/freedreno/vulkan/tu_image.cc',
       """      case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
          VkMemoryDedicatedRequirements *req =
             (VkMemoryDedicatedRequirements *) ext;
+         /* Host pointer imports carry no per-image metadata, so an image
+          * over one may be bound at any offset of a shared import.
+          */
+         const VkExternalMemoryHandleTypeFlags host_types =
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT |
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT;
          req->requiresDedicatedAllocation =
-            image->vk.external_handle_types != 0;
+            (image->vk.external_handle_types & ~host_types) != 0;
          req->prefersDedicatedAllocation = req->requiresDedicatedAllocation;
          break;
       }
@@ -93,6 +96,12 @@ patch('src/freedreno/vulkan/tu_image.cc',
       """      case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
          VkMemoryDedicatedRequirements *req =
             (VkMemoryDedicatedRequirements *) ext;
+         /* Host pointer imports carry no per-image metadata, so an image
+          * over one may be bound at any offset of a shared import.
+          */
+         const VkExternalMemoryHandleTypeFlags host_types =
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT |
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT;
          /* Linear and DRM-modifier images are laid out at fixed pitches and
           * bind at any offset their alignment allows inside an imported
           * allocation; only tiled external images (AHB's compressed layouts)
@@ -102,7 +111,7 @@ patch('src/freedreno/vulkan/tu_image.cc',
           * surface (108,922 copies in one 90 s desktop session).
           */
          req->requiresDedicatedAllocation =
-            image->vk.external_handle_types != 0 &&
+            (image->vk.external_handle_types & ~host_types) != 0 &&
             image->vk.tiling != VK_IMAGE_TILING_LINEAR &&
             image->vk.tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
          req->prefersDedicatedAllocation = req->requiresDedicatedAllocation;
