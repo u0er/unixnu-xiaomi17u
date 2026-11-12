@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..cb6d9ee
+index 0000000..fa4c5d7
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,4264 @@
+@@ -0,0 +1,4281 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -3922,16 +3922,33 @@ index 0000000..cb6d9ee
 +	    pc_rd(tpg2, 0x64), pc_rd(tpg2, 0x1f4), pc_rd(tpg2, 0x4));
 +	(void)pandora_log_sync();
 +
-+	/* ---- P4: CSID RX mux + RDI0 (§3.2/§3.3), non-lite ---- */
++	/* ---- P4: CSID RX mux + RDI0 (§3.2/§3.3), adaptive RDI page ---- */
 +	pc_tpg_mark("P4: CSID RX/RDI begin");
 +	pc_wr(csid0, 0x880, 0x38000003u); /* RX_CFG0: tpg2 mux_sel=3, 4 lane */
 +	pc_wr(csid0, 0x884, 0x1u);        /* RX_CFG1: ECC_CORRECTION_EN */
-+	pc_wr(csid0, 0x5480, 0x002bf160u);/* RDI_CFG0: payload-only RAW10 VC0 */
-+	pc_wr(csid0, 0x5494, 0x8000u);    /* RDI_CFG1: PACKING_FORMAT_MIPI */
-+	pc_wr(csid0, 0x5498, 0x9u);       /* RDI_PIX_STORE_CFG0: MIN_HBI=4|EN */
-+	pc_wr(csid0, 0x5488, 0x0u);       /* RDI_CTRL: 0 before enable */
-+	uint32_t rdi_cfg0 = pc_rd(csid0, 0x5480);
-+	pc_wr(csid0, 0x5480, rdi_cfg0 | 0x80000000u); /* RDI_CFG0 EN */
++	/* 2a saw non-lite RDI_CFG0@0x5480 read back 0 while RX_CFG0@0x880 took
++	 * the write. csid0 (HW 0x3000000a) may decode as lite (0x3080). Probe
++	 * both pages with the same CFG0 and keep whichever latches. */
++	pc_wr(csid0, 0x5480, 0x002bf160u);
++	uint32_t rb_nl = pc_rd(csid0, 0x5480);
++	pc_wr(csid0, 0x3080, 0x002bf160u);
++	uint32_t rb_l = pc_rd(csid0, 0x3080);
++	pc_wr(csid0, 0x5480, 0x0u);
++	pc_wr(csid0, 0x3080, 0x0u);
++	uint32_t rdi_base = 0x5480;
++	bool rdi_lite = false;
++	if (rb_nl == 0x002bf160u) { rdi_base = 0x5480; rdi_lite = false; }
++	else if (rb_l == 0x002bf160u) { rdi_base = 0x3080; rdi_lite = true; }
++	printf("PANDORA TPG: P4 RDI probe nonlite@0x5480=%#x lite@0x3080=%#x -> base=%#x lite=%u\n",
++	    rb_nl, rb_l, rdi_base, (unsigned)rdi_lite);
++	(void)pandora_log_sync();
++	pc_wr(csid0, rdi_base, 0x002bf160u);         /* RDI_CFG0: payload-only RAW10 VC0 */
++	pc_wr(csid0, rdi_base + 0x14, 0x8000u);      /* RDI_CFG1: PACKING_FORMAT_MIPI */
++	if (!rdi_lite)
++		pc_wr(csid0, 0x5498, 0x9u);                /* RDI_PIX_STORE_CFG0: non-lite only */
++	pc_wr(csid0, rdi_base + 0x8, 0x0u);          /* RDI_CTRL: 0 before enable */
++	uint32_t rdi_cfg0 = pc_rd(csid0, rdi_base);
++	pc_wr(csid0, rdi_base, rdi_cfg0 | 0x80000000u); /* RDI_CFG0 EN */
 +	/* CAMSS_INIT_BUF_COUNT=2 address updates, each committed via RUP_SET */
 +	for (unsigned i = 0; i < 2; i++) {
 +		pc_wr(csid0, 0x118, 0x100u);  /* AUP_CMD: RDI0 */
@@ -3940,10 +3957,10 @@ index 0000000..cb6d9ee
 +	pc_wr(csid0, 0x114, 0x100u);      /* RUP_CMD: RDI0 reg update */
 +	pc_wr(csid0, 0x11c, 0x1u);        /* RUP_AUP_CMD: RUP_SET */
 +	pc_tpg_mark("P4: about to start RDI0 (RDI_CTRL START_CMD)");
-+	pc_wr(csid0, 0x5488, 0x1u);       /* RDI_CTRL: START_CMD */
++	pc_wr(csid0, rdi_base + 0x8, 0x1u);          /* RDI_CTRL: START_CMD */
 +	pc_sleep(2);
-+	printf("PANDORA TPG: P4 RDI0 started rdi_cfg0=%#x rdi_ctrl=%#x rx_cfg0=%#x\n",
-+	    pc_rd(csid0, 0x5480), pc_rd(csid0, 0x5488), pc_rd(csid0, 0x880));
++	printf("PANDORA TPG: P4 RDI0 started rdi_cfg0=%#x rdi_ctrl=%#x rx_cfg0=%#x rx_irq=%#x\n",
++	    pc_rd(csid0, rdi_base), pc_rd(csid0, rdi_base + 0x8), pc_rd(csid0, 0x880), pc_rd(csid0, 0x1b0));
 +	(void)pandora_log_sync();
 +
 +	/* ---- Observe: bounded poll of BUF_DONE / RX IRQ status ---- */
@@ -3968,7 +3985,7 @@ index 0000000..cb6d9ee
 +	/* Graceful stop before the caller's power-down: halt RDI0 then reset
 +	 * the TPG so no block is streaming when clocks/GDSCs are pulled. */
 +	pc_tpg_mark("P4: stopping RDI0 + TPG before teardown");
-+	pc_wr(csid0, 0x5488, 0x0u);       /* RDI_CTRL: stop */
++	pc_wr(csid0, rdi_base + 0x8, 0x0u); /* RDI_CTRL: stop */
 +	pc_wr(tpg2, 0x1f4, 0x1u);         /* TPG CTRL_CMD: HW_RESET = stream off */
 +	pc_sleep(1);
 +}
