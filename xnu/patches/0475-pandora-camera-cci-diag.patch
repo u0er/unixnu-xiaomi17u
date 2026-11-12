@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..382271a
+index 0000000..cb6d9ee
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,4150 @@
+@@ -0,0 +1,4264 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -3869,6 +3869,110 @@ index 0000000..382271a
 +	return 0;
 +}
 +
++/* Increment 2a: drive the TPG->CSID RDI0 path far enough to observe frame
++ * events at the CSID, without VFE yet (VFE DMA is increment 2b). Spec:
++ * CAMERA_L2_TPG_IMPL_2026-11-12.md §2 (TPG v2.4.0), §3 (CSID 1080 reset/RX/RDI),
++ * §8.2 (tpg2 @0x93ff000 <-> MUX_SEL=3 <-> RX_CFG0=0x38000003). Offsets/values
++ * are factual register data; the sequence is rewritten in C. 640x480 RAW10,
++ * 4 lane. Every block is marked+synced so a bus hang on any MMIO write is
++ * pinpointed on disk. Caller gates on confirmed TPG/CSID HW versions. */
++static void
++pc_tpg_stream_2a(vm_offset_t tpg2, vm_offset_t csid0)
++{
++	/* ---- P2: CSID reset (§3.1), bounded poll of INFO_RST_DONE ---- */
++	pc_tpg_mark("P2: CSID reset begin");
++	pc_wr(csid0, 0x188, 0x9u);        /* TOP_IRQ_CLEAR: RST_DONE|BUF_DONE */
++	pc_wr(csid0, 0x184, 0x9u);        /* TOP_IRQ_MASK */
++	pc_wr(csid0, 0x1a8, 0x10000u);    /* BUF_DONE_IRQ_CLEAR: VC0 */
++	pc_wr(csid0, 0x1a4, 0x10000u);    /* BUF_DONE_IRQ_MASK: VC0 */
++	pc_wr(csid0, 0x110, 0x1u);        /* IRQ_CMD: clear */
++	pc_wr(csid0, 0x108, 0x11u);       /* RST_CFG: RST_LOCATION|RST_MODE */
++	pc_tpg_mark("P2: about to issue CSID_RST_CMD");
++	pc_wr(csid0, 0x10c, 0x5u);        /* RST_CMD: HW_RST|IRQ_RST */
++	unsigned rst_done = 0;
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		if (pc_rd(csid0, 0x180) & 0x1u) { rst_done = 1; break; }
++		pc_sleep(1);
++	}
++	printf("PANDORA TPG: P2 CSID reset rst_done=%u top_irq_status=%#x\n",
++	    rst_done, pc_rd(csid0, 0x180));
++	(void)pandora_log_sync();
++	if (!rst_done) {
++		pc_tpg_mark("P2: CSID reset TIMEOUT - aborting stream (no RDI)");
++		return;
++	}
++
++	/* ---- P3: TPG v2.4.0 config (§2), 640x480 RAW10 / 4 lane ---- */
++	pc_tpg_mark("P3: TPG config begin");
++	pc_wr(tpg2, 0x1f4, 0x1u);         /* CTRL_CMD: HW_RESET (v2.4.0 reset) */
++	pc_sleep(1);
++	pc_wr(tpg2, 0x68, 0x0u);          /* VC_0_CFG0: 0 = continuous frames */
++	pc_wr(tpg2, 0x6c, 0x12345678u);   /* VC_0_LSFR_SEED */
++	pc_wr(tpg2, 0x70, 0x442u);        /* VC_0_HBI_CFG = 1090 */
++	pc_wr(tpg2, 0x74, 0x30u);         /* VC_0_VBI_CFG = 48 */
++	pc_wr(tpg2, 0x78, 0xa00u);        /* VC_0_COLOR_BARS_CFG */
++	pc_wr(tpg2, 0x7c, 0x028001e0u);   /* DT_0_CFG_0: W=640 H=480 */
++	pc_wr(tpg2, 0x80, 0x2bu);         /* DT_0_CFG_1: DATA_TYPE=RAW10 */
++	pc_wr(tpg2, 0x84, 0x20000be8u);   /* DT_0_CFG_2: payload mode 8 */
++	pc_wr(tpg2, 0x64, 0x30u);         /* CTRL: 4 lane, 1 VC (no TEST_EN) */
++	pc_tpg_mark("P3: about to start TPG (CTRL_CMD TEST_EN)");
++	pc_wr(tpg2, 0x1f4, 0x10u);        /* CTRL_CMD: TEST_EN = start */
++	pc_sleep(2);
++	printf("PANDORA TPG: P3 TPG started ctrl=%#x ctrl_cmd=%#x hw_status=%#x\n",
++	    pc_rd(tpg2, 0x64), pc_rd(tpg2, 0x1f4), pc_rd(tpg2, 0x4));
++	(void)pandora_log_sync();
++
++	/* ---- P4: CSID RX mux + RDI0 (§3.2/§3.3), non-lite ---- */
++	pc_tpg_mark("P4: CSID RX/RDI begin");
++	pc_wr(csid0, 0x880, 0x38000003u); /* RX_CFG0: tpg2 mux_sel=3, 4 lane */
++	pc_wr(csid0, 0x884, 0x1u);        /* RX_CFG1: ECC_CORRECTION_EN */
++	pc_wr(csid0, 0x5480, 0x002bf160u);/* RDI_CFG0: payload-only RAW10 VC0 */
++	pc_wr(csid0, 0x5494, 0x8000u);    /* RDI_CFG1: PACKING_FORMAT_MIPI */
++	pc_wr(csid0, 0x5498, 0x9u);       /* RDI_PIX_STORE_CFG0: MIN_HBI=4|EN */
++	pc_wr(csid0, 0x5488, 0x0u);       /* RDI_CTRL: 0 before enable */
++	uint32_t rdi_cfg0 = pc_rd(csid0, 0x5480);
++	pc_wr(csid0, 0x5480, rdi_cfg0 | 0x80000000u); /* RDI_CFG0 EN */
++	/* CAMSS_INIT_BUF_COUNT=2 address updates, each committed via RUP_SET */
++	for (unsigned i = 0; i < 2; i++) {
++		pc_wr(csid0, 0x118, 0x100u);  /* AUP_CMD: RDI0 */
++		pc_wr(csid0, 0x11c, 0x1u);    /* RUP_AUP_CMD: RUP_SET */
++	}
++	pc_wr(csid0, 0x114, 0x100u);      /* RUP_CMD: RDI0 reg update */
++	pc_wr(csid0, 0x11c, 0x1u);        /* RUP_AUP_CMD: RUP_SET */
++	pc_tpg_mark("P4: about to start RDI0 (RDI_CTRL START_CMD)");
++	pc_wr(csid0, 0x5488, 0x1u);       /* RDI_CTRL: START_CMD */
++	pc_sleep(2);
++	printf("PANDORA TPG: P4 RDI0 started rdi_cfg0=%#x rdi_ctrl=%#x rx_cfg0=%#x\n",
++	    pc_rd(csid0, 0x5480), pc_rd(csid0, 0x5488), pc_rd(csid0, 0x880));
++	(void)pandora_log_sync();
++
++	/* ---- Observe: bounded poll of BUF_DONE / RX IRQ status ---- */
++	pc_tpg_mark("P4: polling CSID BUF_DONE/RX IRQ for frame events");
++	uint32_t buf_done = 0, rx_irq = 0;
++	unsigned frames = 0;
++	for (unsigned i = 0; i < 100; i++) {
++		buf_done = pc_rd(csid0, 0x1a0);   /* BUF_DONE_IRQ_STATUS */
++		rx_irq = pc_rd(csid0, 0x1b0);     /* CSI2_RX_IRQ_STATUS */
++		if (buf_done & 0x10000u) {        /* VC0 buffer done */
++			frames++;
++			pc_wr(csid0, 0x1a8, 0x10000u); /* clear VC0 */
++		}
++		pc_sleep(1);
++	}
++	printf("PANDORA TPG: P4 RESULT frames=%u buf_done=%#x rx_irq=%#x top_irq=%#x\n",
++	    frames, buf_done, rx_irq, pc_rd(csid0, 0x180));
++	(void)pandora_log_sync();
++	pc_tpg_mark(frames ? "P4: CSID observed TPG frame events (2a PASS)"
++	                   : "P4: NO CSID frame events (2a FAIL - check mux/clock)");
++
++	/* Graceful stop before the caller's power-down: halt RDI0 then reset
++	 * the TPG so no block is streaming when clocks/GDSCs are pulled. */
++	pc_tpg_mark("P4: stopping RDI0 + TPG before teardown");
++	pc_wr(csid0, 0x5488, 0x0u);       /* RDI_CTRL: stop */
++	pc_wr(tpg2, 0x1f4, 0x1u);         /* TPG CTRL_CMD: HW_RESET = stream off */
++	pc_sleep(1);
++}
++
 +static void
 +pc_tpg_p0_bringup(void)
 +{
@@ -4044,6 +4148,16 @@ index 0000000..382271a
 +	int smmu_err = pc_tpg_smmu_map();
 +	printf("PANDORA TPG: camera SMMU map result=%d\n", smmu_err);
 +	(void)pandora_log_sync();
++	/* Increment 2a: with the camera fully up and the frame buffer mapped,
++	 * drive TPG->CSID RDI0 and look for frame events. Gated on the TPG/CSID
++	 * HW versions actually read back (a write into a powered-off block is a
++	 * Synchronous External Abort). VFE DMA is the next increment (2b). */
++	if (tv == 0x20040000u && cv != 0 && cv != 0xffffffffu) {
++		pc_tpg_stream_2a(tpg2, csid0);
++	} else {
++		pc_tpg_mark("2a SKIPPED (tpg2/csid0 version not confirmed up)");
++	}
++
 +
 +	/* Reverse-order power-down: branches off, RCG/PLL state restored, GDSCs
 +	 * collapsed child-first. Restoring exact before-values leaves no camera
