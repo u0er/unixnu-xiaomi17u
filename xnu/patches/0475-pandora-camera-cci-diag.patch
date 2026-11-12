@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..3484e46
+index 0000000..122033e
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,3908 @@
+@@ -0,0 +1,3924 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -3830,25 +3830,41 @@ index 0000000..3484e46
 +
 +	/* Reverse-order power-down: branches off, RCG/PLL state restored, GDSCs
 +	 * collapsed child-first. Restoring exact before-values leaves no camera
-+	 * state behind (the w1 rollback discipline). */
-+	printf("PANDORA TPG: teardown (reverse order)\n");
++	 * state behind (the w1 rollback discipline). The GCC-enable trial froze the
++	 * whole kernel right after the vfe0 version read, i.e. somewhere in here;
++	 * every step is marked + synced so a bus hang on any single MMIO write is
++	 * pinpointed on disk (the helpers' own prints are not synced). */
++	pc_tpg_mark("teardown: begin (reverse order)");
 +	if (gccaxi) {
++		pc_tpg_mark("teardown: about to restore GCC hf/sf");
 +		pc_wr(gccaxi, PC_GCC_HF_AXI_OFF, gcc_hf0);
 +		pc_wr(gccaxi, PC_GCC_SF_AXI_OFF, gcc_sf0);
++		pc_tpg_mark("teardown: GCC hf/sf restored");
 +	}
++	pc_tpg_mark("teardown: about to restore 12 branches + core_ahb");
 +	for (unsigned i = 0; i < PC_TPG_NBRANCH; i++)
 +		pc_wr(pc_camcc, pc_tpg_branches[i], branch_before[i]);
 +	pc_wr(pc_camcc, PC_CORE_AHB_CBCR, core_before);
++	pc_tpg_mark("teardown: branches restored");
++	pc_tpg_mark("teardown: about to restore 6 RCGs");
 +	for (unsigned i = 0; i < PC_TPG_NRCG; i++) {
 +		pc_wr(pc_camcc, pc_tpg_rcgs[i].cmd + 4, rcg_cfg_before[i]);
 +		pc_wr(pc_camcc, pc_tpg_rcgs[i].cmd, rcg_cmd_before[i]);
 +	}
++	pc_tpg_mark("teardown: RCGs restored");
++	pc_tpg_mark("teardown: about to restore pll0/pll3");
 +	pc_wr(pc_camcc, 0x00, pll0_mode0); pc_wr(pc_camcc, 0x04, pll0_op0);
 +	pc_wr(pc_camcc, 0x3000, pll3_mode0); pc_wr(pc_camcc, 0x3004, pll3_op0);
-+	for (unsigned i = 4; i-- > 0;)
++	pc_tpg_mark("teardown: PLLs restored");
++	for (unsigned i = 4; i-- > 0;) {
++		printf("PANDORA TPG: teardown: about to collapse %s\n", gdsc_names[i]);
++		(void)pandora_log_sync();
 +		pc_tpg_gdsc_down(gdscs[i], gdsc_names[i]);
++	}
++	pc_tpg_mark("teardown: GDSCs collapsed");
 +	printf("PANDORA TPG: P0 bring-up done tpg_version=%#x gdsc=%u pll=%u rcg=%u branch=%u\n",
 +	    tv, gdsc_ok, pll_ok, rcg_ok, br_ok);
++	(void)pandora_log_sync();
 +}
 +
 +static void
