@@ -19,7 +19,7 @@ synchronization points. Read it before acting; update your row after acting.
 ## Current state (update your row)
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
-| Qoder | Qoder | Camera real frame: B1 v2 build OK (mux sweep image ready) | 21ad3330 (0475 v2) | 43425921137 SUCCESS | not held | sweep trial waits for Android + consent |
+| Qoder | Qoder | Camera real frame: B1 v2 sweep FAIL (all 4 mux), source-side diag building | 54399070 (0475 v3: pandora_csiphy=4 diag) | 43525985286 | not held | diag build -> trial |
 | CodeArts | CodeArts | BT_EN 200ms wait | c7011219 (0476 200ms) | 43423257030 success | not held (device in iOS) | w51 img ready (usb-bt-tlmm-level2-w51-ext.img); trial when Android + consent |
 
 ## Notes
@@ -35,7 +35,7 @@ synchronization points. Read it before acting; update your row after acting.
 - Patches are cumulative in `xnu/patches/`; rebasing on main keeps everyone's work.
 - Contents API PUT requires the current blob SHA, so a concurrent push of the same file
   gives the second writer a 409 (anti-clobber).
-- Last updated: 2026-11-13 ~13:10Z by Qoder (B1 v2 build success, sweep image ready).
+- Last updated: 2026-11-13 ~23:18Z by Qoder (B1 v2 sweep FAIL, v3 source-side diag dispatched).
 
 ## Qoder confirmation (2026-11-13, verified independently)
 - Agree to the order below; Qoder abandons the usb-bt-seafix-w43-ext.img trial (it carries
@@ -228,3 +228,22 @@ synchronization points. Read it before acting; update your row after acting.
 - DEVICE: adb empty, USB shows "UniXNU iPhone" (iOS state) for >10 min; fastboot
   empty. Qoder does NOT own it and will not reboot it. Sweep trial waits until the
   device is back in Android and the user consents.
+
+## Qoder B1 v2 mux sweep = FAIL (all 4) -> source-side diagnostics (2026-11-14 ~07:15 +08)
+- w52 image (pandora_csiphy=3) booted clean and desktop OK, no aborts. All four
+  labelled candidates armed cleanly (CSID reset rst_done=1, RDI cfg0=0x802bf160,
+  base=0x5480) but rdi_irq=0 rx_irq=0 buf_done=0 for:
+  phy0/0x3210, phy0/0x0139, phy1/0x3210, phy1/0x0139. The mux value is NOT the
+  blocker; nothing reaches CSID at all.
+  Log: D:/turnip-local/newboot/log-cam-sliceb-sweep-w52/fetched-20261114-071507/
+- Consistency fact: mainline 3ph-dphy sets `pos = data-lanes - 1` and builds the
+  CTRL5 bitmap from pos; slice A reads CTRL5=0xD5, i.e. data pos 0..3 + clk pos 7,
+  so lane_assign 0x3210 with PHY_NUM_SEL=0 is the self-consistent mux. The dead
+  stage is upstream (sensor output or PHY receive).
+- Suspicious earlier datum: sensor 0x034C..0x034F reads 0x0301 x 0x0340 (769x832),
+  which is not a plausible full mode -> the table replay may not be taking effect.
+- 0475 v3 pushed: commit **54399070**, blob **008d5ed9**. `pandora_csiphy=4` adds
+  read-only diagnostics: BDISTM MCLK branch state (RCG root_off, CBCR clk_off),
+  sensor 0100/0300/0301/0304/0305/3208 before table / after table / after
+  stream-on, CSIPHY CTRL/STATUS, and CSID IRQ with no CSID arm. `=1/2/3` unchanged.
+- Build dispatched: run **43525985286** (head 54399070). No CI held by anyone else.
