@@ -12,6 +12,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_gpu.c			standard
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
 @@ -0,0 +1,524 @@
