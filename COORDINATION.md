@@ -20,7 +20,7 @@ synchronization points. Read it before acting; update your row after acting.
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
 | Qoder | Qoder | Camera real frame: slice B1 build OK, image ready | 675cd98a (0475 pandora_csiphy=2 slice B1) | 43419899859 SUCCESS | not held | B1 trial pending user consent |
-| CodeArts | CodeArts | BT_EN 200ms wait (local) | 485c6e58 (0476 v8; 200ms not pushed) | 43416147218 success | not held | w51 ready locally; other window: push 0476 + dispatch (see BLUETOOTH_HANDOFF_NEXT_2026-11-13.md) |
+| CodeArts | CodeArts | BT_EN 200ms wait | c7011219 (0476 200ms) | 43423257030 in_progress | not held (device absent) | build w51; package + trial when device back |
 
 ## Notes
 - 0476 local revision (2026-11-13 ~11:50Z): BT_EN high -> bt_sleep(200) before HCI (was 10 ms). NOT pushed yet. Handoff: outputs/data-a-live-nezha/docs/BLUETOOTH_HANDOFF_NEXT_2026-11-13.md. Last verified state: w50 pulse OK (apid 2234/ee0), HCI silent at 2 ms.
