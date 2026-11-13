@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..31d2bab
+index 0000000..df1ffd4
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,4337 @@
+@@ -0,0 +1,4373 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -3736,6 +3736,19 @@ index 0000000..31d2bab
 +	__asm__ volatile("dsb sy" ::: "memory");
 +}
 +
++/* Invalidate (not clean) the data cache for a VA range so a CPU read fetches
++ * what a device DMA wrote to physical memory, discarding stale cache lines. */
++static void pc_dcache_invalidate(vm_offset_t va, size_t bytes)
++{
++	uint64_t ctr;
++	__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	uint64_t line = 4ull << ((ctr >> 16) & 0xf);
++	va &= ~(line - 1);
++	for (vm_offset_t end = va + bytes; va < end; va += line)
++		__asm__ volatile("dc ivac, %0" :: "r"(va) : "memory");
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
 +static int
 +pc_tpg_smmu_map(void)
 +{
@@ -3879,6 +3892,17 @@ index 0000000..31d2bab
 +static void
 +pc_tpg_stream_2a(vm_offset_t tpg2, vm_offset_t csid0, vm_offset_t vfe0)
 +{
++	/* P6 diagnostic: pre-fill the DMA buffer with a known pattern so the
++	 * post-stream readback can tell "DMA wrote here" from a stale cache. */
++	if (pc_frame_va) {
++		volatile uint32_t *fb = (volatile uint32_t *)pc_frame_va;
++		for (unsigned i = 0; i < PC_CAM_FRAME_BYTES / 4; i++) fb[i] = 0xa5a5a5a5u;
++		clean_dcache64(pc_frame_pa, PC_CAM_FRAME_BYTES, TRUE);
++		printf("PANDORA TPG: P6 prefill 0xa5a5a5a5 done frame_pa=%#llx\n",
++		    (unsigned long long)pc_frame_pa);
++		(void)pandora_log_sync();
++	}
++
 +	/* ---- P2: CSID reset (§3.1), bounded poll of INFO_RST_DONE ---- */
 +	pc_tpg_mark("P2: CSID reset begin");
 +	pc_wr(csid0, 0x188, 0x9u);        /* TOP_IRQ_CLEAR: RST_DONE|BUF_DONE */
@@ -4029,9 +4053,21 @@ index 0000000..31d2bab
 +	/* P6 judge: dump the first words of the SMMU frame buffer (color bars?).
 +	 * pc_frame_va is the kernel VA of the same pages the VFE DMAs to. */
 +	if (pc_frame_va) {
++		pc_dcache_invalidate(pc_frame_va, PC_CAM_FRAME_BYTES);
 +		volatile uint32_t *fb = (volatile uint32_t *)pc_frame_va;
 +		printf("PANDORA TPG: P6 frame[0..7]=%#x %#x %#x %#x %#x %#x %#x %#x\n",
 +		    fb[0], fb[1], fb[2], fb[3], fb[4], fb[5], fb[6], fb[7]);
++		unsigned n_a5 = 0, n_ff = 0, n_00 = 0, n_other = 0, first_idx = 0;
++		uint32_t first_other = 0;
++		for (unsigned i = 0; i < PC_CAM_FRAME_BYTES / 4; i++) {
++			uint32_t w = fb[i];
++			if (w == 0xa5a5a5a5u) n_a5++;
++			else if (w == 0xffffffffu) n_ff++;
++			else if (w == 0u) n_00++;
++			else { if (!n_other) { first_other = w; first_idx = i; } n_other++; }
++		}
++		printf("PANDORA TPG: P6 scan a5=%u ff=%u zero=%u other=%u first_other[%u]=%#x\n",
++		    n_a5, n_ff, n_00, n_other, first_idx, first_other);
 +		(void)pandora_log_sync();
 +	}
 +
