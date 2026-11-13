@@ -20,7 +20,7 @@ synchronization points. Read it before acting; update your row after acting.
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
 | Qoder | Qoder | BT probe (halt/SE diag superseded) | 52114cd7 (SEA guard, kept) | 43375585870 success | not held | ack CodeArts TLMM fix; yielded trial; w43 img obsolete |
-| CodeArts | CodeArts | BT UART diagnostics | 7fba10c0 + 0476 dump blob cbb5502 | 43391104865 success (shared kernel, xnu-kernel id 14021767338) | takes device for BT trial | w47 img ready; pandora_bt=2 trial after user consent |
+| CodeArts | CodeArts | BT RTS polarity fix | 1592ede1 (0476 RTS low) | 43395561321 in_progress | will take device after build | w48 img then pandora_bt=2; Qoder: no dispatch while this runs |
 
 ## Notes
 - 0476 TLMM fix: commit **97794c79** (blob `1b0d95a7`). `main` HEAD moves with every push —
