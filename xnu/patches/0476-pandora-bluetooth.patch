@@ -471,7 +471,7 @@ index 0000000..008e6a1
 +	bool en = bt_spmi_write(chan, BT_SPMI_REG_EN, 0x80);
 +	bt_sleep(10);
 +	bool high = bt_spmi_write(chan, BT_SPMI_REG_OUT, 0x01);
-+	bt_sleep(200);
++	bt_sleep(200 * 1000);	/* bt_sleep takes microseconds */
 +	printf("PANDORA BT: BT_EN pulse apid %u/ee%u low=%d en=%d high=%d\n", apid, owner, low, en, high);
 +	return (low && en && high) ? 0 : EIO;
 +}
