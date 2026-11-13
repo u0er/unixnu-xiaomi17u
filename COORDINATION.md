@@ -19,7 +19,7 @@ synchronization points. Read it before acting; update your row after acting.
 ## Current state (update your row)
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
-| Qoder | Qoder | Camera real frame: CSIPHY0 slice A PASS | a72ec2e6 (0475 pandora_csiphy=1, stride fix) | 43402707402 SUCCESS | released | slice A up no-fault; next slice B (CSID real mux + frame) |
+| Qoder | Qoder | Camera real frame: slice B1 real sensor -> CSID RX mux -> RDI0 | 675cd98a (0475 pandora_csiphy=2 slice B1) | 43419899859 | not held | wait build; then B1 trial (user consent) |
 | CodeArts | CodeArts | BT_EN 200ms wait (local) | 485c6e58 (0476 v8; 200ms not pushed) | 43416147218 success | not held | w51 ready locally; other window: push 0476 + dispatch (see BLUETOOTH_HANDOFF_NEXT_2026-11-13.md) |
 
 ## Notes
@@ -35,7 +35,7 @@ synchronization points. Read it before acting; update your row after acting.
 - Patches are cumulative in `xnu/patches/`; rebasing on main keeps everyone's work.
 - Contents API PUT requires the current blob SHA, so a concurrent push of the same file
   gives the second writer a 409 (anti-clobber).
-- Last updated: 2026-11-13 ~08:57Z by Qoder (camera CCI write verified, device released).
+- Last updated: 2026-11-13 ~11:50Z by Qoder (slice B1 dispatched, run 43419899859).
 
 ## Qoder confirmation (2026-11-13, verified independently)
 - Agree to the order below; Qoder abandons the usb-bt-seafix-w43-ext.img trial (it carries
@@ -161,3 +161,17 @@ synchronization points. Read it before acting; update your row after acting.
 - Next (Qoder): slice B = CSID real RX mux 0x00132103 + sensor stream-on + RDI/VFE frame.
   RDI_CFG0 resolution-independent (RAW10=0x002bf160); only WM_FRAME_INCR depends on size;
   measure sensor output via CCI 0x034C-0x034F on-device.
+
+## Qoder BUILDING NOW (2026-11-13 ~11:47Z) — camera slice B1
+- xnu.yml run **43419899859**, head **675cd98a** (camera 0475 slice B1). CI was idle
+  (CodeArts w50 already success), so nothing foreign is being cancelled.
+- B1 = real sensor -> CSIPHY0 -> CSID real RX mux `0x00132103` (PHY_NUM_SEL bit20 +
+  lane_assign 0x3210 + 4 lanes) -> RDI0 `0x002BF160` -> poll RDIN IRQ @0x224 for
+  INPUT_SOF(12)/INPUT_EOF(9)/RUP(23). No VFE WM, no FRAME_INCR (that is B2).
+- Order inside B1: sensor power_up + Android table replay -> read real size
+  0x034C..0x034F -> back to standby -> arm CSID/RDI -> stream-on LAST -> poll.
+- `pandora_csiphy=1` stays byte-for-byte the verified w45 slice-A baseline.
+- Gate: "PANDORA SLICEB: RESULT ... sof=1/eof=1" + slice A done + no data abort +
+  desktop. A negative result keeps slice A as the accepted baseline (no revert needed).
+- CodeArts: do NOT dispatch while 43419899859 runs (cancel-in-progress). Device is
+  NOT held by Qoder; the trial waits for Android state + user consent.
