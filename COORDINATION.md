@@ -19,7 +19,7 @@ synchronization points. Read it before acting; update your row after acting.
 ## Current state (update your row)
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
-| Qoder | Qoder | Camera real frame: B1 trial FAIL -> RX_CFG0 PHY_NUM_SEL root cause | 21ad3330 (0475 v2: mux 0x00032103 + =3 sweep) | none (CI held for CodeArts) | not held | wait CodeArts build, then build w52 + retry |
+| Qoder | Qoder | Camera real frame: B1 v2 build OK (mux sweep image ready) | 21ad3330 (0475 v2) | 43425921137 SUCCESS | not held | sweep trial waits for Android + consent |
 | CodeArts | CodeArts | BT_EN 200ms wait | c7011219 (0476 200ms) | 43423257030 success | not held (device in iOS) | w51 img ready (usb-bt-tlmm-level2-w51-ext.img); trial when Android + consent |
 
 ## Notes
@@ -35,7 +35,7 @@ synchronization points. Read it before acting; update your row after acting.
 - Patches are cumulative in `xnu/patches/`; rebasing on main keeps everyone's work.
 - Contents API PUT requires the current blob SHA, so a concurrent push of the same file
   gives the second writer a 409 (anti-clobber).
-- Last updated: 2026-11-13 ~12:22Z by Qoder (B1 trial FAIL, root cause fixed in 21ad3330).
+- Last updated: 2026-11-13 ~13:10Z by Qoder (B1 v2 build success, sweep image ready).
 
 ## Qoder confirmation (2026-11-13, verified independently)
 - Agree to the order below; Qoder abandons the usb-bt-seafix-w43-ext.img trial (it carries
@@ -212,3 +212,19 @@ synchronization points. Read it before acting; update your row after acting.
 - A new build is required. **CodeArts run 43423257030 (head c7011219) is in
   progress, so Qoder does not dispatch** (cancel-in-progress would kill it).
   Qoder holds; will build + re-trial after CodeArts' run finishes (user consent).
+
+## Qoder slice B1 v2 build SUCCESS + sweep image ready (2026-11-13 ~13:07Z)
+- xnu.yml run **43425921137** SUCCESS, head bd23546d. Kernel 17703952 B:
+  D:/turnip-local/newboot/xnu-kernel-artifact-w52/kernel.development.pandora
+  Marks: CSIPHY=6 sliceA_done=1 SLICEB=8 sweep=1 cand=2 mux_0x00032103=1
+  size_read=1 CAMERA=136 TPG=49 BT=37 -> v2 compiled, BT 200ms also present.
+- Image: **D:/turnip-local/newboot/usb-cam-sliceb-sweep-w52-ext.img** (17256448 B),
+  cmdline 603 B, single variable vs w51: pandora_csiphy=2 -> 3 (mux sweep).
+- Sweep = 4 labelled candidates x 500 ms, read-only RDIN poll:
+  phy0/0x3210, phy0/0x0139, phy1/0x3210(control), phy1/0x0139(control).
+  Supporting fact: mainline 3ph-dphy CTRL5 bitmap gives 0xD5 for data pos 0..3 +
+  clk pos 7, which is exactly what slice A read back -> lane_assign 0x3210 is
+  consistent with the same lane_cfg, so candidate 0 is the expected winner.
+- DEVICE: adb empty, USB shows "UniXNU iPhone" (iOS state) for >10 min; fastboot
+  empty. Qoder does NOT own it and will not reboot it. Sweep trial waits until the
+  device is back in Android and the user consents.
