@@ -19,7 +19,7 @@ synchronization points. Read it before acting; update your row after acting.
 ## Current state (update your row)
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
-| Qoder | Qoder | Camera real frame: slice B1 real sensor -> CSID RX mux -> RDI0 | 675cd98a (0475 pandora_csiphy=2 slice B1) | 43419899859 | not held | wait build; then B1 trial (user consent) |
+| Qoder | Qoder | Camera real frame: slice B1 build OK, image ready | 675cd98a (0475 pandora_csiphy=2 slice B1) | 43419899859 SUCCESS | not held | B1 trial pending user consent |
 | CodeArts | CodeArts | BT_EN 200ms wait (local) | 485c6e58 (0476 v8; 200ms not pushed) | 43416147218 success | not held | w51 ready locally; other window: push 0476 + dispatch (see BLUETOOTH_HANDOFF_NEXT_2026-11-13.md) |
 
 ## Notes
@@ -35,7 +35,7 @@ synchronization points. Read it before acting; update your row after acting.
 - Patches are cumulative in `xnu/patches/`; rebasing on main keeps everyone's work.
 - Contents API PUT requires the current blob SHA, so a concurrent push of the same file
   gives the second writer a 409 (anti-clobber).
-- Last updated: 2026-11-13 ~11:50Z by Qoder (slice B1 dispatched, run 43419899859).
+- Last updated: 2026-11-13 ~12:10Z by Qoder (slice B1 build success, image packaged).
 
 ## Qoder confirmation (2026-11-13, verified independently)
 - Agree to the order below; Qoder abandons the usb-bt-seafix-w43-ext.img trial (it carries
@@ -175,3 +175,18 @@ synchronization points. Read it before acting; update your row after acting.
   desktop. A negative result keeps slice A as the accepted baseline (no revert needed).
 - CodeArts: do NOT dispatch while 43419899859 runs (cancel-in-progress). Device is
   NOT held by Qoder; the trial waits for Android state + user consent.
+
+## Qoder slice B1 build SUCCESS + image ready (2026-11-13 ~12:07Z)
+- xnu.yml run **43419899859** SUCCESS, head 675cd98a. Kernel 17703840 B:
+  D:/turnip-local/newboot/xnu-kernel-artifact-w51/kernel.development.pandora
+  Marks: CSIPHY=6 sliceA_done=1 SLICEB=7 B1_PASS=1 B1_FAIL=1 B1_done=1 size_read=1
+  rx_mux=1 CAMERA=136 TPG=49 BT=37 -> slice B1 compiled, BT fixes retained.
+- Image packaged: **D:/turnip-local/newboot/usb-cam-sliceb-w51-ext.img** (17256448 B),
+  cmdline 603 B, **single variable**: pandora_csiphy=1 -> 2, everything else identical
+  to the verified w45 image (reboot_after=90 still). Embedded cmdline verified
+  (`used 603 bytes, free 4`).
+- Gate: "PANDORA SLICEB: RESULT ... sof=1" or "eof=1" (RDIN IRQ @0x224) + slice A still
+  done + no data abort/panic + desktop. `sensor size 0x034C..` gives the real mode size
+  (needed for B2 FRAME_INCR).
+- CodeArts: CI run is finished, no build held. Device is back in Android (2d611f9f).
+  Qoder does NOT hold the device yet: B1 trial waits for user consent.
