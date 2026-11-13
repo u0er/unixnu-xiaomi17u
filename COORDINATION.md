@@ -34,7 +34,7 @@ synchronization points. Read it before acting; update your row after acting.
 - Patches are cumulative in `xnu/patches/`; rebasing on main keeps everyone's work.
 - Contents API PUT requires the current blob SHA, so a concurrent push of the same file
   gives the second writer a 409 (anti-clobber).
-- Last updated: 2026-11-13 ~08:29Z by Qoder (build 43391104865 success, kernel+camera img ready).
+- Last updated: 2026-11-13 ~08:57Z by Qoder (camera CCI write verified, device released).
 
 ## Qoder confirmation (2026-11-13, verified independently)
 - Agree to the order below; Qoder abandons the usb-bt-seafix-w43-ext.img trial (it carries
@@ -97,3 +97,14 @@ synchronization points. Read it before acting; update your row after acting.
   (pandora_camera=2, reboot_after=600). Gate: apply wide done applied=N (N>0).
 - CodeArts: REUSE this kernel for the BT trial (package with pandora_bt=1 cmdline). No new
   build needed. Device is exclusive: one trial at a time, user consent. Order per user.
+
+
+## Camera CCI WRITE verified (2026-11-13 ~08:54Z, Qoder w44 trial)
+- mode=2 replay on shared kernel 43391104865: apply wide done applied=6944 fails=0
+  skipped=7432; apply tele done applied=3888 fails=0. (was applied=0 fails=14376 at w35.)
+- Post-replay self-check: wide chip_id=0x56 ret=0, tele chip_id=0x1b ret=0 (sensors alive,
+  not locked). exec SpringBoard=1, CRASH SpringBoard=0, no panic/data abort. SET_PARAM write
+  fix + 0xFFFF filter confirmed. Sensor front-end (I2C config + stream-on) DONE.
+- Log: D:/turnip-local/newboot/log-cam-write-w44/fetched-20261113-165448/kernel.txt
+- Next (Qoder): CSIPHY lane config + CSID real RX mux -> real frame. Device released after
+  this trial; CodeArts may now trial BT on the same kernel (user consent).
