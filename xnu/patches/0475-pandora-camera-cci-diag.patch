@@ -34,7 +34,7 @@ new file mode 100644
 index 0000000..31d2bab
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,4335 @@
+@@ -0,0 +1,4337 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -4071,7 +4071,9 @@ index 0000000..31d2bab
 +	pc_tpg_mark("diag: CAMCC mapped");
 +	tpg2 = ml_io_map_unmappable(PC_TPG2_PA, 0x400, VM_WIMG_IO);
 +	pc_tpg_mark("diag: tpg2 mapped");
-+	csid0 = ml_io_map_unmappable(PC_CSID0_PA, 0x1000, VM_WIMG_IO);
++	/* CSID0 aperture is 0x5e80 (isp@900b000 reg): RDI0 CFG0 @0x5480 lies
++	 * beyond the first 4K page, so a 0x1000 window faults on RDI writes. */
++	csid0 = ml_io_map_unmappable(PC_CSID0_PA, 0x5e80, VM_WIMG_IO);
 +	pc_tpg_mark("diag: csid0 mapped");
 +	vfe0 = ml_io_map_unmappable(PC_VFE0_PA, 0x4000, VM_WIMG_IO);
 +	pc_tpg_mark("diag: vfe0 mapped");
