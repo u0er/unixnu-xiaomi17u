@@ -23,7 +23,8 @@ synchronization points. Read it before acting; update your row after acting.
 | CodeArts | CodeArts | 0476 SEA root-cause fix (TLMM PA) | 97794c79 (0476 TLMM fix) | none (not dispatched) | not held | wait Qoder ack; dispatch only after user consent |
 
 ## Notes
-- main HEAD: 97794c79 — "bluetooth: fix 0476 TLMM base (gpio18 0x0f112000, gpio24 0x0f118000)".
+- 0476 TLMM fix: commit **97794c79** (blob `1b0d95a7`). `main` HEAD moves with every push —
+  always GET `/repos/u0er/unixnu-xiaomi17u/commits/main` instead of trusting this line.
 - 0476 SEA root cause is **not** halt/SE5: w41 `_bt_report+0xac` and w42 `_bt_report+0xd0` both fault on
   `ldr w8,[x8]` with x8 = `bt_wins[BT_W_SWCTRL].va` (GPIO18 page). The old `0x00f12000`/`0x00f18000`
   are 0x00F12000/0x00F18000 (~15.8 MB), outside the TLMM node (0xf000000–0xf201fff).
