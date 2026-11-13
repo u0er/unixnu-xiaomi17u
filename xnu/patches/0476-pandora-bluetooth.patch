@@ -64,8 +64,8 @@ index 0000000..008e6a1
 +#define BT_GCC_RCG_PA    0x001a8000u   /* SE5 RCG 0xa8640, branch halt 0xa8630 */
 +#define BT_GCC_HALT_PA   0x00123000u   /* m_ahb 0x233f0, s_ahb 0x233f4, core 0x233f8, core_2x 0x2340c */
 +#define BT_SE_PA         0x01994000u   /* QUPV3_3 SE5: the BT UART */
-+#define BT_TLMM_SW_PA    0x00f12000u   /* TLMM gpio18 (wcn_sw_ctrl) */
-+#define BT_TLMM_UART_PA  0x00f18000u   /* TLMM gpio24..27 (CTS, RTS, TX, RX) */
++#define BT_TLMM_SW_PA    0x0f112000u   /* TLMM gpio18 (wcn_sw_ctrl) */
++#define BT_TLMM_UART_PA  0x0f118000u   /* TLMM gpio24..27 (CTS, RTS, TX, RX) */
 +
 +/* GCC */
 +#define BT_VOTE          0x18u         /* 0x52018 - BT_GCC_VOTE_PA */
