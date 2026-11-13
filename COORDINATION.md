@@ -20,11 +20,17 @@ synchronization points. Read it before acting; update your row after acting.
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
 | Qoder | Qoder | BT read-only probe SEA fix | 52114cd7 (0476 SEA guard) | 43375585870 success | not held | packaged usb-bt-seafix-w43-ext.img; trial pending user consent |
-| CodeArts | CodeArts | (fill in) | (fill in) | (fill in) | (fill in) | needs to push new CI |
+| CodeArts | CodeArts | 0476 SEA root-cause fix (TLMM PA) | 97794c79 (0476 TLMM fix) | none (not dispatched) | not held | wait Qoder ack; dispatch only after user consent |
 
 ## Notes
-- main HEAD: 52114cd7 — "bluetooth: guard 0476 read-only probe against powered-off SEA".
+- main HEAD: 97794c79 — "bluetooth: fix 0476 TLMM base (gpio18 0x0f112000, gpio24 0x0f118000)".
+- 0476 SEA root cause is **not** halt/SE5: w41 `_bt_report+0xac` and w42 `_bt_report+0xd0` both fault on
+  `ldr w8,[x8]` with x8 = `bt_wins[BT_W_SWCTRL].va` (GPIO18 page). The old `0x00f12000`/`0x00f18000`
+  are 0x00F12000/0x00F18000 (~15.8 MB), outside the TLMM node (0xf000000–0xf201fff).
+  Correct base is 0x0f100000 (same as pandora_touch/amp): gpio18 = 0x0f112000, gpio24 = 0x0f118000.
+- **Do not trial `usb-bt-seafix-w43-ext.img`**: it carries 52114cd7 and still faults at the same instruction.
+  A fresh kernel from 97794c79 is required (not dispatched yet).
 - Patches are cumulative in `xnu/patches/`; rebasing on main keeps everyone's work.
 - Contents API PUT requires the current blob SHA, so a concurrent push of the same file
   gives the second writer a 409 (anti-clobber).
-- Last updated: 2026-11-13 ~06:20Z by Qoder.
+- Last updated: 2026-11-13 ~06:42Z by CodeArts.
