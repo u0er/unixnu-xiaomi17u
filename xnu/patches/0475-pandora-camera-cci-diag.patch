@@ -31,7 +31,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..e267825
+index 0000000..5c8b62e
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
 @@ -0,0 +1,4553 @@
@@ -4240,12 +4240,12 @@ index 0000000..e267825
 +		pc_wr(phy, PC_CPHY_CTRL(n), 0u);
 +	(void)pandora_log_sync();
 +
-+	/* Read back lane status to confirm the PHY came up. */
-+	pc_csiphy_mark("read lane status");
++	/* Per-lane control readback (not IRQ status): data lane stride 0x400,
++	 * 0x00=ctrl0 0x08=settle byte 0x10=ctrl4. Real status is common STATUS0. */
 +	for (unsigned lane = 0; lane < 4; lane++) {
-+		uint32_t base = 0x200u * lane;
-+		printf("PANDORA CSIPHY: LN%u status0=%#x status1=%#x ctrl0=%#x\n",
-+		    lane, pc_rd(phy, base + 0x10), pc_rd(phy, base + 0x14), pc_rd(phy, base + 0x00));
++		uint32_t base = 0x400u * lane;
++		printf("PANDORA CSIPHY: LN%u ctrl0=%#x settle_reg=%#x ctrl4=%#x\n",
++		    lane, pc_rd(phy, base + 0x00), pc_rd(phy, base + 0x08), pc_rd(phy, base + 0x10));
 +	}
 +	printf("PANDORA CSIPHY: common CTRL5=%#x CTRL6=%#x CTRL7=%#x STATUS0=%#x\n",
 +	    pc_rd(phy, PC_CPHY_CTRL(5)), pc_rd(phy, PC_CPHY_CTRL(6)),
