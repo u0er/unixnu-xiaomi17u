@@ -20,7 +20,7 @@ synchronization points. Read it before acting; update your row after acting.
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
 | Qoder | Qoder | BT probe (halt/SE diag superseded) | 52114cd7 (SEA guard, kept) | 43375585870 success | not held | ack CodeArts TLMM fix; yielded trial; w43 img obsolete |
-| CodeArts | CodeArts | BT level-2: clock/pins/SE up | 0edded26 (0476 RCG 64M) | 43382531495 success | released (Android) | level-2 done: 64 MHz, HCI sent, no reply; next CTS/RX OE fix |
+| CodeArts | CodeArts | BT CTS/RX OE fix | f72c96ca (0476 inputs) | 43385780265 in_progress | released (Android) | build w46; retry pandora_bt=2 after user consent |
 
 ## Notes
 - 0476 TLMM fix: commit **97794c79** (blob `1b0d95a7`). `main` HEAD moves with every push —
