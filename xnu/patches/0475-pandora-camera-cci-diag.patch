@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..ae603c5
+index 0000000..c22d20f
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,4815 @@
+@@ -0,0 +1,4908 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -383,6 +383,7 @@ index 0000000..ae603c5
 +static unsigned pc_level;
 +static unsigned pc_tpg;
 +static unsigned pc_csiphy;
++static vm_offset_t pc_csiphy0_va;	/* CSIPHY0 aperture kept for slice-B diagnostics */
 +static unsigned pc_steps_ms;
 +static bool pc_started;
 +
@@ -4284,6 +4285,92 @@ index 0000000..ae603c5
 +	return seen_rdi;
 +}
 +
++/* Diagnostic mode (pandora_csiphy=4): locate the dead stage when no SOF/EOF
++ * appears. Read-only probes inside already powered domains:
++ *   - BDISTMCLKCC MCLK branch: RCG CMD bit31 (root off) + CBCR bit31 (clk off)
++ *   - sensor 0x0100/0x0300/0x0301/0x0304/0x0305/0x3208 before the table, after
++ *     the table, and after stream-on (does the replay actually change it?)
++ *   - CSIPHY common CTRL/STATUS + lane0 state
++ *   - CSID RX/RDIN IRQ with no CSID arm, so only the source can produce events
++ * Every line is synced, so the last stage reached survives a later fault. */
++static void
++pc_sliceb_diag(void)
++{
++	static const uint32_t mclk_cmd[] = { 0x4000u, 0x4038u, 0x4054u, 0x4070u };
++	static const uint32_t mclk_cbcr[] = { 0x4018u, 0x4050u, 0x406cu, 0x4088u };
++	static const uint16_t regs[] = { 0x0100u, 0x0300u, 0x0301u, 0x0304u, 0x0305u, 0x3208u };
++	uint8_t pre[6], post[6], on[6];
++	vm_offset_t csid0;
++	int ret;
++
++	pc_csiphy_mark("diag start: map CSID0 + sensor bus");
++	csid0 = ml_io_map_unmappable(PC_CSID0_PA, 0x5e80u, VM_WIMG_IO);
++	pc_bdistm = ml_io_map_unmappable(PC_BDISTM_PA, 0x6000u, VM_WIMG_IO);
++	pc_tlmm = ml_io_map_unmappable(PC_TLMM_PA, 0xb0000u, VM_WIMG_IO);
++	for (unsigned n = 0; n < 3; n++)
++		pc_cci[n] = ml_io_map_unmappable(PC_CCI_PA(n), 0x1000u, VM_WIMG_IO);
++	if (!csid0 || !pc_bdistm || !pc_tlmm || !pc_cci[0] || !pc_csiphy0_va) {
++		printf("PANDORA SLICEB: diag map failed csid0=%#llx bdistm=%#llx tlmm=%#llx "
++		    "cci0=%#llx phy=%#llx\n", (unsigned long long)csid0,
++		    (unsigned long long)pc_bdistm, (unsigned long long)pc_tlmm,
++		    (unsigned long long)pc_cci[0], (unsigned long long)pc_csiphy0_va);
++		(void)pandora_log_sync();
++		return;
++	}
++
++	(void)pc_sensor_power_up();
++	pc_sleep(20);
++	for (unsigned i = 0; i < 4; i++) {
++		uint32_t cmd = pc_rd(pc_bdistm, mclk_cmd[i]);
++		uint32_t cfg = pc_rd(pc_bdistm, mclk_cmd[i] + 4);
++		uint32_t cbcr = pc_rd(pc_bdistm, mclk_cbcr[i]);
++		printf("PANDORA SLICEB: mclk[%u] cmd=%#x root_off=%u cfg=%#x cbcr=%#x "
++		    "clk_off=%u\n", i, cmd, cmd >> 31, cfg, cbcr, cbcr >> 31);
++	}
++	(void)pandora_log_sync();
++
++	for (unsigned i = 0; i < 6; i++)
++		pre[i] = pc_sliceb_rd8(regs[i], &ret);
++	printf("PANDORA SLICEB: sensor pre-table 0100=%#x 0300=%#x 0301=%#x 0304=%#x "
++	    "0305=%#x 3208=%#x\n", pre[0], pre[1], pre[2], pre[3], pre[4], pre[5]);
++	(void)pandora_log_sync();
++
++	pc_csiphy_mark("diag: replay wide table");
++	pc_sensor_apply_tbl(pc_wide_tbl, pc_wide_tbl_n, PC_SLICEB_MASTER,
++	    PC_SLICEB_SLAVE, 1u, 0u, "wide-diag");
++	for (unsigned i = 0; i < 6; i++)
++		post[i] = pc_sliceb_rd8(regs[i], &ret);
++	printf("PANDORA SLICEB: sensor post-table 0100=%#x 0300=%#x 0301=%#x 0304=%#x "
++	    "0305=%#x 3208=%#x\n", post[0], post[1], post[2], post[3], post[4], post[5]);
++	(void)pandora_log_sync();
++
++	pc_csiphy_mark("diag: stream on + read sensor/PHY/CSID");
++	pc_sliceb_stream_on(1);
++	pc_sleep(30);
++	for (unsigned i = 0; i < 6; i++)
++		on[i] = pc_sliceb_rd8(regs[i], &ret);
++	printf("PANDORA SLICEB: sensor stream-on 0100=%#x 0300=%#x 0301=%#x 0304=%#x "
++	    "0305=%#x 3208=%#x\n", on[0], on[1], on[2], on[3], on[4], on[5]);
++	pc_csiphy_mark("diag: PHY + CSID status");
++	printf("PANDORA SLICEB: phy CTRL0=%#x CTRL5=%#x CTRL6=%#x CTRL7=%#x "
++	    "STATUS0=%#x STATUS1=%#x STATUS2=%#x STATUS3=%#x\n",
++	    pc_rd(pc_csiphy0_va, PC_CPHY_CTRL(0)),
++	    pc_rd(pc_csiphy0_va, PC_CPHY_CTRL(5)),
++	    pc_rd(pc_csiphy0_va, PC_CPHY_CTRL(6)),
++	    pc_rd(pc_csiphy0_va, PC_CPHY_CTRL(7)),
++	    pc_rd(pc_csiphy0_va, PC_CPHY_STATUS(0)),
++	    pc_rd(pc_csiphy0_va, PC_CPHY_STATUS(1)),
++	    pc_rd(pc_csiphy0_va, PC_CPHY_STATUS(2)),
++	    pc_rd(pc_csiphy0_va, PC_CPHY_STATUS(3)));
++	printf("PANDORA SLICEB: lane0 ctrl0=%#x settle=%#x ctrl4=%#x | csid rx_irq=%#x "
++	    "rdin=%#x top_irq=%#x\n", pc_rd(pc_csiphy0_va, 0x00),
++	    pc_rd(pc_csiphy0_va, 0x08), pc_rd(pc_csiphy0_va, 0x10),
++	    pc_rd(csid0, 0x1b0), pc_rd(csid0, 0x224), pc_rd(csid0, 0x180));
++	(void)pandora_log_sync();
++	pc_sliceb_stream_on(0);
++	pc_csiphy_mark("diag done (no stream left on)");
++}
++
 +static void
 +pc_sliceb_stream(void)
 +{
@@ -4292,6 +4379,11 @@ index 0000000..ae603c5
 +	int rw0 = -1, rw1 = -1, rh0 = -1, rh1 = -1;
 +	uint32_t seen_rdi = 0, seen_rx = 0, seen_buf = 0;
 +	uint32_t base = 0;
++
++	if (pc_csiphy >= 4u) {
++		pc_sliceb_diag();
++		return;
++	}
 +
 +	pc_csiphy_mark("slice B1 start: map CSID0 + sensor bus (BDISTM/TLMM/CCI0)");
 +	csid0 = ml_io_map_unmappable(PC_CSID0_PA, 0x5e80u, VM_WIMG_IO);
@@ -4407,7 +4499,8 @@ index 0000000..ae603c5
 +	pc_sleep(4000);
 +	pc_csiphy_mark("slice A start: map CAMCC + CSIPHY0");
 +	pc_camcc = ml_io_map_unmappable(PC_CAMCC_PA, 0x80000, VM_WIMG_IO);
-+	vm_offset_t phy = ml_io_map_unmappable(PC_CSIPHY0_PA, PC_CSIPHY0_BYTES, VM_WIMG_IO);
++	pc_csiphy0_va = ml_io_map_unmappable(PC_CSIPHY0_PA, PC_CSIPHY0_BYTES, VM_WIMG_IO);
++	vm_offset_t phy = pc_csiphy0_va;
 +	if (!pc_camcc || !phy) {
 +		printf("PANDORA CSIPHY: map failed camcc=%#llx phy=%#llx\n",
 +		    (unsigned long long)pc_camcc, (unsigned long long)phy);
