@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..008e6a1
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,699 @@
+@@ -0,0 +1,714 @@
 +/*
 + * PANDORA Bluetooth: the WCN786x BT core on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -372,22 +372,31 @@ index 0000000..008e6a1
 +	bt_wr(BT_W_RCG, BT_SE5_HALT, 1u);		/* the s5 branch enable */
 +}
 +
-+/* PMIC SPMI arbiter v7, same windows/constants as fuxi_keys.c. PMH0104 is
-+ * SID 9, its GPIO block is 0x8800 and GPIO5 lives at 0x8c00, so the PPID is
-+ * (9 << 8) | (0x8c00 >> 8) = 0x98c. btpower normally gives this pin a
-+ * low->high edge when it opens BT; iBoot leaves it high, which may keep the
-+ * ROM out of its HCI boot path. */
-+#define BT_SPMI_CORE_PA   0x0c400000u
-+#define BT_SPMI_CNFG_PA   0x0c42d000u
-+#define BT_SPMI_OBS_PA    0x0c440000u
-+#define BT_SPMI_CHNLS_PA  0x0c500000u
-+#define BT_SPMI_GPIO_PPID 0x98cu
-+#define BT_SPMI_MAP_OFF   0x2000u
-+#define BT_SPMI_MAX_APIDS 1024u
-+#define BT_SPMI_REG_OUT   0x45u         /* DIG_OUT_CTL */
-+#define BT_SPMI_REG_EN    0x46u         /* EN_CTL, bit 7 = output enable */
++/* PMIC SPMI arbiter v8 (DT arbiter@c400000, "qcom,canoe-spmi-pmic-arb").
++ * PMH0104 is SID 9 on bus 1 (spmi@c437000), its GPIO block is 0x8800 and
++ * GPIO5 lives at 0x8c00, so the PPID is (9 << 8) | (0x8c00 >> 8) = 0x98c.
++ * v8 (unlike v7):
++ *   - APID->PPID table is the separate "chnl_map" window, indexed 4*apid,
++ *     PPID in bits[12:0];
++ *   - per-EE/channel owner is "chnl_owner" of each bus, 4*apid (bus-local);
++ *   - RW channel stride is 0x200 (v7 used 0x1000);
++ *   - per-bus APID count is core+0x4, one word per bus, mask 0x1fff.
++ * btpower normally gives this pin a low->high edge when it opens BT; iBoot
++ * leaves it high, which may keep the ROM out of its HCI boot path. */
++#define BT_SPMI_CORE_PA    0x0c400000u
++#define BT_SPMI_MAP_PA     0x0c403000u  /* chnl_map */
++#define BT_SPMI_CHNLS_PA   0x0c900000u
++#define BT_SPMI_OWNER1_PA  0x0c43b000u  /* bus 1 (spmi@c437000) chnl_owner */
++#define BT_SPMI_FEATURES   0x0004u
++#define BT_SPMI_PERIPH_MASK 0x1fffu
++#define BT_SPMI_PPID_MASK  0x1fffu
++#define BT_SPMI_GPIO_PPID  0x98cu
++#define BT_SPMI_RW_STRIDE  0x200u
++#define BT_SPMI_MAX_PERIPHS 8192u
++#define BT_SPMI_REG_OUT    0x45u        /* DIG_OUT_CTL */
++#define BT_SPMI_REG_EN     0x46u        /* EN_CTL, bit 7 = output enable */
 +
-+static vm_offset_t bt_spmi_core, bt_spmi_obs, bt_spmi_cnfg;
++static vm_offset_t bt_spmi_core, bt_spmi_map, bt_spmi_chnls, bt_spmi_owner1;
 +
 +static uint32_t
 +bt_spmi_rd(vm_offset_t base, uint32_t off)
@@ -402,7 +411,7 @@ index 0000000..008e6a1
 +{
 +	*(volatile uint32_t *)(chan + 0x10u) = val;              /* WDATA0 */
 +	__asm__ volatile("dmb oshst" ::: "memory");
-+	*(volatile uint32_t *)(chan + 0x00u) = (uint32_t)reg << 4; /* EXT_WRITEL */
++	*(volatile uint32_t *)(chan + 0x00u) = ((uint32_t)reg << 4) | 1u; /* EXT_WRITEL, 1 byte */
 +	__asm__ volatile("dsb osh" ::: "memory");
 +	for (unsigned i = 0; i < 1000; i++) {
 +		uint32_t st = bt_spmi_rd(chan, 0x08u);
@@ -418,40 +427,46 @@ index 0000000..008e6a1
 +bt_en_pulse(void)
 +{
 +	bt_spmi_core = ml_io_map_unmappable(BT_SPMI_CORE_PA, 0x3000, VM_WIMG_IO);
-+	bt_spmi_cnfg = ml_io_map_unmappable(BT_SPMI_CNFG_PA, 0x1000, VM_WIMG_IO);
-+	bt_spmi_obs = ml_io_map_unmappable(BT_SPMI_OBS_PA, 0x8000, VM_WIMG_IO);
-+	if (!bt_spmi_core || !bt_spmi_cnfg || !bt_spmi_obs) {
++	bt_spmi_map = ml_io_map_unmappable(BT_SPMI_MAP_PA, 0x8000, VM_WIMG_IO);
++	bt_spmi_chnls = ml_io_map_unmappable(BT_SPMI_CHNLS_PA, 0x400000, VM_WIMG_IO);
++	bt_spmi_owner1 = ml_io_map_unmappable(BT_SPMI_OWNER1_PA, 0x8000, VM_WIMG_IO);
++	if (!bt_spmi_core || !bt_spmi_map || !bt_spmi_chnls || !bt_spmi_owner1) {
 +		printf("PANDORA BT: SPMI map failed: no BT_EN pulse\n");
 +		return ENOMEM;
 +	}
 +	uint32_t version = bt_spmi_rd(bt_spmi_core, 0);
-+	uint32_t count = bt_spmi_rd(bt_spmi_core, 4) & 0x7ffu;
-+	if (version < 0x70000000u || version >= 0x80000000u || count == 0 || count > BT_SPMI_MAX_APIDS) {
-+		printf("PANDORA BT: SPMI arbiter version %#x apids %u: no BT_EN pulse\n", version, count);
++	if (version < 0x80000000u) {
++		printf("PANDORA BT: SPMI arbiter %#x is not v8: no BT_EN pulse\n", version);
++		return ENOTSUP;
++	}
++	/* SID 9 lives on bus 1; its APID space starts after bus 0's count. */
++	uint32_t bus0 = bt_spmi_rd(bt_spmi_core, BT_SPMI_FEATURES) & BT_SPMI_PERIPH_MASK;
++	uint32_t bus1 = bt_spmi_rd(bt_spmi_core, BT_SPMI_FEATURES + 4u) & BT_SPMI_PERIPH_MASK;
++	if (bus1 == 0 || bus0 + bus1 > BT_SPMI_MAX_PERIPHS) {
++		printf("PANDORA BT: SPMI bus1 apids %u (bus0 %u): no BT_EN pulse\n", bus1, bus0);
 +		return ENOTSUP;
 +	}
 +	uint16_t apid = 0xffffu;
 +	unsigned owner = 7;
-+	for (uint32_t i = 0; i < count; i++) {
-+		uint32_t map = bt_spmi_rd(bt_spmi_core, BT_SPMI_MAP_OFF + 4u * i);
-+		if (map == 0 || ((map >> 8) & 0xfffu) != BT_SPMI_GPIO_PPID) {
++	for (uint32_t i = bus0; i < bus0 + bus1; i++) {
++		uint32_t e = bt_spmi_rd(bt_spmi_map, 4u * i);
++		if ((e & BT_SPMI_PPID_MASK) != BT_SPMI_GPIO_PPID) {
 +			continue;
 +		}
-+		unsigned o = bt_spmi_rd(bt_spmi_cnfg, 4u * i) & 7u;
++		unsigned o = bt_spmi_rd(bt_spmi_owner1, 4u * (i - bus0)) & 7u;
 +		if (apid == 0xffffu || o == 0) {
 +			apid = (uint16_t)i;
 +			owner = o;
++		}
++		if (o == 0) {
++			break;
 +		}
 +	}
 +	if (apid == 0xffffu || owner != 0) {
 +		printf("PANDORA BT: PMH0104 gpio5 apid %u/ee%u: no BT_EN pulse\n", apid, owner);
 +		return ENOTSUP;
 +	}
-+	vm_offset_t chan = ml_io_map_unmappable(BT_SPMI_CHNLS_PA + 0x1000u * apid, 0x1000, VM_WIMG_IO);
-+	if (!chan) {
-+		printf("PANDORA BT: SPMI channel %u not mapped\n", apid);
-+		return ENOMEM;
-+	}
++	vm_offset_t chan = bt_spmi_chnls + BT_SPMI_RW_STRIDE * apid;
 +	bool low = bt_spmi_write(chan, BT_SPMI_REG_OUT, 0x00);
 +	bool en = bt_spmi_write(chan, BT_SPMI_REG_EN, 0x80);
 +	bt_sleep(10);
