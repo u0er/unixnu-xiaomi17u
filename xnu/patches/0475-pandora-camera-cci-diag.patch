@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..df1ffd4
+index 0000000..333f1b2
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,4373 @@
+@@ -0,0 +1,4388 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -3437,10 +3437,19 @@ index 0000000..df1ffd4
 + * distribution; per-register width is inferred, not authoritative). */
 +static int
 +pc_sensor_apply_tbl(const struct pc_init_reg *t, unsigned n, unsigned master,
-+    uint8_t slave, unsigned def_width, const char *name)
++    uint8_t slave, unsigned def_width, unsigned cap, const char *name)
 +{
-+	unsigned applied = 0, fails = 0;
++	unsigned applied = 0, fails = 0, skipped = 0;
 +	for (unsigned i = 0; i < n; i++) {
++		/* reg 0xFFFF is a trace artifact (52% of the wide dump), not a
++		 * real register; writing it NACKs and pollutes the fail count. */
++		if (t[i].reg == 0xffffu) {
++			skipped++;
++			continue;
++		}
++		if (cap && (applied + fails) >= cap) {
++			break;
++		}
 +		unsigned w = t[i].width ? t[i].width : def_width;
 +		int ret = pc_cci_write_reg(pc_cci[0], master, slave,
 +		    t[i].reg, t[i].val, w);
@@ -3451,10 +3460,13 @@ index 0000000..df1ffd4
 +				    name, i, t[i].reg, ret);
 +		} else {
 +			applied++;
++			if (applied <= 4)
++				printf("PANDORA CAMERA: apply %s[%u] reg=0x%04x val=0x%04x OK\n",
++				    name, i, t[i].reg, t[i].val);
 +		}
 +	}
-+	printf("PANDORA CAMERA: apply %s done applied=%u fails=%u\n",
-+	    name, applied, fails);
++	printf("PANDORA CAMERA: apply %s done applied=%u fails=%u skipped=%u cap=%u\n",
++	    name, applied, fails, skipped, cap);
 +	return fails ? EIO : 0;
 +}
 +
@@ -3490,12 +3502,15 @@ index 0000000..df1ffd4
 +		unsigned apply = 0;
 +		(void)PE_parse_boot_argn("pandora_camera_apply", &apply,
 +		    sizeof(apply));
-+		if (pc_level == 2u) {
++		if (pc_level == 2u && !apply) {
 +			apply = 1;
 +		}
 +		if (apply) {
-+			pc_sensor_apply_tbl(pc_wide_tbl, pc_wide_tbl_n, 1, 0x10u, 1, "wide");
-+			pc_sensor_apply_tbl(pc_tele_tbl, pc_tele_tbl_n, 0, 0x2du, 2, "tele");
++			/* apply==1 -> full replay; apply>1 -> first N valid entries
++			 * (quick write-path verification, single variable). */
++			unsigned cap = (apply > 1u) ? apply : 0u;
++			pc_sensor_apply_tbl(pc_wide_tbl, pc_wide_tbl_n, 1, 0x10u, 1, cap, "wide");
++			pc_sensor_apply_tbl(pc_tele_tbl, pc_tele_tbl_n, 0, 0x2du, 2, cap, "tele");
 +		}
 +	}
 +
