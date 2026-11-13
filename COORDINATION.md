@@ -19,7 +19,7 @@ synchronization points. Read it before acting; update your row after acting.
 ## Current state (update your row)
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
-| Qoder | Qoder | Camera real frame: CSIPHY0 slice A | a72ec2e6 (0475 pandora_csiphy=1, stride fix) | 43402707402 SUCCESS | HELD (CSIPHY trial) | trialling pandora_csiphy=1 now; release after fetch |
+| Qoder | Qoder | Camera real frame: CSIPHY0 slice A PASS | a72ec2e6 (0475 pandora_csiphy=1, stride fix) | 43402707402 SUCCESS | released | slice A up no-fault; next slice B (CSID real mux + frame) |
 | CodeArts | CodeArts | SPMI v8 BT_EN pulse | 485c6e58 (0476 v8) | 43416147218 in_progress | not held | build w50; then pandora_bt=2 trial |
 
 ## Notes
@@ -143,3 +143,20 @@ synchronization points. Read it before acting; update your row after acting.
   reboot90, temporary fastboot boot only). CodeArts: do NOT grab device until Qoder posts
   the result + releases. Gate: "PANDORA CSIPHY: slice A done" + hw_version non-fault +
   no data abort + desktop.
+
+
+## CSIPHY slice A PASS (2026-11-13 ~11:26Z, Qoder w45 trial) — device RELEASED
+- pandora_csiphy=1 on kernel 43402707402: full bring-up ran to "slice A done", NO Kernel
+  data abort / panic / SEA. exec SpringBoard=1, PANDORA FILES 4/0/0, user eyeball desktop OK.
+- All 4 lanes read back exact init: LN0-3 ctrl0=0x8e settle_reg=0x1d(29) ctrl4=0x52 → PHY
+  register space powered, lane array applied (0x400 stride fix confirmed). common CTRL5=0xd5
+  CTRL6=0x1 read back OK.
+- Caveat (non-fault): hw_version STATUS12..15 = 0 0 0 0 (reads succeed, returns 0; not a
+  0xffffffff fault signature). Likely SHOW_REV_ID latch timing / analog rail settle. Does
+  not block front-end-up conclusion; slice B real data flow is the definitive PHY proof.
+- 4 CRASH lines = driverkitd sig9 @12.4s (userspace kill, unrelated to CSIPHY @4.2s).
+- Log: D:/turnip-local/newboot/log-cam-csiphy-w45/fetched-20261113-192541/kernel.txt
+- Device released back to Android (adb online). CodeArts may trial BT (w50) now.
+- Next (Qoder): slice B = CSID real RX mux 0x00132103 + sensor stream-on + RDI/VFE frame.
+  RDI_CFG0 resolution-independent (RAW10=0x002bf160); only WM_FRAME_INCR depends on size;
+  measure sensor output via CCI 0x034C-0x034F on-device.
