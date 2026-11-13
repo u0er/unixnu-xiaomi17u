@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..008e6a1
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,606 @@
 +/*
 + * PANDORA Bluetooth: the WCN786x BT core on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -450,6 +450,26 @@ index 0000000..008e6a1
 +	return 0;
 +}
 +
++/* Read back what bt_uart_init() programmed, plus the CTS/RX pad input levels.
++ * Offset 4 in the window is GPIO24's IO register and 0x3004 is GPIO27's; the
++ * low bit of each is the sampled pin level. */
++static void
++bt_uart_dump(void)
++{
++	printf("PANDORA BT: UART tx_cfg %#x rx_cfg %#x pack0 %#x pack1 %#x wl %u/%u stop %#x par %#x/%#x\n",
++	    bt_rd(BT_W_SE, SE_TX_TRANS_CFG), bt_rd(BT_W_SE, SE_RX_TRANS_CFG),
++	    bt_rd(BT_W_SE, SE_RX_PACK0), bt_rd(BT_W_SE, SE_RX_PACK1),
++	    bt_rd(BT_W_SE, SE_TX_WORD_LEN), bt_rd(BT_W_SE, SE_RX_WORD_LEN),
++	    bt_rd(BT_W_SE, SE_TX_STOP_LEN), bt_rd(BT_W_SE, SE_TX_PARITY), bt_rd(BT_W_SE, SE_RX_PARITY));
++	printf("PANDORA BT: UART mclk %#x sclk %#x irq_en %#x m_irq_en %#x s_irq_en %#x stale %#x\n",
++	    bt_rd(BT_W_SE, SE_SER_M_CLK), bt_rd(BT_W_SE, SE_SER_S_CLK), bt_rd(BT_W_SE, SE_IRQ_EN),
++	    bt_rd(BT_W_SE, SE_M_IRQ_EN), bt_rd(BT_W_SE, SE_S_IRQ_EN), bt_rd(BT_W_SE, SE_RX_STALE));
++	printf("PANDORA BT: UART status %#x m_irq %#x s_irq %#x tx_fifo %#x rx_fifo %#x cts_in %#x rx_in %#x\n",
++	    bt_rd(BT_W_SE, SE_STATUS), bt_rd(BT_W_SE, SE_M_IRQ), bt_rd(BT_W_SE, SE_S_IRQ),
++	    bt_rd(BT_W_SE, SE_TX_FIFO_ST), bt_rd(BT_W_SE, SE_RX_FIFO_ST),
++	    bt_rd(BT_W_UART, 0x4), bt_rd(BT_W_UART, 3 * 0x1000u + 0x4));
++}
++
 +/* Wait for up to MS, collecting RX FIFO words; returns bytes in OUT. */
 +static unsigned
 +bt_rx_poll(uint8_t *out, unsigned cap, unsigned ms)
@@ -574,6 +594,7 @@ index 0000000..008e6a1
 +			goto out;
 +		}
 +		if (bt_uart_init(115200) == 0) {
++			bt_uart_dump();
 +			bt_try_hci_reset();
 +		}
 +	} else {
