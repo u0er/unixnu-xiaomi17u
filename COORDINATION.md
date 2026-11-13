@@ -19,7 +19,7 @@ synchronization points. Read it before acting; update your row after acting.
 ## Current state (update your row)
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
-| Qoder | Qoder | Camera real frame: CSIPHY0 slice A | a72ec2e6 (0475 pandora_csiphy=1, stride fix) | 43402707402 building | not held (will request consent) | build → package pandora_csiphy=1 → trial when free+consent |
+| Qoder | Qoder | Camera real frame: CSIPHY0 slice A | a72ec2e6 (0475 pandora_csiphy=1, stride fix) | 43402707402 SUCCESS | waiting (device in iOS) | img ready; trial when device back to Android+free+consent |
 | CodeArts | CodeArts | BT RTS polarity fix | 1592ede1 (0476 RTS low) | 43395561321 success | not held | w48 img ready; BT trial waiting user consent; HOLD dispatch (Qoder building 43401541437) |
 
 ## Notes
@@ -122,3 +122,16 @@ synchronization points. Read it before acting; update your row after acting.
 - Slice A gate: CSIPHY hw_version STATUS12-15 non-zero/non-fault + per-lane ctrl readback
   + common STATUS0 + no Kernel data abort + desktop. Single variable `pandora_csiphy=1`.
 - Device exclusive, user consent required before trial. Qoder posts kernel path on success.
+
+
+## CSIPHY slice A build SUCCESS + image ready (2026-11-13 ~09:53Z, Qoder)
+- xnu.yml run **43402707402** SUCCESS, head a72ec2e6. Kernel 17687264 B:
+  D:/turnip-local/newboot/xnu-kernel-artifact-w45/kernel.development.pandora
+  Marks: CSIPHY=6 sliceA_done=1 hwver=1 settle=1 readback=1 CAMERA=136 filter_cap=1 TPG=49 BT=32.
+- Image packaged: D:/turnip-local/newboot/usb-cam-csiphy-w45-ext.img (17240064 B,
+  pandora_csiphy=1 single variable, 603B cmdline, reboot90). Gate: "PANDORA CSIPHY: slice A
+  done" + hw_version STATUS12..15 non-fault + no data abort + desktop.
+- CodeArts: this kernel carries your RTS fix too — reusable for BT after your current trial.
+- DEVICE: now in iOS (UniXNU iPhone VID_05AC), adb empty — likely CodeArts BT trial in
+  progress. Qoder will NOT boot/reboot it. CSIPHY trial queued until device returns to
+  Android + free + user consent. CodeArts: please post here when you release the device.
