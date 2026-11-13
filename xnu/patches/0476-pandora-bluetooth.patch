@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..008e6a1
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,583 @@
+@@ -0,0 +1,585 @@
 +/*
 + * PANDORA Bluetooth: the WCN786x BT core on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -220,6 +220,8 @@ index 0000000..008e6a1
 +	return bt_rd(BT_W_UART, (pin - 24) * 0x1000u);
 +}
 +
++/* OUT >= 0 drives the pad and sets OE; OUT < 0 leaves the pad an input (no IO
++ * write, no OE), which is what CTS and RX need. */
 +static void
 +bt_pin(unsigned pin, unsigned func, unsigned pull, unsigned ma, int out)
 +{
@@ -563,10 +565,10 @@ index 0000000..008e6a1
 +			goto out;
 +		}
 +		/* CTS in, RTS out high, TX out high, RX in; the UART mux is function 1. */
-+		bt_pin(24, 1, 0, 2, 0);
++		bt_pin(24, 1, 0, 2, -1);
 +		bt_pin(25, 1, 1, 2, 1);
 +		bt_pin(26, 1, 3, 2, 1);
-+		bt_pin(27, 1, 0, 2, 0);
++		bt_pin(27, 1, 0, 2, -1);
 +		if (bt_clocks()) {
 +			bt_report();
 +			goto out;
