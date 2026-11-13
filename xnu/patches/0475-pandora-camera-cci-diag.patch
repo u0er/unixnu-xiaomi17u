@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..5c8b62e
+index 0000000..b3ecc9a
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,4553 @@
+@@ -0,0 +1,4749 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -4143,6 +4143,198 @@ index 0000000..5c8b62e
 +	return (unsigned)(settle_ps / timer_ps - 6);
 +}
 +
++/* ---------------------------------------------------------------------------
++ * Slice B1: real sensor -> CSIPHY0 -> CSID real RX mux -> RDI0 input events.
++ * Boot arg pandora_csiphy=2 runs slice A (PHY front-end up) and then this.
++ * =1 keeps slice A byte-for-byte unchanged, so the single-variable A/B stays
++ * intact and a negative result is attributable to B1 alone.
++ *
++ * Facts (CAMERA_L2_TPG_IMPL §3.2/§3.3 + mainline camss-csid.c):
++ *   RX_CFG0 real mux = PHY_NUM_SEL BIT(20) | lane_assign 0x3210 << 4 |
++ *   (lane_cnt-1)=3 -> 0x00132103. No TPG_MUX_EN BIT(27) / TPG_MUX_SEL.
++ *   RDI_CFG0 is resolution independent: 0x002BF160, enabled by readback |
++ *   BIT(31). RDI_CFG1 = PACKING_FORMAT_MIPI BIT(15). Non-lite only:
++ *   RDI_PIX_STORE_CFG0 = 9. RDIN IRQ @0x224: RUP_DONE BIT(23),
++ *   INPUT_SOF BIT(12), INPUT_EOF BIT(9) -- SOF/EOF are input-side events and
++ *   need no capture buffer, which is exactly what B1 asserts (VFE DMA is B2).
++ *   Sensor: wide ovx10500u, CCI0 master1, slave 0x10, 8-bit data. The live DT
++ *   has no mode node, so the real output size is latched in 0x034C..0x034F
++ *   (16-bit big-endian pairs) and has to be measured on-device.
++ *
++ * Order: the source streams LAST (same rule that fixed the TPG RDI_CFG0 race):
++ * replay the Android table, read the size back, return the sensor to standby,
++ * arm CSID RX/RDI, then issue stream-on and poll.
++ * ------------------------------------------------------------------------- */
++#define PC_SLICEB_SLAVE    0x10u
++#define PC_SLICEB_MASTER   1u
++#define PC_RDIN_IRQ(n)     (0x224u + 0x10u * (n))
++#define PC_RDIN_RUP_DONE   PC_BIT(23)
++#define PC_RDIN_INPUT_SOF  PC_BIT(12)
++#define PC_RDIN_INPUT_EOF  PC_BIT(9)
++
++/* One 8-bit sensor register read through the verified timed read path. The
++ * helper returns the data byte in *ret's value; errors are reported by the
++ * helper itself and surface as ret != 0. */
++static uint8_t
++pc_sliceb_rd8(uint16_t reg, int *ret)
++{
++	uint16_t v = 0;
++
++	*ret = pc_cci_read_reg16_timed(pc_cci[0], PC_SLICEB_MASTER,
++	    PC_SLICEB_SLAVE, reg, &v);
++	return (uint8_t)(v & 0xffu);
++}
++
++static void
++pc_sliceb_stream_on(int on)
++{
++	int ret = pc_cci_write_reg(pc_cci[0], PC_SLICEB_MASTER, PC_SLICEB_SLAVE,
++	    0x0100u, on ? 1u : 0u, 1u);
++
++	printf("PANDORA SLICEB: sensor 0x0100 stream %s ret=%d\n",
++	    on ? "on" : "off", ret);
++	(void)pandora_log_sync();
++}
++
++static void
++pc_sliceb_stream(void)
++{
++	vm_offset_t csid0;
++	uint8_t w_hi = 0, w_lo = 0, h_hi = 0, h_lo = 0;
++	int rw0 = -1, rw1 = -1, rh0 = -1, rh1 = -1;
++	uint32_t rdi_base = 0x5480u;
++	bool rdi_lite = false;
++	uint32_t seen_rdi = 0, last_rdi = 0, seen_rx = 0, seen_buf = 0;
++
++	pc_csiphy_mark("slice B1 start: map CSID0 + sensor bus (BDISTM/TLMM/CCI0)");
++	csid0 = ml_io_map_unmappable(PC_CSID0_PA, 0x5e80u, VM_WIMG_IO);
++	pc_bdistm = ml_io_map_unmappable(PC_BDISTM_PA, 0x6000u, VM_WIMG_IO);
++	pc_tlmm = ml_io_map_unmappable(PC_TLMM_PA, 0xb0000u, VM_WIMG_IO);
++	for (unsigned n = 0; n < 3; n++)
++		pc_cci[n] = ml_io_map_unmappable(PC_CCI_PA(n), 0x1000u, VM_WIMG_IO);
++	if (!csid0 || !pc_bdistm || !pc_tlmm || !pc_cci[0]) {
++		printf("PANDORA SLICEB: map failed csid0=%#llx bdistm=%#llx tlmm=%#llx "
++		    "cci0=%#llx\n", (unsigned long long)csid0,
++		    (unsigned long long)pc_bdistm, (unsigned long long)pc_tlmm,
++		    (unsigned long long)pc_cci[0]);
++		(void)pandora_log_sync();
++		return;
++	}
++
++	/* Sensor front-end: rails + MCLK 19.2 MHz + CCI0 37.5 MHz, then the
++	 * Android-dumped wide table through the verified write path (w44). */
++	pc_csiphy_mark("slice B1: sensor power_up (rails/MCLK/CCI)");
++	(void)pc_sensor_power_up();
++	pc_sleep(20);
++	pc_csiphy_mark("slice B1: replay wide init table");
++	pc_sensor_apply_tbl(pc_wide_tbl, pc_wide_tbl_n, PC_SLICEB_MASTER,
++	    PC_SLICEB_SLAVE, 1u, 0u, "wide-sliceb");
++
++	/* Actual output size: 16-bit big-endian halves, read as single bytes at
++	 * 0x034C..0x034F (0x034C x-hi, 0x034D x-lo, ...) by the timed helper. */
++	w_hi = pc_sliceb_rd8(0x034cu, &rw0);
++	w_lo = pc_sliceb_rd8(0x034du, &rw1);
++	h_hi = pc_sliceb_rd8(0x034eu, &rh0);
++	h_lo = pc_sliceb_rd8(0x034fu, &rh1);
++	printf("PANDORA SLICEB: sensor size 0x034C..0x034F=%#x %#x %#x %#x ret=%d/%d/%d/%d "
++	    "-> %ux%u\n", w_hi, w_lo, h_hi, h_lo, rw0, rw1, rh0, rh1,
++	    ((unsigned)w_hi << 8) | w_lo, ((unsigned)h_hi << 8) | h_lo);
++	(void)pandora_log_sync();
++
++	/* Back to standby before arming CSID: the table may itself end with a
++	 * stream-on write, and the source must not run while RDI is configured. */
++	pc_sliceb_stream_on(0);
++	pc_sleep(2);
++
++	/* CSID reset: same sequence/values as the verified TPG slice. */
++	pc_csiphy_mark("slice B1: CSID reset");
++	pc_wr(csid0, 0x188, 0x9u);        /* TOP_IRQ_CLEAR: RST_DONE|BUF_DONE */
++	pc_wr(csid0, 0x184, 0x9u);        /* TOP_IRQ_MASK */
++	pc_wr(csid0, 0x1a8, 0x10000u);    /* BUF_DONE_IRQ_CLEAR: VC0 */
++	pc_wr(csid0, 0x1a4, 0x10000u);    /* BUF_DONE_IRQ_MASK: VC0 */
++	pc_wr(csid0, 0x110, 0x1u);        /* IRQ_CMD: clear */
++	pc_wr(csid0, 0x108, 0x11u);       /* RST_CFG */
++	pc_wr(csid0, 0x10c, 0x5u);        /* RST_CMD: HW_RST|IRQ_RST */
++	unsigned rst_done = 0;
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		if (pc_rd(csid0, 0x180) & 0x1u) { rst_done = 1; break; }
++		pc_sleep(1);
++	}
++	printf("PANDORA SLICEB: CSID reset rst_done=%u top_irq=%#x\n",
++	    rst_done, pc_rd(csid0, 0x180));
++	(void)pandora_log_sync();
++	if (!rst_done) {
++		pc_csiphy_mark("slice B1: CSID reset TIMEOUT - aborting (no RDI)");
++		return;
++	}
++
++	/* Real RX mux: PHY_NUM_SEL(csiphy0) + lane_assign 0x3210 + 4 lanes. */
++	pc_csiphy_mark("slice B1: CSID real RX mux 0x00132103");
++	pc_wr(csid0, 0x880, 0x00132103u);  /* RX_CFG0: real csiphy0 input */
++	pc_wr(csid0, 0x884, 0x1u);         /* RX_CFG1: ECC_CORRECTION_EN */
++
++	/* RDI0: latch probe across non-lite 0x5480 / lite 0x3080 (same race and
++	 * same resolution-independent payload as the proven TPG path). */
++	for (unsigned try = 0; try < 50; try++) {
++		pc_wr(csid0, 0x5480, 0x002bf160u);
++		if (pc_rd(csid0, 0x5480) == 0x002bf160u) {
++			rdi_base = 0x5480u; rdi_lite = false; break;
++		}
++		pc_wr(csid0, 0x3080, 0x002bf160u);
++		if (pc_rd(csid0, 0x3080) == 0x002bf160u) {
++			rdi_base = 0x3080u; rdi_lite = true; break;
++		}
++		pc_sleep(1);
++	}
++	printf("PANDORA SLICEB: RDI latch base=%#x lite=%u\n", rdi_base,
++	    (unsigned)rdi_lite);
++	(void)pandora_log_sync();
++	pc_wr(csid0, rdi_base, 0x002bf160u);              /* RDI_CFG0: RAW10 VC0 */
++	pc_wr(csid0, rdi_base + 0x14, 0x8000u);           /* RDI_CFG1: MIPI packing */
++	if (!rdi_lite)
++		pc_wr(csid0, 0x5498, 0x9u);               /* PIX_STORE (non-lite) */
++	pc_wr(csid0, rdi_base + 0x8, 0x0u);               /* RDI_CTRL: 0 */
++	pc_wr(csid0, rdi_base, pc_rd(csid0, rdi_base) | 0x80000000u); /* EN */
++	for (unsigned i = 0; i < 2; i++) {
++		pc_wr(csid0, 0x118, 0x100u);   /* AUP_CMD: RDI0 */
++		pc_wr(csid0, 0x11c, 0x1u);     /* RUP_AUP_CMD: RUP_SET */
++	}
++	pc_wr(csid0, 0x114, 0x100u);       /* RUP_CMD: RDI0 */
++	pc_wr(csid0, 0x11c, 0x1u);         /* RUP_AUP_CMD: RUP_SET */
++	pc_wr(csid0, rdi_base + 0x8, 0x1u);               /* RDI_CTRL: START */
++	pc_sleep(2);
++	printf("PANDORA SLICEB: RDI0 armed cfg0=%#x ctrl=%#x rx_cfg0=%#x\n",
++	    pc_rd(csid0, rdi_base), pc_rd(csid0, rdi_base + 0x8), pc_rd(csid0, 0x880));
++	(void)pandora_log_sync();
++
++	/* Source last: stream-on, then watch the input-side frame boundary. */
++	pc_csiphy_mark("slice B1: sensor stream on (source last)");
++	pc_sliceb_stream_on(1);
++	pc_csiphy_mark("slice B1: polling RDIN IRQ (SOF/EOF/RUP) + RX + BUF_DONE");
++	for (unsigned i = 0; i < 800; i++) {
++		last_rdi = pc_rd(csid0, PC_RDIN_IRQ(0));
++		seen_rdi |= last_rdi;
++		seen_rx |= pc_rd(csid0, 0x1b0);
++		seen_buf |= pc_rd(csid0, 0x1a0);
++		pc_sleep(1);
++	}
++	printf("PANDORA SLICEB: RESULT rdi_irq=%#x last=%#x rx_irq=%#x buf_done=%#x "
++	    "sof=%u eof=%u rup=%u\n", seen_rdi, last_rdi, seen_rx, seen_buf,
++	    (seen_rdi & PC_RDIN_INPUT_SOF) ? 1u : 0u,
++	    (seen_rdi & PC_RDIN_INPUT_EOF) ? 1u : 0u,
++	    (seen_rdi & PC_RDIN_RUP_DONE) ? 1u : 0u);
++	(void)pandora_log_sync();
++	pc_csiphy_mark((seen_rdi & (PC_RDIN_INPUT_SOF | PC_RDIN_INPUT_EOF))
++	    ? "slice B1 PASS: real sensor frame events at CSID RDI0"
++	    : "slice B1 FAIL: no SOF/EOF at CSID RDI0");
++
++	pc_csiphy_mark("slice B1: stop (stream off + RDI0 stop; no teardown)");
++	pc_sliceb_stream_on(0);
++	pc_wr(csid0, rdi_base + 0x8, 0x0u);
++	pc_sleep(1);
++	pc_csiphy_mark("slice B1 done (PHY+sensor parked; VFE DMA/FRAME_INCR is B2)");
++}
++
 +static void
 +pc_csiphy0_bringup(void)
 +{
@@ -4251,6 +4443,10 @@ index 0000000..5c8b62e
 +	    pc_rd(phy, PC_CPHY_CTRL(5)), pc_rd(phy, PC_CPHY_CTRL(6)),
 +	    pc_rd(phy, PC_CPHY_CTRL(7)), pc_rd(phy, PC_CPHY_STATUS(0)));
 +	pc_csiphy_mark("slice A done (PHY front-end up; CSID real mux is slice B)");
++	/* =2 adds slice B1 (real sensor -> CSID RX mux -> RDI0 SOF/EOF). =1 stops
++	 * here exactly as the verified w45 baseline did. */
++	if (pc_csiphy >= 2u)
++		pc_sliceb_stream();
 +}
 +
 +static void
