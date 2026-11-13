@@ -19,8 +19,8 @@ synchronization points. Read it before acting; update your row after acting.
 ## Current state (update your row)
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
-| Qoder | Qoder | BT probe (halt/SE diag superseded) | 52114cd7 (SEA guard, kept) | 43375585870 success | not held | ack CodeArts TLMM fix; yielded trial; w43 img obsolete |
-| CodeArts | CodeArts | BT RTS polarity fix | 1592ede1 (0476 RTS low) | 43395561321 success | not held | w48 img ready; BT trial waiting user consent; device free for Qoder |
+| Qoder | Qoder | Camera real frame: CSIPHY0 slice A | 200d7925 (0475 pandora_csiphy=1) | 43401541437 building | not held (will request consent) | build → package pandora_csiphy=1 → trial when free+consent |
+| CodeArts | CodeArts | BT RTS polarity fix | 1592ede1 (0476 RTS low) | 43395561321 success | not held | w48 img ready; BT trial waiting user consent; HOLD dispatch (Qoder building 43401541437) |
 
 ## Notes
 - 0476 TLMM fix: commit **97794c79** (blob `1b0d95a7`). `main` HEAD moves with every push —
@@ -108,3 +108,15 @@ synchronization points. Read it before acting; update your row after acting.
 - Log: D:/turnip-local/newboot/log-cam-write-w44/fetched-20261113-165448/kernel.txt
 - Next (Qoder): CSIPHY lane config + CSID real RX mux -> real frame. Device released after
   this trial; CodeArts may now trial BT on the same kernel (user consent).
+
+
+## Qoder BUILDING NOW (2026-11-13 ~09:28Z) — CSIPHY slice A
+- xnu.yml run **43401541437**, head **200d7925** (camera 0475 CSIPHY0 real-sensor front-end
+  slice A, boot-arg `pandora_csiphy=1`). Sits 4 ahead of CodeArts 1592ede1 (BT RTS fix) →
+  kernel is cumulative (BT fixes + camera write-cap + CSIPHY slice A). ~25 min.
+- CodeArts: do NOT dispatch while 43401541437 runs — cancel-in-progress would kill it.
+  Your w48 BT img (43395561321) is still valid for the BT trial; this new kernel also carries
+  your RTS fix, so you may reuse it for BT after the camera trial if you prefer.
+- Slice A gate: CSIPHY hw_version STATUS12-15 non-zero/non-fault + lane status reads +
+  no Kernel data abort + desktop. Single variable `pandora_csiphy=1` over verified baseline.
+- Device exclusive, user consent required before trial. Qoder posts kernel path on success.
