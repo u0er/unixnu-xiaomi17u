@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..333f1b2
+index 0000000..e267825
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,4388 @@
+@@ -0,0 +1,4553 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -229,6 +229,7 @@ index 0000000..333f1b2
 +#include <vm/pmap.h>
 +#include <arm/caches_internal.h>	/* clean_dcache64 for SMMU table publication */
 +#include "pandora_camera_init_tables.h"	/* AUTO-GEN Android init tables */
++#include "pandora_csiphy_lane_regs.h"	/* mainline lane_regs_x1e80100 (3ph D-PHY) */
 +#include "adreno/ArmSmmu4KStreams.h"	/* SMMUv2 native-4K lease (MIT), as WiFi */
 +
 +extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
@@ -381,6 +382,7 @@ index 0000000..333f1b2
 +static int pc_chan;
 +static unsigned pc_level;
 +static unsigned pc_tpg;
++static unsigned pc_csiphy;
 +static unsigned pc_steps_ms;
 +static bool pc_started;
 +
@@ -4095,6 +4097,162 @@ index 0000000..333f1b2
 +	pc_sleep(1);
 +}
 +
++/* ---------------------------------------------------------------------------
++ * CSIPHY0 real-sensor receive front-end (boot arg pandora_csiphy=1), slice A.
++ * Brings up the wide sensor's CSI D-PHY (csiphy0 @ 0x9523000) on top of the
++ * proven TPG clock/power tree, then reads back PHY status to verify the analog
++ * front-end initializes without fault. Does NOT yet route real data into CSID
++ * (slice B adds the CSID real RX mux + sensor stream-on + frame capture).
++ *
++ * Facts: mainline phy-qcom-mipi-csi2-3ph-dphy.c (lane_regs_x1e80100, 3ph ops) +
++ * phy-qcom-mipi-csi2-core.c (power-on order); live base.dtb csiphy0 supplies
++ * (csi-vdd-0p9 = pmh0110_i_l3 -> L3I_E0, csi-vdd-1p2 = pmh0110_d_l1 -> L1D_E0);
++ * clk_camcc-kaanapali.c (csiphy0_clk branch 0x2001c, csi0phytimer 0x20018 /
++ * RCG 0x20000). Wide link_freq ~1067.7 MHz (DT cphy_rx_clk_src 266.9 MHz = link/4),
++ * timer 400 MHz -> settle_cnt 29. GPL-2.0 fact-only rewrite.
++ * ------------------------------------------------------------------------- */
++#define PC_CSIPHY0_PA      0x09523000u
++#define PC_CSIPHY0_BYTES   0x2000u
++#define PC_CPHY_CMN        0x1000u          /* common_regs_offset */
++#define PC_CPHY_CTRL(n)    (PC_CPHY_CMN + 4u * (n))
++#define PC_CPHY_STATUS(n)  (0x10b0u + 4u * (n))
++#define PC_CSIPHY0_CLK_CBCR    0x2001cu     /* csiphy0_clk branch */
++#define PC_CSI0PHYTIMER_CBCR   0x20018u     /* csi0phytimer_clk branch */
++#define PC_CSI0PHYTIMER_RCG    0x20000u     /* csi0phytimer_clk_src RCG */
++#define PC_WIDE_LINK_FREQ      1067715244ull
++#define PC_CPHY_TIMER_RATE     400000000u
++
++extern int pandora_rpmh_arc(const char *, uint32_t);
++
++static void
++pc_csiphy_mark(const char *msg)
++{
++	printf("PANDORA CSIPHY: %s\n", msg);
++	(void)pandora_log_sync();
++}
++
++/* settle_cnt per mainline phy_qcom_mipi_csi2_settle_cnt_calc (ps math). */
++static unsigned
++pc_csiphy_settle(uint64_t link_freq, uint32_t timer_rate)
++{
++	uint64_t ui_ps = 1000000000000ull / link_freq / 2;
++	uint64_t settle_ps = 85000 + 6 * ui_ps;
++	uint64_t timer_ps = 1000000000000ull / timer_rate;
++	if (settle_ps / timer_ps < 6)
++		return 0;
++	return (unsigned)(settle_ps / timer_ps - 6);
++}
++
++static void
++pc_csiphy0_bringup(void)
++{
++	pc_sleep(4000);
++	pc_csiphy_mark("slice A start: map CAMCC + CSIPHY0");
++	pc_camcc = ml_io_map_unmappable(PC_CAMCC_PA, 0x80000, VM_WIMG_IO);
++	vm_offset_t phy = ml_io_map_unmappable(PC_CSIPHY0_PA, PC_CSIPHY0_BYTES, VM_WIMG_IO);
++	if (!pc_camcc || !phy) {
++		printf("PANDORA CSIPHY: map failed camcc=%#llx phy=%#llx\n",
++		    (unsigned long long)pc_camcc, (unsigned long long)phy);
++		(void)pandora_log_sync();
++		return;
++	}
++
++	/* Analog rails + MMCX/MX ARC levels before any PHY register access. */
++	pc_csiphy_mark("vote analog rails L3I_E0(0p9) L1D_E0(1p2) + MMCX/MX");
++	(void)pandora_rpmh_resource("L3I_E0", 0, 900);
++	(void)pandora_rpmh_resource("L3I_E0", 4, 1);
++	(void)pandora_rpmh_resource("L1D_E0", 0, 1200);
++	(void)pandora_rpmh_resource("L1D_E0", 4, 1);
++	(void)pandora_rpmh_arc("mmcxc.lvl", 384);
++	(void)pandora_rpmh_arc("mx.lvl", 384);
++	(void)pandora_log_sync();
++
++	/* Reuse the TPG power/clock tree: GDSCs, PLL0, RCGs, branches. */
++	static const uint32_t gdscs[4] = {
++		PC_GDSCR, PC_TFE0_GDSCR, PC_TFE1_GDSCR, PC_TFE2_GDSCR };
++	static const char *gdsc_names[4] = { "titan_top", "tfe_0", "tfe_1", "tfe_2" };
++	for (unsigned i = 0; i < 4; i++) {
++		pc_csiphy_mark(gdsc_names[i]);
++		(void)pc_tpg_gdsc_up(gdscs[i], gdsc_names[i]);
++	}
++	pc_csiphy_mark("pll0 enable");
++	(void)pc_tpg_pll_enable(0x0000u, 0x0044003eu, 0x8000u, 0x840fu, "pll0");
++	for (unsigned i = 0; i < PC_TPG_NRCG; i++) {
++		pc_csiphy_mark(pc_tpg_rcgs[i].name);
++		(void)pc_tpg_rcg_set(&pc_tpg_rcgs[i]);
++	}
++	/* phytimer RCG 400 MHz (PLL0_MAIN/3, sel 1 hid 5) + its branch. */
++	struct pc_tpg_rcg phytimer = { PC_CSI0PHYTIMER_RCG, 1u, 5u, "csi0phytimer" };
++	pc_csiphy_mark("csi0phytimer rcg");
++	(void)pc_tpg_rcg_set(&phytimer);
++
++	pc_csiphy_mark("core_ahb + branches");
++	pc_wr(pc_camcc, PC_CORE_AHB_CBCR, pc_rd(pc_camcc, PC_CORE_AHB_CBCR) | PC_CBCR_ENABLE);
++	pc_sleep(1);
++	for (unsigned i = 0; i < PC_TPG_NBRANCH; i++) {
++		pc_wr(pc_camcc, pc_tpg_branches[i],
++		    pc_rd(pc_camcc, pc_tpg_branches[i]) | PC_CBCR_ENABLE);
++		(void)pc_wait_branch_on("csiphy", pc_tpg_branches[i]);
++	}
++	pc_wr(pc_camcc, PC_CSIPHY0_CLK_CBCR, pc_rd(pc_camcc, PC_CSIPHY0_CLK_CBCR) | PC_CBCR_ENABLE);
++	(void)pc_wait_branch_on("csiphy", PC_CSIPHY0_CLK_CBCR);
++	pc_wr(pc_camcc, PC_CSI0PHYTIMER_CBCR, pc_rd(pc_camcc, PC_CSI0PHYTIMER_CBCR) | PC_CBCR_ENABLE);
++	(void)pc_wait_branch_on("csiphy", PC_CSI0PHYTIMER_CBCR);
++	(void)pandora_log_sync();
++
++	/* PHY reset: CTRL0=1, 5-8 ms, =0 (mainline phy_qcom_mipi_csi2_reset). */
++	pc_csiphy_mark("PHY reset");
++	pc_wr(phy, PC_CPHY_CTRL(0), 1u);
++	pc_sleep(8);
++	pc_wr(phy, PC_CPHY_CTRL(0), 0u);
++	pc_sleep(1);
++
++	/* hw_version_read: CTRL6=2, read STATUS12..15. */
++	pc_wr(phy, PC_CPHY_CTRL(6), 2u);
++	uint32_t v0 = pc_rd(phy, PC_CPHY_STATUS(12));
++	uint32_t v1 = pc_rd(phy, PC_CPHY_STATUS(13));
++	uint32_t v2 = pc_rd(phy, PC_CPHY_STATUS(14));
++	uint32_t v3 = pc_rd(phy, PC_CPHY_STATUS(15));
++	printf("PANDORA CSIPHY: hw_version STATUS12..15 = %#x %#x %#x %#x\n", v0, v1, v2, v3);
++	(void)pandora_log_sync();
++
++	/* lanes_enable: CTRL5 lane bitmap (4 data + clk = 0xD5), CTRL6 pwrDN_b=1,
++	 * CTRL7=2, CTRL0=0, then the 105-entry lane array (settle substituted,
++	 * skew skipped), then mask all IRQs (CTRL11..21=0). */
++	unsigned settle = pc_csiphy_settle(PC_WIDE_LINK_FREQ, PC_CPHY_TIMER_RATE);
++	printf("PANDORA CSIPHY: link=%llu Hz timer=%u Hz settle_cnt=%u\n",
++	    (unsigned long long)PC_WIDE_LINK_FREQ, PC_CPHY_TIMER_RATE, settle);
++	pc_csiphy_mark("lanes_enable CTRL5=0xD5");
++	pc_wr(phy, PC_CPHY_CTRL(5), 0xD5u);
++	pc_wr(phy, PC_CPHY_CTRL(6), 1u);
++	pc_wr(phy, PC_CPHY_CTRL(7), 2u);
++	pc_wr(phy, PC_CPHY_CTRL(0), 0u);
++	for (unsigned i = 0; i < PC_CSIPHY_LANE_REGS_N; i++) {
++		const struct pc_csiphy_lane_reg *r = &pc_csiphy_lane_regs_x1e80100[i];
++		if (r->type == 2)	/* CSIPHY_SKEW_CAL: skip */
++			continue;
++		uint32_t val = (r->type == 1) ? (settle & 0xffu) : r->val;
++		pc_wr(phy, r->addr, val);
++		if (r->delay_us)
++			delay(r->delay_us);
++	}
++	for (unsigned n = 11; n <= 21; n++)
++		pc_wr(phy, PC_CPHY_CTRL(n), 0u);
++	(void)pandora_log_sync();
++
++	/* Read back lane status to confirm the PHY came up. */
++	pc_csiphy_mark("read lane status");
++	for (unsigned lane = 0; lane < 4; lane++) {
++		uint32_t base = 0x200u * lane;
++		printf("PANDORA CSIPHY: LN%u status0=%#x status1=%#x ctrl0=%#x\n",
++		    lane, pc_rd(phy, base + 0x10), pc_rd(phy, base + 0x14), pc_rd(phy, base + 0x00));
++	}
++	printf("PANDORA CSIPHY: common CTRL5=%#x CTRL6=%#x CTRL7=%#x STATUS0=%#x\n",
++	    pc_rd(phy, PC_CPHY_CTRL(5)), pc_rd(phy, PC_CPHY_CTRL(6)),
++	    pc_rd(phy, PC_CPHY_CTRL(7)), pc_rd(phy, PC_CPHY_STATUS(0)));
++	pc_csiphy_mark("slice A done (PHY front-end up; CSID real mux is slice B)");
++}
++
 +static void
 +pc_tpg_p0_bringup(void)
 +{
@@ -4350,6 +4508,12 @@ index 0000000..333f1b2
 +		pc_tpg_p0_bringup();
 +		goto out;
 +	}
++	/* CSIPHY0 real-sensor receive front-end (pandora_csiphy=1), slice A:
++	 * separately gated, clean single variable against the TPG baseline. */
++	if (pc_csiphy) {
++		pc_csiphy0_bringup();
++		goto out;
++	}
 +	/* No GCC map: the GPU/touch drivers already map 0x100000 and report its vote; a second
 +	 * unmappable mapping of the same aperture plus a later unmap unmaps the shared window. */
 +	pc_step("CAMCC", PC_CAMCC_PA);
@@ -4408,7 +4572,8 @@ index 0000000..333f1b2
 +{
 +	(void)PE_parse_boot_argn("pandora_camera", &pc_level, sizeof(pc_level));
 +	(void)PE_parse_boot_argn("pandora_tpg", &pc_tpg, sizeof(pc_tpg));
-+	if (!pc_level && !pc_tpg) {
++	(void)PE_parse_boot_argn("pandora_csiphy", &pc_csiphy, sizeof(pc_csiphy));
++	if (!pc_level && !pc_tpg && !pc_csiphy) {
 +		return;
 +	}
 +	if (pc_started) {
@@ -28065,3 +28230,124 @@ index 0000000..34348a5
 +static const unsigned pc_ultra_tbl_n = (unsigned)(sizeof(pc_ultra_tbl)/sizeof(pc_ultra_tbl[0]));
 +
 +#endif /* PC_INIT_TABLES_H */
+diff --git a/bsd/dev/pandora_csiphy_lane_regs.h b/bsd/dev/pandora_csiphy_lane_regs.h
+new file mode 100644
+index 0000000..1cf723d
+--- /dev/null
++++ b/bsd/dev/pandora_csiphy_lane_regs.h
+@@ -0,0 +1,115 @@
++/* Auto-extracted from mainline phy-qcom-mipi-csi2-3ph-dphy.c lane_regs_x1e80100
++ * (Kaanapali 3-phase D-PHY reuses x1e80100 init_seq). GPL-2.0 fact-only.
++ * type: 0=default, 1=settle_cnt lower byte (substitute), 2=skew cal (skip). */
++#ifndef PANDORA_CSIPHY_LANE_REGS_H
++#define PANDORA_CSIPHY_LANE_REGS_H
++struct pc_csiphy_lane_reg { uint32_t addr; uint32_t val; unsigned type; unsigned delay_us; };
++static const struct pc_csiphy_lane_reg pc_csiphy_lane_regs_x1e80100[] = {
++	{ 0x101c, 0x7a, 0, 0 },
++	{ 0x1018, 0x01, 0, 0 },
++	{ 0x0094, 0x00, 0, 0 },
++	{ 0x00a0, 0x00, 0, 0 },
++	{ 0x0090, 0x0f, 0, 0 },
++	{ 0x0098, 0x08, 0, 0 },
++	{ 0x0094, 0x07, 0, 1 },
++	{ 0x0030, 0x00, 0, 0 },
++	{ 0x0000, 0x8e, 0, 0 },
++	{ 0x0038, 0xfe, 0, 0 },
++	{ 0x002c, 0x01, 0, 0 },
++	{ 0x0034, 0x0f, 0, 0 },
++	{ 0x001c, 0x0a, 0, 0 },
++	{ 0x0014, 0x60, 0, 0 },
++	{ 0x003c, 0xb8, 0, 0 },
++	{ 0x0004, 0x0c, 0, 0 },
++	{ 0x0020, 0x00, 0, 0 },
++	{ 0x0008, 0x10, 1, 0 },
++	{ 0x0010, 0x52, 0, 0 },
++	{ 0x0094, 0xd7, 2, 0 },
++	{ 0x005c, 0x00, 2, 0 },
++	{ 0x0060, 0xbd, 2, 0 },
++	{ 0x0064, 0x7f, 2, 0 },
++	{ 0x0e94, 0x00, 0, 0 },
++	{ 0x0ea0, 0x00, 0, 0 },
++	{ 0x0e90, 0x0f, 0, 0 },
++	{ 0x0e98, 0x08, 0, 0 },
++	{ 0x0e94, 0x07, 0, 1 },
++	{ 0x0e30, 0x00, 0, 0 },
++	{ 0x0e28, 0x04, 0, 0 },
++	{ 0x0e00, 0x80, 0, 0 },
++	{ 0x0e0c, 0xff, 0, 0 },
++	{ 0x0e38, 0x1f, 0, 0 },
++	{ 0x0e2c, 0x01, 0, 0 },
++	{ 0x0e34, 0x0f, 0, 0 },
++	{ 0x0e1c, 0x0a, 0, 0 },
++	{ 0x0e14, 0x60, 0, 0 },
++	{ 0x0e3c, 0xb8, 0, 0 },
++	{ 0x0e04, 0x0c, 0, 0 },
++	{ 0x0e20, 0x00, 0, 0 },
++	{ 0x0e08, 0x10, 1, 0 },
++	{ 0x0e10, 0x52, 0, 0 },
++	{ 0x0494, 0x00, 0, 0 },
++	{ 0x04a0, 0x00, 0, 0 },
++	{ 0x0490, 0x0f, 0, 0 },
++	{ 0x0498, 0x08, 0, 0 },
++	{ 0x0494, 0x07, 0, 1 },
++	{ 0x0430, 0x00, 0, 0 },
++	{ 0x0400, 0x8e, 0, 0 },
++	{ 0x0438, 0xfe, 0, 0 },
++	{ 0x042c, 0x01, 0, 0 },
++	{ 0x0434, 0x0f, 0, 0 },
++	{ 0x041c, 0x0a, 0, 0 },
++	{ 0x0414, 0x60, 0, 0 },
++	{ 0x043c, 0xb8, 0, 0 },
++	{ 0x0404, 0x0c, 0, 0 },
++	{ 0x0420, 0x00, 0, 0 },
++	{ 0x0408, 0x10, 1, 0 },
++	{ 0x0410, 0x52, 0, 0 },
++	{ 0x0494, 0xd7, 2, 0 },
++	{ 0x045c, 0x00, 2, 0 },
++	{ 0x0460, 0xbd, 2, 0 },
++	{ 0x0464, 0x7f, 2, 0 },
++	{ 0x0894, 0x00, 0, 0 },
++	{ 0x08a0, 0x00, 0, 0 },
++	{ 0x0890, 0x0f, 0, 0 },
++	{ 0x0898, 0x08, 0, 0 },
++	{ 0x0894, 0x07, 0, 1 },
++	{ 0x0830, 0x00, 0, 0 },
++	{ 0x0800, 0x8e, 0, 0 },
++	{ 0x0838, 0xfe, 0, 0 },
++	{ 0x082c, 0x01, 0, 0 },
++	{ 0x0834, 0x0f, 0, 0 },
++	{ 0x081c, 0x0a, 0, 0 },
++	{ 0x0814, 0x60, 0, 0 },
++	{ 0x083c, 0xb8, 0, 0 },
++	{ 0x0804, 0x0c, 0, 0 },
++	{ 0x0820, 0x00, 0, 0 },
++	{ 0x0808, 0x10, 1, 0 },
++	{ 0x0810, 0x52, 0, 0 },
++	{ 0x0894, 0xd7, 2, 0 },
++	{ 0x085c, 0x00, 2, 0 },
++	{ 0x0860, 0xbd, 2, 0 },
++	{ 0x0864, 0x7f, 2, 0 },
++	{ 0x0c94, 0x00, 0, 0 },
++	{ 0x0ca0, 0x00, 0, 0 },
++	{ 0x0c90, 0x0f, 0, 0 },
++	{ 0x0c98, 0x08, 0, 0 },
++	{ 0x0c94, 0x07, 0, 1 },
++	{ 0x0c30, 0x00, 0, 0 },
++	{ 0x0c00, 0x8e, 0, 0 },
++	{ 0x0c38, 0xfe, 0, 0 },
++	{ 0x0c2c, 0x01, 0, 0 },
++	{ 0x0c34, 0x0f, 0, 0 },
++	{ 0x0c1c, 0x0a, 0, 0 },
++	{ 0x0c14, 0x60, 0, 0 },
++	{ 0x0c3c, 0xb8, 0, 0 },
++	{ 0x0c04, 0x0c, 0, 0 },
++	{ 0x0c20, 0x00, 0, 0 },
++	{ 0x0c08, 0x10, 1, 0 },
++	{ 0x0c10, 0x52, 0, 0 },
++	{ 0x0c94, 0xd7, 2, 0 },
++	{ 0x0c5c, 0x00, 2, 0 },
++	{ 0x0c60, 0xbd, 2, 0 },
++	{ 0x0c64, 0x7f, 2, 0 },
++};
++#define PC_CSIPHY_LANE_REGS_N (sizeof(pc_csiphy_lane_regs_x1e80100)/sizeof(pc_csiphy_lane_regs_x1e80100[0]))
++#endif
