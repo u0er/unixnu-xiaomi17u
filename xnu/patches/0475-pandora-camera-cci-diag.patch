@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..b3ecc9a
+index 0000000..ae603c5
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,4749 @@
+@@ -0,0 +1,4815 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -4196,15 +4196,102 @@ index 0000000..b3ecc9a
 +	(void)pandora_log_sync();
 +}
 +
++/* Arm CSID for one RX mux candidate: reset, RX_CFG0/1, RDI0 (payload-only,
++ * resolution independent), 2x AUP + RUP, RDI_CTRL=1. Returns the RDI base that
++ * latched, or 0 when the CSID reset never completed (then nothing was armed).
++ * RX_CFG0 = (csiphy_id << PHY_NUM_SEL(20)) | (lane_assign << 4) | (lane_cnt-1)
++ * per mainline camss-csid-gen2.c __csid_configure_rx, so csiphy0 contributes
++ * NO bit20: the earlier 0x00132103 selected csiphy1 and could never see data. */
++static uint32_t
++pc_sliceb_arm(vm_offset_t csid0, uint32_t rx_cfg0)
++{
++	uint32_t rdi_base = 0x5480u;
++	bool rdi_lite = false;
++	unsigned rst_done = 0;
++
++	pc_wr(csid0, 0x188, 0x9u);        /* TOP_IRQ_CLEAR: RST_DONE|BUF_DONE */
++	pc_wr(csid0, 0x184, 0x9u);        /* TOP_IRQ_MASK */
++	pc_wr(csid0, 0x1a8, 0x10000u);    /* BUF_DONE_IRQ_CLEAR: VC0 */
++	pc_wr(csid0, 0x1a4, 0x10000u);    /* BUF_DONE_IRQ_MASK: VC0 */
++	pc_wr(csid0, 0x110, 0x1u);        /* IRQ_CMD: clear */
++	pc_wr(csid0, 0x108, 0x11u);       /* RST_CFG */
++	pc_wr(csid0, 0x10c, 0x5u);        /* RST_CMD: HW_RST|IRQ_RST */
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		if (pc_rd(csid0, 0x180) & 0x1u) { rst_done = 1; break; }
++		pc_sleep(1);
++	}
++	printf("PANDORA SLICEB: CSID reset rst_done=%u top_irq=%#x\n",
++	    rst_done, pc_rd(csid0, 0x180));
++	(void)pandora_log_sync();
++	if (!rst_done)
++		return 0;
++
++	pc_wr(csid0, 0x880, rx_cfg0);     /* RX_CFG0: real csiphy input mux */
++	pc_wr(csid0, 0x884, 0x1u);        /* RX_CFG1: ECC_CORRECTION_EN */
++
++	/* RDI0 latch probe across non-lite 0x5480 / lite 0x3080 (same race the
++	 * proven TPG path documents); payload value is resolution independent. */
++	for (unsigned try = 0; try < 50; try++) {
++		pc_wr(csid0, 0x5480, 0x002bf160u);
++		if (pc_rd(csid0, 0x5480) == 0x002bf160u) {
++			rdi_base = 0x5480u; rdi_lite = false; break;
++		}
++		pc_wr(csid0, 0x3080, 0x002bf160u);
++		if (pc_rd(csid0, 0x3080) == 0x002bf160u) {
++			rdi_base = 0x3080u; rdi_lite = true; break;
++		}
++		pc_sleep(1);
++	}
++	pc_wr(csid0, rdi_base, 0x002bf160u);              /* RDI_CFG0: RAW10 VC0 */
++	pc_wr(csid0, rdi_base + 0x14, 0x8000u);           /* RDI_CFG1: MIPI packing */
++	if (!rdi_lite)
++		pc_wr(csid0, 0x5498, 0x9u);               /* PIX_STORE (non-lite) */
++	pc_wr(csid0, rdi_base + 0x8, 0x0u);               /* RDI_CTRL: 0 */
++	pc_wr(csid0, rdi_base, pc_rd(csid0, rdi_base) | 0x80000000u); /* EN */
++	for (unsigned i = 0; i < 2; i++) {
++		pc_wr(csid0, 0x118, 0x100u);   /* AUP_CMD: RDI0 */
++		pc_wr(csid0, 0x11c, 0x1u);     /* RUP_AUP_CMD: RUP_SET */
++	}
++	pc_wr(csid0, 0x114, 0x100u);       /* RUP_CMD: RDI0 */
++	pc_wr(csid0, 0x11c, 0x1u);         /* RUP_AUP_CMD: RUP_SET */
++	pc_wr(csid0, rdi_base + 0x8, 0x1u);               /* RDI_CTRL: RESUME */
++	pc_sleep(2);
++	printf("PANDORA SLICEB: RDI0 armed rx_cfg0=%#x cfg0=%#x ctrl=%#x base=%#x\n",
++	    rx_cfg0, pc_rd(csid0, rdi_base), pc_rd(csid0, rdi_base + 0x8), rdi_base);
++	(void)pandora_log_sync();
++	return rdi_base;
++}
++
++/* Watch the input-side frame boundary for iters ms. SOF/EOF live in the RDIN
++ * wrapper IRQ (@0x224) and do not need a capture buffer, so a positive result
++ * proves real MIPI data reached CSID without any VFE DMA. */
++static uint32_t
++pc_sliceb_poll(vm_offset_t csid0, unsigned iters, uint32_t *rx_out,
++    uint32_t *buf_out)
++{
++	uint32_t seen_rdi = 0, seen_rx = 0, seen_buf = 0;
++
++	for (unsigned i = 0; i < iters; i++) {
++		seen_rdi |= pc_rd(csid0, PC_RDIN_IRQ(0));
++		seen_rx |= pc_rd(csid0, 0x1b0);
++		seen_buf |= pc_rd(csid0, 0x1a0);
++		pc_sleep(1);
++	}
++	if (rx_out)
++		*rx_out = seen_rx;
++	if (buf_out)
++		*buf_out = seen_buf;
++	return seen_rdi;
++}
++
 +static void
 +pc_sliceb_stream(void)
 +{
 +	vm_offset_t csid0;
 +	uint8_t w_hi = 0, w_lo = 0, h_hi = 0, h_lo = 0;
 +	int rw0 = -1, rw1 = -1, rh0 = -1, rh1 = -1;
-+	uint32_t rdi_base = 0x5480u;
-+	bool rdi_lite = false;
-+	uint32_t seen_rdi = 0, last_rdi = 0, seen_rx = 0, seen_buf = 0;
++	uint32_t seen_rdi = 0, seen_rx = 0, seen_buf = 0;
++	uint32_t base = 0;
 +
 +	pc_csiphy_mark("slice B1 start: map CSID0 + sensor bus (BDISTM/TLMM/CCI0)");
 +	csid0 = ml_io_map_unmappable(PC_CSID0_PA, 0x5e80u, VM_WIMG_IO);
@@ -4246,80 +4333,58 @@ index 0000000..b3ecc9a
 +	pc_sliceb_stream_on(0);
 +	pc_sleep(2);
 +
-+	/* CSID reset: same sequence/values as the verified TPG slice. */
-+	pc_csiphy_mark("slice B1: CSID reset");
-+	pc_wr(csid0, 0x188, 0x9u);        /* TOP_IRQ_CLEAR: RST_DONE|BUF_DONE */
-+	pc_wr(csid0, 0x184, 0x9u);        /* TOP_IRQ_MASK */
-+	pc_wr(csid0, 0x1a8, 0x10000u);    /* BUF_DONE_IRQ_CLEAR: VC0 */
-+	pc_wr(csid0, 0x1a4, 0x10000u);    /* BUF_DONE_IRQ_MASK: VC0 */
-+	pc_wr(csid0, 0x110, 0x1u);        /* IRQ_CMD: clear */
-+	pc_wr(csid0, 0x108, 0x11u);       /* RST_CFG */
-+	pc_wr(csid0, 0x10c, 0x5u);        /* RST_CMD: HW_RST|IRQ_RST */
-+	unsigned rst_done = 0;
-+	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
-+		if (pc_rd(csid0, 0x180) & 0x1u) { rst_done = 1; break; }
-+		pc_sleep(1);
-+	}
-+	printf("PANDORA SLICEB: CSID reset rst_done=%u top_irq=%#x\n",
-+	    rst_done, pc_rd(csid0, 0x180));
-+	(void)pandora_log_sync();
-+	if (!rst_done) {
-+		pc_csiphy_mark("slice B1: CSID reset TIMEOUT - aborting (no RDI)");
-+		return;
-+	}
-+
-+	/* Real RX mux: PHY_NUM_SEL(csiphy0) + lane_assign 0x3210 + 4 lanes. */
-+	pc_csiphy_mark("slice B1: CSID real RX mux 0x00132103");
-+	pc_wr(csid0, 0x880, 0x00132103u);  /* RX_CFG0: real csiphy0 input */
-+	pc_wr(csid0, 0x884, 0x1u);         /* RX_CFG1: ECC_CORRECTION_EN */
-+
-+	/* RDI0: latch probe across non-lite 0x5480 / lite 0x3080 (same race and
-+	 * same resolution-independent payload as the proven TPG path). */
-+	for (unsigned try = 0; try < 50; try++) {
-+		pc_wr(csid0, 0x5480, 0x002bf160u);
-+		if (pc_rd(csid0, 0x5480) == 0x002bf160u) {
-+			rdi_base = 0x5480u; rdi_lite = false; break;
++	/* CSID mux candidates. PHY_NUM_SEL is csiphy_id (0 for csiphy0), so bit20
++	 * must be CLEAR -- the first trial wrote 0x00132103 and armed csiphy1,
++	 * which can never see this sensor. lane_assign for the real sensor is not
++	 * in the live DT (csiphy0 has no data-lanes child), so =3 sweeps both
++	 * documented encodings and keeps the csiphy1 values as controls. */
++	if (pc_csiphy >= 3u) {
++		static const struct {
++			uint32_t cfg;
++			const char *tag;
++		} cand[] = {
++			{ 0x00032103u, "phy0 assign0x3210" },
++			{ 0x00001393u, "phy0 assign0x0139" },
++			{ 0x00132103u, "phy1 assign0x3210 control" },
++			{ 0x00101393u, "phy1 assign0x0139 control" },
++		};
++		pc_csiphy_mark("slice B1: mux sweep (diag=3, 4 candidates x 500 ms)");
++		for (unsigned c = 0; c < (unsigned)(sizeof(cand) / sizeof(cand[0])); c++) {
++			pc_sliceb_stream_on(0);
++			pc_sleep(2);
++			seen_rdi = seen_rx = seen_buf = 0;
++			base = pc_sliceb_arm(csid0, cand[c].cfg);
++			if (!base) {
++				printf("PANDORA SLICEB: cand[%u] %s -> CSID reset timeout\n",
++				    c, cand[c].tag);
++				(void)pandora_log_sync();
++				continue;
++			}
++			pc_sliceb_stream_on(1);
++			seen_rdi = pc_sliceb_poll(csid0, 500, &seen_rx, &seen_buf);
++			printf("PANDORA SLICEB: cand[%u] %s rdi=%#x rx=%#x buf=%#x "
++			    "sof=%u eof=%u\n", c, cand[c].tag, seen_rdi, seen_rx, seen_buf,
++			    (seen_rdi & PC_RDIN_INPUT_SOF) ? 1u : 0u,
++			    (seen_rdi & PC_RDIN_INPUT_EOF) ? 1u : 0u);
++			(void)pandora_log_sync();
++			if (seen_rdi & (PC_RDIN_INPUT_SOF | PC_RDIN_INPUT_EOF))
++				break;
 +		}
-+		pc_wr(csid0, 0x3080, 0x002bf160u);
-+		if (pc_rd(csid0, 0x3080) == 0x002bf160u) {
-+			rdi_base = 0x3080u; rdi_lite = true; break;
++	} else {
++		/* Single-variable B1 (=2): the fact-corrected mux only. */
++		pc_csiphy_mark("slice B1: arm CSID real RX mux 0x00032103");
++		base = pc_sliceb_arm(csid0, 0x00032103u);
++		if (base) {
++			pc_csiphy_mark("slice B1: sensor stream on (source last)");
++			pc_sliceb_stream_on(1);
++			pc_csiphy_mark("slice B1: polling RDIN IRQ (SOF/EOF/RUP) + RX + BUF_DONE");
++			seen_rdi = pc_sliceb_poll(csid0, 800, &seen_rx, &seen_buf);
++		} else {
++			pc_csiphy_mark("slice B1: CSID reset TIMEOUT - aborting (no RDI)");
 +		}
-+		pc_sleep(1);
 +	}
-+	printf("PANDORA SLICEB: RDI latch base=%#x lite=%u\n", rdi_base,
-+	    (unsigned)rdi_lite);
-+	(void)pandora_log_sync();
-+	pc_wr(csid0, rdi_base, 0x002bf160u);              /* RDI_CFG0: RAW10 VC0 */
-+	pc_wr(csid0, rdi_base + 0x14, 0x8000u);           /* RDI_CFG1: MIPI packing */
-+	if (!rdi_lite)
-+		pc_wr(csid0, 0x5498, 0x9u);               /* PIX_STORE (non-lite) */
-+	pc_wr(csid0, rdi_base + 0x8, 0x0u);               /* RDI_CTRL: 0 */
-+	pc_wr(csid0, rdi_base, pc_rd(csid0, rdi_base) | 0x80000000u); /* EN */
-+	for (unsigned i = 0; i < 2; i++) {
-+		pc_wr(csid0, 0x118, 0x100u);   /* AUP_CMD: RDI0 */
-+		pc_wr(csid0, 0x11c, 0x1u);     /* RUP_AUP_CMD: RUP_SET */
-+	}
-+	pc_wr(csid0, 0x114, 0x100u);       /* RUP_CMD: RDI0 */
-+	pc_wr(csid0, 0x11c, 0x1u);         /* RUP_AUP_CMD: RUP_SET */
-+	pc_wr(csid0, rdi_base + 0x8, 0x1u);               /* RDI_CTRL: START */
-+	pc_sleep(2);
-+	printf("PANDORA SLICEB: RDI0 armed cfg0=%#x ctrl=%#x rx_cfg0=%#x\n",
-+	    pc_rd(csid0, rdi_base), pc_rd(csid0, rdi_base + 0x8), pc_rd(csid0, 0x880));
-+	(void)pandora_log_sync();
-+
-+	/* Source last: stream-on, then watch the input-side frame boundary. */
-+	pc_csiphy_mark("slice B1: sensor stream on (source last)");
-+	pc_sliceb_stream_on(1);
-+	pc_csiphy_mark("slice B1: polling RDIN IRQ (SOF/EOF/RUP) + RX + BUF_DONE");
-+	for (unsigned i = 0; i < 800; i++) {
-+		last_rdi = pc_rd(csid0, PC_RDIN_IRQ(0));
-+		seen_rdi |= last_rdi;
-+		seen_rx |= pc_rd(csid0, 0x1b0);
-+		seen_buf |= pc_rd(csid0, 0x1a0);
-+		pc_sleep(1);
-+	}
-+	printf("PANDORA SLICEB: RESULT rdi_irq=%#x last=%#x rx_irq=%#x buf_done=%#x "
-+	    "sof=%u eof=%u rup=%u\n", seen_rdi, last_rdi, seen_rx, seen_buf,
++	printf("PANDORA SLICEB: RESULT rdi_irq=%#x rx_irq=%#x buf_done=%#x "
++	    "sof=%u eof=%u rup=%u\n", seen_rdi, seen_rx, seen_buf,
 +	    (seen_rdi & PC_RDIN_INPUT_SOF) ? 1u : 0u,
 +	    (seen_rdi & PC_RDIN_INPUT_EOF) ? 1u : 0u,
 +	    (seen_rdi & PC_RDIN_RUP_DONE) ? 1u : 0u);
@@ -4330,7 +4395,8 @@ index 0000000..b3ecc9a
 +
 +	pc_csiphy_mark("slice B1: stop (stream off + RDI0 stop; no teardown)");
 +	pc_sliceb_stream_on(0);
-+	pc_wr(csid0, rdi_base + 0x8, 0x0u);
++	if (base)
++		pc_wr(csid0, base + 0x8, 0x0u);
 +	pc_sleep(1);
 +	pc_csiphy_mark("slice B1 done (PHY+sensor parked; VFE DMA/FRAME_INCR is B2)");
 +}
