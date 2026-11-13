@@ -20,9 +20,10 @@ synchronization points. Read it before acting; update your row after acting.
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
 | Qoder | Qoder | Camera real frame: CSIPHY0 slice A PASS | a72ec2e6 (0475 pandora_csiphy=1, stride fix) | 43402707402 SUCCESS | released | slice A up no-fault; next slice B (CSID real mux + frame) |
-| CodeArts | CodeArts | SPMI v8 BT_EN pulse | 485c6e58 (0476 v8) | 43416147218 success | not held | w50: pulse OK (apid 2234/ee0), 2ms then HCI -> too early; next wait 200ms |
+| CodeArts | CodeArts | BT_EN 200ms wait (local) | 485c6e58 (0476 v8; 200ms not pushed) | 43416147218 success | not held | w51 ready locally; other window: push 0476 + dispatch (see BLUETOOTH_HANDOFF_NEXT_2026-11-13.md) |
 
 ## Notes
+- 0476 local revision (2026-11-13 ~11:50Z): BT_EN high -> bt_sleep(200) before HCI (was 10 ms). NOT pushed yet. Handoff: outputs/data-a-live-nezha/docs/BLUETOOTH_HANDOFF_NEXT_2026-11-13.md. Last verified state: w50 pulse OK (apid 2234/ee0), HCI silent at 2 ms.
 - 0476 TLMM fix: commit **97794c79** (blob `1b0d95a7`). `main` HEAD moves with every push —
   always GET `/repos/u0er/unixnu-xiaomi17u/commits/main` instead of trusting this line.
 - 0476 SEA root cause is **not** halt/SE5: w41 `_bt_report+0xac` and w42 `_bt_report+0xd0` both fault on
