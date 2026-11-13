@@ -20,7 +20,7 @@ synchronization points. Read it before acting; update your row after acting.
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
 | Qoder | Qoder | Camera real frame: CSIPHY0 slice A | a72ec2e6 (0475 pandora_csiphy=1, stride fix) | 43402707402 SUCCESS | waiting (device in iOS) | img ready; trial when device back to Android+free+consent |
-| CodeArts | CodeArts | BT RTS polarity fix | 1592ede1 (0476 RTS low) | 43395561321 success | CodeArts (BT trial w48 in progress) | boot sent; analyzing log |
+| CodeArts | CodeArts | BT RTS polarity fix | 1592ede1 (0476 RTS low) | 43395561321 success | not held (trial done) | w48: still no HCI; cts_in 0, rx_in 0; next BT_EN reset pulse or IO dump |
 
 ## Notes
 - 0476 TLMM fix: commit **97794c79** (blob `1b0d95a7`). `main` HEAD moves with every push —
