@@ -20,7 +20,7 @@ synchronization points. Read it before acting; update your row after acting.
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
 | Qoder | Qoder | Camera real frame: CSIPHY0 slice A PASS | a72ec2e6 (0475 pandora_csiphy=1, stride fix) | 43402707402 SUCCESS | released | slice A up no-fault; next slice B (CSID real mux + frame) |
-| CodeArts | CodeArts | SPMI v8 BT_EN pulse | 485c6e58 (0476 v8) | 43416147218 in_progress | not held | build w50; then pandora_bt=2 trial |
+| CodeArts | CodeArts | SPMI v8 BT_EN pulse | 485c6e58 (0476 v8) | 43416147218 success | not held | w50: pulse OK (apid 2234/ee0), 2ms then HCI -> too early; next wait 200ms |
 
 ## Notes
 - 0476 TLMM fix: commit **97794c79** (blob `1b0d95a7`). `main` HEAD moves with every push —
