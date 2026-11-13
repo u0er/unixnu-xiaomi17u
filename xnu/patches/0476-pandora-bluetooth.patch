@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..247e678
+index 0000000..008e6a1
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,538 @@
+@@ -0,0 +1,557 @@
 +/*
 + * PANDORA Bluetooth: the WCN786x BT core on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -55,6 +55,7 @@ index 0000000..247e678
 +extern kern_return_t thread_terminate(thread_t);
 +extern int pandora_rpmh_resource(const char *, uint32_t, uint32_t);
 +extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern bool pandora_log_sync(void);
 +void pandora_bt_init(void);
 +
 +/* Physical windows. One page each: the vote register, the RCG and branch
@@ -254,6 +255,7 @@ index 0000000..247e678
 +	}
 +	printf("PANDORA BT: SE5 RCG cfg %#x m %u n %u d %u (src %u mode %u pre %u) -> %llu Hz\n",
 +	    cfg, m, n, d, src, mode, pre, rate);
++	pandora_log_sync();
 +	return (unsigned)rate;
 +}
 +
@@ -285,28 +287,40 @@ index 0000000..247e678
 +static void
 +bt_report(void)
 +{
-+	printf("PANDORA BT: rpt vote+halts\n");
++	/* vote (GCC), RCG cmd (GCC) and the TLMM pins are always-on space: safe to
++	 * read even with wrapper3 powered off. The branch-halt and SE5 registers
++	 * are not: reading them with the domain off raises a synchronous external
++	 * abort. Gate those behind the vote actually being asserted. */
 +	uint32_t vote = bt_rd(BT_W_VOTE, BT_VOTE);
-+	printf("PANDORA BT: wrapper3 vote %#x (want %#x); halts m_ahb %#x s_ahb %#x core %#x core2x %#x se5 %#x\n",
-+	    vote, BT_VOTE_BITS, bt_rd(BT_W_HALT, BT_HALT_M_AHB), bt_rd(BT_W_HALT, BT_HALT_S_AHB),
-+	    bt_rd(BT_W_HALT, BT_HALT_CORE), bt_rd(BT_W_HALT, BT_HALT_CORE2X), bt_rd(BT_W_RCG, BT_SE5_HALT));
-+	printf("PANDORA BT: rpt rcgcmd\n");
++	printf("PANDORA BT: wrapper3 vote %#x (want %#x)\n", vote, BT_VOTE_BITS);
++	pandora_log_sync();
 +	printf("PANDORA BT: RCG cmd %#x; SE5 rate %u Hz\n", bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CMD), bt_rate);
-+	printf("PANDORA BT: rpt pins\n");
++	pandora_log_sync();
 +	printf("PANDORA BT: pins 18 %#x, cts %#x rts %#x tx %#x rx %#x\n",
 +	    bt_rd(BT_W_SWCTRL, 0), bt_pin_ctl(24), bt_pin_ctl(25), bt_pin_ctl(26), bt_pin_ctl(27));
-+	printf("PANDORA BT: rpt seclk\n");
-+	if (!bt_se_clocked()) {
-+		printf("PANDORA BT: SE5 unclocked at this point; its registers are not read\n");
++	pandora_log_sync();
++	if ((vote & BT_VOTE_BITS) != BT_VOTE_BITS) {
++		printf("PANDORA BT: wrapper3 not voted on; halt/SE registers not read (domain off)\n");
++		pandora_log_sync();
 +		return;
 +	}
-+	printf("PANDORA BT: rpt se regs\n");
++	printf("PANDORA BT: halts m_ahb %#x s_ahb %#x core %#x core2x %#x se5 %#x\n",
++	    bt_rd(BT_W_HALT, BT_HALT_M_AHB), bt_rd(BT_W_HALT, BT_HALT_S_AHB),
++	    bt_rd(BT_W_HALT, BT_HALT_CORE), bt_rd(BT_W_HALT, BT_HALT_CORE2X), bt_rd(BT_W_RCG, BT_SE5_HALT));
++	pandora_log_sync();
++	if (!bt_se_clocked()) {
++		printf("PANDORA BT: SE5 unclocked at this point; its registers are not read\n");
++		pandora_log_sync();
++		return;
++	}
 +	printf("PANDORA BT: SE status %#x fw %#x if_disable %#x clk_sel %#x hw_param0 %#x dma %#x\n",
 +	    bt_rd(BT_W_SE, SE_STATUS), bt_rd(BT_W_SE, SE_FW_REV), bt_rd(BT_W_SE, SE_IF_DISABLE),
 +	    bt_rd(BT_W_SE, SE_CLK_SEL), bt_rd(BT_W_SE, SE_HW_PARAM0), bt_rd(BT_W_SE, SE_DMA_MODE));
++	pandora_log_sync();
 +	printf("PANDORA BT: SE M_CMD0 %#x M_IRQ %#x S_CMD0 %#x S_IRQ %#x tx_fifo %#x rx_fifo %#x\n",
 +	    bt_rd(BT_W_SE, SE_M_CMD0), bt_rd(BT_W_SE, SE_M_IRQ), bt_rd(BT_W_SE, SE_S_CMD0),
 +	    bt_rd(BT_W_SE, SE_S_IRQ), bt_rd(BT_W_SE, SE_TX_FIFO_ST), bt_rd(BT_W_SE, SE_RX_FIFO_ST));
++	pandora_log_sync();
 +}
 +
 +/* The DT's bt-vdd-* supplies, in the vendor btpower table's order. */
@@ -506,14 +520,17 @@ index 0000000..247e678
 +	(void)arg;
 +	(void)result;
 +	printf("PANDORA BT: thread start level=%d\n", bt_level);
++	pandora_log_sync();
 +	if (bt_map_all()) {
 +		printf("PANDORA BT: map_all FAILED\n");
++		pandora_log_sync();
 +		goto out;
 +	}
 +	printf("PANDORA BT: mapped vote=%#llx rcg=%#llx halt=%#llx se=%#llx sw=%#llx uart=%#llx\n",
 +	    (unsigned long long)bt_wins[BT_W_VOTE].va, (unsigned long long)bt_wins[BT_W_RCG].va,
 +	    (unsigned long long)bt_wins[BT_W_HALT].va, (unsigned long long)bt_wins[BT_W_SE].va,
 +	    (unsigned long long)bt_wins[BT_W_SWCTRL].va, (unsigned long long)bt_wins[BT_W_UART].va);
++	pandora_log_sync();
 +	if (bt_level >= 2) {
 +		if (bt_power()) {
 +			bt_report();
@@ -536,8 +553,10 @@ index 0000000..247e678
 +		bt_rate = bt_rcg_rate();
 +	}
 +	printf("PANDORA BT: about to report\n");
++	pandora_log_sync();
 +	bt_report();
 +out:
++	pandora_log_sync();
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
