@@ -20,7 +20,7 @@ synchronization points. Read it before acting; update your row after acting.
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
 | Qoder | Qoder | Camera real frame: CSIPHY0 slice A | a72ec2e6 (0475 pandora_csiphy=1, stride fix) | 43402707402 SUCCESS | HELD (CSIPHY trial) | trialling pandora_csiphy=1 now; release after fetch |
-| CodeArts | CodeArts | BT_EN SPMI pulse (v8 blocked) | 88b18b99 (0476 BT_EN) | 43408404258 success | not held | w49: arbiter v8 -> pulse skipped, no HCI; next: Android disable/enable edge OR SPMI v8 |
+| CodeArts | CodeArts | SPMI v8 BT_EN pulse | 485c6e58 (0476 v8) | 43416147218 in_progress | not held | build w50; then pandora_bt=2 trial |
 
 ## Notes
 - 0476 TLMM fix: commit **97794c79** (blob `1b0d95a7`). `main` HEAD moves with every push —
