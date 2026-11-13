@@ -13,9 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
+index 0000000..247e678
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,524 @@
+@@ -0,0 +1,538 @@
 +/*
 + * PANDORA Bluetooth: the WCN786x BT core on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -237,6 +238,7 @@ new file mode 100644
 +static unsigned
 +bt_rcg_rate(void)
 +{
++	printf("PANDORA BT: rcg cfg read\n");
 +	uint32_t cfg = bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CFG);
 +	uint32_t m = bt_rd(BT_W_RCG, BT_RCG + BT_RCG_M);
 +	uint32_t n = bt_rd(BT_W_RCG, BT_RCG + BT_RCG_N);
@@ -283,17 +285,22 @@ new file mode 100644
 +static void
 +bt_report(void)
 +{
++	printf("PANDORA BT: rpt vote+halts\n");
 +	uint32_t vote = bt_rd(BT_W_VOTE, BT_VOTE);
 +	printf("PANDORA BT: wrapper3 vote %#x (want %#x); halts m_ahb %#x s_ahb %#x core %#x core2x %#x se5 %#x\n",
 +	    vote, BT_VOTE_BITS, bt_rd(BT_W_HALT, BT_HALT_M_AHB), bt_rd(BT_W_HALT, BT_HALT_S_AHB),
 +	    bt_rd(BT_W_HALT, BT_HALT_CORE), bt_rd(BT_W_HALT, BT_HALT_CORE2X), bt_rd(BT_W_RCG, BT_SE5_HALT));
++	printf("PANDORA BT: rpt rcgcmd\n");
 +	printf("PANDORA BT: RCG cmd %#x; SE5 rate %u Hz\n", bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CMD), bt_rate);
++	printf("PANDORA BT: rpt pins\n");
 +	printf("PANDORA BT: pins 18 %#x, cts %#x rts %#x tx %#x rx %#x\n",
 +	    bt_rd(BT_W_SWCTRL, 0), bt_pin_ctl(24), bt_pin_ctl(25), bt_pin_ctl(26), bt_pin_ctl(27));
++	printf("PANDORA BT: rpt seclk\n");
 +	if (!bt_se_clocked()) {
 +		printf("PANDORA BT: SE5 unclocked at this point; its registers are not read\n");
 +		return;
 +	}
++	printf("PANDORA BT: rpt se regs\n");
 +	printf("PANDORA BT: SE status %#x fw %#x if_disable %#x clk_sel %#x hw_param0 %#x dma %#x\n",
 +	    bt_rd(BT_W_SE, SE_STATUS), bt_rd(BT_W_SE, SE_FW_REV), bt_rd(BT_W_SE, SE_IF_DISABLE),
 +	    bt_rd(BT_W_SE, SE_CLK_SEL), bt_rd(BT_W_SE, SE_HW_PARAM0), bt_rd(BT_W_SE, SE_DMA_MODE));
@@ -498,9 +505,15 @@ new file mode 100644
 +{
 +	(void)arg;
 +	(void)result;
++	printf("PANDORA BT: thread start level=%d\n", bt_level);
 +	if (bt_map_all()) {
++		printf("PANDORA BT: map_all FAILED\n");
 +		goto out;
 +	}
++	printf("PANDORA BT: mapped vote=%#llx rcg=%#llx halt=%#llx se=%#llx sw=%#llx uart=%#llx\n",
++	    (unsigned long long)bt_wins[BT_W_VOTE].va, (unsigned long long)bt_wins[BT_W_RCG].va,
++	    (unsigned long long)bt_wins[BT_W_HALT].va, (unsigned long long)bt_wins[BT_W_SE].va,
++	    (unsigned long long)bt_wins[BT_W_SWCTRL].va, (unsigned long long)bt_wins[BT_W_UART].va);
 +	if (bt_level >= 2) {
 +		if (bt_power()) {
 +			bt_report();
@@ -519,8 +532,10 @@ new file mode 100644
 +			bt_try_hci_reset();
 +		}
 +	} else {
++		printf("PANDORA BT: about to read RCG\n");
 +		bt_rate = bt_rcg_rate();
 +	}
++	printf("PANDORA BT: about to report\n");
 +	bt_report();
 +out:
 +	(void)thread_terminate(current_thread());
