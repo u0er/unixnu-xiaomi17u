@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..174d7de
+index 0000000..b991396
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,4974 @@
+@@ -0,0 +1,5014 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -4433,6 +4433,42 @@ index 0000000..174d7de
 +	pc_csiphy_mark("wtest done (sensor left in standby)");
 +}
 +
++/* Reset-effect probe (pandora_csiphy=6): "write ACKed but inert" and "readback
++ * unreliable" look identical until a write has an observable side effect.
++ * 0x0103 is the sensor software-reset register; a real write clears the PLL
++ * registers (0x0301 read 0x40), while the chip ID must survive the reset. */
++static void
++pc_sliceb_rtest(void)
++{
++	int ret = 0;
++	uint8_t id0, pll0, rst0, id1, pll1, rst1;
++
++	pc_csiphy_mark("rtest start: map sensor bus");
++	pc_bdistm = ml_io_map_unmappable(PC_BDISTM_PA, 0x6000u, VM_WIMG_IO);
++	pc_tlmm = ml_io_map_unmappable(PC_TLMM_PA, 0xb0000u, VM_WIMG_IO);
++	pc_cci[0] = ml_io_map_unmappable(PC_CCI_PA(0), 0x1000u, VM_WIMG_IO);
++	if (!pc_bdistm || !pc_tlmm || !pc_cci[0] || !pc_camcc) {
++		printf("PANDORA SLICEB: rtest map failed\n");
++		(void)pandora_log_sync();
++		return;
++	}
++	(void)pc_sensor_power_up();
++	pc_sleep(20);
++
++	id0 = pc_sliceb_rd8(0x300au, &ret);
++	pll0 = pc_sliceb_rd8(0x0301u, &ret);
++	rst0 = pc_sliceb_rd8(0x0103u, &ret);
++	printf("PANDORA SLICEB: rtest before id=%#x pll=%#x rst=%#x\n", id0, pll0, rst0);
++	pc_sliceb_wprobe(0x0103u, 0x0001u, 1u, "reset-8bit");
++	pc_sleep(100);
++	id1 = pc_sliceb_rd8(0x300au, &ret);
++	pll1 = pc_sliceb_rd8(0x0301u, &ret);
++	rst1 = pc_sliceb_rd8(0x0103u, &ret);
++	printf("PANDORA SLICEB: rtest after id=%#x pll=%#x rst=%#x id_changed=%u "
++	    "pll_changed=%u\n", id1, pll1, rst1, id0 != id1, pll0 != pll1);
++	pc_csiphy_mark("rtest done (verdict: pll_changed=1 means writes reach the sensor)");
++}
++
 +static void
 +pc_sliceb_stream(void)
 +{
@@ -4446,8 +4482,12 @@ index 0000000..174d7de
 +		pc_sliceb_diag();
 +		return;
 +	}
-+	if (pc_csiphy >= 5u) {
++	if (pc_csiphy == 5u) {
 +		pc_sliceb_wtest();
++		return;
++	}
++	if (pc_csiphy >= 6u) {
++		pc_sliceb_rtest();
 +		return;
 +	}
 +
