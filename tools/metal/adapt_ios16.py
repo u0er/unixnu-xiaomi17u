@@ -244,6 +244,11 @@ static BOOL pandoraConforms(Class cls,Protocol *protocol) {
  for(Class c=cls;c;c=class_getSuperclass(c))if(class_conformsToProtocol(c,protocol))return YES;
  return NO;
 }
+// A method entry whose IMP is NULL answers methodForSelector: with NULL, and a caller that
+// caches IMPs and calls directly (RenderBox) dies at pc 0 - the inherited _MTLDevice on this
+// OS carries such entries (the pinned tree already special-cases targetDeviceInfo for the
+// same reason). Forward them instead: missingSignature/answerMissing answer nil and note it.
+extern "C" void _objc_msgForward(void);
 #define PANDORA_ASKED_METHODS \\
 - (BOOL)respondsToSelector:(SEL)sel { \\
  if(class_respondsToSelector(object_getClass(self),sel))return YES; \\
@@ -254,8 +259,9 @@ static BOOL pandoraConforms(Class cls,Protocol *protocol) {
  pandoraAsked(1,object_getClass(self),(__bridge const void *)protocol,protocol_getName(protocol));return NO; \\
 } \\
 - (IMP)methodForSelector:(SEL)sel { \\
- if(!class_respondsToSelector(object_getClass(self),sel))pandoraAsked(2,object_getClass(self),sel,sel_getName(sel)); \\
- return class_getMethodImplementation(object_getClass(self),sel); \\
+ IMP imp=class_getMethodImplementation(object_getClass(self),sel); \\
+ if(!imp)pandoraAsked(2,object_getClass(self),sel,sel_getName(sel)); \\
+ return imp?imp:(IMP)_objc_msgForward; \\
 }
 @implementation NBObject
 PANDORA_ASKED_METHODS
@@ -270,7 +276,18 @@ edit('NativeBridgeMetalFrontend.mm',
 - (NSString *)name {return gName;}
 """,
      """@implementation NBDeviceMethods
-PANDORA_ASKED_METHODS   // data-a-live: copied onto the device class with the rest (native_bridge_metal_open)
+// data-a-live: the device class logs the questions its own overrides answer (the pinned tree
+// already overrides respondsToSelector: here); methodForSelector: forwards a NULL IMP instead
+// of handing one to a caller that calls it directly.
+- (BOOL)conformsToProtocol:(Protocol *)protocol {
+ if(pandoraConforms(object_getClass(self),protocol))return YES;
+ pandoraAsked(1,object_getClass(self),(__bridge const void *)protocol,protocol_getName(protocol));return NO;
+}
+- (IMP)methodForSelector:(SEL)sel {
+ IMP imp=class_getMethodImplementation(object_getClass(self),sel);
+ if(!imp)pandoraAsked(2,object_getClass(self),sel,sel_getName(sel));
+ return imp?imp:(IMP)_objc_msgForward;
+}
 - (NSString *)name {return gName;}
 """)
 
