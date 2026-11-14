@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..008e6a1
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,719 @@
+@@ -0,0 +1,738 @@
 +/*
 + * PANDORA Bluetooth: the WCN786x BT core on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -425,6 +425,24 @@ index 0000000..008e6a1
 +	return false;
 +}
 +
++/* RPMh RF_CLK1 (DT clocks = <&rpmhcc 6>, clock-names "bt_rf_clk1"): btpower
++ * enables it before opening the UART. Without the RF clock the WCN BT
++ * subsystem stays quiet even with BT_EN high. The CMD-DB name is tried
++ * in the few spellings an 8-byte RPMh resource name allows. */
++static int
++bt_rf_clk(void)
++{
++	static const char *names[] = { "rf_clk1", "rfclk1", "clk1", "rf_clk" };
++	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		if (pandora_rpmh_resource(names[i], 0, 1) == 0) {
++			printf("PANDORA BT: RF clock voted via %s\n", names[i]);
++			return 0;
++		}
++	}
++	printf("PANDORA BT: RF clock not found in CMD-DB\n");
++	return ENOENT;
++}
++
 +static int
 +bt_en_pulse(void)
 +{
@@ -695,6 +713,7 @@ index 0000000..008e6a1
 +		}
 +		/* A low->high edge on PMH0104 GPIO5 is what btpower does before it
 +		 * opens the UART; failure here is reported and the rest still runs. */
++		(void)bt_rf_clk();
 +		(void)bt_en_pulse();
 +		/* CTS in, RTS out LOW (the asserted "ready to receive" level Android
 +		 * shows), TX out high, RX in; the UART mux is function 1. */
