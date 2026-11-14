@@ -79,10 +79,6 @@ jobs:
           python3 tools/turnip/pandora_bo_finish_order.py mesa
           # Autotune: prefer GMEM when samples are unavailable; tune small RPs.
           python3 tools/turnip/pandora_autotune.py mesa
-          # Accept imported LINEAR image pitches (16-byte-aligned IOSurface 160/176) and exempt
-          # external linear/DRM-modifier images from dedicated allocation, so the runtime stops
-          # shadow-copying whole surfaces (~108k copies/90s); tiled paths keep the strict checks.
-          python3 tools/turnip/pandora_linear_pitch.py mesa
           ls nativeadreno/NativeAdrenoABI.h
           # 128 IBs per submission, as the kernel takes them (0194): Turnip no longer splits larger ones.
           python3 tools/turnip/abi_128.py nativeadreno/NativeAdrenoABI.h
