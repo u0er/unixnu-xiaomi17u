@@ -215,6 +215,81 @@ edit('NativeBridgeMetalFrontend.mm',
 }
 """)
 
+edit('NativeBridgeMetalFrontend.mm',
+     """#include <unordered_map>
+""",
+     """#include <unordered_map>
+#include <unordered_set>
+#include <atomic>
+""")
+
+edit('NativeBridgeMetalFrontend.mm',
+     """@implementation NBObject
+""",
+     """// data-a-live: a question a client asked a bridge object and got NO for (respondsToSelector: and the like), logged once per
+// (question, class, name) into the unified log, at most 400 a process (tools/metal/adapt_ios16.py, conformance step 1).
+static void pandoraAsked(unsigned how,Class cls,const void *what,const char *name) {
+ static const char *const hows[]={"responds","conforms","methodFor"};
+ static std::mutex lock;
+ static std::unordered_set<uint64_t> seen;
+ static std::atomic<bool> full{false};
+ if(full.load(std::memory_order_relaxed))return;
+ const uint64_t key=((uint64_t)(uintptr_t)cls*1000003u)^((uint64_t)(uintptr_t)what<<2)^how;
+ {std::lock_guard<std::mutex> hold(lock);
+  if(!seen.insert(key).second)return;
+  if(seen.size()>=400)full=true;}
+ NSLog(@"pandora-metal asked: %s %s %s -> NO",hows[how],class_getName(cls),name);
+}
+static BOOL pandoraConforms(Class cls,Protocol *protocol) {
+ for(Class c=cls;c;c=class_getSuperclass(c))if(class_conformsToProtocol(c,protocol))return YES;
+ return NO;
+}
+#define PANDORA_ASKED_METHODS \\
+- (BOOL)respondsToSelector:(SEL)sel { \\
+ if(class_respondsToSelector(object_getClass(self),sel))return YES; \\
+ pandoraAsked(0,object_getClass(self),sel,sel_getName(sel));return NO; \\
+} \\
+- (BOOL)conformsToProtocol:(Protocol *)protocol { \\
+ if(pandoraConforms(object_getClass(self),protocol))return YES; \\
+ pandoraAsked(1,object_getClass(self),(__bridge const void *)protocol,protocol_getName(protocol));return NO; \\
+} \\
+- (IMP)methodForSelector:(SEL)sel { \\
+ if(!class_respondsToSelector(object_getClass(self),sel))pandoraAsked(2,object_getClass(self),sel,sel_getName(sel)); \\
+ return class_getMethodImplementation(object_getClass(self),sel); \\
+}
+@implementation NBObject
+PANDORA_ASKED_METHODS
++ (BOOL)instancesRespondToSelector:(SEL)sel {
+ if(class_respondsToSelector(self,sel))return YES;
+ pandoraAsked(0,self,sel,sel_getName(sel));return NO;
+}
+""")
+
+edit('NativeBridgeMetalFrontend.mm',
+     """@implementation NBDeviceMethods
+- (NSString *)name {return gName;}
+""",
+     """@implementation NBDeviceMethods
+PANDORA_ASKED_METHODS   // data-a-live: copied onto the device class with the rest (native_bridge_metal_open)
+- (NSString *)name {return gName;}
+""")
+
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(Protocol *spi=objc_getProtocol("MTLDeviceSPI"))class_addProtocol(cls,spi);
+""",
+     """ if(Protocol *spi=objc_getProtocol("MTLDeviceSPI"))class_addProtocol(cls,spi);
+ // data-a-live: every other bridge class adopts its public Metal protocol too (tools/metal/adapt_ios16.py, conformance step 1).
+ const struct {const char *cls;Protocol *protocol;} adopted[]={
+  {"NBQueue",@protocol(MTLCommandQueue)},{"NBCommandBuffer",@protocol(MTLCommandBuffer)},
+  {"NBRenderEncoder",@protocol(MTLRenderCommandEncoder)},{"NBComputeEncoder",@protocol(MTLComputeCommandEncoder)},
+  {"NBBlitEncoder",@protocol(MTLBlitCommandEncoder)},{"NBTexture",@protocol(MTLTexture)},{"NBBuffer",@protocol(MTLBuffer)},
+  {"NBHeap",@protocol(MTLHeap)},{"NBLibrary",@protocol(MTLLibrary)},{"NBFunction",@protocol(MTLFunction)},
+  {"NBRenderPipeline",@protocol(MTLRenderPipelineState)},{"NBComputePipeline",@protocol(MTLComputePipelineState)},
+  {"NBSampler",@protocol(MTLSamplerState)},{"NBDepthStencil",@protocol(MTLDepthStencilState)},{"NBEvent",@protocol(MTLEvent)},
+  {"NBSharedEvent",@protocol(MTLSharedEvent)},{"NBFence",@protocol(MTLFence)},{"NBBinaryArchive",@protocol(MTLBinaryArchive)}};
+ for(const auto &a:adopted)if(Class c=objc_getClass(a.cls))class_addProtocol(c,a.protocol);
+""")
+
 edit('NativeAdrenoMetalPlugin.mm',
      """    char turnip[1024];
     if (!turnip::libraryPath""",
