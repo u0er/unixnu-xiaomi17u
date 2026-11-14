@@ -184,6 +184,11 @@ ADT 里的 extent 数组带预留零槽，比较时必须按有效区间解析�
 不能从 MODE/SOURCE 配置读回推断模拟电压；本次也尚未确认 GPIO6 的运行时配置。
 现在的证据足以继续软件隔离，没有重新引入“必须逻辑分析仪”的前置条件。
 
+接收 sequencer 的 S_IRQ=0xc00（489、500 行）也应保留：Linux UART 驱动把
+GP IRQ1/2 分别放在丢弃错误接收数据 / break 处理分支。它支持继续检查接收链路，
+但不是一份 HCI 包，更不能单独判定控制器已启动或损坏。内部回环会在切换到内部
+接收后清除旧 IRQ，再记录本次状态，避免把外部 RX 持续低造成的状态沿用为判据。
+
 ### 下一候选：level 7 内部回环
 
 `pandora_bt=7` 是独立诊断模式：仅打开 QUP 时钟并配置 UART，不投 BT rail、不脉冲
@@ -199,3 +204,12 @@ BT_EN、不修改 TLMM mux，也不发送 HCI Reset。使用上游驱动相同�
 芯片已启动、外部走线正确或绝对波特率准确；FAIL 则优先检查 AP 串口路径。
 level 7 已通过 ARM64 单文件编译并同步 0476，完整构建和设备结果须单独记录。
 本次用户只授权了上面的 level 2 启动，未据此执行第二次 boot。
+
+level 7 完整构建 **43653645421 成功**，仍在独立蓝牙分支，main 未改动。
+产物内已确认回环诊断字符串，主机打包已完成：
+`D:/turnip-local/newboot/bt-no-analyzer-20261115/level7/loader/nezha-loader-boot.img`，
+17,285,120 字节，90 秒自动返回。它继承 level 2 已实机使用的全部 root/FW/log 映射和
+trust cache，仅 boot-arg 的 BT level 改为 7；内核新增独立回环代码。
+记录在 `level7/trial.json` / `verification.json` 和审计目录的 `level7-preparation.json`。
+**尚未启动这份回环镜像**。下一步请求一个新的 90 秒 iOS 临时启动窗口；会覆盖
+设备日志，level 2 的原始日志已经保存。不得把 level 2 的 boot 成功当成 level 7 的结果。
