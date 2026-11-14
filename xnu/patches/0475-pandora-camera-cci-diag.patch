@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..fbaddfa
+index 0000000..392719b
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,5641 @@
+@@ -0,0 +1,5704 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -5060,6 +5060,65 @@ index 0000000..fbaddfa
 +	pc_csiphy_mark("ptest done (sensor left in standby)");
 +}
 +
++/* MIPI-enable probe (pandora_csiphy=16). Neither PHY sees a lane, and the
++ * captured table writes PLL dividers but no MIPI-output control. On OV sensors
++ * 0x4800 bit0 is the MIPI enable and 0x4600/0x4610 select lanes; if the table
++ * never sets them, the sensor can be "streaming" yet drive no clock lane.
++ * This reads the PLL/lane/MIPI group after the replay, sets only bit0 of
++ * 0x4800 (preserving every other bit), then arms CSID and streams. */
++static void
++pc_sliceb_mitest(void)
++{
++	static const uint16_t regs[] = { 0x0300u, 0x0301u, 0x0302u, 0x0303u,
++	    0x0304u, 0x0305u, 0x0306u, 0x0307u, 0x4600u, 0x4610u, 0x4800u, 0x4810u };
++	vm_offset_t csid0;
++	uint32_t seen_rdi = 0;
++	uint8_t r[12], v;
++	int ret = 0;
++
++	pc_csiphy_mark("mitest start: PLL/MIPI/lane group + MIPI enable");
++	csid0 = ml_io_map_unmappable(PC_CSID0_PA, 0x5e80u, VM_WIMG_IO);
++	pc_bdistm = ml_io_map_unmappable(PC_BDISTM_PA, 0x6000u, VM_WIMG_IO);
++	pc_tlmm = ml_io_map_unmappable(PC_TLMM_PA, 0xb0000u, VM_WIMG_IO);
++	pc_cci[0] = ml_io_map_unmappable(PC_CCI_PA(0), 0x1000u, VM_WIMG_IO);
++	if (!csid0 || !pc_bdistm || !pc_tlmm || !pc_cci[0] || !pc_camcc ||
++	    !pc_csiphy0_va) {
++		printf("PANDORA SLICEB: mitest map failed\n");
++		(void)pandora_log_sync();
++		return;
++	}
++	(void)pc_sensor_power_up();
++	pc_sleep(20);
++	(void)pc_sliceb_replay_cfg("wide-mitest");
++	for (unsigned i = 0; i < 12; i++)
++		r[i] = pc_sliceb_rd8(regs[i], &ret);
++	printf("PANDORA SLICEB: mitest pll 0300..0307 = %#x %#x %#x %#x %#x %#x %#x %#x\n",
++	    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
++	printf("PANDORA SLICEB: mitest mipi 4600=%#x 4610=%#x 4800=%#x 4810=%#x\n",
++	    r[8], r[9], r[10], r[11]);
++	(void)pandora_log_sync();
++
++	v = pc_sliceb_rd8(0x4800u, &ret);
++	pc_sliceb_wprobe(0x4800u, (uint16_t)(v | 0x01u), 1u, "mipi-enable-bit0");
++	pc_sleep(30);
++	printf("PANDORA SLICEB: mitest 0x4800 before=%#x after=%#x\n", v,
++	    pc_sliceb_rd8(0x4800u, &ret));
++	(void)pandora_log_sync();
++
++	uint32_t base = pc_sliceb_arm(csid0, 0x00032103u);
++	if (base) {
++		pc_sliceb_stream_on(1);
++		pc_sleep(30);
++		seen_rdi = pc_sliceb_poll(csid0, 800, NULL, NULL);
++	}
++	printf("PANDORA SLICEB: mitest RESULT rdi=%#x sof=%u eof=%u arm=%#x\n",
++	    seen_rdi, (seen_rdi & PC_RDIN_INPUT_SOF) ? 1u : 0u,
++	    (seen_rdi & PC_RDIN_INPUT_EOF) ? 1u : 0u, base);
++	(void)pandora_log_sync();
++	pc_sliceb_stream_on(0);
++	pc_csiphy_mark("mitest done (sensor left in standby)");
++}
++
 +static void
 +pc_sliceb_stream(void)
 +{
@@ -5113,8 +5172,12 @@ index 0000000..fbaddfa
 +		pc_sliceb_p4test();
 +		return;
 +	}
-+	if (pc_csiphy >= 15u) {
++	if (pc_csiphy == 15u) {
 +		pc_sliceb_ptest();
++		return;
++	}
++	if (pc_csiphy >= 16u) {
++		pc_sliceb_mitest();
 +		return;
 +	}
 +
