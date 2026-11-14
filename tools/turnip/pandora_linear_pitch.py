@@ -8,21 +8,40 @@ fd6_layout.c forced the locally-allocated 64-byte perf alignment on those explic
 LINEAR images, rejected the pitch (ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT)
 and the runtime fell back to a shadow copy of the whole surface.
 
-Two exact edits (tiled paths keep the strict checks):
+Four exact edits (tiled paths keep the strict checks):
 
 1. fd6_layout.c: for an explicit LINEAR image accept max(cpp,16)-byte pitch alignment
    and override pitchalign = ffs(pitch0)-1 so fdl_pitch() writes the real stride into
    the texture descriptor (otherwise 160/176 rounds to 192 and samples wrong bytes).
 
-2. tu_image.cc: external LINEAR / DRM-modifier images no longer require a dedicated
-   allocation (only tiled external images do); orthogonal to (1), kept together.
+2. fd6_view.cc: the descriptor's PITCHALIGN / MIN_LINE_OFFSET fields encode
+   log2(min-mipmap-pitch / 64) in four bits, and the code writes (pitchalign - 6).
+   An accepted 16-byte-aligned pitch gives pitchalign 4..5, so the write underflows
+   and programs garbage (field value 14/15 = a 1 MiB mipmap alignment). The first
+   on-device trial (2026-11-14) rendered every app icon corrupted while all
+   64-byte-aligned surfaces stayed correct -- exactly these two writes. Clamp to
+   the 64-byte floor: the stride itself goes into PITCH (raw bytes) / TEX_LINE_OFFSET
+   (raw bits), which the hardware reads directly, and the imports are single-level
+   (tu_image.c rejects multi-level explicit layouts), so the mipmap-minimum metadata
+   has nothing left to describe.
+
+3. tu_image.cc (dedicated): external LINEAR / DRM-modifier images no longer require
+   a dedicated allocation (only tiled external images do); orthogonal to (1).
+
+4. tu_image.cc (attachments): the RB color/depth pitch registers encode the stride
+   in 64-byte units (a6xx.xml "shr=6", e.g. RB_DEPTH_BUFFER_PITCH), so a render
+   target with non-64-byte rows cannot be written correctly by the GPU however the
+   texture descriptor is built. Keep the pre-relaxation rejection for attachment
+   usage and let the caller shadow-copy those surfaces as before; sampling-only
+   imports keep the relaxed acceptance.
 
   pandora_linear_pitch.py MESA_DIR
 
 Exact text edits, asserted; run once on a patched tree (CI: turnip.yml Sources step,
-after the UniXNU patches and the other pandora_*.py scripts). fd6_layout.c anchor is
-mesa 85fda3b upstream; tu_image.cc anchor is the UniXNU turnip-host-import-images.patch
-version (& ~host_types), composed with the tiling exemption so both relaxations hold.
+after the UniXNU patches and the other pandora_*.py scripts). fd6_layout.c and
+fd6_view.cc anchors are mesa 85fda3b upstream (UniXNU's stack touches neither);
+tu_image.cc anchors are the UniXNU turnip-host-import-images.patch version,
+composed with the tiling exemption so both relaxations hold.
 """
 import pathlib
 import sys
@@ -77,6 +96,32 @@ patch('src/freedreno/fdl/fd6_layout.c',
    }
 """)
 
+patch('src/freedreno/fdl/fd6_view.cc',
+      """      view->descriptor[2] =
+         A6XX_TEX_MEMOBJ_2_PITCHALIGN(layout->pitchalign - 6) |
+""",
+      """      /* PITCHALIGN holds log2(min mipmap pitch / 64) in four bits. An imported
+       * LINEAR image with a 16-byte-aligned pitch has pitchalign 4..5, so the
+       * raw (pitchalign - 6) write underflows and programs garbage; the on-device
+       * trial of 2026-11-14 showed it as corrupted app icons. Clamp to the
+       * 64-byte floor: the stride is carried by PITCH below (raw bytes), and the
+       * imports are single-level, so the mipmap minimum describes nothing. */
+      view->descriptor[2] =
+         A6XX_TEX_MEMOBJ_2_PITCHALIGN(MAX2(layout->pitchalign, 6) - 6) |
+""")
+
+patch('src/freedreno/fdl/fd6_view.cc',
+      """      descriptor[6] = A8XX_TEX_MEMOBJ_6_TEX_LINE_OFFSET(pitch * 8) |   /* in bits */
+                      A8XX_TEX_MEMOBJ_6_MIN_LINE_OFFSET(layout->pitchalign - 6) |
+""",
+      """      /* Same underflow as the A6XX PITCHALIGN above: MIN_LINE_OFFSET is
+       * log2(min mipmap pitch / 64) in four bits and a 16-byte-aligned import
+       * needs a clamp. TEX_LINE_OFFSET carries the stride in raw bits, so the
+       * clamped minimum stays metadata-only for the single-level imports. */
+      descriptor[6] = A8XX_TEX_MEMOBJ_6_TEX_LINE_OFFSET(pitch * 8) |   /* in bits */
+                      A8XX_TEX_MEMOBJ_6_MIN_LINE_OFFSET(MAX2(layout->pitchalign, 6) - 6) |
+""")
+
 patch('src/freedreno/vulkan/tu_image.cc',
       """      case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
          VkMemoryDedicatedRequirements *req =
@@ -117,4 +162,31 @@ patch('src/freedreno/vulkan/tu_image.cc',
          req->prefersDedicatedAllocation = req->requiresDedicatedAllocation;
          break;
       }
+""")
+
+patch('src/freedreno/vulkan/tu_image.cc',
+      """      if (plane_layouts) {
+         /* only expect simple 2D images for now */
+         if (image->vk.mip_levels != 1 ||
+            image->vk.array_layers != 1 ||
+            image->vk.extent.depth != 1)
+            return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+""",
+      """      if (plane_layouts) {
+         /* only expect simple 2D images for now */
+         if (image->vk.mip_levels != 1 ||
+            image->vk.array_layers != 1 ||
+            image->vk.extent.depth != 1)
+            return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+         /* The RB color/depth pitch registers encode the stride in 64-byte
+          * units (a6xx.xml "shr=6"; RB_DEPTH_BUFFER_PITCH and its MRT
+          * siblings), so an attachment whose rows are not 64 bytes apart
+          * cannot be written correctly no matter what the texture descriptor
+          * says. Keep the pre-relaxation rejection for attachment usage; the
+          * caller shadow-copies those surfaces as before. Sampling-only
+          * imports keep the relaxed acceptance above. */
+         if ((pCreateInfo->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
+             plane_layouts[i].rowPitch % 64)
+            return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
 """)
