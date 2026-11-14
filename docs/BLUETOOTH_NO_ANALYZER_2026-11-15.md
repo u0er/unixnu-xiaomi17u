@@ -4,7 +4,9 @@
 
 有可继续执行的软件路线。旧交接的“软件全部对齐、两个独立信号为零，所以只能接逻辑分析仪”不成立；源码、原始 w67 日志和当前 Android DT 已足以指出多处具体错误。
 
-本轮已修正本地 `wsl/pandora_bt.c`，同步到 `xnu/patches/0476-pandora-bluetooth.patch`。这是一份待试机候选，不代表蓝牙已工作。尚未获得 PMIC GPIO5/6 的实际 TYPE/SUBTYPE 或 QUP wrapper 硬件版本，不能把候选预期写成实机结果。
+已修正 `wsl/pandora_bt.c`，同步到 `xnu/patches/0476-pandora-bluetooth.patch`。
+最终完整构建 43651227510 和离线打包检查均已通过；这仍是一份待试机候选，不代表蓝牙已工作。
+尚未获得 PMIC GPIO5/6 的实际 TYPE/SUBTYPE 或 QUP wrapper 硬件版本，不能把候选预期写成实机结果。
 
 本轮手机操作仅为 Android 上读取 sysfs、DT 和复制现用内核模块到主机。没有开关蓝牙、挂载 debugfs、重启、启动 iOS、推送文件或写固件容器。Android 当前没有挂载 debugfs，也没有 `/dev/mem`，因此旧的 debugfs/devmem 采集脚本不能原样复用。当前工作区的根 Git 尚无提交；旧交接所称远端 main 不等于本地可核验的 HEAD。
 
@@ -88,7 +90,7 @@ GPIO9 的其他用途，也没有重新做没有判据的唤醒极性试验。
 | 次序 | 可执行动作 | 能区分的问题 | 状态 |
 |---|---|---|---|
 | A | 源码 + 原始日志 + Android 只读 DT / 模块审计 | 是否真的已经排除软件错误 | 本轮已完成，发现上述错误 |
-| B | 完整构建候选；经用户明确同意，做一次 level 2 的 90 秒临时启动 | TYPE/SUBTYPE、正确 BT_EN、QUP sampling、pad / IOS、HCI | 未构建完整内核、未启动；level 2 单次初始化优先，避免混入重试因素 |
+| B | 完整构建候选；经用户明确同意，做一次 level 2 的 90 秒临时启动 | TYPE/SUBTYPE、正确 BT_EN、QUP sampling、pad / IOS、HCI | 最终完整构建和镜像准备已完成，尚未启动；level 2 单次初始化优先，避免混入重试因素 |
 | C | 若正常 HCI 仍无应答，单独加入 GENI 内部 loopback 并收回原字节 | AP FIFO / sequencer / packing / 接收是否工作 | 未实现；上游已有 SE_UART_LOOPBACK_CFG=0x22c 可参考；此测试不能证明外部连线或绝对波特率 |
 | D | 对照 Android 的 PMIC 配置和上电事件 | kernel API 所用子类型、真实 pinconf、时钟/电源调用顺序 | 尚缺运行时寄存器快照；debugfs 未挂载，不能假称已抓到 |
 | E | 按 Qualcomm 初始化顺序发 `qca_read_soc_version`，验证匹配的 vendor / Command Complete 响应 | ROM 握手与通用 HCI Reset 行为是否不同 | 未实现；Linux 并不把通用 Reset 成功作为读取版本的唯一前提 |
@@ -114,7 +116,7 @@ GPIO9 的其他用途，也没有重新做没有判据的唤醒极性试验。
 
 本地使用现有 XNU DEVELOPMENT_ARM64_PANDORA 生成头和 NDK clang，以 `arm64-apple-macos11.0`、`-mkernel -O2 -Wall -Wextra` 编译单个 BT 源文件，检查真实进程返回码；构建补丁的新增文件须与 `.c` 完全一致，两个注册 / 调用上下文块保持原样。最终实际结果记在审计目录 `verification.txt`。
 
-没有把单文件编译当作完整内核链接或设备验证。下一步是完整构建此候选，再在明确获准的独占窗口做 B；第一次日志必须包含 TYPE/SUBTYPE、MODE/SOURCE、wrapper version / sampling 和真实 HCI 数据。未获得用户明确启动同意前，停止在主机构建阶段。
+单文件编译之后，最终完整内核构建和镜像准备也已通过（见下方最终记录）。下一步是在明确获准的独占窗口做 B；第一次日志必须包含 TYPE/SUBTYPE、MODE/SOURCE、wrapper version / sampling 和真实 HCI 数据。未获得用户明确启动同意前，停止在主机准备阶段。
 
 ## 后续构建与映射准备
 
@@ -134,7 +136,29 @@ Android FIEMAP / pin-status 的只读预检还发现：旧镜像的固件映射�
 16 GiB 暴露区间及日志映射与手机当前物理布局相符，保持原样；没有把 root.img
 的 64 GiB 文件长度擅自改成新的对外磁盘大小。
 
+随后通过现有 pinfile 的只读 rawreadat 读取 root 物理视图的 HFS 卷头：HX、
+blockSize=4096、totalBlocks=4194304，即卷声明容量确实仍为 16 GiB。
+证据在 `android-root-volume.json`；不是仅凭旧镜像大小决定保留该值。
+
 快照与有效范围比较结果见 `work/bluetooth-source-audit/extent-preflight.json`。
 ADT 里的 extent 数组带预留零槽，比较时必须按有效区间解析；不能用 JSON 长度或
 未去掉预留槽的字节长度判断是否漂移。最终内核运行、镜像路径和验证结果将在
 构建完成后记录，当前仍没有启动手机。
+
+## 最终候选已准备（2026-11-15）
+
+- 初版完整构建 43649529960 成功；含 GPIO9 修正的最终完整构建
+  **43651227510 成功**。下载产物中的 BT 诊断字符串已核对，单文件检查不能替代的
+  完整内核编译/链接层现已通过。
+- 最终内核：`D:/turnip-local/newboot/bt-no-analyzer-20261115/artifact/kernel.development.pandora`。
+- 最终镜像：`D:/turnip-local/newboot/bt-no-analyzer-20261115/level2/loader/nezha-loader-boot.img`，
+  17,285,120 字节，level 2，`pandora_reboot_after=90`。只在主机生成，未启动。
+- 镜像为 Android boot v4；payload/segment/ADT 范围、trust-cache 复制及重定位、
+  root/log 映射保留、固件映射采用当前 6 段快照均已检查。
+- 备份的试机前日志：`D:/turnip-local/newboot/bt-no-analyzer-20261115/before-trial/`，
+  包含物理视图 `log.img` 与解码 `kernel.txt`。采集使用现有 pinfile，只读，未推送 helper。
+- 记录：最终输出目录的 `trial.json`、`verification.json`，以及工作区审计目录
+  `final-preparation.json`。初版镜像只用于验证打包工具，不用于设备试验。
+- **设备验证仍未发生**。下一步须先取得明确的独占启动窗口同意，再临时 boot 最终镜像，
+  预期 iOS 阶段 90 秒后自动返回 Android，立即只读抓取并分析新日志。启动将覆盖设备
+  `log.img`；旧日志已有主机备份。不得写 firmware 容器，不得用旧镜像替代。
