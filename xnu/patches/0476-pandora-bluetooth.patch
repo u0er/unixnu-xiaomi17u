@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..008e6a1
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,717 @@
+@@ -0,0 +1,719 @@
 +/*
 + * PANDORA Bluetooth: the WCN786x BT core on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -298,8 +298,10 @@ index 0000000..008e6a1
 +	pandora_log_sync();
 +	printf("PANDORA BT: RCG cmd %#x; SE5 rate %u Hz\n", bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CMD), bt_rate);
 +	pandora_log_sync();
-+	printf("PANDORA BT: pins 18 %#x, cts %#x rts %#x tx %#x rx %#x\n",
-+	    bt_rd(BT_W_SWCTRL, 0), bt_pin_ctl(24), bt_pin_ctl(25), bt_pin_ctl(26), bt_pin_ctl(27));
++	printf("PANDORA BT: pins 18 %#x, cts %#x rts %#x tx %#x rx %#x; io 18 %#x 24 %#x 25 %#x 26 %#x 27 %#x\n",
++	    bt_rd(BT_W_SWCTRL, 0), bt_pin_ctl(24), bt_pin_ctl(25), bt_pin_ctl(26), bt_pin_ctl(27),
++	    bt_rd(BT_W_SWCTRL, 0x4), bt_rd(BT_W_UART, 0x4), bt_rd(BT_W_UART, 0x1004u),
++	    bt_rd(BT_W_UART, 0x2004u), bt_rd(BT_W_UART, 0x3004u));
 +	pandora_log_sync();
 +	if ((vote & BT_VOTE_BITS) != BT_VOTE_BITS) {
 +		printf("PANDORA BT: wrapper3 not voted on; halt/SE registers not read (domain off)\n");
@@ -635,7 +637,7 @@ index 0000000..008e6a1
 +		return ETIMEDOUT;
 +	}
 +	bt_wr(BT_W_SE, SE_M_IRQ_CLR, M_CMD_DONE);
-+	printf("PANDORA BT: %s sent (%u bytes)\n", what, len);
++	printf("PANDORA BT: %s sent (%u bytes), tx io %#x\n", what, len, bt_rd(BT_W_UART, 0x2004u));
 +	return 0;
 +}
 +
