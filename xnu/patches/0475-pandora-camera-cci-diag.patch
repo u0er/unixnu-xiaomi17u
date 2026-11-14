@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..9a14301
+index 0000000..3faec1c
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,5281 @@
+@@ -0,0 +1,5363 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -4720,6 +4720,84 @@ index 0000000..9a14301
 +	pc_csiphy_mark("ltest done (sensor left in standby)");
 +}
 +
++/* Partial replay + stream (pandora_csiphy=11). The captured wide table is an
++ * Android session dump (14376 entries, ~7432 of them 0xFFFF artifacts); the
++ * first stream-on entry is at index 9720 and thousands of entries follow it,
++ * so a full replay ends in whatever state the last entries leave. This replays
++ * only the configuration up to (but not including) the first 0x0100=1, then
++ * arms CSID, then streams — the "source last" order — and polls for SOF/EOF. */
++static unsigned
++pc_sliceb_replay_cfg(const char *name)
++{
++	unsigned applied = 0, fails = 0;
++
++	for (unsigned i = 0; i < pc_wide_tbl_n; i++) {
++		const struct pc_init_reg *e = &pc_wide_tbl[i];
++		if (e->reg == 0xffffu)
++			continue;
++		if (e->reg == 0x0100u && e->val == 1u) {
++			printf("PANDORA SLICEB: %s stop before first stream-on at index %u "
++			    "(applied=%u fails=%u)\n", name, i, applied, fails);
++			(void)pandora_log_sync();
++			return applied;
++		}
++		unsigned w = e->width ? e->width : 1u;
++		int ret = pc_cci_write_reg(pc_cci[0], PC_SLICEB_MASTER, PC_SLICEB_SLAVE,
++		    e->reg, e->val, w);
++		if (ret) {
++			fails++;
++			if (fails <= 5)
++				printf("PANDORA SLICEB: %s[%u] reg=%#x FAIL ret=%d\n",
++				    name, i, e->reg, ret);
++		} else {
++			applied++;
++		}
++	}
++	printf("PANDORA SLICEB: %s no stream-on entry applied=%u fails=%u\n",
++	    name, applied, fails);
++	return applied;
++}
++
++static void
++pc_sliceb_utest(void)
++{
++	vm_offset_t csid0;
++	uint32_t seen_rdi = 0;
++	int ret = 0;
++	uint8_t v;
++
++	pc_csiphy_mark("utest start: map sensor bus + CSID");
++	csid0 = ml_io_map_unmappable(PC_CSID0_PA, 0x5e80u, VM_WIMG_IO);
++	pc_bdistm = ml_io_map_unmappable(PC_BDISTM_PA, 0x6000u, VM_WIMG_IO);
++	pc_tlmm = ml_io_map_unmappable(PC_TLMM_PA, 0xb0000u, VM_WIMG_IO);
++	pc_cci[0] = ml_io_map_unmappable(PC_CCI_PA(0), 0x1000u, VM_WIMG_IO);
++	if (!csid0 || !pc_bdistm || !pc_tlmm || !pc_cci[0] || !pc_camcc ||
++	    !pc_csiphy0_va) {
++		printf("PANDORA SLICEB: utest map failed\n");
++		(void)pandora_log_sync();
++		return;
++	}
++	(void)pc_sensor_power_up();
++	pc_sleep(20);
++	(void)pc_sliceb_replay_cfg("wide-utest");
++	v = pc_sliceb_rd8(0x0100u, &ret);
++	printf("PANDORA SLICEB: utest before stream 0x0100=%#x\n", v);
++	uint32_t base = pc_sliceb_arm(csid0, 0x00032103u);
++	if (base) {
++		pc_sliceb_stream_on(1);
++		pc_sleep(30);
++		v = pc_sliceb_rd8(0x0100u, &ret);
++		printf("PANDORA SLICEB: utest after stream 0x0100=%#x\n", v);
++		seen_rdi = pc_sliceb_poll(csid0, 800, NULL, NULL);
++	}
++	printf("PANDORA SLICEB: utest RESULT rdi=%#x sof=%u eof=%u arm=%#x\n",
++	    seen_rdi, (seen_rdi & PC_RDIN_INPUT_SOF) ? 1u : 0u,
++	    (seen_rdi & PC_RDIN_INPUT_EOF) ? 1u : 0u, base);
++	(void)pandora_log_sync();
++	pc_sliceb_stream_on(0);
++	pc_csiphy_mark("utest done (sensor left in standby)");
++}
++
 +static void
 +pc_sliceb_stream(void)
 +{
@@ -4753,8 +4831,12 @@ index 0000000..9a14301
 +		pc_sliceb_ttest();
 +		return;
 +	}
-+	if (pc_csiphy >= 10u) {
++	if (pc_csiphy == 10u) {
 +		pc_sliceb_ltest();
++		return;
++	}
++	if (pc_csiphy >= 11u) {
++		pc_sliceb_utest();
 +		return;
 +	}
 +
