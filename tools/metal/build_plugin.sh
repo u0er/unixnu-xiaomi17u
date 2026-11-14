@@ -51,6 +51,9 @@ done
 LLVM_AS=$(brew --prefix llvm)/bin/llvm-as
 "$LLVM_AS" -o "$B/runtime_examples.air" "$M2V/crates/metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll"
 "$LLVM_AS" -o "$B/function_constant.air" "$M2V/crates/metal2vulkan-validation/fixtures/public/kernel_function_constant_gate_fold.ll"
+# The pinned tree's scanout half-float kernel (bridge/NativeMetalObjects.rs NMB_SCANOUT_AIR) is
+# hand-written AIR assembled at build time; the other include_bytes! fixtures are set below.
+"$LLVM_AS" -o "$B/scanout_convert.air" "$NM/shaders/scanout_convert.ll"
 cat > "$B/Cargo.toml" <<EOF
 [package]
 name = "native-metal-bridge"
@@ -71,7 +74,7 @@ panic = "unwind"
 debug = 1
 EOF
 RID=$( (git -C "$M2V" rev-parse HEAD; git -C "$M2V" diff HEAD) | shasum -a 256 | cut -c1-32)
-NMB_RUNTIME_ID=$RID NMB_FIXTURE_AIR=$B/runtime_examples.air NMB_FC_AIR=$B/function_constant.air \
+NMB_RUNTIME_ID=$RID NMB_FIXTURE_AIR=$B/runtime_examples.air NMB_FC_AIR=$B/function_constant.air NMB_SCANOUT_AIR=$B/scanout_convert.air \
 	IPHONEOS_DEPLOYMENT_TARGET=16.0 \
 	cargo +1.98.0 build --release --manifest-path "$B/Cargo.toml" --target aarch64-apple-ios --target-dir "$B/target"
 BRIDGE=$B/target/aarch64-apple-ios/release/libnative_metal_bridge.a
