@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..008e6a1
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,868 @@
+@@ -0,0 +1,1059 @@
 +/*
 + * PANDORA Bluetooth: the WCN786x BT core on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -31,13 +31,14 @@ index 0000000..008e6a1
 + * RCG, the SE identity and its pins. =2 also votes the BT rails from the DT's
 + * bt-vdd-* supplies, drives the four UART pins, enables the wrapper and SE5
 + * clocks and sends HCI Reset at 115200, printing whatever comes back.
-+ * BT_EN is the PMH0104's SPMI GPIO5 (live.dts qcom,bt-reset-gpio); it is not
-+ * touched here: with WLAN on, the boot state already holds it high, and an
-+ * SPMI write needs its own single-variable test.
++ * BT_EN is PMH0104 SPMI GPIO5. Levels 2 and 6 pulse it using the encoding
++ * selected by the peripheral's TYPE/SUBTYPE; level 1 only reads its state.
++ * Level 6 retries cold initialization at 115200. Only level 5 uses 4 Mbps.
 + *
 + * Register map: Linux drivers/soc/qcom/qcom-geni-se.c, drivers/tty/serial/
 + * msm_geni_serial.c and u-boot's drivers/serial/serial_msm_geni.c (GPL-2.0+,
 + * same register facts), plus the captured DT.
++ * See docs/BLUETOOTH_NO_ANALYZER_2026-11-15.md for evidence and trial criteria.
 + * All mappings stay for the life of the kernel, including on failure.
 + */
 +#if defined(PANDORA)
@@ -64,6 +65,7 @@ index 0000000..008e6a1
 +#define BT_GCC_RCG_PA    0x001a8000u   /* SE5 RCG 0xa8640, branch halt 0xa8630 */
 +#define BT_GCC_HALT_PA   0x00123000u   /* m_ahb 0x233f0, s_ahb 0x233f4, core 0x233f8, core_2x 0x2340c */
 +#define BT_SE_PA         0x01994000u   /* QUPV3_3 SE5: the BT UART */
++#define BT_WRAPPER_PA    0x019c0000u   /* QUPV3_3: version at +4, read only with clocks on */
 +#define BT_TLMM_SW_PA    0x0f112000u   /* TLMM gpio18 (wcn_sw_ctrl) */
 +#define BT_TLMM_UART_PA  0x0f118000u   /* TLMM gpio24..27 (CTS, RTS, TX, RX) */
 +#define BT_TLMM_WAKE_PA  0x0f109000u   /* TLMM gpio9: BT_WAKE (dev wake, DT mpm_wake_set_gpios[1]) */
@@ -112,6 +114,7 @@ index 0000000..008e6a1
 +#define SE_M_IRQ_EN      0x614u
 +#define SE_M_IRQ_CLR     0x618u
 +#define SE_S_CMD0        0x630u
++#define SE_S_CMD_CTRL    0x634u
 +#define SE_S_IRQ         0x640u
 +#define SE_S_IRQ_EN      0x644u
 +#define SE_S_IRQ_CLR     0x648u
@@ -119,6 +122,7 @@ index 0000000..008e6a1
 +#define SE_RX_FIFO       0x780u
 +#define SE_TX_FIFO_ST    0x800u
 +#define SE_RX_FIFO_ST    0x804u
++#define SE_IOS           0x908u        /* GENI input samples: RX bit0, IO2/CTS bit1 */
 +#define SE_TX_WM         0x80cu
 +#define SE_RX_WM         0x810u
 +#define SE_RX_RFR_WM     0x814u
@@ -133,9 +137,9 @@ index 0000000..008e6a1
 +
 +/* GENI status and interrupt bits (geni-se.h, msm_geni_serial.c). */
 +#define GENI_STATUS_M_ACTIVE (1u << 0)
++#define GENI_STATUS_S_ACTIVE (1u << 12)
++#define GENI_CMD_ABORT        (1u << 1) /* CMD_CTRL command, distinct from IRQ completion bit */
 +#define M_CMD_DONE           (1u << 0)
-+#define M_CMD_ABORT          (1u << 5)
-+#define M_CMD_CANCEL         (1u << 4)
 +#define M_TX_WM              (1u << 30)
 +#define M_RX_WM              (1u << 26)
 +#define M_RX_LAST            (1u << 27)
@@ -152,14 +156,16 @@ index 0000000..008e6a1
 +#define BT_PIN_DRIVE(ma) ((((ma) / 2) - 1) << 6)
 +#define BT_PIN_OUT       (1u << 9)
 +#define BT_PIN_MUX(f)    ((f) << 2)
++#define BT_PIN_INPUT     1u            /* canoe PINGROUP: GPIO_IO in_bit=0, out_bit=1 */
 +
 +struct bt_win { uint32_t pa, bytes; vm_offset_t va; };
 +static struct bt_win bt_wins[] = {
 +	{BT_GCC_VOTE_PA, 0x1000, 0}, {BT_GCC_RCG_PA, 0x1000, 0}, {BT_GCC_HALT_PA, 0x1000, 0},
 +	{BT_SE_PA, 0x4000, 0}, {BT_TLMM_SW_PA, 0x1000, 0}, {BT_TLMM_UART_PA, 0x4000, 0},
 +	{BT_TLMM_WAKE_PA, 0x1000, 0},
++	{BT_WRAPPER_PA, 0x1000, 0},
 +};
-+enum { BT_W_VOTE, BT_W_RCG, BT_W_HALT, BT_W_SE, BT_W_SWCTRL, BT_W_UART, BT_W_WAKE, BT_W_COUNT };
++enum { BT_W_VOTE, BT_W_RCG, BT_W_HALT, BT_W_SE, BT_W_SWCTRL, BT_W_UART, BT_W_WAKE, BT_W_WRAPPER, BT_W_COUNT };
 +
 +static int bt_level, bt_wait;
 +static unsigned bt_rate;
@@ -304,6 +310,9 @@ index 0000000..008e6a1
 +	    bt_rd(BT_W_SWCTRL, 0), bt_pin_ctl(24), bt_pin_ctl(25), bt_pin_ctl(26), bt_pin_ctl(27),
 +	    bt_rd(BT_W_SWCTRL, 0x4), bt_rd(BT_W_UART, 0x4), bt_rd(BT_W_UART, 0x1004u),
 +	    bt_rd(BT_W_UART, 0x2004u), bt_rd(BT_W_UART, 0x3004u), bt_rd(BT_W_WAKE, 0x4));
++	printf("PANDORA BT: pad samples sw_ctrl %u cts %u rx %u (GPIO_IO bit0)\n",
++	    bt_rd(BT_W_SWCTRL, 0x4) & BT_PIN_INPUT, bt_rd(BT_W_UART, 0x4) & BT_PIN_INPUT,
++	    bt_rd(BT_W_UART, 0x3004u) & BT_PIN_INPUT);
 +	pandora_log_sync();
 +	if ((vote & BT_VOTE_BITS) != BT_VOTE_BITS) {
 +		printf("PANDORA BT: wrapper3 not voted on; halt/SE registers not read (domain off)\n");
@@ -386,7 +395,7 @@ index 0000000..008e6a1
 + *   - RW channel stride is 0x200 (v7 used 0x1000);
 + *   - per-bus APID count is core+0x4, one word per bus, mask 0x1fff.
 + * btpower normally gives this pin a low->high edge when it opens BT; iBoot
-+ * leaves it high, which may keep the ROM out of its HCI boot path. */
++ * hands over register values whose meaning depends on the GPIO subtype. */
 +#define BT_SPMI_CORE_PA    0x0c400000u
 +#define BT_SPMI_MAP_PA     0x0c403000u  /* chnl_map */
 +#define BT_SPMI_CHNLS_PA   0x0c900000u
@@ -395,13 +404,17 @@ index 0000000..008e6a1
 +#define BT_SPMI_PERIPH_MASK 0x1fffu
 +#define BT_SPMI_PPID_MASK  0x1fffu
 +#define BT_SPMI_GPIO_PPID  0x98cu        /* PMH0104 gpio5: BT_EN */
-+#define BT_SPMI_FMD_PPID   0x98du        /* PMH0104 gpio6: BT FMD/XO clock */
++#define BT_SPMI_FMD_PPID   0x98du        /* PMH0104 gpio6: FMD, DT input-only; diagnostics only */
 +#define BT_SPMI_RW_STRIDE  0x200u
 +#define BT_SPMI_MAX_PERIPHS 8192u
-+#define BT_SPMI_REG_MODE   0x40u        /* MODE_CTL: direction 6:4, function 3:1, level bit1 */
++#define BT_SPMI_REG_TYPE   0x04u
++#define BT_SPMI_REG_SUBTYPE 0x05u
++#define BT_SPMI_REG_STATUS 0x10u        /* RT_STS bit0: pad sample when input buffer is enabled */
++#define BT_SPMI_REG_MODE   0x40u        /* Legacy: direction 6:4, function 3:1, level bit0; LV/MV: direction 1:0 */
 +#define BT_SPMI_REG_VIN    0x41u        /* DIG_VIN_CTL: power source 2:0 */
 +#define BT_SPMI_REG_PULL   0x42u        /* DIG_PULL_CTL: 5 = pull disabled */
 +#define BT_SPMI_REG_IN     0x43u        /* DIG_IN_CTL */
++#define BT_SPMI_REG_SOURCE 0x44u       /* LV/MV: normal source 0, output value bit7 */
 +#define BT_SPMI_REG_OUT    0x45u        /* DIG_OUT_CTL: strength 1:0, buffer type 5:4 */
 +#define BT_SPMI_REG_EN     0x46u        /* EN_CTL, bit 7 = master enable */
 +
@@ -435,7 +448,7 @@ index 0000000..008e6a1
 +	return false;
 +}
 +
-+/* SPMI v8 read: EXT_READL is cmd = (reg << 4) | 2, the byte lands in RDATA0. */
++/* SPMI v8 EXT_READL: opcode 1, byte count 0, result in RDATA0. */
 +static bool
 +bt_spmi_read8(vm_offset_t chan, uint8_t reg, uint8_t *out)
 +{
@@ -473,8 +486,10 @@ index 0000000..008e6a1
 +	return ENOENT;
 +}
 +
++/* Resolve only AP-owned bus1 channels. Reads and writes must use the same
++ * channel; a matching PPID owned by another EE is not an alternate route. */
 +static int
-+bt_spmi_gpio(uint32_t bus0, uint32_t bus1, uint16_t ppid, uint8_t val, unsigned vin, const char *what)
++bt_spmi_channel(uint32_t bus0, uint32_t bus1, uint16_t ppid, vm_offset_t *chan)
 +{
 +	uint16_t apid = 0xffffu;
 +	unsigned owner = 7;
@@ -493,52 +508,139 @@ index 0000000..008e6a1
 +		}
 +	}
 +	if (apid == 0xffffu || owner != 0) {
-+		printf("PANDORA BT: %s ppid %#x apid %u/ee%u: skipped\n", what, ppid, apid, owner);
++		printf("PANDORA BT: ppid %#x apid %u/ee%u: skipped\n", ppid, apid, owner);
 +		return ENOTSUP;
 +	}
-+	vm_offset_t chan = bt_spmi_chnls + BT_SPMI_RW_STRIDE * apid;
-+	uint8_t m = 0, di = 0, o = 0, e = 0;
-+	bool rd = bt_spmi_read8(chan, BT_SPMI_REG_MODE, &m) &&
-+	    bt_spmi_read8(chan, BT_SPMI_REG_IN, &di) &&
-+	    bt_spmi_read8(chan, BT_SPMI_REG_OUT, &o) &&
-+	    bt_spmi_read8(chan, BT_SPMI_REG_EN, &e);
-+	printf("PANDORA BT: %s before mode %#x in %#x out %#x en %#x (read %d)\n",
-+	    what, m, di, o, e, rd);
++	*chan = bt_spmi_chnls + BT_SPMI_RW_STRIDE * apid;
++	return 0;
++}
++
++struct bt_gpio_state {
++	uint8_t type, subtype, status, mode, vin, pull, in, source, out, en;
++	bool lv_mv;
++};
++
++/* pinctrl-spmi-gpio.c pmic_gpio_populate(): TYPE/SUBTYPE, not the PMIC's marketing
++ * name or the observed MODE value, determines which layout is valid. */
++static int
++bt_gpio_read(vm_offset_t chan, struct bt_gpio_state *s)
++{
++	*s = (struct bt_gpio_state){0};
++	if (!bt_spmi_read8(chan, BT_SPMI_REG_TYPE, &s->type) ||
++	    !bt_spmi_read8(chan, BT_SPMI_REG_SUBTYPE, &s->subtype)) {
++		return EIO;
++	}
++	if (s->type != 0x10) {
++		return ENOTSUP;
++	}
++	switch (s->subtype) {
++	case 0x01: case 0x05: case 0x09: case 0x0d:
++		break;
++	case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:
++		s->lv_mv = true;
++		break;
++	default:
++		return ENOTSUP;
++	}
++	if (!bt_spmi_read8(chan, BT_SPMI_REG_STATUS, &s->status) ||
++	    !bt_spmi_read8(chan, BT_SPMI_REG_MODE, &s->mode) ||
++	    !bt_spmi_read8(chan, BT_SPMI_REG_VIN, &s->vin) ||
++	    !bt_spmi_read8(chan, BT_SPMI_REG_PULL, &s->pull) ||
++	    !bt_spmi_read8(chan, BT_SPMI_REG_IN, &s->in) ||
++	    !bt_spmi_read8(chan, BT_SPMI_REG_OUT, &s->out) ||
++	    !bt_spmi_read8(chan, BT_SPMI_REG_EN, &s->en) ||
++	    (s->lv_mv && !bt_spmi_read8(chan, BT_SPMI_REG_SOURCE, &s->source))) {
++		return EIO;
++	}
++	return 0;
++}
++
++static void
++bt_gpio_dump(const char *what, uint16_t ppid, const struct bt_gpio_state *s)
++{
++	/* DIG_IN_CTL is input routing, not a sample. RT_STS is only meaningful
++	 * with the input buffer enabled; an output-only pad can report zero. */
++	printf("PANDORA BT: %s ppid %#x type %#x subtype %#x %s mode %#x source %#x vin %#x pull %#x in_cfg %#x out %#x en %#x rt_status %#x\n",
++	    what, ppid, s->type, s->subtype, s->lv_mv ? "LV/MV" : "legacy",
++	    s->mode, s->source, s->vin, s->pull, s->in, s->out, s->en, s->status);
 +	pandora_log_sync();
-+	/* pinctrl-spmi-gpio: MODE_CTL 0 is "normal"; DIG_OUT_CTL bit0 is the
-+	 * level and bit7 selects the power source (BT_EN sits on vin-1). Writing
-+	 * the bare level used to clear that selector, which moves the pad to the
-+	 * other supply; keep every bit but bit0 and bit7 instead. */
-+	/* MODE_CTL carries the direction and the level (bit1); DIG_OUT_CTL is only
-+	 * drive strength/buffer type, so writing the level there never moved the
-+	 * pad. Matches Android's gpio5: out high, vin-1, no pull, push-pull. */
-+	uint8_t mode = (uint8_t)((1u << 4) | ((uint32_t)(val & 1u) << 1));
-+	bool ok = bt_spmi_write(chan, BT_SPMI_REG_MODE, mode);
-+	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_VIN, (uint8_t)(vin & 0x7u));
-+	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_PULL, 0x05u);
-+	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_OUT, 0x03u);
-+	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_EN, 0x80u);
-+	uint8_t m2 = 0xff, v2 = 0xff, i2 = 0xff, o2 = 0xff, e2 = 0xff;
-+	bt_spmi_read8(chan, BT_SPMI_REG_MODE, &m2);
-+	bt_spmi_read8(chan, BT_SPMI_REG_VIN, &v2);
-+	bt_spmi_read8(chan, BT_SPMI_REG_IN, &i2);
-+	bt_spmi_read8(chan, BT_SPMI_REG_OUT, &o2);
-+	bt_spmi_read8(chan, BT_SPMI_REG_EN, &e2);
-+	printf("PANDORA BT: %s apid %u/ee%u val=%u vin=%u ok=%d -> mode %#x vin %#x in %#x out %#x en %#x\n",
-+	    what, apid, owner, val, vin, ok, m2, v2, i2, o2, e2);
-+	return ok ? 0 : EIO;
 +}
 +
 +static int
-+bt_en_pulse(void)
++bt_spmi_gpio(uint32_t bus0, uint32_t bus1, uint16_t ppid, uint8_t val, unsigned vin, const char *what)
++{
++	vm_offset_t chan;
++	struct bt_gpio_state before, after;
++	int err = bt_spmi_channel(bus0, bus1, ppid, &chan);
++	if (err) {
++		return err;
++	}
++	err = bt_gpio_read(chan, &before);
++	if (err) {
++		printf("PANDORA BT: %s GPIO identity/config read failed (%d), type %#x subtype %#x\n",
++		    what, err, before.type, before.subtype);
++		return err;
++	}
++	bt_gpio_dump("before", ppid, &before);
++	unsigned sources;
++	if (!before.lv_mv) {
++		sources = (before.subtype == 0x01 || before.subtype == 0x05) ? 4 : 8;
++	} else {
++		sources = before.subtype == 0x10 ? 1 :
++		    (before.subtype == 0x13 || before.subtype == 0x15) ? 3 : 2;
++	}
++	if (vin >= sources) {
++		printf("PANDORA BT: %s VIN %u unsupported by subtype %#x\n", what, vin, before.subtype);
++		return EINVAL;
++	}
++	/* Legacy normal GPIO output uses MODE=0x10/0x11. LV/MV uses MODE=1
++	 * and SOURCE=0/0x80. MODE=0x12 means paired-low on legacy, and does
++	 * not set the output latch on LV/MV. Never infer this from readback. */
++	uint8_t mode = before.lv_mv ? 1u : (uint8_t)(0x10u | (val & 1u));
++	uint8_t source = val & 1u ? 0x80u : 0;
++	bool ok = bt_spmi_write(chan, BT_SPMI_REG_VIN, (uint8_t)vin) &&
++	    bt_spmi_write(chan, BT_SPMI_REG_PULL, 0x05u) &&
++	    bt_spmi_write(chan, BT_SPMI_REG_OUT, 0x03u) &&
++	    (!before.lv_mv || bt_spmi_write(chan, BT_SPMI_REG_SOURCE, source)) &&
++	    bt_spmi_write(chan, BT_SPMI_REG_MODE, mode) &&
++	    bt_spmi_write(chan, BT_SPMI_REG_EN, 0x80u);
++	if (!ok) {
++		printf("PANDORA BT: %s SPMI write failed; power sequence stopped\n", what);
++		return EIO;
++	}
++	err = bt_gpio_read(chan, &after);
++	if (err) {
++		printf("PANDORA BT: %s readback failed (%d)\n", what, err);
++		return err;
++	}
++	bt_gpio_dump(what, ppid, &after);
++	if (after.mode != mode || after.vin != vin || after.pull != 0x05u ||
++	    after.out != 0x03u || after.en != 0x80u ||
++	    (before.lv_mv && after.source != source)) {
++		printf("PANDORA BT: %s config mismatch; power sequence stopped\n", what);
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++bt_spmi_init(void)
 +{
 +	/* Map once: the retry loop below re-enters this function after a failed
 +	 * attempt and the arbiter window must not be mapped twice. */
 +	if (!bt_spmi_ready) {
-+		bt_spmi_core = ml_io_map_unmappable(BT_SPMI_CORE_PA, 0x3000, VM_WIMG_IO);
-+		bt_spmi_map = ml_io_map_unmappable(BT_SPMI_MAP_PA, 0x8000, VM_WIMG_IO);
-+		bt_spmi_chnls = ml_io_map_unmappable(BT_SPMI_CHNLS_PA, 0x400000, VM_WIMG_IO);
-+		bt_spmi_owner1 = ml_io_map_unmappable(BT_SPMI_OWNER1_PA, 0x8000, VM_WIMG_IO);
++		if (!bt_spmi_core) {
++			bt_spmi_core = ml_io_map_unmappable(BT_SPMI_CORE_PA, 0x3000, VM_WIMG_IO);
++		}
++		if (!bt_spmi_map) {
++			bt_spmi_map = ml_io_map_unmappable(BT_SPMI_MAP_PA, 0x8000, VM_WIMG_IO);
++		}
++		if (!bt_spmi_chnls) {
++			bt_spmi_chnls = ml_io_map_unmappable(BT_SPMI_CHNLS_PA, 0x400000, VM_WIMG_IO);
++		}
++		if (!bt_spmi_owner1) {
++			bt_spmi_owner1 = ml_io_map_unmappable(BT_SPMI_OWNER1_PA, 0x8000, VM_WIMG_IO);
++		}
 +		if (!bt_spmi_core || !bt_spmi_map || !bt_spmi_chnls || !bt_spmi_owner1) {
 +			printf("PANDORA BT: SPMI map failed: no BT_EN pulse\n");
 +			return ENOMEM;
@@ -556,12 +658,53 @@ index 0000000..008e6a1
 +		}
 +		bt_spmi_ready = true;
 +	}
++	return 0;
++}
++
++static void
++bt_pmic_report(void)
++{
++	int err = bt_spmi_init();
++	if (err) {
++		return;
++	}
++	static const uint16_t ppids[] = { BT_SPMI_GPIO_PPID, BT_SPMI_FMD_PPID };
++	for (unsigned i = 0; i < sizeof(ppids) / sizeof(ppids[0]); i++) {
++		vm_offset_t chan;
++		struct bt_gpio_state s;
++		err = bt_spmi_channel(bt_bus0, bt_bus1, ppids[i], &chan);
++		if (!err) {
++			err = bt_gpio_read(chan, &s);
++		}
++		if (err) {
++			printf("PANDORA BT: read-only PMIC ppid %#x failed (%d)\n", ppids[i], err);
++			continue;
++		}
++		bt_gpio_dump("read-only PMIC", ppids[i], &s);
++	}
++}
++
++static int
++bt_en_pulse(void)
++{
++	int err = bt_spmi_init();
++	if (err) {
++		return err;
++	}
 +	uint32_t bus0 = bt_bus0, bus1 = bt_bus1;
-+	/* btpower's order: BT_EN low 100 ms -> XO/FMD clock pad high -> BT_EN high. */
-+	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_GPIO_PPID, 0x00, 1, "BT_EN low");
++	/* PMH0104 GPIO6 is bt_fmd_clk_en, configured as an input at VIN1 in
++	 * this board's live DT. SM8850 btpower only records that GPIO; its XO
++	 * helper uses the separate qcom,xo-clk-gpio. Preserve GPIO6 instead of
++	 * driving the FMD input high on VIN0 as earlier experiments did. */
++	err = bt_spmi_gpio(bus0, bus1, BT_SPMI_GPIO_PPID, 0x00, 1, "BT_EN low");
++	if (err) {
++		return err;
++	}
 +	bt_sleep(100 * 1000);
-+	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_FMD_PPID, 0x01, 0, "FMD clk");
-+	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_GPIO_PPID, 0x01, 1, "BT_EN high");
++	err = bt_spmi_gpio(bus0, bus1, BT_SPMI_GPIO_PPID, 0x01, 1, "BT_EN high");
++	if (err) {
++		return err;
++	}
 +	bt_sleep(150 * 1000);	/* Linux qca_power_on: 150 ms after BT_EN */
 +	/* btpower then asserts BT_WAKE (dev wake); the ROM stays quiet without it. */
 +	bt_wr(BT_W_WAKE, 0x4, 2u);
@@ -581,7 +724,7 @@ index 0000000..008e6a1
 +	/* level 5 takes over a chip that Android already trained to 4 Mbps:
 +	 * 128 MHz RCG (M 32 / N 75) gives divider 1. Everything else stays at
 +	 * the 64 MHz/115200 pairing. */
-+	if (bt_level >= 5) {
++	if (bt_level == 5) {
 +		bt_rcg_set(32, 75);
 +	} else {
 +		bt_rcg_set(16, 75);
@@ -608,16 +751,48 @@ index 0000000..008e6a1
 +		printf("PANDORA BT: SE5 FIFO interface is disabled (fw %#x); no UART\n", fw);
 +		return ENOTSUP;
 +	}
++	if (((fw >> 8) & 0xffu) != 2u) {
++		printf("PANDORA BT: SE5 firmware protocol is not UART (%#x)\n", fw);
++		return ENOTSUP;
++	}
 +	printf("PANDORA BT: SE5 protocol %u (fw %#x), FIFO interface\n", (fw >> 8) & 0xffu, fw);
-+	unsigned div = bt_rate / (baud * 32u);
-+	if (div < 1) {
-+		div = 1;
++	/* Android's msm_geni_serial_config_baud_rate and upstream both switch
++	 * from 32x to 16x at QUP v2.5. SE_FW_REV identifies protocol firmware,
++	 * not that hardware revision. A correct RCG readback alone cannot
++	 * establish the wire baud rate. Use the driver's rounded-up divider. */
++	uint32_t ver = bt_rd(BT_W_WRAPPER, 4);
++	if (ver == 0 || ver == 0xffffffffu) {
++		printf("PANDORA BT: invalid QUP wrapper version %#x\n", ver);
++		return EIO;
 +	}
-+	if (div > 0xfff) {
-+		div = 0xfff;
++	unsigned sampling = ver >= 0x20050000u ? 16 : 32;
++	unsigned div = (bt_rate + baud * sampling - 1u) / (baud * sampling);
++	if (div < 1 || div > 0xfff) {
++		printf("PANDORA BT: UART divider %u out of range\n", div);
++		return EINVAL;
 +	}
-+	printf("PANDORA BT: UART %u baud from %u Hz: divider %u (actual %u)\n",
-+	    baud, bt_rate, div, bt_rate / (div * 32u));
++	printf("PANDORA BT: QUP version %#x sampling %u; UART %u baud from %u Hz: divider %u (actual %u)\n",
++	    ver, sampling, baud, bt_rate, div, bt_rate / (div * sampling));
++	/* The receiver is a persistent secondary command. Stop inherited or
++	 * previous-attempt commands before changing their clock and format. */
++	uint32_t active = bt_rd(BT_W_SE, SE_STATUS);
++	if (active & GENI_STATUS_M_ACTIVE) {
++		bt_wr(BT_W_SE, SE_M_CMD_CTRL, GENI_CMD_ABORT);
++	}
++	if (active & GENI_STATUS_S_ACTIVE) {
++		bt_wr(BT_W_SE, SE_S_CMD_CTRL, GENI_CMD_ABORT);
++	}
++	unsigned waited;
++	for (waited = 0; waited < 5000; waited++) {
++		if (!(bt_rd(BT_W_SE, SE_STATUS) & (GENI_STATUS_M_ACTIVE | GENI_STATUS_S_ACTIVE))) {
++			break;
++		}
++		delay(1);
++	}
++	if (waited == 5000) {
++		printf("PANDORA BT: UART sequencers did not stop (status %#x)\n", bt_rd(BT_W_SE, SE_STATUS));
++		return ETIMEDOUT;
++	}
 +
 +	bt_wr(BT_W_SE, SE_GSI_EVENT_EN, 0);
 +	bt_wr(BT_W_SE, SE_M_IRQ_CLR, 0xffffffffu);
@@ -659,9 +834,8 @@ index 0000000..008e6a1
 +	return 0;
 +}
 +
-+/* Read back what bt_uart_init() programmed, plus the CTS/RX pad input levels.
-+ * Offset 4 in the window is GPIO24's IO register and 0x3004 is GPIO27's; the
-+ * low bit of each is the sampled pin level. */
++/* Read back what bt_uart_init() programmed, plus CTS/RX pad input levels.
++ * GPIO_IO bit0 is the sample; bit1 is the output latch. */
 +static void
 +bt_uart_dump(void)
 +{
@@ -676,7 +850,8 @@ index 0000000..008e6a1
 +	printf("PANDORA BT: UART status %#x m_irq %#x s_irq %#x tx_fifo %#x rx_fifo %#x cts_in %#x rx_in %#x\n",
 +	    bt_rd(BT_W_SE, SE_STATUS), bt_rd(BT_W_SE, SE_M_IRQ), bt_rd(BT_W_SE, SE_S_IRQ),
 +	    bt_rd(BT_W_SE, SE_TX_FIFO_ST), bt_rd(BT_W_SE, SE_RX_FIFO_ST),
-+	    (bt_rd(BT_W_UART, 0x4) >> 1) & 1u, (bt_rd(BT_W_UART, 3 * 0x1000u + 0x4) >> 1) & 1u);
++	    bt_rd(BT_W_UART, 0x4) & BT_PIN_INPUT, bt_rd(BT_W_UART, 3 * 0x1000u + 0x4) & BT_PIN_INPUT);
++	printf("PANDORA BT: GENI IOS %#x (RX bit0, IO2/CTS bit1)\n", bt_rd(BT_W_SE, SE_IOS));
 +}
 +
 +/* Wait for up to MS, collecting RX FIFO words; returns bytes in OUT. */
@@ -709,6 +884,10 @@ index 0000000..008e6a1
 +	for (i = 0; i < 5000 && (bt_rd(BT_W_SE, SE_STATUS) & GENI_STATUS_M_ACTIVE); i++) {
 +		delay(1);
 +	}
++	if (bt_rd(BT_W_SE, SE_STATUS) & GENI_STATUS_M_ACTIVE) {
++		printf("PANDORA BT: %s: previous TX still active\n", what);
++		return ETIMEDOUT;
++	}
 +	bt_wr(BT_W_SE, SE_M_IRQ_CLR, 0xffffffffu);
 +	bt_wr(BT_W_SE, SE_TX_WM, 2);
 +	bt_wr(BT_W_SE, SE_TX_TRANS_LEN, len);
@@ -719,7 +898,7 @@ index 0000000..008e6a1
 +	}
 +	if (!(bt_rd(BT_W_SE, SE_M_IRQ) & M_TX_WM)) {
 +		printf("PANDORA BT: %s: TX FIFO never opened (irq %#x)\n", what, bt_rd(BT_W_SE, SE_M_IRQ));
-+		bt_wr(BT_W_SE, SE_M_CMD_CTRL, M_CMD_ABORT);
++		bt_wr(BT_W_SE, SE_M_CMD_CTRL, GENI_CMD_ABORT);
 +		return ETIMEDOUT;
 +	}
 +	for (i = 0; i < len; i++) {
@@ -732,7 +911,7 @@ index 0000000..008e6a1
 +	uint32_t irq = bt_rd(BT_W_SE, SE_M_IRQ);
 +	if (!(irq & M_CMD_DONE)) {
 +		printf("PANDORA BT: %s: command not done (irq %#x status %#x)\n", what, irq, bt_rd(BT_W_SE, SE_STATUS));
-+		bt_wr(BT_W_SE, SE_M_CMD_CTRL, M_CMD_ABORT);
++		bt_wr(BT_W_SE, SE_M_CMD_CTRL, GENI_CMD_ABORT);
 +		bt_wr(BT_W_SE, SE_M_IRQ_CLR, 0xffffffffu);
 +		return ETIMEDOUT;
 +	}
@@ -765,11 +944,14 @@ index 0000000..008e6a1
 +		return false;
 +	}
 +	bt_dump("HCI event", rx, got);
-+	if (got >= 7 && rx[0] == 0x04 && rx[1] == 0x0e && rx[2] >= 4) {
++	if (got >= 7 && rx[0] == 0x04 && rx[1] == 0x0e && rx[2] == 4 &&
++	    rx[4] == 0x03 && rx[5] == 0x0c) {
 +		printf("PANDORA BT: Command Complete opcode %#x status %u\n",
 +		    (unsigned)rx[4] | (unsigned)rx[5] << 8, rx[6]);
++		return rx[6] == 0;
 +	}
-+	return true;
++	printf("PANDORA BT: response is not a successful HCI Reset completion\n");
++	return false;
 +}
 +
 +static void
@@ -794,16 +976,17 @@ index 0000000..008e6a1
 +			bt_report();
 +			goto out;
 +		}
-+		/* A low->high edge on PMH0104 GPIO5 is what btpower does before it
-+		 * opens the UART; failure here is reported and the rest still runs. */
-+		(void)bt_rf_clk();
++		if (bt_rf_clk()) {
++			goto out;
++		}
 +		if (bt_level < 3 || bt_level == 6) {
 +			/* level 6 also needs the SPMI windows mapped for its retries. */
-+			(void)bt_en_pulse();
++			if (bt_en_pulse()) {
++				goto out;
++			}
 +		} else {
-+			/* iBoot hands this pad over already high (mode 1, out 1, en on)
-+			 * and the chip is running: level 3 leaves it alone instead of
-+			 * resetting it, and only reports the RX level. */
++			/* Preserve the inherited pad configuration. Its output level and
++			 * controller readiness have not been established by MODE alone. */
 +			printf("PANDORA BT: level 3 keeps the iBoot BT_RESET level\n");
 +			pandora_log_sync();
 +		}
@@ -814,16 +997,15 @@ index 0000000..008e6a1
 +		bt_pin(26, 1, 3, 2, 1);
 +		bt_pin(27, 1, 0, 2, -1);
 +		printf("PANDORA BT: RX pin level before the UART %#x (1 = WCN TX idle high)\n",
-+		    (bt_rd(BT_W_UART, 3 * 0x1000u + 0x4) >> 1) & 1u);
++		    bt_rd(BT_W_UART, 3 * 0x1000u + 0x4) & BT_PIN_INPUT);
 +		pandora_log_sync();
-+		if (bt_level >= 4) {
-+			/* The combo chip only comes up with the WiFi side: NEZHA WIFI
-+			 * starts at ~20 s (PCIe + WL reset). Poll the WCN TX line and
-+			 * open the UART once it goes idle high. */
++		if (bt_level == 4) {
++			/* Isolated historical wait experiment; cold retries must not
++			 * silently inherit its 60-second delay. */
 +			unsigned waited = 0;
 +			uint32_t lvl = 0;
 +			for (unsigned i = 0; i < 600; i++) {
-+				lvl = (bt_rd(BT_W_UART, 3 * 0x1000u + 0x4) >> 1) & 1u;
++				lvl = bt_rd(BT_W_UART, 3 * 0x1000u + 0x4) & BT_PIN_INPUT;
 +				if (lvl) {
 +					break;
 +				}
@@ -838,7 +1020,7 @@ index 0000000..008e6a1
 +			goto out;
 +		}
 +		for (unsigned attempt = 1; attempt <= 3; attempt++) {
-+			if (bt_uart_init(bt_level >= 5 ? 4000000 : 115200) == 0) {
++			if (bt_uart_init(bt_level == 5 ? 4000000 : 115200) == 0) {
 +				bt_uart_dump();
 +				if (bt_try_hci_reset()) {
 +					printf("PANDORA BT: controller answered on attempt %u\n", attempt);
@@ -852,14 +1034,19 @@ index 0000000..008e6a1
 +			/* hci_qca retries qca_power_on after a failed setup: drop the
 +			 * enable pad, wait, then bring it back up before retrying. */
 +			printf("PANDORA BT: attempt %u failed (RX %#x): power cycling\n", attempt,
-+			    (bt_rd(BT_W_UART, 3 * 0x1000u + 0x4) >> 1) & 1u);
++			    bt_rd(BT_W_UART, 3 * 0x1000u + 0x4) & BT_PIN_INPUT);
 +			pandora_log_sync();
-+			(void)bt_spmi_gpio(bt_bus0, bt_bus1, BT_SPMI_GPIO_PPID, 0x00, 1, "retry BT_RESET low");
++			if (bt_spmi_gpio(bt_bus0, bt_bus1, BT_SPMI_GPIO_PPID, 0x00, 1, "retry BT_RESET low")) {
++				goto out;
++			}
 +			bt_sleep(100 * 1000);
-+			(void)bt_spmi_gpio(bt_bus0, bt_bus1, BT_SPMI_GPIO_PPID, 0x01, 1, "retry BT_RESET high");
++			if (bt_spmi_gpio(bt_bus0, bt_bus1, BT_SPMI_GPIO_PPID, 0x01, 1, "retry BT_RESET high")) {
++				goto out;
++			}
 +			bt_sleep(150 * 1000);
 +		}
 +	} else {
++		bt_pmic_report();
 +		printf("PANDORA BT: about to read RCG\n");
 +		bt_rate = bt_rcg_rate();
 +	}
@@ -877,6 +1064,10 @@ index 0000000..008e6a1
 +{
 +	(void)PE_parse_boot_argn("pandora_bt", &bt_level, sizeof(bt_level));
 +	if (!bt_level) {
++		return;
++	}
++	if (bt_level < 1 || bt_level > 6) {
++		printf("PANDORA BT: unsupported pandora_bt=%d (expected 1..6)\n", bt_level);
 +		return;
 +	}
 +	thread_t thread;

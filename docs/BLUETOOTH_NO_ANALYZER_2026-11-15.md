@@ -1,0 +1,105 @@
+# 蓝牙：无需逻辑分析仪的软件排查路线（2026-11-15）
+
+## 结论与验证边界
+
+有可继续执行的软件路线。旧交接的“软件全部对齐、两个独立信号为零，所以只能接逻辑分析仪”不成立；源码、原始 w67 日志和当前 Android DT 已足以指出多处具体错误。
+
+本轮已修正本地 `wsl/pandora_bt.c`，同步到 `xnu/patches/0476-pandora-bluetooth.patch`。这是一份待试机候选，不代表蓝牙已工作。尚未获得 PMIC GPIO5/6 的实际 TYPE/SUBTYPE 或 QUP wrapper 硬件版本，不能把候选预期写成实机结果。
+
+本轮手机操作仅为 Android 上读取 sysfs、DT 和复制现用内核模块到主机。没有开关蓝牙、挂载 debugfs、重启、启动 iOS、推送文件或写固件容器。Android 当前没有挂载 debugfs，也没有 `/dev/mem`，因此旧的 debugfs/devmem 采集脚本不能原样复用。当前工作区的根 Git 尚无提交；旧交接所称远端 main 不等于本地可核验的 HEAD。
+
+## 五项决定路线的证据
+
+### 1. PMIC GPIO 编码仍然错误，且遗漏了硬件子类型
+
+Linux `pinctrl-spmi-gpio.c` 的 `pmic_gpio_populate` / `pmic_gpio_config_set` 区分两种布局：
+
+| 布局 | TYPE / SUBTYPE | normal 输出低 / 高 |
+|---|---|---|
+| legacy | TYPE=0x10；SUBTYPE=0x01/0x05/0x09/0x0d | MODE_CTL=0x10 / 0x11；电平在 bit0 |
+| LV/MV | TYPE=0x10；SUBTYPE=0x10..0x15 | MODE_CTL=1；DIG_OUT_SOURCE_CTL（0x44）=0 / 0x80 |
+
+旧代码写 `MODE_CTL=0x12` 表示高电平。legacy 下它是 paired function、低输出值；LV/MV 下它也没有设置 0x44 的输出值。读回 0x12 只能证明写入值读回，不能证明输出 high。
+
+从手机复制的 `pinctrl-spmi-gpio.ko` 也验证了这两个编码分支：`pmic_gpio_config_set` 的 LV/MV 分支在 0x13dc..0x13e8 写 offset 0x44，输出值左移 7；legacy 分支在 0x13f4..0x1414 把 function 左移 1、direction 左移 4，再与未移位的布尔输出值合并。这是本机模块证据，避免只套用相近硬件的实现。
+
+同时，0x43 是输入路由 / DTEST 配置，不是电平采样。采样在 RT_STS（0x10）bit0，并且需要输入缓冲开启；纯输出配置下读到零不能证明物理低电平。候选按 TYPE/SUBTYPE 选编码，未知类型不写，检查 VIN 范围、写入返回值和配置读回。level 1 新增 GPIO5/6 的只读快照；SPMI 读事务需要提交 arbiter 命令，但不修改 PMIC 配置。
+
+### 2. TLMM 输入采样位读反，“SW_CTRL=0”是误判
+
+同款 SM8850 的 `pinctrl-canoe.c` 明确 `.in_bit=0, .out_bit=1`，并给出相同的 GPIO18、24..27 地址步长和 UART mux。手机 sysfs 也确认正在使用 `pinctrl_canoe`。
+
+旧代码把 GPIO_IO 右移 1 当作输入。w67 原始日志第 4292 行是：gpio18 IO=0x1、gpio24 IO=0x1、gpio27 IO=0。正确解码为 **SW_CTRL=1、CTS=1、RX=0**。因此“SW_CTRL 与 RX 两个独立信号都低”的前提已被原日志反证。RX 的原始值确实为零，仍需解释；不能由错误解码推出整颗 BT core 没启动。
+
+候选统一读取 bit0，并同时打印 GENI IOS（0x908）的输入采样，便于区分 pad / mux / 串口接收路径。IOS 与 TLMM 都是数字域观测，不等同于测量模拟电压或波形质量。
+
+### 3. w67 的 level 6 实际用了 4 Mbps，还继承了等待 60 秒
+
+旧 `bt_level >= 5` 同时控制 128 MHz RCG 和 4 Mbps；`bt_level >= 4` 又把等待实验带进了 level 6。
+
+原日志：第 4243 行等待 60000 ms；第 4247、4269、4283 行三次均打印 `UART 4000000`。这不能证明文档描述的“115200 冷启动、三次重试”失败。
+
+候选只让 **level 5** 使用 4 Mbps，只让 **level 4** 执行 60 秒等待；level 6 回到冷启动速率。w66 的 115200 试验仍使用错误 PMIC 编码，不能作为修正后组合的失败证据。
+
+### 4. 波特率计算缺少 QUP v2.5 的采样倍数分支
+
+Linux 串口源码与本机 `msm_geni_serial.ko` 的 `msm_geni_serial_config_baud_rate` 都在 QUP v2.5 及以上采用 16 倍采样，旧版本使用 32 倍。本机模块反汇编 0x95e8..0x9610 明确比较 major / minor 并选择 16 或 32。
+
+旧代码始终用 32，并向下取整。候选在 wrapper/SE 时钟开启且读回正常后，读取 QUPV3_3 `0x019c0000 + 4` 的硬件版本，按版本选择采样倍数，依照 Android 的向上取整计算 divider，打印请求速率和计算实际速率。SE_FW_REV=0x206 是 UART 协议固件标识，不能代替 wrapper 版本。
+
+**条件性推论**：如果本机 wrapper >=2.5，旧 64 MHz/divider17 的“115200”实际约为 235294 baud。当前尚未读出该硬件版本，不能称这个数值已在手机上测得。RCG=64/128 MHz 的读回也不排除此错误。
+
+### 5. FMD GPIO6 被误当成 XO 输出
+
+本轮直接读取手机 DT：
+
+| 节点 | 引脚 | function | power-source | 方向属性 |
+|---|---|---|---|---|
+| `bt_en` | gpio5 | normal | 1 | input-disable、output-enable |
+| `bt_fmd_clk_en` | gpio6 | normal | 1 | input-enable、output-disable |
+
+旧代码却把 GPIO6 设置为 VIN0、强制输出高；交接称它与 Android 一致，和当前 DT 不符。同平台 SM8850 的 `btpower.c` 只解析并保存 `bt_gpio_fmd_clk_ctrl`；正常上电里的 XO helper 使用独立的 `qcom,xo-clk-gpio`，不能把两个字段混用。该源码和本机模块都包含新式 FMD / 多客户端电源路径；旧 `work/tmp_btpower.c` 不能独自代表当前设备驱动。
+
+候选去掉 GPIO6 的强制写入，保留交接状态，level 1 可读出其配置。DT 表明预期配置；当前运行时 PMIC 寄存器值仍待采集，不把 DT 当作寄存器快照。
+
+## 候选的其余必要修正
+
+- SPMI / RF clock 失败立即终止当前初始化，不再吞掉返回值后打印正常上电流程。共享 rail 不擅自撤票，避免干扰 Wi-Fi。
+- 部分 SPMI 窗口映射失败后保留已成功映射，后续进入只补缺失窗口，避免重复映射。映射仍按原有约定随内核存活。
+- 重试重新配置串口前停止仍活跃的主 / 次 sequencer；CMD_CTRL 的 abort 命令是 bit1，不能使用 IRQ 的 abort 完成位 bit5。
+- HCI 成功必须收到完整的 Reset Command Complete、opcode=0x0c03、status=0。噪声、截断数据或其他事件不再记为控制器成功应答。
+
+改动限定在 BT 驱动、其构建补丁和蓝牙说明；未修改 Wi-Fi 驱动、固件/NVM、IPA 安装路径或设备镜像。
+
+## 无需仪器的执行顺序与判据
+
+| 次序 | 可执行动作 | 能区分的问题 | 状态 |
+|---|---|---|---|
+| A | 源码 + 原始日志 + Android 只读 DT / 模块审计 | 是否真的已经排除软件错误 | 本轮已完成，发现上述错误 |
+| B | 完整构建候选；经用户明确同意，做一次 level 2 的 90 秒临时启动 | TYPE/SUBTYPE、正确 BT_EN、QUP sampling、pad / IOS、HCI | 未构建完整内核、未启动；level 2 单次初始化优先，避免混入重试因素 |
+| C | 若正常 HCI 仍无应答，单独加入 GENI 内部 loopback 并收回原字节 | AP FIFO / sequencer / packing / 接收是否工作 | 未实现；上游已有 SE_UART_LOOPBACK_CFG=0x22c 可参考；此测试不能证明外部连线或绝对波特率 |
+| D | 对照 Android 的 PMIC 配置和上电事件 | kernel API 所用子类型、真实 pinconf、时钟/电源调用顺序 | 尚缺运行时寄存器快照；debugfs 未挂载，不能假称已抓到 |
+| E | 按 Qualcomm 初始化顺序发 `qca_read_soc_version`，验证匹配的 vendor / Command Complete 响应 | ROM 握手与通用 HCI Reset 行为是否不同 | 未实现；Linux 并不把通用 Reset 成功作为读取版本的唯一前提 |
+| F | ROM 通信成立后再移植 TLV / NVM 下载 | 固件加载、运行速率、后续栈接入 | 未开始，不能用盲灌固件解决链路问题 |
+
+后续若需要 Android 主动开关蓝牙或使用 trace 配置，必须单独说明具体实验；本轮未执行。对 GPIO 做输入/输出同时开启并读取 RT_STS 也是一个可选的数字电平验证实验，但会改变 pad 配置，应独立设计并恢复原配置，不混入首个候选。数字回读不能覆盖模拟电气故障，但当前没有理由以仪器为继续工作的前提。
+
+## 复用与资料入口
+
+以下均为一手开源资料，按硬件寄存器事实与接口约定参考，未整段搬入其他系统的驱动框架：
+
+- Linux `drivers/pinctrl/qcom/pinctrl-spmi-gpio.c`，v6.12 与 master：TYPE/SUBTYPE、MODE、SOURCE、RT_STS。用于适配编码。
+- OnePlusOSS `android_kernel_oneplus_sm8850`，分支 `oneplus/sm8850_b_16.0.0_oneplus_15`，`drivers/pinctrl/qcom/pinctrl-canoe.c`：同平台 TLMM 输入/输出位和 mux。用于直接核对寄存器事实。
+- OnePlusOSS `android_kernel_modules_and_devicetree_oneplus_sm8850`，同名分支，`vendor/qcom/opensource/bt-kernel/pwr/btpower.c`：FMD 与 XO 的不同字段、SW_CTRL 输入语义。可适配顺序，不能把别的整机 rail 表直接套入小米。
+- Linux `drivers/tty/serial/qcom_geni_serial.c`、`drivers/soc/qcom/qcom-geni-se.c`、`include/linux/soc/qcom/geni-se.h`：采样倍数、wrapper version、sequencer abort、IOS、loopback。
+- Linux `drivers/bluetooth/hci_qca.c`、`btqca.c`：冷启动初始化、版本握手、固件下载。UART/固件协议可适配，不是 XNU HCI 栈的直接替代品。
+
+原始资料、本机模块及定点反汇编保存在工作区 `work/bluetooth-source-audit/`，入口为该目录的 `README.md`；后续接手可不依赖 debugfs 或手机重新启动来复核本轮静态结论。
+
+固件来源也不是“只能写 280 KB C 数组”：现有 `pandora_wifi.c` 已通过 `pandora_firmware_pread` 读取外部固件。可以参考该接口设计 BT loader；本轮未改动仍由 IPA 实验占用的容器，也未声称 BT 固件已经在可读存储中。
+
+## 本轮验证与下一步
+
+本地使用现有 XNU DEVELOPMENT_ARM64_PANDORA 生成头和 NDK clang，以 `arm64-apple-macos11.0`、`-mkernel -O2 -Wall -Wextra` 编译单个 BT 源文件，检查真实进程返回码；构建补丁的新增文件须与 `.c` 完全一致，两个注册 / 调用上下文块保持原样。最终实际结果记在审计目录 `verification.txt`。
+
+没有把单文件编译当作完整内核链接或设备验证。下一步是完整构建此候选，再在明确获准的独占窗口做 B；第一次日志必须包含 TYPE/SUBTYPE、MODE/SOURCE、wrapper version / sampling 和真实 HCI 数据。未获得用户明确启动同意前，停止在主机构建阶段。
