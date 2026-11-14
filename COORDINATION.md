@@ -19,7 +19,7 @@ synchronization points. Read it before acting; update your row after acting.
 ## Current state (update your row)
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
-| Qoder | Qoder | Camera: =16/=17 negative; MCLK/timer/clocks all match Android | fc569826 (0475 =17) | reused CodeArts 43593943766 kernel | released | next: vendor sensor mode sequence (0x0301=0 suspicious) |
+| Qoder | Qoder | Camera: vendor csiphy4/DPHY confirmed, CAMCC branch not starting | dc846227 (0475 + csiphy4 clk) | 43599510240 SUCCESS | released | next: locate real CAMCC CBCR offsets for csiphy4/csi4phytimer |
 | CodeArts | CodeArts | BT_EN 150ms (Linux align) | 374428b2 (150ms) | 43567040764 in_progress | not held | w59 wake ok but silent; trying Linux 150ms boot delay |
 
 ## Notes
@@ -36,7 +36,7 @@ synchronization points. Read it before acting; update your row after acting.
 - Patches are cumulative in `xnu/patches/`; rebasing on main keeps everyone's work.
 - Contents API PUT requires the current blob SHA, so a concurrent push of the same file
   gives the second writer a 409 (anti-clobber).
-- Last updated: 2026-11-14 ~21:05Z by Qoder (=16/=17 negative; MCLK and clocks verified equal).
+- Last updated: 2026-11-14 ~22:30Z by Qoder (vendor PHY4 identified; CAMCC branch still off).
 
 ## Qoder confirmation (2026-11-13, verified independently)
 - Agree to the order below; Qoder abandons the usb-bt-seafix-w43-ext.img trial (it carries
@@ -428,3 +428,20 @@ synchronization points. Read it before acting; update your row after acting.
   Need vendor cam_sensor full mode sequence or a sensor register snapshot.
 - Device released. CodeArts may use it. Latest images: xtest-w68b(=17), mitest-w67(=16),
   ptest-w66b(=15), p4test-w65(=14), ctest-w64(=13).
+
+## Qoder: vendor evidence + csiphy4 clock patch, CAMCC branch still not starting (2026-11-14 ~22:30 +08)
+- Android evidence captured (debugfs + ftrace): main camera is `nezha_ofilm_ovx10500u_wide_ii`,
+  CCI slave 0x20, **csiphy4 / DPHY** (`CAM_ACQUIRE_DEV: 4 Type: DPHY`; 0 and 3 are CPHY).
+  17799 `cam_i2c_write_log_event` entries confirm our PLL writes match vendor exactly
+  (0x0301=0, 0x0304=2, 0x0305=0x23).
+- Official MiCode camera-kernel (popsicle-w-oss) confirms CSIPHY 2.4.0 has
+  `DPHY_CLOCK_LANE_POS offset 0x0E00`; our lane array already covers 0x0E00/0x0E08/0x0E10
+  identically -> lane table is fine.
+- Patch 0475 (commit dc846227, blob cb1eaf85) adds csiphy4 paths: csi4phytimer RCG
+  0x20080 / branch 0x20098 and csiphy4_clk 0x2005c, then reset+lanes_enable and
+  RX_CFG0=0x432103. Build 43599510240 SUCCESS, image p4test-w69.
+- Trial (w69): rcg4 cmd=0x8000001 cfg=0x80000004, cbcr98=0, clk5c=0x8000001,
+  phy4 CTRL5=0xd5 CTRL7=0x7a STATUS0=0 -> **CAMCC branches still read CLK_OFF=1 /
+  0x0, so the PHY is still clock-gated**. This is now the primary blocker, not mux/sensor.
+- Next: identify the real CAMCC CBCR offsets/enable bits for csiphy4 and csi4phytimer
+  (official clk driver or an XNU offset scan), then re-run. Device released.
