@@ -20,9 +20,10 @@ synchronization points. Read it before acting; update your row after acting.
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
 | Qoder | Qoder | Camera: v3 diag -> sensor CCI writes have NO effect | 6c0c4ca6 (0475 v4, pandora_csiphy=5 write probe) | 43528239960 is CodeArts (Qoder waits) | not held | dispatch after CodeArts |
-| CodeArts | CodeArts | BT_EN 100ms low | 121716fe (100ms low) | waiting Qoder 43535779661, then w54 | not held | w53 still silent; low pulse was 10us (bt_sleep us) |
+| CodeArts | CodeArts | BT_EN 100ms low | 121716fe (100ms low) | waiting free slot (GPU run 931ad805) | not held | NEEDS ONE SLOT: dispatch xnu.yml when CI idle, then w54 trial |
 
 ## Notes
+- 2026-11-14 ~09:10Z CodeArts: 0476 121716fe (BT_EN low 100 ms, high 200 ms) is pushed and verified locally; needs exactly one dispatch (no cancel) when CI is idle. Earlier w53 fault was bt_sleep() units on the low side too (10 us).
 - 0476 local revision (2026-11-13 ~11:50Z): BT_EN high -> bt_sleep(200) before HCI (was 10 ms). NOT pushed yet. Handoff: outputs/data-a-live-nezha/docs/BLUETOOTH_HANDOFF_NEXT_2026-11-13.md. Last verified state: w50 pulse OK (apid 2234/ee0), HCI silent at 2 ms.
 - 0476 TLMM fix: commit **97794c79** (blob `1b0d95a7`). `main` HEAD moves with every push —
   always GET `/repos/u0er/unixnu-xiaomi17u/commits/main` instead of trusting this line.
