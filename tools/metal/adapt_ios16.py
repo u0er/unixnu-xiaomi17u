@@ -331,6 +331,13 @@ edit('NativeBridgeMetalFrontend.mm',
 """)
 
 edit('NativeAdrenoMetalPlugin.mm',
+     """static id clientDevice(unsigned port) {
+    char turnip[1024];""",
+     """static id clientDevice(unsigned port) {
+    NSLog(@"pandora-metal client0 %s enter", getprogname());
+    char turnip[1024];""")
+
+edit('NativeAdrenoMetalPlugin.mm',
      """    char turnip[1024];
     if (!turnip::libraryPath""",
      """    // Every native client needs the iOS private-ABI adapter, including ImageIO's
@@ -366,4 +373,37 @@ edit('NativeAdrenoMetalPlugin.mm',
 edit('NativeAdrenoMetalPlugin.mm',
      '    if (!strcmp(getprogname(), "AegirPoster")) {\n        gClientPort = port;\n',
      '    if (!strcmp(getprogname(), "AegirPoster") || !strcmp(getprogname(), "WeatherPoster")) {\n        gClientPort = port;\n')
+
+# ---- data-a-live: step log through the client open path (the pc-0 hunt) --------
+# Three trials died at the same pc 0 with the same backtrace, and neither the asked
+# journal nor the NULL-IMP enumeration ever printed: the crash is inside
+# native_bridge_metal_open (or before it), under objc_msgSend's reach. Log every step;
+# backboardd takes the same clientDevice path and survives, so the SpringBoard vs
+# backboardd step traces name the exact fork point.
+edit('NativeAdrenoMetalPlugin.mm',
+     """        @try {
+            device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
+        } @catch (NSException *exception) {""",
+     """        NSLog(@"pandora-metal client2 open dir %u", i);
+        @try {
+            device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
+            NSLog(@"pandora-metal client3 open returned %@", device ? @"device" : @"nil");
+        } @catch (NSException *exception) {""")
+edit('NativeBridgeMetalFrontend.mm',
+     """extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
+ if(gDeviceObject)return gDeviceObject;
+ gMissing=missing;gInFlight=[NSMutableSet set];""",
+     """extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
+ if(gDeviceObject)return gDeviceObject;
+ gMissing=missing;gInFlight=[NSMutableSet set];
+ NSLog(@"pandora-metal open0 %s enter",getprogname());""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ gDevice=nmb_device_open(loader,cache);""",
+     """ NSLog(@"pandora-metal open1 nmb_device_open begin");
+ gDevice=nmb_device_open(loader,cache);
+ NSLog(@"pandora-metal open2 device=%p",(void *)gDevice);""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ Class cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);if(!cls)return nil;""",
+     """ NSLog(@"pandora-metal open3 subclass begin");
+ Class cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);if(!cls)return nil;""")
 
