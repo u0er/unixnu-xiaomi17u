@@ -15,6 +15,8 @@
  * BT_EN is PMH0104 SPMI GPIO5. Levels 2 and 6 pulse it using the encoding
  * selected by the peripheral's TYPE/SUBTYPE; level 1 only reads its state.
  * Level 6 retries cold initialization at 115200. Only level 5 uses 4 Mbps.
+ * Level 7 runs the GENI internal loopback without BT power/reset or TLMM
+ * programming. A loopback pass establishes AP FIFO/sequence operation only.
  *
  * Register map: Linux drivers/soc/qcom/qcom-geni-se.c, drivers/tty/serial/
  * msm_geni_serial.c and u-boot's drivers/serial/serial_msm_geni.c (GPL-2.0+,
@@ -74,6 +76,7 @@ void pandora_bt_init(void);
 #define SE_IF_DISABLE    0x064u
 #define SE_FW_REV        0x068u
 #define SE_CLK_SEL       0x07cu
+#define SE_UART_LOOPBACK 0x22cu        /* bit0 RX/TX short, bit1 CTS/RTS short */
 #define SE_TX_TRANS_CFG  0x25cu
 #define SE_TX_PACK0      0x260u
 #define SE_TX_PACK1      0x264u
@@ -715,9 +718,32 @@ bt_clocks(void)
 	return 0;
 }
 
-/* FIFO-mode UART, as Linux msm_geni_serial.c / u-boot serial_msm_geni.c. */
+/* Stop persistent commands before reconfiguration or loopback cleanup. The
+ * returned error keeps a failed abort visible instead of assuming quiescence. */
 static int
-bt_uart_init(unsigned baud)
+bt_uart_stop(void)
+{
+	uint32_t active = bt_rd(BT_W_SE, SE_STATUS);
+	if (active & GENI_STATUS_M_ACTIVE) {
+		bt_wr(BT_W_SE, SE_M_CMD_CTRL, GENI_CMD_ABORT);
+	}
+	if (active & GENI_STATUS_S_ACTIVE) {
+		bt_wr(BT_W_SE, SE_S_CMD_CTRL, GENI_CMD_ABORT);
+	}
+	for (unsigned waited = 0; waited < 5000; waited++) {
+		if (!(bt_rd(BT_W_SE, SE_STATUS) & (GENI_STATUS_M_ACTIVE | GENI_STATUS_S_ACTIVE))) {
+			return 0;
+		}
+		delay(1);
+	}
+	printf("PANDORA BT: UART sequencers did not stop (status %#x)\n", bt_rd(BT_W_SE, SE_STATUS));
+	return ETIMEDOUT;
+}
+
+/* FIFO-mode UART, as Linux msm_geni_serial.c / u-boot serial_msm_geni.c.
+ * Loopback must be selected before starting the persistent RX sequencer. */
+static int
+bt_uart_init(unsigned baud, bool loopback)
 {
 	uint32_t fw = bt_rd(BT_W_SE, SE_FW_REV);
 	if (bt_rate < 1000000u) {
@@ -752,23 +778,14 @@ bt_uart_init(unsigned baud)
 	    ver, sampling, baud, bt_rate, div, bt_rate / (div * sampling));
 	/* The receiver is a persistent secondary command. Stop inherited or
 	 * previous-attempt commands before changing their clock and format. */
-	uint32_t active = bt_rd(BT_W_SE, SE_STATUS);
-	if (active & GENI_STATUS_M_ACTIVE) {
-		bt_wr(BT_W_SE, SE_M_CMD_CTRL, GENI_CMD_ABORT);
+	int err = bt_uart_stop();
+	if (err) {
+		return err;
 	}
-	if (active & GENI_STATUS_S_ACTIVE) {
-		bt_wr(BT_W_SE, SE_S_CMD_CTRL, GENI_CMD_ABORT);
-	}
-	unsigned waited;
-	for (waited = 0; waited < 5000; waited++) {
-		if (!(bt_rd(BT_W_SE, SE_STATUS) & (GENI_STATUS_M_ACTIVE | GENI_STATUS_S_ACTIVE))) {
-			break;
-		}
-		delay(1);
-	}
-	if (waited == 5000) {
-		printf("PANDORA BT: UART sequencers did not stop (status %#x)\n", bt_rd(BT_W_SE, SE_STATUS));
-		return ETIMEDOUT;
+	bt_wr(BT_W_SE, SE_UART_LOOPBACK, loopback ? 3u : 0);
+	if (bt_rd(BT_W_SE, SE_UART_LOOPBACK) != (loopback ? 3u : 0)) {
+		printf("PANDORA BT: UART loopback configuration did not latch\n");
+		return EIO;
 	}
 
 	bt_wr(BT_W_SE, SE_GSI_EVENT_EN, 0);
@@ -792,7 +809,7 @@ bt_uart_init(unsigned baud)
 	bt_wr(BT_W_SE, SE_TX_PARITY, 0);
 	bt_wr(BT_W_SE, SE_RX_PARITY, 0);
 	bt_wr(BT_W_SE, SE_RX_STALE, 0xf);
-	bt_wr(BT_W_SE, SE_TX_TRANS_CFG, bt_rd(BT_W_SE, SE_TX_TRANS_CFG) | (1u << 1)); /* CTS */
+	bt_wr(BT_W_SE, SE_TX_TRANS_CFG, bt_rd(BT_W_SE, SE_TX_TRANS_CFG) | (1u << 1)); /* mask external CTS */
 	bt_wr(BT_W_SE, SE_RX_TRANS_CFG, bt_rd(BT_W_SE, SE_RX_TRANS_CFG) | (1u << 1));
 
 	bt_wr(BT_W_SE, SE_TX_WM, 2);
@@ -845,7 +862,7 @@ bt_rx_poll(uint8_t *out, unsigned cap, unsigned ms)
 			out[got++] = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
 		}
 		/* One HCI event: type, event code, length, then that many bytes. */
-		if (got >= 3 && out[0] == 0x04 && got >= 3u + out[2]) {
+		if (got == cap || (got >= 3 && out[0] == 0x04 && got >= 3u + out[2])) {
 			break;
 		}
 		bt_sleep(1000);
@@ -854,7 +871,7 @@ bt_rx_poll(uint8_t *out, unsigned cap, unsigned ms)
 }
 
 static int
-bt_hci(const uint8_t *pkt, unsigned len, const char *what)
+bt_uart_tx(const uint8_t *pkt, unsigned len, const char *what)
 {
 	unsigned i;
 
@@ -907,12 +924,64 @@ bt_dump(const char *what, const uint8_t *buf, unsigned n)
 	printf("\n");
 }
 
+/* Isolate FIFO packing and both sequencers from the external controller.
+ * The fixed eight-byte input fits the SE5 TX FIFO and exercises low/high and
+ * alternating bits. Wait a bounded interval and reject extra/stale bytes.
+ * Restore the inherited loopback value after stopping commands on every path;
+ * this does not restore the entire UART to a previous OS's working session. */
+static void
+bt_loopback(void)
+{
+	static const uint8_t pattern[] = { 0x55, 0xaa, 0x00, 0xff, 0x01, 0x80, 0x7e, 0x81 };
+	uint8_t rx[16];
+	uint32_t saved_loopback = bt_rd(BT_W_SE, SE_UART_LOOPBACK);
+	int err = bt_uart_init(115200, true);
+	unsigned got = 0;
+	if (!err) {
+		/* Ignore inherited FIFO bytes only after the receiver is routed
+		 * internally. A stuck/non-empty FIFO is a setup failure, not data
+		 * to count as loopback response. No unbounded FIFO draining. */
+		unsigned discarded = 0;
+		while (discarded < 64 && (bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
+			(void)bt_rd(BT_W_SE, SE_RX_FIFO);
+			discarded++;
+		}
+		printf("PANDORA BT: internal loopback config %#x; discarded %u inherited bytes\n",
+		    bt_rd(BT_W_SE, SE_UART_LOOPBACK), discarded);
+		if (bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu) {
+			err = EIO;
+		} else {
+			bt_wr(BT_W_SE, SE_S_IRQ_CLR, 0xffffffffu);
+			err = bt_uart_tx(pattern, sizeof(pattern), "internal loopback pattern");
+			if (!err) {
+				got = bt_rx_poll(rx, sizeof(rx), 200);
+				bt_dump("internal loopback RX", rx, got);
+				if (got != sizeof(pattern) || memcmp(rx, pattern, sizeof(pattern))) {
+					err = EIO;
+				}
+			}
+		}
+		bt_uart_dump();
+	}
+	int stop_err = bt_uart_stop();
+	bt_wr(BT_W_SE, SE_UART_LOOPBACK, saved_loopback);
+	if (!err && stop_err) {
+		err = stop_err;
+	}
+	if (bt_rd(BT_W_SE, SE_UART_LOOPBACK) != saved_loopback) {
+		printf("PANDORA BT: loopback restore failed\n");
+		err = EIO;
+	}
+	printf("PANDORA BT: internal loopback %s (error %d, received %u/%u); no controller-ready verdict\n",
+	    err ? "FAIL" : "PASS", err, got, (unsigned)sizeof(pattern));
+}
+
 static bool
 bt_try_hci_reset(void)
 {
 	uint8_t rx[96];
 
-	if (bt_hci(bt_hci_reset, HCI_RESET_LEN, "HCI Reset")) {
+	if (bt_uart_tx(bt_hci_reset, HCI_RESET_LEN, "HCI Reset")) {
 		return false;
 	}
 	unsigned got = bt_rx_poll(rx, sizeof(rx), 200);
@@ -948,6 +1017,16 @@ bt_thread(void *arg, wait_result_t result)
 	    (unsigned long long)bt_wins[BT_W_HALT].va, (unsigned long long)bt_wins[BT_W_SE].va,
 	    (unsigned long long)bt_wins[BT_W_SWCTRL].va, (unsigned long long)bt_wins[BT_W_UART].va);
 	pandora_log_sync();
+	if (bt_level == 7) {
+		/* No BT rail votes, reset pulse, or TLMM programming in this mode.
+		 * The QUP clocks and UART configuration are still changed. */
+		if (bt_clocks()) {
+			goto out;
+		}
+		bt_loopback();
+		bt_report();
+		goto out;
+	}
 	if (bt_level >= 2) {
 		if (bt_power()) {
 			bt_report();
@@ -997,7 +1076,7 @@ bt_thread(void *arg, wait_result_t result)
 			goto out;
 		}
 		for (unsigned attempt = 1; attempt <= 3; attempt++) {
-			if (bt_uart_init(bt_level == 5 ? 4000000 : 115200) == 0) {
+			if (bt_uart_init(bt_level == 5 ? 4000000 : 115200, false) == 0) {
 				bt_uart_dump();
 				if (bt_try_hci_reset()) {
 					printf("PANDORA BT: controller answered on attempt %u\n", attempt);
@@ -1043,8 +1122,8 @@ pandora_bt_init(void)
 	if (!bt_level) {
 		return;
 	}
-	if (bt_level < 1 || bt_level > 6) {
-		printf("PANDORA BT: unsupported pandora_bt=%d (expected 1..6)\n", bt_level);
+	if (bt_level < 1 || bt_level > 7) {
+		printf("PANDORA BT: unsupported pandora_bt=%d (expected 1..7)\n", bt_level);
 		return;
 	}
 	thread_t thread;

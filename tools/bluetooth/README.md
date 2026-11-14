@@ -51,3 +51,9 @@ The first Bluetooth candidate should use level 2, with one initialization at
 the corrected cold-start settings. Level 6 is reserved for a subsequent retry
 experiment. Compilation and image preparation do not establish HCI behavior;
 device startup still follows the repository's explicit-consent rule.
+
+`--level 7` selects the independent GENI internal loopback mode. It sends a
+fixed eight-byte pattern and requires an exact return, without BT power/reset
+or TLMM programming. It does configure UART and QUP clocks. Its image requires
+a kernel built with level 7 support; do not change only the argument of the
+earlier level-2 kernel. A pass establishes the AP UART data path only.

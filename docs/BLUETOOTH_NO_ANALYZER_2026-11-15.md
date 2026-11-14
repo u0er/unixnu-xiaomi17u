@@ -6,7 +6,8 @@
 
 已修正 `wsl/pandora_bt.c`，同步到 `xnu/patches/0476-pandora-bluetooth.patch`。
 最终完整构建 43651227510 和离线打包检查均已通过；这仍是一份待试机候选，不代表蓝牙已工作。
-尚未获得 PMIC GPIO5/6 的实际 TYPE/SUBTYPE 或 QUP wrapper 硬件版本，不能把候选预期写成实机结果。
+随后经用户同意完成一次 level 2 临时启动：已读到 GPIO5 subtype=0x12、QUP=4.3，
+但仍无 HCI 应答。实机结果和下一步内部回环见文末；未宣称蓝牙已恢复。
 
 本轮手机操作仅为 Android 上读取 sysfs、DT 和复制现用内核模块到主机。没有开关蓝牙、挂载 debugfs、重启、启动 iOS、推送文件或写固件容器。Android 当前没有挂载 debugfs，也没有 `/dev/mem`，因此旧的 debugfs/devmem 采集脚本不能原样复用。当前工作区的根 Git 尚无提交；旧交接所称远端 main 不等于本地可核验的 HEAD。
 
@@ -91,7 +92,7 @@ GPIO9 的其他用途，也没有重新做没有判据的唤醒极性试验。
 |---|---|---|---|
 | A | 源码 + 原始日志 + Android 只读 DT / 模块审计 | 是否真的已经排除软件错误 | 本轮已完成，发现上述错误 |
 | B | 完整构建候选；经用户明确同意，做一次 level 2 的 90 秒临时启动 | TYPE/SUBTYPE、正确 BT_EN、QUP sampling、pad / IOS、HCI | 最终完整构建和镜像准备已完成，尚未启动；level 2 单次初始化优先，避免混入重试因素 |
-| C | 若正常 HCI 仍无应答，单独加入 GENI 内部 loopback 并收回原字节 | AP FIFO / sequencer / packing / 接收是否工作 | 未实现；上游已有 SE_UART_LOOPBACK_CFG=0x22c 可参考；此测试不能证明外部连线或绝对波特率 |
+| C | 若正常 HCI 仍无应答，单独加入 GENI 内部 loopback 并收回原字节 | AP FIFO / sequencer / packing / 接收是否工作 | 已实现独立 level 7、ARM64 单文件编译通过；尚未完整构建或实测；不能证明外部连线或绝对波特率 |
 | D | 对照 Android 的 PMIC 配置和上电事件 | kernel API 所用子类型、真实 pinconf、时钟/电源调用顺序 | 尚缺运行时寄存器快照；debugfs 未挂载，不能假称已抓到 |
 | E | 按 Qualcomm 初始化顺序发 `qca_read_soc_version`，验证匹配的 vendor / Command Complete 响应 | ROM 握手与通用 HCI Reset 行为是否不同 | 未实现；Linux 并不把通用 Reset 成功作为读取版本的唯一前提 |
 | F | ROM 通信成立后再移植 TLV / NVM 下载 | 固件加载、运行速率、后续栈接入 | 未开始，不能用盲灌固件解决链路问题 |
@@ -162,3 +163,39 @@ ADT 里的 extent 数组带预留零槽，比较时必须按有效区间解析�
 - **设备验证仍未发生**。下一步须先取得明确的独占启动窗口同意，再临时 boot 最终镜像，
   预期 iOS 阶段 90 秒后自动返回 Android，立即只读抓取并分析新日志。启动将覆盖设备
   `log.img`；旧日志已有主机备份。不得写 firmware 容器，不得用旧镜像替代。
+
+## Level 2 实机结果：2026-11-15 07:25 +08
+
+用户对明确的试机请求回复“继续”后，执行一次 `fastboot boot`。设备按
+`pandora_reboot_after=90` 在内核时间 90.222 秒自动复位，随后回到 Android。
+未再次重启，未写固件容器，未推送 helper；日志取回后已释放设备窗口。
+
+日志路径：`D:/turnip-local/newboot/bt-no-analyzer-20261115/level2/result/kernel.txt`。
+原始 `log.img` 同目录保存；紧邻启动前的旧日志保存在 `level2/preboot/log.img`。
+
+| 观察 | 原始日志行 | 结论 |
+|---|---|---|
+| GPIO5 TYPE=0x10、SUBTYPE=0x12（LV/MV） | 249、253、426、427 | 子类型已实机确认；BT_EN 高读回 MODE=1、SOURCE=0x80、VIN1 |
+| QUP version=0x40030000、sampling=16、divider=35 | 486 | v4.3，确实需要 16 倍采样；请求 115200，计算实际 114285 |
+| GPIO18=1、CTS=1、RX=0；GENI IOS=0x6 | 489、490、496、497 | SW_CTRL 高的纠正得到本次实测支持；pad 与 GENI 的 RX 数字采样均为低 |
+| HCI Reset sent 后 200 ms 无数据 | 491、492 | 该组合仍无 HCI 应答；AP 命令完成不等于外部字节正确到达控制器 |
+| exec SpringBoard；90 秒自动返回 | 931、14484 | 系统启动和计时返回已观察；不等同于用户视觉验收 |
+
+不能从 MODE/SOURCE 配置读回推断模拟电压；本次也尚未确认 GPIO6 的运行时配置。
+现在的证据足以继续软件隔离，没有重新引入“必须逻辑分析仪”的前置条件。
+
+### 下一候选：level 7 内部回环
+
+`pandora_bt=7` 是独立诊断模式：仅打开 QUP 时钟并配置 UART，不投 BT rail、不脉冲
+BT_EN、不修改 TLMM mux，也不发送 HCI Reset。使用上游驱动相同的
+`SE_UART_LOOPBACK_CFG`（0x22c）值 3，在 RX/TX 与 CTS/RTS 之间内部连接。
+
+发送固定八字节 `55 aa 00 ff 01 80 7e 81`，最多收取 16 字节并等待 200 ms。
+仅在收到恰好八个匹配字节时记 PASS；旧 RX 数据先有界排空，排不完则报错。
+退出时停止主/次 sequencer，恢复原 loopback 寄存器，失败也记录，不把它当成
+恢复了之前 OS 的完整 UART 会话。正常 level 2 初始化明确关闭内部回环。
+
+此测试用于判别 AP FIFO packing / sequencer / RX 数据通道是否可用。PASS 不能证明
+芯片已启动、外部走线正确或绝对波特率准确；FAIL 则优先检查 AP 串口路径。
+level 7 已通过 ARM64 单文件编译并同步 0476，完整构建和设备结果须单独记录。
+本次用户只授权了上面的 level 2 启动，未据此执行第二次 boot。
