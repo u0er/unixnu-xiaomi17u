@@ -330,6 +330,15 @@ edit('NativeBridgeMetalFrontend.mm',
  for(const auto &a:adopted)if(Class c=objc_getClass(a.cls))class_addProtocol(c,a.protocol);
 """)
 
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(!base || class_getInstanceSize(base)!=536){NBLOG(@"native-metal: unexpected _MTLDevice ABI");return nil;}""",
+     """ // data-a-live: _MTLDevice is 528 bytes on iOS 16.7 (536 on iPadOS 17.7.11, the only size the
+ // pinned check accepted - this return-nil was the whole crash: every client's open answered nil,
+ // backboardd rendered nothing and SpringBoard died in Metal's nil-device path at pc 0). The
+ // dynamic subclass adds no instance variables and reads none of the base's, so both sizes hold.
+ const size_t pandoraAbi=class_getInstanceSize(base);
+ if(!base || (pandoraAbi!=536 && pandoraAbi!=528)){NBLOG(@"native-metal: unexpected _MTLDevice ABI %zu",(size_t)pandoraAbi);return nil;}""")
+
 edit('NativeAdrenoMetalPlugin.mm',
      """static id clientDevice(unsigned port) {
     char turnip[1024];""",
