@@ -20,7 +20,7 @@ synchronization points. Read it before acting; update your row after acting.
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
 | Qoder | Qoder | Camera: CCI write FIXED+verified, sensor streams, CSID still silent | 36ac13c7 (0475 v7) | 43550798989 SUCCESS | released | next: PHY timer/settle scan |
-| CodeArts | CodeArts | L2 closed: WCN not driving TX | 29ee2cfe (FMD) | 43557389677 success | not held | level-1 io all 0 (Android high) => WCN BT side not up; next needs AOP/QMP PDC |
+| CodeArts | CodeArts | BT_WAKE (gpio9) | cbec3e11 (gpio9 wake) | 43564268287 in_progress | not held | QMP excluded; btpower asserts BT_WAKE after BT_EN (AIC case: no wake -> HCI timeout); w59 |
 
 ## Notes
 - 2026-11-14 ~09:10Z CodeArts: 0476 121716fe (BT_EN low 100 ms, high 200 ms) is pushed and verified locally; needs exactly one dispatch (no cancel) when CI is idle. Earlier w53 fault was bt_sleep() units on the low side too (10 us).
