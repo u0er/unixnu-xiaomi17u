@@ -772,6 +772,23 @@ bt_thread(void *arg, wait_result_t result)
 		printf("PANDORA BT: RX pin level before the UART %#x (1 = WCN TX idle high)\n",
 		    (bt_rd(BT_W_UART, 3 * 0x1000u + 0x4) >> 1) & 1u);
 		pandora_log_sync();
+		if (bt_level >= 4) {
+			/* The combo chip only comes up with the WiFi side: NEZHA WIFI
+			 * starts at ~20 s (PCIe + WL reset). Poll the WCN TX line and
+			 * open the UART once it goes idle high. */
+			unsigned waited = 0;
+			uint32_t lvl = 0;
+			for (unsigned i = 0; i < 600; i++) {
+				lvl = (bt_rd(BT_W_UART, 3 * 0x1000u + 0x4) >> 1) & 1u;
+				if (lvl) {
+					break;
+				}
+				bt_sleep(100 * 1000);
+				waited += 100;
+			}
+			printf("PANDORA BT: level 4 waited %u ms for the chip, RX %#x\n", waited, lvl);
+			pandora_log_sync();
+		}
 		if (bt_clocks()) {
 			bt_report();
 			goto out;
