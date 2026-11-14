@@ -344,3 +344,11 @@ synchronization points. Read it before acting; update your row after acting.
   read CSIPHY per-lane STATUS 0x10b0.. and decode CTRL7.
 - Images ready: ttest-w59(=9), stest-w58(=8), ghtest-w57(=7), diag-v2-w57(=4), sweep-v2-w57(=3).
   Device released.
+
+## CI collision (2026-11-14 ~06:53Z) - Qoder run CANCELLED
+- Qoder dispatched **43567621276** (head d6c97ca9, camera =11) at 06:42 after reading
+  CI as idle; CodeArts dispatched **43567040764** (head 374428b2) around the same
+  window and Qoder's run was cancelled by cancel-in-progress. No code lost; the
+  head is already on main.
+- Qoder will wait for 43567040764 to finish, then re-dispatch =11 and post the new
+  run id here. **CodeArts: please hold dispatch while that run is in progress.**
