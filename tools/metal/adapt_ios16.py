@@ -292,6 +292,29 @@ edit('NativeBridgeMetalFrontend.mm',
 """)
 
 edit('NativeBridgeMetalFrontend.mm',
+     """free(methods);installAnswers(cls);class_addProtocol(cls,@protocol(MTLDevice));""",
+     """free(methods);
+ // data-a-live (iOS 16): the inherited _MTLDevice carries method entries whose IMP is NULL on
+ // this OS (the pinned tree already special-cases targetDeviceInfo for one of them, and its own
+ // ABI check names 17's shape). objc_msgSend jumps to the entry's IMP directly, so any client
+ // that sends one dies at pc 0 (SpringBoard, every launch); methodForSelector: never sees it,
+ // which is why the asked journal stayed empty. Add a forwarding implementation on the subclass
+ // for every NULL-IMP entry of the base: the message then reaches missingSignature and
+ // answerMissing, which answer it nil with the true signature and note the selector once.
+ {Method *baseMethods=class_copyMethodList(base,&count);
+  unsigned forwarded=0;
+  for(unsigned i=0;i<count&&i<4096;i++) {
+   if(method_getImplementation(baseMethods[i]))continue;
+   class_addMethod(cls,method_getName(baseMethods[i]),(IMP)_objc_msgForward,method_getTypeEncoding(baseMethods[i]));
+   if(forwarded<64)NSLog(@"pandora-metal null-imp forwarded: %s %s",sel_getName(method_getName(baseMethods[i])),method_getTypeEncoding(baseMethods[i]));
+   ++forwarded;
+  }
+  free(baseMethods);
+  NSLog(@"pandora-metal null-imp entries forwarded: %u of %u",forwarded,count);
+ }
+ installAnswers(cls);class_addProtocol(cls,@protocol(MTLDevice));""")
+
+edit('NativeBridgeMetalFrontend.mm',
      """ if(Protocol *spi=objc_getProtocol("MTLDeviceSPI"))class_addProtocol(cls,spi);
 """,
      """ if(Protocol *spi=objc_getProtocol("MTLDeviceSPI"))class_addProtocol(cls,spi);
