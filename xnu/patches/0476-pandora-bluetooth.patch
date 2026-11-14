@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..008e6a1
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,738 @@
+@@ -0,0 +1,747 @@
 +/*
 + * PANDORA Bluetooth: the WCN786x BT core on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -392,7 +392,8 @@ index 0000000..008e6a1
 +#define BT_SPMI_FEATURES   0x0004u
 +#define BT_SPMI_PERIPH_MASK 0x1fffu
 +#define BT_SPMI_PPID_MASK  0x1fffu
-+#define BT_SPMI_GPIO_PPID  0x98cu
++#define BT_SPMI_GPIO_PPID  0x98cu        /* PMH0104 gpio5: BT_EN */
++#define BT_SPMI_FMD_PPID   0x98du        /* PMH0104 gpio6: BT FMD/XO clock */
 +#define BT_SPMI_RW_STRIDE  0x200u
 +#define BT_SPMI_MAX_PERIPHS 8192u
 +#define BT_SPMI_REG_OUT    0x45u        /* DIG_OUT_CTL */
@@ -444,6 +445,36 @@ index 0000000..008e6a1
 +}
 +
 +static int
++bt_spmi_gpio(uint32_t bus0, uint32_t bus1, uint16_t ppid, uint8_t val, const char *what)
++{
++	uint16_t apid = 0xffffu;
++	unsigned owner = 7;
++	for (uint32_t i = bus0; i < bus0 + bus1; i++) {
++		uint32_t e = bt_spmi_rd(bt_spmi_map, 4u * i);
++		if ((e & BT_SPMI_PPID_MASK) != ppid) {
++			continue;
++		}
++		unsigned o = bt_spmi_rd(bt_spmi_owner1, 4u * (i - bus0)) & 7u;
++		if (apid == 0xffffu || o == 0) {
++			apid = (uint16_t)i;
++			owner = o;
++		}
++		if (o == 0) {
++			break;
++		}
++	}
++	if (apid == 0xffffu || owner != 0) {
++		printf("PANDORA BT: %s ppid %#x apid %u/ee%u: skipped\n", what, ppid, apid, owner);
++		return ENOTSUP;
++	}
++	vm_offset_t chan = bt_spmi_chnls + BT_SPMI_RW_STRIDE * apid;
++	bool ok = bt_spmi_write(chan, BT_SPMI_REG_OUT, val) &&
++	    bt_spmi_write(chan, BT_SPMI_REG_EN, 0x80);
++	printf("PANDORA BT: %s apid %u/ee%u val=%u ok=%d\n", what, apid, owner, val, ok);
++	return ok ? 0 : EIO;
++}
++
++static int
 +bt_en_pulse(void)
 +{
 +	bt_spmi_core = ml_io_map_unmappable(BT_SPMI_CORE_PA, 0x3000, VM_WIMG_IO);
@@ -459,41 +490,19 @@ index 0000000..008e6a1
 +		printf("PANDORA BT: SPMI arbiter %#x is not v8: no BT_EN pulse\n", version);
 +		return ENOTSUP;
 +	}
-+	/* SID 9 lives on bus 1; its APID space starts after bus 0's count. */
 +	uint32_t bus0 = bt_spmi_rd(bt_spmi_core, BT_SPMI_FEATURES) & BT_SPMI_PERIPH_MASK;
 +	uint32_t bus1 = bt_spmi_rd(bt_spmi_core, BT_SPMI_FEATURES + 4u) & BT_SPMI_PERIPH_MASK;
 +	if (bus1 == 0 || bus0 + bus1 > BT_SPMI_MAX_PERIPHS) {
 +		printf("PANDORA BT: SPMI bus1 apids %u (bus0 %u): no BT_EN pulse\n", bus1, bus0);
 +		return ENOTSUP;
 +	}
-+	uint16_t apid = 0xffffu;
-+	unsigned owner = 7;
-+	for (uint32_t i = bus0; i < bus0 + bus1; i++) {
-+		uint32_t e = bt_spmi_rd(bt_spmi_map, 4u * i);
-+		if ((e & BT_SPMI_PPID_MASK) != BT_SPMI_GPIO_PPID) {
-+			continue;
-+		}
-+		unsigned o = bt_spmi_rd(bt_spmi_owner1, 4u * (i - bus0)) & 7u;
-+		if (apid == 0xffffu || o == 0) {
-+			apid = (uint16_t)i;
-+			owner = o;
-+		}
-+		if (o == 0) {
-+			break;
-+		}
-+	}
-+	if (apid == 0xffffu || owner != 0) {
-+		printf("PANDORA BT: PMH0104 gpio5 apid %u/ee%u: no BT_EN pulse\n", apid, owner);
-+		return ENOTSUP;
-+	}
-+	vm_offset_t chan = bt_spmi_chnls + BT_SPMI_RW_STRIDE * apid;
-+	bool low = bt_spmi_write(chan, BT_SPMI_REG_OUT, 0x00);
-+	bool en = bt_spmi_write(chan, BT_SPMI_REG_EN, 0x80);
-+	bt_sleep(100 * 1000);	/* 100 ms low: real reset pulse, us units */
-+	bool high = bt_spmi_write(chan, BT_SPMI_REG_OUT, 0x01);
-+	bt_sleep(200 * 1000);	/* bt_sleep takes microseconds */
-+	printf("PANDORA BT: BT_EN pulse apid %u/ee%u low=%d en=%d high=%d\n", apid, owner, low, en, high);
-+	return (low && en && high) ? 0 : EIO;
++	/* btpower's order: BT_EN low 100 ms -> XO/FMD clock pad high -> BT_EN high. */
++	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_GPIO_PPID, 0x00, "BT_EN low");
++	bt_sleep(100 * 1000);
++	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_FMD_PPID, 0x01, "FMD clk");
++	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_GPIO_PPID, 0x01, "BT_EN high");
++	bt_sleep(50 * 1000);
++	return 0;
 +}
 +
 +static int
