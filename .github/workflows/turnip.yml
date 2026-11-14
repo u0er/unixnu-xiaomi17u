@@ -27,6 +27,8 @@ env:
   M2V_SHA: 555b13d57e09bff70996a88cff64f1275256d5cf
   ADRENOPM4_SHA: 445f8fe6d115738352b9d78dc70af6d61aa7f62f
   NATIVEMOBILEDISPLAY_SHA: 8666a9950c9699b368931d18cac92c0fdb2ce9c0
+  # drivers/GopFramebuffer's submodule pointer at UNIXNU_SHA (NativeMetal includes ../GopFramebuffer/)
+  GOPFRAMEBUFFER_SHA: b0d812d578efa2acb005b66f73168891719af09a
 
 jobs:
   build:
@@ -156,6 +158,8 @@ jobs:
           fetch unixnu/kits/AdrenoPM4 https://github.com/UniXNU/AdrenoPM4.git "$ADRENOPM4_SHA"
           # NativeMetal includes ../NativeMobileDisplay/ (its sibling under UniXNU's drivers/)
           fetch NativeMobileDisplay https://github.com/UniXNU/NativeMobileDisplay.git "$NATIVEMOBILEDISPLAY_SHA"
+          # and ../GopFramebuffer/ (the same sibling pattern; the SHA is the submodule pointer at UNIXNU_SHA)
+          fetch GopFramebuffer https://github.com/UniXNU/GopFramebuffer.git "$GOPFRAMEBUFFER_SHA"
           bash tools/metal/build_plugin.sh unixnu nativemetal nativeadreno metal2vulkan mesa out/metal
 
       - name: Metal summary
