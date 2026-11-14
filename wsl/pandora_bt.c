@@ -379,10 +379,12 @@ bt_rcg_set(unsigned m, unsigned n)
 #define BT_SPMI_FMD_PPID   0x98du        /* PMH0104 gpio6: BT FMD/XO clock */
 #define BT_SPMI_RW_STRIDE  0x200u
 #define BT_SPMI_MAX_PERIPHS 8192u
-#define BT_SPMI_REG_MODE   0x40u        /* MODE_CTL: 0 = normal (pinctrl-spmi-gpio) */
-#define BT_SPMI_REG_IN     0x41u        /* DIG_IN_CTL */
-#define BT_SPMI_REG_OUT    0x45u        /* DIG_OUT_CTL: bit0 = level, bit7 = power source */
-#define BT_SPMI_REG_EN     0x46u        /* EN_CTL, bit 7 = output enable */
+#define BT_SPMI_REG_MODE   0x40u        /* MODE_CTL: direction 6:4, function 3:1, level bit1 */
+#define BT_SPMI_REG_VIN    0x41u        /* DIG_VIN_CTL: power source 2:0 */
+#define BT_SPMI_REG_PULL   0x42u        /* DIG_PULL_CTL: 5 = pull disabled */
+#define BT_SPMI_REG_IN     0x43u        /* DIG_IN_CTL */
+#define BT_SPMI_REG_OUT    0x45u        /* DIG_OUT_CTL: strength 1:0, buffer type 5:4 */
+#define BT_SPMI_REG_EN     0x46u        /* EN_CTL, bit 7 = master enable */
 
 static vm_offset_t bt_spmi_core, bt_spmi_map, bt_spmi_chnls, bt_spmi_owner1;
 
@@ -486,20 +488,23 @@ bt_spmi_gpio(uint32_t bus0, uint32_t bus1, uint16_t ppid, uint8_t val, unsigned 
 	 * level and bit7 selects the power source (BT_EN sits on vin-1). Writing
 	 * the bare level used to clear that selector, which moves the pad to the
 	 * other supply; keep every bit but bit0 and bit7 instead. */
-	bool ok = bt_spmi_write(chan, BT_SPMI_REG_MODE, 0x00);
-	uint8_t nv = (uint8_t)((o & 0xfeu) | (val & 1u));
-	nv = (uint8_t)((nv & 0x7fu) | (vin ? 0x80u : 0u));
-	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_OUT, nv);
-	/* 0xc0 = output + input enable, so DIG_IN_CTL reports the pad back and we
-	 * can tell whether the level we wrote actually reached the pin. */
-	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_EN, 0xc0);
-	uint8_t m2 = 0xff, i2 = 0xff, o2 = 0xff, e2 = 0xff;
+	/* MODE_CTL carries the direction and the level (bit1); DIG_OUT_CTL is only
+	 * drive strength/buffer type, so writing the level there never moved the
+	 * pad. Matches Android's gpio5: out high, vin-1, no pull, push-pull. */
+	uint8_t mode = (uint8_t)((1u << 4) | ((uint32_t)(val & 1u) << 1));
+	bool ok = bt_spmi_write(chan, BT_SPMI_REG_MODE, mode);
+	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_VIN, (uint8_t)(vin & 0x7u));
+	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_PULL, 0x05u);
+	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_OUT, 0x03u);
+	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_EN, 0x80u);
+	uint8_t m2 = 0xff, v2 = 0xff, i2 = 0xff, o2 = 0xff, e2 = 0xff;
 	bt_spmi_read8(chan, BT_SPMI_REG_MODE, &m2);
+	bt_spmi_read8(chan, BT_SPMI_REG_VIN, &v2);
 	bt_spmi_read8(chan, BT_SPMI_REG_IN, &i2);
 	bt_spmi_read8(chan, BT_SPMI_REG_OUT, &o2);
 	bt_spmi_read8(chan, BT_SPMI_REG_EN, &e2);
-	printf("PANDORA BT: %s apid %u/ee%u val=%u vin=%u ok=%d -> mode %#x in %#x out %#x en %#x\n",
-	    what, apid, owner, val, vin, ok, m2, i2, o2, e2);
+	printf("PANDORA BT: %s apid %u/ee%u val=%u vin=%u ok=%d -> mode %#x vin %#x in %#x out %#x en %#x\n",
+	    what, apid, owner, val, vin, ok, m2, v2, i2, o2, e2);
 	return ok ? 0 : EIO;
 }
 
