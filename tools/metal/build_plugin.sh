@@ -38,12 +38,12 @@ print("};")' "$B/$n.spv" "$n"
 } > "$B/gen/NativeTurnipShaders.h"
 
 echo "== metal2vulkan bridge (UniXNU build-native-metal-bridge.py)"
-# Apply the original seven bridge patches, then the maintained local equivalents.
-# AdrenoMetal's later patches overlap the local padded-target and reuse changes.
-PATCHES=("$NM"/bridge/patches/000[1-7]-*.patch)
-for p in "$ROOT"/tools/metal/m2v/[0-9][0-9][0-9][0-9]-*.patch; do
-	[ -e "$p" ] && PATCHES+=("$p")
-done
+# Apply every NativeMetal bridge patch (the series is renumbered against m2v 555b13d5:
+# 0002..0041, where 0040 is the unixnu-runtime adaptation). The fork's local
+# tools/metal/m2v/*.patch stack targets m2v 720ef1c and does NOT apply at this pin
+# (2026-11-14 check: 0/23 apply, triage in gpu-optimization/RUNTIME_SHADOW_CACHE.md) --
+# re-port selectively, only where the new runtime counters show a gap.
+PATCHES=("$NM"/bridge/patches/*.patch)
 for p in "${PATCHES[@]}"; do
 	echo "   $(basename "$p")"
 	git -C "$M2V" apply "$p"
