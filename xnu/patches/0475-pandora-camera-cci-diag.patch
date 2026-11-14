@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..832fd02
+index 0000000..3eee6cf
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,5147 @@
+@@ -0,0 +1,5222 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -4594,6 +4594,77 @@ index 0000000..832fd02
 +	pc_csiphy_mark("stest done (sensor left in standby)");
 +}
 +
++/* Timer-rate probe (pandora_csiphy=9). The settle sweep at the driver's fixed
++ * timer (400 MHz) changed nothing, so retime the PHY timer to the rate mainline
++ * derives from the link: link/4 = 266.7 MHz. CAMCC RCG cfg layout is
++ * BIT(20) | sel<<8 | hid, with div = (hid+1)/2, so PLL0_MAIN/4.5 is
++ * 0x00100108. Then re-run a short settle sweep (17 is the value mainline would
++ * compute at this timer). */
++static void
++pc_sliceb_ttest(void)
++{
++	static const unsigned cand[] = { 14u, 17u, 20u };
++	vm_offset_t csid0;
++	uint32_t seen_rdi, cmd;
++
++	pc_csiphy_mark("ttest start: map sensor bus + CSID");
++	csid0 = ml_io_map_unmappable(PC_CSID0_PA, 0x5e80u, VM_WIMG_IO);
++	pc_bdistm = ml_io_map_unmappable(PC_BDISTM_PA, 0x6000u, VM_WIMG_IO);
++	pc_tlmm = ml_io_map_unmappable(PC_TLMM_PA, 0xb0000u, VM_WIMG_IO);
++	pc_cci[0] = ml_io_map_unmappable(PC_CCI_PA(0), 0x1000u, VM_WIMG_IO);
++	if (!csid0 || !pc_bdistm || !pc_tlmm || !pc_cci[0] || !pc_camcc ||
++	    !pc_csiphy0_va) {
++		printf("PANDORA SLICEB: ttest map failed\n");
++		(void)pandora_log_sync();
++		return;
++	}
++	printf("PANDORA SLICEB: ttest timer before cmd=%#x cfg=%#x\n",
++	    pc_rd(pc_camcc, PC_CSI0PHYTIMER_RCG),
++	    pc_rd(pc_camcc, PC_CSI0PHYTIMER_RCG + 4));
++	pc_wr(pc_camcc, PC_CSI0PHYTIMER_RCG + 4, 0x00100108u);	/* /4.5 = 266.7 MHz */
++	cmd = pc_rd(pc_camcc, PC_CSI0PHYTIMER_RCG);
++	pc_wr(pc_camcc, PC_CSI0PHYTIMER_RCG, (cmd & ~0x80000000u) | 0x1u);
++	for (unsigned i = 0; i < 50; i++) {
++		if (!(pc_rd(pc_camcc, PC_CSI0PHYTIMER_RCG) & 0x1u))
++			break;
++		pc_sleep(1);
++	}
++	printf("PANDORA SLICEB: ttest timer after cmd=%#x cfg=%#x\n",
++	    pc_rd(pc_camcc, PC_CSI0PHYTIMER_RCG),
++	    pc_rd(pc_camcc, PC_CSI0PHYTIMER_RCG + 4));
++	(void)pandora_log_sync();
++
++	(void)pc_sensor_power_up();
++	pc_sleep(20);
++	pc_sensor_apply_tbl(pc_wide_tbl, pc_wide_tbl_n, PC_SLICEB_MASTER,
++	    PC_SLICEB_SLAVE, 1u, 0u, "wide-ttest");
++	pc_sliceb_stream_on(0);
++	pc_sleep(2);
++
++	for (unsigned c = 0; c < (unsigned)(sizeof(cand) / sizeof(cand[0])); c++) {
++		for (unsigned i = 0; i < PC_CSIPHY_LANE_REGS_N; i++) {
++			const struct pc_csiphy_lane_reg *r = &pc_csiphy_lane_regs_x1e80100[i];
++			if (r->type == 1)
++				pc_wr(pc_csiphy0_va, r->addr, cand[c] & 0xffu);
++		}
++		uint32_t base = pc_sliceb_arm(csid0, 0x00032103u);
++		seen_rdi = 0;
++		if (base) {
++			pc_sliceb_stream_on(1);
++			seen_rdi = pc_sliceb_poll(csid0, 800, NULL, NULL);
++			pc_sliceb_stream_on(0);
++		}
++		printf("PANDORA SLICEB: ttest settle=%u lane0=%#x rdi=%#x sof=%u eof=%u arm=%#x\n",
++		    cand[c], pc_rd(pc_csiphy0_va, 0x08), seen_rdi,
++		    (seen_rdi & PC_RDIN_INPUT_SOF) ? 1u : 0u,
++		    (seen_rdi & PC_RDIN_INPUT_EOF) ? 1u : 0u, base);
++		(void)pandora_log_sync();
++		if (seen_rdi & (PC_RDIN_INPUT_SOF | PC_RDIN_INPUT_EOF))
++			break;
++	}
++	pc_csiphy_mark("ttest done (sensor left in standby)");
++}
++
 +static void
 +pc_sliceb_stream(void)
 +{
@@ -4619,8 +4690,12 @@ index 0000000..832fd02
 +		pc_sliceb_ghtest();
 +		return;
 +	}
-+	if (pc_csiphy >= 8u) {
++	if (pc_csiphy == 8u) {
 +		pc_sliceb_stest();
++		return;
++	}
++	if (pc_csiphy >= 9u) {
++		pc_sliceb_ttest();
 +		return;
 +	}
 +
