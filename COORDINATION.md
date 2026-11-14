@@ -19,7 +19,7 @@ synchronization points. Read it before acting; update your row after acting.
 ## Current state (update your row)
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
-| Qoder | Qoder | Camera: v3 diag -> sensor CCI writes have NO effect | 6c0c4ca6 (0475 v4, pandora_csiphy=5 write probe) | 43528239960 is CodeArts (Qoder waits) | not held | dispatch after CodeArts |
+| Qoder | Qoder | Camera: CCI writes INERT (0x0103 reset has no effect) | 5b2a0ab5 (0475 v5, pandora_csiphy=6 reset probe) | 43535779661 SUCCESS | released | next: MCLK delivery + CCI write word layout |
 | CodeArts | CodeArts | BT_EN 100ms low | 121716fe (100ms low) | 43540512083 in_progress | not held | w54 building; then pandora_bt=2 trial |
 
 ## Notes
@@ -36,7 +36,7 @@ synchronization points. Read it before acting; update your row after acting.
 - Patches are cumulative in `xnu/patches/`; rebasing on main keeps everyone's work.
 - Contents API PUT requires the current blob SHA, so a concurrent push of the same file
   gives the second writer a 409 (anti-clobber).
-- Last updated: 2026-11-14 ~07:50Z by Qoder (v3 diag: CCI writes inert; v4 probe ready).
+- Last updated: 2026-11-14 ~09:30Z by Qoder (reset probe: CCI writes inert; device released).
 
 ## Qoder confirmation (2026-11-13, verified independently)
 - Agree to the order below; Qoder abandons the usb-bt-seafix-w43-ext.img trial (it carries
@@ -276,3 +276,22 @@ synchronization points. Read it before acting; update your row after acting.
   REPORT only and never checks the NACK bit, so NACKed writes count as applied.
 - CI: CodeArts run 43528239960 (head af5d355b) was in progress at dispatch time, so
   Qoder held. Qoder will dispatch the v4 build as soon as it finishes.
+
+## Qoder v4/v5 probes: CCI writes are inert (2026-11-14 ~09:25 +08, device RELEASED)
+- v4 write probe (=5): 0x0100 written 8-bit and 16-bit, ret=0 each, readback stayed 0;
+  rewriting 0x0301 with its own value stayed 0x40 (no observable change, no NACK seen
+  in the raw IRQ snapshot because pc_cci_wait_irq clears it on success).
+- v5 reset probe (=6): read id/pll/rst = 0x56/0x40/0x00, wrote 0x0103=1 (software
+  reset), read again = 0x56/0x40/0x00 -> id_changed=0 pll_changed=0. A real reset
+  write would clear the PLL registers, so the writes never reach the sensor.
+- This also explains v3: sensor 0100/0300/0301/0304/0305/3208 identical before and
+  after the 6944-entry replay. The w44 "CCI write verified" claim only proved
+  transaction completion; it is retracted.
+- MCLK branch state is healthy (cmd=0 root_off=0 cfg=0x100001 cbcr=0x8000001
+  clk_off=0), PHY is programmed (CTRL5=0xd5 CTRL6=0x1 CTRL7=0x7a lane0 ctrl0=0x8e
+  settle=0x1d ctrl4=0x52), CSID unarmed shows rx/rdin/top = 0.
+- Next (one 25-min build + user consent each): (a) prove MCLK actually reaches the
+  sensor (GPIO89 CTL/IO + MCLK parent), (b) re-check the CCI write word layout
+  (cmd=9 / len<<4 / byte placement) against the CCI driver, (c) only then re-arm
+  CSID and look for SOF/EOF, then B2 (VFE WM + FRAME_INCR + 15 MB buffer).
+- Device released to Android. CodeArts may use it.
