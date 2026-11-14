@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..7b874db
+index 0000000..56ce93a
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,5023 @@
+@@ -0,0 +1,5078 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -1161,11 +1161,13 @@ index 0000000..7b874db
 +}
 +
 +/* Wait for a CCI IRQ status bit (bounded poll). Returns 0 on success. */
++static uint32_t pc_cci_last_irq;	/* last IRQ_STATUS seen by any wait (diag) */
 +static int
 +pc_cci_wait_irq(vm_offset_t cci, uint32_t mask)
 +{
 +	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
 +		uint32_t s = pc_rd(cci, PC_CCI_IRQ_STATUS_0);
++		pc_cci_last_irq = s;
 +		if (s & mask) {
 +			/* clear: global clear + W1C */
 +			pc_wr(cci, PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
@@ -4390,15 +4392,19 @@ index 0000000..7b874db
 +static void
 +pc_sliceb_wprobe(uint16_t reg, uint16_t val, unsigned bytes, const char *tag)
 +{
-+	uint32_t irq;
++	uint32_t irq, cur;
 +	int ret = pc_cci_write_reg(pc_cci[0], PC_SLICEB_MASTER, PC_SLICEB_SLAVE,
 +	    reg, val, bytes);
 +
-+	irq = pc_rd(pc_cci[0], PC_CCI_IRQ_STATUS_0);
++	/* The wait clears the REPORT bit, so use the status captured inside the
++	 * wait loop (pc_cci_last_irq) and also report CUR_WORD_CNT, which proves
++	 * the queue actually drained. */
++	irq = pc_cci_last_irq;
++	cur = pc_rd(pc_cci[0], PC_CCI_Qn_CUR_WORD_CNT(PC_SLICEB_MASTER, 0));
 +	printf("PANDORA SLICEB: wprobe %s reg=%#x val=%#x bytes=%u ret=%d irq=%#x "
-+	    "rep=%u nack=%u\n", tag, reg, val, bytes, ret, irq,
++	    "rep=%u nack=%u cur=%u\n", tag, reg, val, bytes, ret, irq,
 +	    (irq >> (4u + PC_SLICEB_MASTER * 12u)) & 1u,
-+	    (irq >> (27u + PC_SLICEB_MASTER * 2u)) & 1u);
++	    (irq >> (27u + PC_SLICEB_MASTER * 2u)) & 1u, cur);
 +	(void)pandora_log_sync();
 +}
 +
@@ -4478,6 +4484,51 @@ index 0000000..7b874db
 +	pc_csiphy_mark("rtest done (verdict: pll_changed=1 means writes reach the sensor)");
 +}
 +
++/* Register-write judge probe (pandora_csiphy=7). The 0x0103 reset probe cannot
++ * distinguish "reset happened" from "write inert" because 0x0301 may default to
++ * 0x40. This writes ordinary RW registers with a distinctive value and reads
++ * them back, prints the GPIO state of the MCLK pad (89) and the wide reset pad
++ * (106), and (via wprobe) reports the full CCI IRQ word plus CUR_WORD_CNT. */
++static void
++pc_sliceb_ghtest(void)
++{
++	int ret = 0;
++	uint8_t v;
++
++	pc_csiphy_mark("ghtest start: map sensor bus");
++	pc_bdistm = ml_io_map_unmappable(PC_BDISTM_PA, 0x6000u, VM_WIMG_IO);
++	pc_tlmm = ml_io_map_unmappable(PC_TLMM_PA, 0xb0000u, VM_WIMG_IO);
++	pc_cci[0] = ml_io_map_unmappable(PC_CCI_PA(0), 0x1000u, VM_WIMG_IO);
++	if (!pc_bdistm || !pc_tlmm || !pc_cci[0] || !pc_camcc) {
++		printf("PANDORA SLICEB: ghtest map failed\n");
++		(void)pandora_log_sync();
++		return;
++	}
++	(void)pc_sensor_power_up();
++	pc_sleep(20);
++	printf("PANDORA SLICEB: gpio89(mclk) ctl=%#x io=%#x | gpio106(wide rst) "
++	    "ctl=%#x io=%#x\n", pc_rd(pc_tlmm, PC_GPIO(89)),
++	    pc_rd(pc_tlmm, PC_GPIO(89) + 4), pc_rd(pc_tlmm, PC_GPIO(106)),
++	    pc_rd(pc_tlmm, PC_GPIO(106) + 4));
++	(void)pandora_log_sync();
++
++	v = pc_sliceb_rd8(0x0300u, &ret);
++	printf("PANDORA SLICEB: ghtest 0x0300 before=%#x\n", v);
++	pc_sliceb_wprobe(0x0300u, 0x0077u, 1u, "0300=0x77");
++	pc_sleep(10);
++	v = pc_sliceb_rd8(0x0300u, &ret);
++	printf("PANDORA SLICEB: ghtest 0x0300 after=%#x\n", v);
++
++	v = pc_sliceb_rd8(0x3208u, &ret);
++	printf("PANDORA SLICEB: ghtest 0x3208 before=%#x\n", v);
++	pc_sliceb_wprobe(0x3208u, 0x0001u, 1u, "3208=1");
++	pc_sleep(10);
++	v = pc_sliceb_rd8(0x3208u, &ret);
++	printf("PANDORA SLICEB: ghtest 0x3208 after=%#x\n", v);
++	pc_sliceb_wprobe(0x3208u, 0x0000u, 1u, "3208=0");
++	pc_csiphy_mark("ghtest done");
++}
++
 +static void
 +pc_sliceb_stream(void)
 +{
@@ -4495,8 +4546,12 @@ index 0000000..7b874db
 +		pc_sliceb_wtest();
 +		return;
 +	}
-+	if (pc_csiphy >= 6u) {
++	if (pc_csiphy == 6u) {
 +		pc_sliceb_rtest();
++		return;
++	}
++	if (pc_csiphy >= 7u) {
++		pc_sliceb_ghtest();
 +		return;
 +	}
 +
