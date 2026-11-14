@@ -31,7 +31,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..f471830
+index 0000000..df22b61
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
 @@ -0,0 +1,5803 @@
@@ -4975,14 +4975,14 @@ index 0000000..f471830
 +	printf("PANDORA SLICEB: p4test rcg4 before cmd=%#x cfg=%#x cbcr9c=%#x clka0=%#x\n",
 +	    pc_rd(pc_camcc, 0x20084u), pc_rd(pc_camcc, 0x20088u),
 +	    pc_rd(pc_camcc, 0x2009cu), pc_rd(pc_camcc, 0x200a0u));
-+	pc_wr(pc_camcc, 0x20088u, 0x00100105u);	/* csi4phytimer_clk_src 400 MHz */
-+	uint32_t c4 = pc_rd(pc_camcc, 0x20084u);
-+	pc_wr(pc_camcc, 0x20084u, (c4 & ~0x80000000u) | 0x1u);
-+	for (unsigned k = 0; k < 50; k++) {
-+		if (!(pc_rd(pc_camcc, 0x20084u) & 0x1u))
-+			break;
-+		pc_sleep(1);
-+	}
++	/* Use the proven helper: it sets CMD_ROOT_EN before CMD_UPDATE (the w5
++	 * lesson) and picks the ODD PLL0 output that the official freq_tbl uses for
++	 * csiNphytimer. The hand-written version only wrote UPDATE, so the RCG
++	 * never started and the branch stayed CLK_OFF. */
++	struct pc_tpg_rcg p4t = { 0x20084u, 3u, 5u, "csi4phytimer" };
++	struct pc_tpg_rcg p4c = { 0x21064u, 1u, 8u, "cphy_rx_266m" };
++	(void)pc_tpg_rcg_set(&p4t);
++	(void)pc_tpg_rcg_set(&p4c);
 +	pc_wr(pc_camcc, 0x2009cu, pc_rd(pc_camcc, 0x2009cu) | 0x1u);
 +	(void)pc_wait_branch_on("csi4phytimer", 0x2009cu);
 +	pc_wr(pc_camcc, 0x200a0u, pc_rd(pc_camcc, 0x200a0u) | 0x1u);
