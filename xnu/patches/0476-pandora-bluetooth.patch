@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..008e6a1
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,714 @@
+@@ -0,0 +1,717 @@
 +/*
 + * PANDORA Bluetooth: the WCN786x BT core on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -529,6 +529,9 @@ index 0000000..008e6a1
 +	 * FIFO layout), no parity, one stop bit. */
 +	bt_wr(BT_W_SE, SE_RX_PACK0, 0xfu);
 +	bt_wr(BT_W_SE, SE_RX_PACK1, 0);
++	/* One byte per FIFO word on TX as well: the TX path writes single bytes. */
++	bt_wr(BT_W_SE, SE_TX_PACK0, 0xfu);
++	bt_wr(BT_W_SE, SE_TX_PACK1, 0);
 +	bt_wr(BT_W_SE, SE_TX_WORD_LEN, 8);
 +	bt_wr(BT_W_SE, SE_RX_WORD_LEN, 8);
 +	bt_wr(BT_W_SE, SE_TX_STOP_LEN, 0);
