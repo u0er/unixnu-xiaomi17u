@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..008e6a1
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,754 @@
+@@ -0,0 +1,793 @@
 +/*
 + * PANDORA Bluetooth: the WCN786x BT core on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -398,7 +398,9 @@ index 0000000..008e6a1
 +#define BT_SPMI_FMD_PPID   0x98du        /* PMH0104 gpio6: BT FMD/XO clock */
 +#define BT_SPMI_RW_STRIDE  0x200u
 +#define BT_SPMI_MAX_PERIPHS 8192u
-+#define BT_SPMI_REG_OUT    0x45u        /* DIG_OUT_CTL */
++#define BT_SPMI_REG_MODE   0x40u        /* MODE_CTL: 0 = normal (pinctrl-spmi-gpio) */
++#define BT_SPMI_REG_IN     0x41u        /* DIG_IN_CTL */
++#define BT_SPMI_REG_OUT    0x45u        /* DIG_OUT_CTL: bit0 = level, bit7 = power source */
 +#define BT_SPMI_REG_EN     0x46u        /* EN_CTL, bit 7 = output enable */
 +
 +static vm_offset_t bt_spmi_core, bt_spmi_map, bt_spmi_chnls, bt_spmi_owner1;
@@ -428,6 +430,23 @@ index 0000000..008e6a1
 +	return false;
 +}
 +
++/* SPMI v8 read: EXT_READL is cmd = (reg << 4) | 2, the byte lands in RDATA0. */
++static bool
++bt_spmi_read8(vm_offset_t chan, uint8_t reg, uint8_t *out)
++{
++	*(volatile uint32_t *)(chan + 0x00u) = ((uint32_t)reg << 4) | 2u;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t st = bt_spmi_rd(chan, 0x08u);
++		if (st & 1u) {
++			*out = (uint8_t)(bt_spmi_rd(chan, 0x14u) & 0xffu);
++			return (st & 0x0eu) == 0;
++		}
++		delay(1);
++	}
++	return false;
++}
++
 +/* RPMh RF_CLK1 (DT clocks = <&rpmhcc 6>, clock-names "bt_rf_clk1"): btpower
 + * enables it before opening the UART. Without the RF clock the WCN BT
 + * subsystem stays quiet even with BT_EN high. The CMD-DB name is tried
@@ -447,7 +466,7 @@ index 0000000..008e6a1
 +}
 +
 +static int
-+bt_spmi_gpio(uint32_t bus0, uint32_t bus1, uint16_t ppid, uint8_t val, const char *what)
++bt_spmi_gpio(uint32_t bus0, uint32_t bus1, uint16_t ppid, uint8_t val, unsigned vin, const char *what)
 +{
 +	uint16_t apid = 0xffffu;
 +	unsigned owner = 7;
@@ -470,9 +489,29 @@ index 0000000..008e6a1
 +		return ENOTSUP;
 +	}
 +	vm_offset_t chan = bt_spmi_chnls + BT_SPMI_RW_STRIDE * apid;
-+	bool ok = bt_spmi_write(chan, BT_SPMI_REG_OUT, val) &&
-+	    bt_spmi_write(chan, BT_SPMI_REG_EN, 0x80);
-+	printf("PANDORA BT: %s apid %u/ee%u val=%u ok=%d\n", what, apid, owner, val, ok);
++	uint8_t m = 0, di = 0, o = 0, e = 0;
++	bool rd = bt_spmi_read8(chan, BT_SPMI_REG_MODE, &m) &&
++	    bt_spmi_read8(chan, BT_SPMI_REG_IN, &di) &&
++	    bt_spmi_read8(chan, BT_SPMI_REG_OUT, &o) &&
++	    bt_spmi_read8(chan, BT_SPMI_REG_EN, &e);
++	printf("PANDORA BT: %s before mode %#x in %#x out %#x en %#x (read %d)\n",
++	    what, m, di, o, e, rd);
++	pandora_log_sync();
++	/* pinctrl-spmi-gpio: MODE_CTL 0 is "normal"; DIG_OUT_CTL bit0 is the
++	 * level and bit7 selects the power source (BT_EN sits on vin-1). Writing
++	 * the bare level used to clear that selector, which moves the pad to the
++	 * other supply; keep every bit but bit0 and bit7 instead. */
++	bool ok = bt_spmi_write(chan, BT_SPMI_REG_MODE, 0x00);
++	uint8_t nv = (uint8_t)((o & 0xfeu) | (val & 1u));
++	nv = (uint8_t)((nv & 0x7fu) | (vin ? 0x80u : 0u));
++	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_OUT, nv);
++	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_EN, 0x80);
++	uint8_t m2 = 0xff, o2 = 0xff, e2 = 0xff;
++	bt_spmi_read8(chan, BT_SPMI_REG_MODE, &m2);
++	bt_spmi_read8(chan, BT_SPMI_REG_OUT, &o2);
++	bt_spmi_read8(chan, BT_SPMI_REG_EN, &e2);
++	printf("PANDORA BT: %s apid %u/ee%u val=%u vin=%u ok=%d -> mode %#x out %#x en %#x\n",
++	    what, apid, owner, val, vin, ok, m2, o2, e2);
 +	return ok ? 0 : EIO;
 +}
 +
@@ -499,10 +538,10 @@ index 0000000..008e6a1
 +		return ENOTSUP;
 +	}
 +	/* btpower's order: BT_EN low 100 ms -> XO/FMD clock pad high -> BT_EN high. */
-+	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_GPIO_PPID, 0x00, "BT_EN low");
++	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_GPIO_PPID, 0x00, 1, "BT_EN low");
 +	bt_sleep(100 * 1000);
-+	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_FMD_PPID, 0x01, "FMD clk");
-+	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_GPIO_PPID, 0x01, "BT_EN high");
++	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_FMD_PPID, 0x01, 0, "FMD clk");
++	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_GPIO_PPID, 0x01, 1, "BT_EN high");
 +	bt_sleep(150 * 1000);	/* Linux qca_power_on: 150 ms after BT_EN */
 +	/* btpower then asserts BT_WAKE (dev wake); the ROM stays quiet without it. */
 +	bt_wr(BT_W_WAKE, 0x4, 2u);
