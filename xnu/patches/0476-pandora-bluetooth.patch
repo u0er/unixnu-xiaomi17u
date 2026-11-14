@@ -503,7 +503,7 @@ index 0000000..008e6a1
 +	bt_sleep(100 * 1000);
 +	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_FMD_PPID, 0x01, "FMD clk");
 +	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_GPIO_PPID, 0x01, "BT_EN high");
-+	bt_sleep(50 * 1000);
++	bt_sleep(150 * 1000);	/* Linux qca_power_on: 150 ms after BT_EN */
 +	/* btpower then asserts BT_WAKE (dev wake); the ROM stays quiet without it. */
 +	bt_wr(BT_W_WAKE, 0x4, 2u);
 +	uint32_t wctl = bt_rd(BT_W_WAKE, 0) & ~0x3ffu;
