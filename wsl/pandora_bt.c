@@ -338,7 +338,7 @@ bt_power(void)
  * on the TCXO with the branch gated; Android programs this entry before it opens
  * the UART. */
 static void
-bt_rcg_64m(void)
+bt_rcg_set(unsigned m, unsigned n)
 {
 	/* Read-modify-write the same way pandora_amp.c does: 0x371f covers
 	 * src/mode/pre-divider, bit 20 is the parked-state bit iBoot leaves
@@ -347,8 +347,8 @@ bt_rcg_64m(void)
 	cfg &= ~(0x371fu | (1u << 20));
 	cfg |= 6u << 8;
 	bt_wr(BT_W_RCG, BT_RCG + BT_RCG_CFG, cfg);
-	bt_wr(BT_W_RCG, BT_RCG + BT_RCG_M, 16u);
-	bt_wr(BT_W_RCG, BT_RCG + BT_RCG_N, 75u);
+	bt_wr(BT_W_RCG, BT_RCG + BT_RCG_M, m);
+	bt_wr(BT_W_RCG, BT_RCG + BT_RCG_N, n);
 	bt_wr(BT_W_RCG, BT_RCG + BT_RCG_D, 0);
 	bt_wr(BT_W_RCG, BT_RCG + BT_RCG_CMD, bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CMD) | 1u);
 	for (unsigned i = 0; i < 5000 && (bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CMD) & 1u); i++) {
@@ -543,7 +543,14 @@ bt_clocks(void)
 	if ((vote & BT_VOTE_BITS) != BT_VOTE_BITS) {
 		bt_wr(BT_W_VOTE, BT_VOTE, vote | BT_VOTE_BITS);
 	}
-	bt_rcg_64m();
+	/* level 5 takes over a chip that Android already trained to 4 Mbps:
+	 * 128 MHz RCG (M 32 / N 75) gives divider 1. Everything else stays at
+	 * the 64 MHz/115200 pairing. */
+	if (bt_level >= 5) {
+		bt_rcg_set(32, 75);
+	} else {
+		bt_rcg_set(16, 75);
+	}
 	if (bt_wait_on(BT_W_HALT, BT_HALT_M_AHB, "m_ahb") || bt_wait_on(BT_W_HALT, BT_HALT_S_AHB, "s_ahb") ||
 	    bt_wait_on(BT_W_HALT, BT_HALT_CORE, "core") || bt_wait_on(BT_W_HALT, BT_HALT_CORE2X, "core_2x") ||
 	    bt_wait_on(BT_W_RCG, BT_SE5_HALT, "se5")) {
@@ -793,7 +800,7 @@ bt_thread(void *arg, wait_result_t result)
 			bt_report();
 			goto out;
 		}
-		if (bt_uart_init(115200) == 0) {
+		if (bt_uart_init(bt_level >= 5 ? 4000000 : 115200) == 0) {
 			bt_uart_dump();
 			bt_try_hci_reset();
 		}
