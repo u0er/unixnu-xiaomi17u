@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..b201a09
+index 0000000..5912343
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,5503 @@
+@@ -0,0 +1,5588 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -4930,6 +4930,87 @@ index 0000000..b201a09
 +	pc_csiphy_mark("ctest done (sensor left in standby)");
 +}
 +
++/* csiphy4 probe (pandora_csiphy=14). Android vendor logs (user opened the main
++ * camera) say:
++ *   cam_sensor_power_up: Setup for Main Camera with csiphy index: 4
++ *   cam_csiphy_core_cfg: CAM_ACQUIRE_DEV: 4 Type: DPHY
++ *   CAM_ACQUIRE_DEV: 0 Type: CPHY   (csiphy0 is another camera)
++ * So the wide sensor is on csiphy4 (0x952b000), not csiphy0 (0x9523000), which
++ * explains why STATUS0..15 on csiphy0 is always 0. This brings up csiphy4 with
++ * the same lane array, arms CSID with PHY_NUM_SEL=4 (RX_CFG0 0x432103), and
++ * runs the verified slice-B1 sequence. It also dumps the CAMCC 0x20000 timer
++ * RCG block so the right csi4phytimer source can be identified. */
++static void
++pc_sliceb_p4test(void)
++{
++	vm_offset_t phy4, csid0;
++	uint32_t seen_rdi = 0;
++	unsigned settle;
++
++	pc_csiphy_mark("p4test start: csiphy4 + CAMCC timer block");
++	phy4 = ml_io_map_unmappable(0x0952b000u, 0x2000u, VM_WIMG_IO);
++	csid0 = ml_io_map_unmappable(PC_CSID0_PA, 0x5e80u, VM_WIMG_IO);
++	pc_bdistm = ml_io_map_unmappable(PC_BDISTM_PA, 0x6000u, VM_WIMG_IO);
++	pc_tlmm = ml_io_map_unmappable(PC_TLMM_PA, 0xb0000u, VM_WIMG_IO);
++	pc_cci[0] = ml_io_map_unmappable(PC_CCI_PA(0), 0x1000u, VM_WIMG_IO);
++	if (!phy4 || !csid0 || !pc_bdistm || !pc_tlmm || !pc_cci[0] || !pc_camcc) {
++		printf("PANDORA SLICEB: p4test map failed phy4=%#llx csid0=%#llx\n",
++		    (unsigned long long)phy4, (unsigned long long)csid0);
++		(void)pandora_log_sync();
++		return;
++	}
++	for (unsigned off = 0x20000u; off <= 0x20078u; off += 0x10u) {
++		printf("PANDORA SLICEB: p4test camcc[%#x] cmd=%#x cfg=%#x cbcr@+18=%#x\n",
++		    off, pc_rd(pc_camcc, off), pc_rd(pc_camcc, off + 4),
++		    pc_rd(pc_camcc, off + 0x18));
++	}
++	(void)pandora_log_sync();
++
++	settle = pc_csiphy_settle(PC_WIDE_LINK_FREQ, PC_CPHY_TIMER_RATE);
++	pc_csiphy_mark("p4test: csiphy4 reset + lanes_enable");
++	pc_wr(phy4, PC_CPHY_CTRL(0), 1u);
++	pc_sleep(8);
++	pc_wr(phy4, PC_CPHY_CTRL(0), 0u);
++	pc_sleep(1);
++	pc_wr(phy4, PC_CPHY_CTRL(5), 0xD5u);
++	pc_wr(phy4, PC_CPHY_CTRL(6), 1u);
++	pc_wr(phy4, PC_CPHY_CTRL(7), 2u);
++	pc_wr(phy4, PC_CPHY_CTRL(0), 0u);
++	for (unsigned i = 0; i < PC_CSIPHY_LANE_REGS_N; i++) {
++		const struct pc_csiphy_lane_reg *r = &pc_csiphy_lane_regs_x1e80100[i];
++		if (r->type == 2)
++			continue;
++		uint32_t val = (r->type == 1) ? (settle & 0xffu) : r->val;
++		pc_wr(phy4, r->addr, val);
++		if (r->delay_us)
++			delay(r->delay_us);
++	}
++	for (unsigned n = 11; n <= 21; n++)
++		pc_wr(phy4, PC_CPHY_CTRL(n), 0u);
++	printf("PANDORA SLICEB: p4test phy4 CTRL5=%#x CTRL6=%#x CTRL7=%#x STATUS0=%#x\n",
++	    pc_rd(phy4, PC_CPHY_CTRL(5)), pc_rd(phy4, PC_CPHY_CTRL(6)),
++	    pc_rd(phy4, PC_CPHY_CTRL(7)), pc_rd(phy4, PC_CPHY_STATUS(0)));
++	(void)pandora_log_sync();
++
++	(void)pc_sensor_power_up();
++	pc_sleep(20);
++	(void)pc_sliceb_replay_cfg("wide-p4test");
++	uint32_t base = pc_sliceb_arm(csid0, 0x00432103u);
++	if (base) {
++		pc_sliceb_stream_on(1);
++		pc_sleep(30);
++		seen_rdi = pc_sliceb_poll(csid0, 800, NULL, NULL);
++	}
++	printf("PANDORA SLICEB: p4test RESULT rdi=%#x sof=%u eof=%u arm=%#x "
++	    "phy4_status0=%#x ctrl7=%#x\n", seen_rdi,
++	    (seen_rdi & PC_RDIN_INPUT_SOF) ? 1u : 0u,
++	    (seen_rdi & PC_RDIN_INPUT_EOF) ? 1u : 0u, base,
++	    pc_rd(phy4, PC_CPHY_STATUS(0)), pc_rd(phy4, PC_CPHY_CTRL(7)));
++	(void)pandora_log_sync();
++	pc_sliceb_stream_on(0);
++	pc_csiphy_mark("p4test done (sensor left in standby)");
++}
++
 +static void
 +pc_sliceb_stream(void)
 +{
@@ -4975,8 +5056,12 @@ index 0000000..b201a09
 +		pc_sliceb_hwreset();
 +		return;
 +	}
-+	if (pc_csiphy >= 13u) {
++	if (pc_csiphy == 13u) {
 +		pc_sliceb_ctest();
++		return;
++	}
++	if (pc_csiphy >= 14u) {
++		pc_sliceb_p4test();
 +		return;
 +	}
 +
