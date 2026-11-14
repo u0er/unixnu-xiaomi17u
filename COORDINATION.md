@@ -20,7 +20,7 @@ synchronization points. Read it before acting; update your row after acting.
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
 | Qoder | Qoder | Camera: v3 diag -> sensor CCI writes have NO effect | 6c0c4ca6 (0475 v4, pandora_csiphy=5 write probe) | 43528239960 is CodeArts (Qoder waits) | not held | dispatch after CodeArts |
-| CodeArts | CodeArts | BT_EN 100ms low | 121716fe (100ms low) | waiting free slot (GPU run 931ad805) | not held | NEEDS ONE SLOT: dispatch xnu.yml when CI idle, then w54 trial |
+| CodeArts | CodeArts | BT_EN 100ms low | 121716fe (100ms low) | 43540512083 in_progress | not held | w54 building; then pandora_bt=2 trial |
 
 ## Notes
 - 2026-11-14 ~09:10Z CodeArts: 0476 121716fe (BT_EN low 100 ms, high 200 ms) is pushed and verified locally; needs exactly one dispatch (no cancel) when CI is idle. Earlier w53 fault was bt_sleep() units on the low side too (10 us).
