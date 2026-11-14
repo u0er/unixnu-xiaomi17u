@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..e9e6d08
+index 0000000..e820435
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,5843 @@
+@@ -0,0 +1,5816 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -4971,65 +4971,38 @@ index 0000000..e9e6d08
 +	 * camcc-sm8750 puts csiphy4_clk at 0x100a0, while that table says 0x200a0;
 +	 * we wrote 0x200a0 and it kept reading 0x8000001 (CLK_OFF=1) with bit0
 +	 * stuck at 0 - the signature of a register that is not the branch we
-+	 * think it is. Read both csiphy banks, then flip bit0 only on registers
-+	 * that actually look like a CBCR (bit31=1, bit0=0), so one run tells us
-+	 * where csiphy4/csi4phytimer really live on Canoe. */
-+	{
-+		static const struct { unsigned base, end; const char *tag; } banks[] = {
-+			{ 0x10000u, 0x100b0u, "bank1" },
-+			{ 0x20000u, 0x200b0u, "bank2" },
-+		};
-+		unsigned b, off;
-+
-+		for (b = 0u; b < 2u; b++) {
-+			for (off = banks[b].base; off <= banks[b].end; off += 4u) {
-+				uint32_t v = pc_rd(pc_camcc, off);
-+				if (v != 0u && v != 0xffffffffu)
-+					printf("PANDORA SLICEB: scan %s[%#x]=%#x\n",
-+					    banks[b].tag, off, v);
-+			}
-+		}
-+		(void)pandora_log_sync();
-+
-+		for (b = 0u; b < 2u; b++) {
-+			for (off = banks[b].base; off <= banks[b].end; off += 4u) {
-+				uint32_t v = pc_rd(pc_camcc, off);
-+				uint32_t n;
-+				if (v != 0x80000000u)
-+					continue;
-+				pc_wr(pc_camcc, off, v | 0x1u);
-+				n = pc_rd(pc_camcc, off);
-+				printf("PANDORA SLICEB: enable %s[%#x] %#x -> %#x\n",
-+				    banks[b].tag, off, v, n);
-+			}
-+		}
-+		(void)pandora_log_sync();
++	 * think it is. The w72 probe proved both: camcc-canoe.ko extracted from
++	 * vendor_boot has 0x200a0 twice (halt_reg + enable_reg) and 0x100a0 not
++	 * at all, so 0x200xx is correct for Canoe. It also died on the very first
++	 * read of 0x10000 - that bank is not clocked here, so touch 0x200xx only.
++	 * Every CBCR reads 0x8000001: bit0 (enable) is already set, bit31
++	 * (CLK_OFF) never clears. That is a missing parent clock, not a bad
++	 * register, so dump PLL0 (MODE bit31 = lock) and the RCG M/N/D next. */
++	printf("PANDORA SLICEB: p4test pll0 mode=%#x l=%#x alpha=%#x user=%#x "
++	    "stat=%#x cfg=%#x\n", pc_rd(pc_camcc, 0x0u), pc_rd(pc_camcc, 0x4u),
++	    pc_rd(pc_camcc, 0x8u), pc_rd(pc_camcc, 0x10u), pc_rd(pc_camcc, 0x14u),
++	    pc_rd(pc_camcc, 0x18u));
++	for (unsigned off = 0x20000u; off <= 0x200b0u; off += 4u) {
++		uint32_t v = pc_rd(pc_camcc, off);
++		if (v != 0u && v != 0xffffffffu)
++			printf("PANDORA SLICEB: probe[%#x]=%#x\n", off, v);
 +	}
++	(void)pandora_log_sync();
 +
-+	/* Program both candidate dividers so whichever bank owns csiphy4 has a
-+	 * live parent: 0x20084 (Kaanapali-table) and 0x10084 (sm8750 table). */
 +	struct pc_tpg_rcg p4t = { 0x20084u, 3u, 5u, "csi4phytimer" };
 +	struct pc_tpg_rcg p4c = { 0x21064u, 1u, 8u, "cphy_rx_266m" };
-+	struct pc_tpg_rcg p4a = { 0x10084u, 3u, 5u, "csi4phytimer_alt" };
-+	struct pc_tpg_rcg p4b = { 0x11068u, 1u, 8u, "cphy_rx_alt_266m" };
 +	(void)pc_tpg_rcg_set(&p4t);
 +	(void)pc_tpg_rcg_set(&p4c);
-+	(void)pc_tpg_rcg_set(&p4a);
-+	(void)pc_tpg_rcg_set(&p4b);
 +	pc_wr(pc_camcc, 0x2009cu, pc_rd(pc_camcc, 0x2009cu) | 0x1u);
 +	pc_wr(pc_camcc, 0x200a0u, pc_rd(pc_camcc, 0x200a0u) | 0x1u);
-+	pc_wr(pc_camcc, 0x1009cu, pc_rd(pc_camcc, 0x1009cu) | 0x1u);
-+	(void)pc_wait_branch_on("csi4phytimer_alt", 0x1009cu);
-+	pc_wr(pc_camcc, 0x100a0u, pc_rd(pc_camcc, 0x100a0u) | 0x1u);
-+	(void)pc_wait_branch_on("csiphy4_alt", 0x100a0u);
-+	printf("PANDORA SLICEB: p4test bank1 rcg=%#x/%#x b9c=%#x ba0=%#x\n",
-+	    pc_rd(pc_camcc, 0x10084u), pc_rd(pc_camcc, 0x10088u),
-+	    pc_rd(pc_camcc, 0x1009cu), pc_rd(pc_camcc, 0x100a0u));
-+	printf("PANDORA SLICEB: p4test bank2 rcg=%#x/%#x b9c=%#x ba0=%#x\n",
++	(void)pc_wait_branch_on("csi4phytimer", 0x2009cu);
++	(void)pc_wait_branch_on("csiphy4", 0x200a0u);
++	printf("PANDORA SLICEB: p4test after pll0=%#x rcg=%#x/%#x b9c=%#x ba0=%#x "
++	    "mnd=%#x/%#x/%#x\n", pc_rd(pc_camcc, 0x0u),
 +	    pc_rd(pc_camcc, 0x20084u), pc_rd(pc_camcc, 0x20088u),
-+	    pc_rd(pc_camcc, 0x2009cu), pc_rd(pc_camcc, 0x200a0u));
-+	printf("PANDORA SLICEB: p4test alt rcg=%#x/%#x\n",
-+	    pc_rd(pc_camcc, 0x11068u), pc_rd(pc_camcc, 0x1106cu));
++	    pc_rd(pc_camcc, 0x2009cu), pc_rd(pc_camcc, 0x200a0u),
++	    pc_rd(pc_camcc, 0x2008cu), pc_rd(pc_camcc, 0x20090u),
++	    pc_rd(pc_camcc, 0x20094u));
 +	(void)pandora_log_sync();
 +
 +	settle = pc_csiphy_settle(PC_WIDE_LINK_FREQ, PC_CPHY_TIMER_RATE);
