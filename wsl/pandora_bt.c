@@ -754,13 +754,24 @@ bt_thread(void *arg, wait_result_t result)
 		/* A low->high edge on PMH0104 GPIO5 is what btpower does before it
 		 * opens the UART; failure here is reported and the rest still runs. */
 		(void)bt_rf_clk();
-		(void)bt_en_pulse();
+		if (bt_level < 3) {
+			(void)bt_en_pulse();
+		} else {
+			/* iBoot hands this pad over already high (mode 1, out 1, en on)
+			 * and the chip is running: level 3 leaves it alone instead of
+			 * resetting it, and only reports the RX level. */
+			printf("PANDORA BT: level 3 keeps the iBoot BT_RESET level\n");
+			pandora_log_sync();
+		}
 		/* CTS in, RTS out LOW (the asserted "ready to receive" level Android
 		 * shows), TX out high, RX in; the UART mux is function 1. */
 		bt_pin(24, 1, 0, 2, -1);
 		bt_pin(25, 1, 1, 2, 0);
 		bt_pin(26, 1, 3, 2, 1);
 		bt_pin(27, 1, 0, 2, -1);
+		printf("PANDORA BT: RX pin level before the UART %#x (1 = WCN TX idle high)\n",
+		    (bt_rd(BT_W_UART, 3 * 0x1000u + 0x4) >> 1) & 1u);
+		pandora_log_sync();
 		if (bt_clocks()) {
 			bt_report();
 			goto out;
