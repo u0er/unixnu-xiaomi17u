@@ -432,7 +432,7 @@ index 0000000..008e6a1
 +static int
 +bt_rf_clk(void)
 +{
-+	static const char *names[] = { "rf_clk1", "rfclk1", "clk1", "rf_clk" };
++	static const char *names[] = { "rfclka1", "rfclka2", "rfclk1" };
 +	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
 +		if (pandora_rpmh_resource(names[i], 0, 1) == 0) {
 +			printf("PANDORA BT: RF clock voted via %s\n", names[i]);
