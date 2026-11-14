@@ -8,7 +8,7 @@
 
 本轮手机操作仅为 Android 上读取 sysfs、DT 和复制现用内核模块到主机。没有开关蓝牙、挂载 debugfs、重启、启动 iOS、推送文件或写固件容器。Android 当前没有挂载 debugfs，也没有 `/dev/mem`，因此旧的 debugfs/devmem 采集脚本不能原样复用。当前工作区的根 Git 尚无提交；旧交接所称远端 main 不等于本地可核验的 HEAD。
 
-## 五项决定路线的证据
+## 六项决定路线的证据
 
 ### 1. PMIC GPIO 编码仍然错误，且遗漏了硬件子类型
 
@@ -62,6 +62,18 @@ Linux 串口源码与本机 `msm_geni_serial.ko` 的 `msm_geni_serial_config_bau
 
 候选去掉 GPIO6 的强制写入，保留交接状态，level 1 可读出其配置。DT 表明预期配置；当前运行时 PMIC 寄存器值仍待采集，不把 DT 当作寄存器快照。
 
+### 6. GPIO9 没有独立的 BT_WAKE 绑定
+
+继续核对本机 `soc:bt_peach/of_node` 后，确认没有 `qcom,btwake_gpio` 或
+`qcom,bthostwake_gpio` 属性。旧代码却把 `mpm_wake_set_gpios` 数组第二项的 9
+直接当作 dev-wake GPIO，强制配置为输出高。
+
+同平台 `btpower.c:get_gpio_dt_pinfo` 对 `mpm_wake_set_gpios` 使用
+`of_property_read_u32`，保存到 SW_CTRL 的 MPM 配置字段；OOBS 的 dev-wake
+则从独立的 `qcom,btwake_gpio` 读取。数组第二项不是 GPIO9 为 dev-wake 输出的依据。
+最终候选删除 GPIO9 的驱动和多余映射，保留该引脚的交接配置。本轮没有据此猜测
+GPIO9 的其他用途，也没有重新做没有判据的唤醒极性试验。
+
 ## 候选的其余必要修正
 
 - SPMI / RF clock 失败立即终止当前初始化，不再吞掉返回值后打印正常上电流程。共享 rail 不擅自撤票，避免干扰 Wi-Fi。
@@ -103,3 +115,26 @@ Linux 串口源码与本机 `msm_geni_serial.ko` 的 `msm_geni_serial_config_bau
 本地使用现有 XNU DEVELOPMENT_ARM64_PANDORA 生成头和 NDK clang，以 `arm64-apple-macos11.0`、`-mkernel -O2 -Wall -Wextra` 编译单个 BT 源文件，检查真实进程返回码；构建补丁的新增文件须与 `.c` 完全一致，两个注册 / 调用上下文块保持原样。最终实际结果记在审计目录 `verification.txt`。
 
 没有把单文件编译当作完整内核链接或设备验证。下一步是完整构建此候选，再在明确获准的独占窗口做 B；第一次日志必须包含 TYPE/SUBTYPE、MODE/SOURCE、wrapper version / sampling 和真实 HCI 数据。未获得用户明确启动同意前，停止在主机构建阶段。
+
+## 后续构建与映射准备
+
+已在独立分支 `codex/bluetooth-no-analyzer-20261115` 启动完整 DEVELOPMENT/PANDORA
+构建，未更新 main。初版运行编号为 43649529960；去掉无绑定依据的 GPIO9 驱动后，
+最终候选需要新的完整构建结果，不能拿初版产物代替。
+
+新增 `tools/bluetooth/prepare_trial.py` 复用现有 mkpayload / ADT / loader 构建链，
+使用新输出目录。基线为上次 BT 镜像 `usb-bt-tlmm-level2-w67-ext.img`，首轮 level 2、
+自动返回 90 秒。loader 使用原有 `E:/IOS16/IOS16` 源码，避免把工作区额外的
+boot_args ABI / framebuffer 修改混进首轮 BT 试验。
+
+Android FIEMAP / pin-status 的只读预检还发现：旧镜像的固件映射对应
+`metal-update-0013.img` 的历史 32 MiB、8 段布局；同名现存文件是 pinned 的
+64 MiB、6 段布局。新工具可显式接收当前映射快照，仅在新镜像的 ADT 更新
+`pandora-fw-extents` / `pandora-fw-blocks`，不写、不重新分配容器。root 的有效
+16 GiB 暴露区间及日志映射与手机当前物理布局相符，保持原样；没有把 root.img
+的 64 GiB 文件长度擅自改成新的对外磁盘大小。
+
+快照与有效范围比较结果见 `work/bluetooth-source-audit/extent-preflight.json`。
+ADT 里的 extent 数组带预留零槽，比较时必须按有效区间解析；不能用 JSON 长度或
+未去掉预留槽的字节长度判断是否漂移。最终内核运行、镜像路径和验证结果将在
+构建完成后记录，当前仍没有启动手机。

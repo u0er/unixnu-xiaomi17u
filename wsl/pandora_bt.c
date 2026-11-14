@@ -49,7 +49,6 @@ void pandora_bt_init(void);
 #define BT_WRAPPER_PA    0x019c0000u   /* QUPV3_3: version at +4, read only with clocks on */
 #define BT_TLMM_SW_PA    0x0f112000u   /* TLMM gpio18 (wcn_sw_ctrl) */
 #define BT_TLMM_UART_PA  0x0f118000u   /* TLMM gpio24..27 (CTS, RTS, TX, RX) */
-#define BT_TLMM_WAKE_PA  0x0f109000u   /* TLMM gpio9: BT_WAKE (dev wake, DT mpm_wake_set_gpios[1]) */
 
 /* GCC */
 #define BT_VOTE          0x18u         /* 0x52018 - BT_GCC_VOTE_PA */
@@ -143,10 +142,9 @@ struct bt_win { uint32_t pa, bytes; vm_offset_t va; };
 static struct bt_win bt_wins[] = {
 	{BT_GCC_VOTE_PA, 0x1000, 0}, {BT_GCC_RCG_PA, 0x1000, 0}, {BT_GCC_HALT_PA, 0x1000, 0},
 	{BT_SE_PA, 0x4000, 0}, {BT_TLMM_SW_PA, 0x1000, 0}, {BT_TLMM_UART_PA, 0x4000, 0},
-	{BT_TLMM_WAKE_PA, 0x1000, 0},
 	{BT_WRAPPER_PA, 0x1000, 0},
 };
-enum { BT_W_VOTE, BT_W_RCG, BT_W_HALT, BT_W_SE, BT_W_SWCTRL, BT_W_UART, BT_W_WAKE, BT_W_WRAPPER, BT_W_COUNT };
+enum { BT_W_VOTE, BT_W_RCG, BT_W_HALT, BT_W_SE, BT_W_SWCTRL, BT_W_UART, BT_W_WRAPPER, BT_W_COUNT };
 
 static int bt_level, bt_wait;
 static unsigned bt_rate;
@@ -287,10 +285,10 @@ bt_report(void)
 	pandora_log_sync();
 	printf("PANDORA BT: RCG cmd %#x; SE5 rate %u Hz\n", bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CMD), bt_rate);
 	pandora_log_sync();
-	printf("PANDORA BT: pins 18 %#x, cts %#x rts %#x tx %#x rx %#x; io 18 %#x 24 %#x 25 %#x 26 %#x 27 %#x 9 %#x\n",
+	printf("PANDORA BT: pins 18 %#x, cts %#x rts %#x tx %#x rx %#x; io 18 %#x 24 %#x 25 %#x 26 %#x 27 %#x\n",
 	    bt_rd(BT_W_SWCTRL, 0), bt_pin_ctl(24), bt_pin_ctl(25), bt_pin_ctl(26), bt_pin_ctl(27),
 	    bt_rd(BT_W_SWCTRL, 0x4), bt_rd(BT_W_UART, 0x4), bt_rd(BT_W_UART, 0x1004u),
-	    bt_rd(BT_W_UART, 0x2004u), bt_rd(BT_W_UART, 0x3004u), bt_rd(BT_W_WAKE, 0x4));
+	    bt_rd(BT_W_UART, 0x2004u), bt_rd(BT_W_UART, 0x3004u));
 	printf("PANDORA BT: pad samples sw_ctrl %u cts %u rx %u (GPIO_IO bit0)\n",
 	    bt_rd(BT_W_SWCTRL, 0x4) & BT_PIN_INPUT, bt_rd(BT_W_UART, 0x4) & BT_PIN_INPUT,
 	    bt_rd(BT_W_UART, 0x3004u) & BT_PIN_INPUT);
@@ -687,11 +685,9 @@ bt_en_pulse(void)
 		return err;
 	}
 	bt_sleep(150 * 1000);	/* Linux qca_power_on: 150 ms after BT_EN */
-	/* btpower then asserts BT_WAKE (dev wake); the ROM stays quiet without it. */
-	bt_wr(BT_W_WAKE, 0x4, 2u);
-	uint32_t wctl = bt_rd(BT_W_WAKE, 0) & ~0x3ffu;
-	bt_wr(BT_W_WAKE, 0, wctl | BT_PIN_MUX(0) | BT_PIN_DRIVE(2) | BT_PIN_OUT);
-	bt_sleep(10 * 1000);
+	/* There is no qcom,btwake_gpio binding on this board. In particular,
+	 * mpm_wake_set_gpios[1] does not establish GPIO9 as a dev-wake output.
+	 * Leave that unrelated pad in its inherited configuration. */
 	return 0;
 }
 
