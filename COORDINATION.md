@@ -20,7 +20,7 @@ synchronization points. Read it before acting; update your row after acting.
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
 | Qoder | Qoder | Camera: v3 diag -> sensor CCI writes have NO effect | 6c0c4ca6 (0475 v4, pandora_csiphy=5 write probe) | 43528239960 is CodeArts (Qoder waits) | not held | dispatch after CodeArts |
-| CodeArts | CodeArts | BT_EN 200ms (unit fix) | e1932a82 (bt_sleep(200*1000)) | 43528239960 in_progress | not held | w51 proved bt_sleep() is us (200 was 200us); w52 building |
+| CodeArts | CodeArts | TX packing fix | 9db246d1 (TX_PACK0 0xf) | waiting Qoder 43530663512, then w53 | not held | w52: 200ms OK but HCI still silent; TX was 4B/word vs 1B writes |
 
 ## Notes
 - 0476 local revision (2026-11-13 ~11:50Z): BT_EN high -> bt_sleep(200) before HCI (was 10 ms). NOT pushed yet. Handoff: outputs/data-a-live-nezha/docs/BLUETOOTH_HANDOFF_NEXT_2026-11-13.md. Last verified state: w50 pulse OK (apid 2234/ee0), HCI silent at 2 ms.
