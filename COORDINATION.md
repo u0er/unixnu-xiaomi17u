@@ -20,7 +20,7 @@ synchronization points. Read it before acting; update your row after acting.
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
 | Qoder | Qoder | Camera: single-WRITE-word fix tried, sensor still ignores writes | e0b9d4f0 (0475 v6) | 43549386109 SUCCESS | released | next: GPIO89/106 + writable-register probe + full IRQ bits |
-| CodeArts | CodeArts | RPMh rfclka1 vote | 6a098ca6 (rfclka1) | 43553294425 in_progress | not held | w56: CMD-DB real name is rfclka1; w57 building |
+| CodeArts | CodeArts | RPMh rfclka1 vote | 6a098ca6 (rfclka1) | 43553294425 success | not held (device absent) | w57 img ready; trial when device back + consent |
 
 ## Notes
 - 2026-11-14 ~09:10Z CodeArts: 0476 121716fe (BT_EN low 100 ms, high 200 ms) is pushed and verified locally; needs exactly one dispatch (no cancel) when CI is idle. Earlier w53 fault was bt_sleep() units on the low side too (10 us).
