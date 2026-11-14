@@ -469,7 +469,7 @@ index 0000000..008e6a1
 +	vm_offset_t chan = bt_spmi_chnls + BT_SPMI_RW_STRIDE * apid;
 +	bool low = bt_spmi_write(chan, BT_SPMI_REG_OUT, 0x00);
 +	bool en = bt_spmi_write(chan, BT_SPMI_REG_EN, 0x80);
-+	bt_sleep(10);
++	bt_sleep(100 * 1000);	/* 100 ms low: real reset pulse, us units */
 +	bool high = bt_spmi_write(chan, BT_SPMI_REG_OUT, 0x01);
 +	bt_sleep(200 * 1000);	/* bt_sleep takes microseconds */
 +	printf("PANDORA BT: BT_EN pulse apid %u/ee%u low=%d en=%d high=%d\n", apid, owner, low, en, high);
