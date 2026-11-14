@@ -387,6 +387,8 @@ bt_rcg_set(unsigned m, unsigned n)
 #define BT_SPMI_REG_EN     0x46u        /* EN_CTL, bit 7 = master enable */
 
 static vm_offset_t bt_spmi_core, bt_spmi_map, bt_spmi_chnls, bt_spmi_owner1;
+static bool bt_spmi_ready;
+static uint32_t bt_bus0, bt_bus1;
 
 static uint32_t
 bt_spmi_rd(vm_offset_t base, uint32_t off)
@@ -511,25 +513,31 @@ bt_spmi_gpio(uint32_t bus0, uint32_t bus1, uint16_t ppid, uint8_t val, unsigned 
 static int
 bt_en_pulse(void)
 {
-	bt_spmi_core = ml_io_map_unmappable(BT_SPMI_CORE_PA, 0x3000, VM_WIMG_IO);
-	bt_spmi_map = ml_io_map_unmappable(BT_SPMI_MAP_PA, 0x8000, VM_WIMG_IO);
-	bt_spmi_chnls = ml_io_map_unmappable(BT_SPMI_CHNLS_PA, 0x400000, VM_WIMG_IO);
-	bt_spmi_owner1 = ml_io_map_unmappable(BT_SPMI_OWNER1_PA, 0x8000, VM_WIMG_IO);
-	if (!bt_spmi_core || !bt_spmi_map || !bt_spmi_chnls || !bt_spmi_owner1) {
-		printf("PANDORA BT: SPMI map failed: no BT_EN pulse\n");
-		return ENOMEM;
+	/* Map once: the retry loop below re-enters this function after a failed
+	 * attempt and the arbiter window must not be mapped twice. */
+	if (!bt_spmi_ready) {
+		bt_spmi_core = ml_io_map_unmappable(BT_SPMI_CORE_PA, 0x3000, VM_WIMG_IO);
+		bt_spmi_map = ml_io_map_unmappable(BT_SPMI_MAP_PA, 0x8000, VM_WIMG_IO);
+		bt_spmi_chnls = ml_io_map_unmappable(BT_SPMI_CHNLS_PA, 0x400000, VM_WIMG_IO);
+		bt_spmi_owner1 = ml_io_map_unmappable(BT_SPMI_OWNER1_PA, 0x8000, VM_WIMG_IO);
+		if (!bt_spmi_core || !bt_spmi_map || !bt_spmi_chnls || !bt_spmi_owner1) {
+			printf("PANDORA BT: SPMI map failed: no BT_EN pulse\n");
+			return ENOMEM;
+		}
+		uint32_t version = bt_spmi_rd(bt_spmi_core, 0);
+		if (version < 0x80000000u) {
+			printf("PANDORA BT: SPMI arbiter %#x is not v8: no BT_EN pulse\n", version);
+			return ENOTSUP;
+		}
+		bt_bus0 = bt_spmi_rd(bt_spmi_core, BT_SPMI_FEATURES) & BT_SPMI_PERIPH_MASK;
+		bt_bus1 = bt_spmi_rd(bt_spmi_core, BT_SPMI_FEATURES + 4u) & BT_SPMI_PERIPH_MASK;
+		if (bt_bus1 == 0 || bt_bus0 + bt_bus1 > BT_SPMI_MAX_PERIPHS) {
+			printf("PANDORA BT: SPMI bus1 apids %u (bus0 %u): no BT_EN pulse\n", bt_bus1, bt_bus0);
+			return ENOTSUP;
+		}
+		bt_spmi_ready = true;
 	}
-	uint32_t version = bt_spmi_rd(bt_spmi_core, 0);
-	if (version < 0x80000000u) {
-		printf("PANDORA BT: SPMI arbiter %#x is not v8: no BT_EN pulse\n", version);
-		return ENOTSUP;
-	}
-	uint32_t bus0 = bt_spmi_rd(bt_spmi_core, BT_SPMI_FEATURES) & BT_SPMI_PERIPH_MASK;
-	uint32_t bus1 = bt_spmi_rd(bt_spmi_core, BT_SPMI_FEATURES + 4u) & BT_SPMI_PERIPH_MASK;
-	if (bus1 == 0 || bus0 + bus1 > BT_SPMI_MAX_PERIPHS) {
-		printf("PANDORA BT: SPMI bus1 apids %u (bus0 %u): no BT_EN pulse\n", bus1, bus0);
-		return ENOTSUP;
-	}
+	uint32_t bus0 = bt_bus0, bus1 = bt_bus1;
 	/* btpower's order: BT_EN low 100 ms -> XO/FMD clock pad high -> BT_EN high. */
 	(void)bt_spmi_gpio(bus0, bus1, BT_SPMI_GPIO_PPID, 0x00, 1, "BT_EN low");
 	bt_sleep(100 * 1000);
@@ -724,24 +732,25 @@ bt_dump(const char *what, const uint8_t *buf, unsigned n)
 	printf("\n");
 }
 
-static void
+static bool
 bt_try_hci_reset(void)
 {
 	uint8_t rx[96];
 
 	if (bt_hci(bt_hci_reset, HCI_RESET_LEN, "HCI Reset")) {
-		return;
+		return false;
 	}
 	unsigned got = bt_rx_poll(rx, sizeof(rx), 200);
 	if (!got) {
 		printf("PANDORA BT: no HCI event within 200 ms\n");
-		return;
+		return false;
 	}
 	bt_dump("HCI event", rx, got);
 	if (got >= 7 && rx[0] == 0x04 && rx[1] == 0x0e && rx[2] >= 4) {
 		printf("PANDORA BT: Command Complete opcode %#x status %u\n",
 		    (unsigned)rx[4] | (unsigned)rx[5] << 8, rx[6]);
 	}
+	return true;
 }
 
 static void
@@ -769,7 +778,8 @@ bt_thread(void *arg, wait_result_t result)
 		/* A low->high edge on PMH0104 GPIO5 is what btpower does before it
 		 * opens the UART; failure here is reported and the rest still runs. */
 		(void)bt_rf_clk();
-		if (bt_level < 3) {
+		if (bt_level < 3 || bt_level == 6) {
+			/* level 6 also needs the SPMI windows mapped for its retries. */
 			(void)bt_en_pulse();
 		} else {
 			/* iBoot hands this pad over already high (mode 1, out 1, en on)
@@ -808,9 +818,27 @@ bt_thread(void *arg, wait_result_t result)
 			bt_report();
 			goto out;
 		}
-		if (bt_uart_init(bt_level >= 5 ? 4000000 : 115200) == 0) {
-			bt_uart_dump();
-			bt_try_hci_reset();
+		for (unsigned attempt = 1; attempt <= 3; attempt++) {
+			if (bt_uart_init(bt_level >= 5 ? 4000000 : 115200) == 0) {
+				bt_uart_dump();
+				if (bt_try_hci_reset()) {
+					printf("PANDORA BT: controller answered on attempt %u\n", attempt);
+					pandora_log_sync();
+					break;
+				}
+			}
+			if (bt_level < 6 || attempt == 3) {
+				break;
+			}
+			/* hci_qca retries qca_power_on after a failed setup: drop the
+			 * enable pad, wait, then bring it back up before retrying. */
+			printf("PANDORA BT: attempt %u failed (RX %#x): power cycling\n", attempt,
+			    (bt_rd(BT_W_UART, 3 * 0x1000u + 0x4) >> 1) & 1u);
+			pandora_log_sync();
+			(void)bt_spmi_gpio(bt_bus0, bt_bus1, BT_SPMI_GPIO_PPID, 0x00, 1, "retry BT_RESET low");
+			bt_sleep(100 * 1000);
+			(void)bt_spmi_gpio(bt_bus0, bt_bus1, BT_SPMI_GPIO_PPID, 0x01, 1, "retry BT_RESET high");
+			bt_sleep(150 * 1000);
 		}
 	} else {
 		printf("PANDORA BT: about to read RCG\n");
