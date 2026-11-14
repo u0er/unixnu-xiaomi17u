@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..008e6a1
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,832 @@
+@@ -0,0 +1,835 @@
 +/*
 + * PANDORA Bluetooth: the WCN786x BT core on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -335,7 +335,7 @@ index 0000000..008e6a1
 +{
 +	static const struct { const char *name; uint16_t mv; } rails[] = {
 +		{"L2G_E0", 1800}, {"L3G_E0", 1200}, {"S2J_E1", 892}, {"S7F_E0", 1328},
-+		{"S8F_E0", 1876}, {"S1J_E1", 892}, {"L6K_E1", 1800},
++		{"S8F_E0", 1800}, {"S1J_E1", 892}, {"L6K_E1", 1800},
 +	};
 +	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
 +		int err = pandora_rpmh_resource(rails[i].name, 0, rails[i].mv);
@@ -509,13 +509,16 @@ index 0000000..008e6a1
 +	uint8_t nv = (uint8_t)((o & 0xfeu) | (val & 1u));
 +	nv = (uint8_t)((nv & 0x7fu) | (vin ? 0x80u : 0u));
 +	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_OUT, nv);
-+	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_EN, 0x80);
-+	uint8_t m2 = 0xff, o2 = 0xff, e2 = 0xff;
++	/* 0xc0 = output + input enable, so DIG_IN_CTL reports the pad back and we
++	 * can tell whether the level we wrote actually reached the pin. */
++	ok = ok && bt_spmi_write(chan, BT_SPMI_REG_EN, 0xc0);
++	uint8_t m2 = 0xff, i2 = 0xff, o2 = 0xff, e2 = 0xff;
 +	bt_spmi_read8(chan, BT_SPMI_REG_MODE, &m2);
++	bt_spmi_read8(chan, BT_SPMI_REG_IN, &i2);
 +	bt_spmi_read8(chan, BT_SPMI_REG_OUT, &o2);
 +	bt_spmi_read8(chan, BT_SPMI_REG_EN, &e2);
-+	printf("PANDORA BT: %s apid %u/ee%u val=%u vin=%u ok=%d -> mode %#x out %#x en %#x\n",
-+	    what, apid, owner, val, vin, ok, m2, o2, e2);
++	printf("PANDORA BT: %s apid %u/ee%u val=%u vin=%u ok=%d -> mode %#x in %#x out %#x en %#x\n",
++	    what, apid, owner, val, vin, ok, m2, i2, o2, e2);
 +	return ok ? 0 : EIO;
 +}
 +
