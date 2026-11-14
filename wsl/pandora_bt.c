@@ -399,8 +399,9 @@ bt_spmi_write(vm_offset_t chan, uint8_t reg, uint8_t val)
 {
 	*(volatile uint32_t *)(chan + 0x10u) = val;              /* WDATA0 */
 	__asm__ volatile("dmb oshst" ::: "memory");
-	*(volatile uint32_t *)(chan + 0x00u) = ((uint32_t)reg << 4) | 1u; /* EXT_WRITEL, 1 byte */
+	*(volatile uint32_t *)(chan + 0x00u) = ((uint32_t)reg << 4); /* EXT_WRITEL, bc = 0 -> 1 byte */
 	__asm__ volatile("dsb osh" ::: "memory");
+	delay(10);	/* let the arbiter clear the stale DONE before polling */
 	for (unsigned i = 0; i < 1000; i++) {
 		uint32_t st = bt_spmi_rd(chan, 0x08u);
 		if (st & 1u) {
@@ -415,12 +416,15 @@ bt_spmi_write(vm_offset_t chan, uint8_t reg, uint8_t val)
 static bool
 bt_spmi_read8(vm_offset_t chan, uint8_t reg, uint8_t *out)
 {
-	*(volatile uint32_t *)(chan + 0x00u) = ((uint32_t)reg << 4) | 2u;
+	/* EXT_READL is opcode 1 in bits 31:27 (mainline pmic_arb_fmt_cmd_v2:
+	 * (opc << 27) | (addr << 4) | bc); one byte lands in RDATA0 at 0x18. */
+	*(volatile uint32_t *)(chan + 0x00u) = (1u << 27) | ((uint32_t)reg << 4);
 	__asm__ volatile("dsb osh" ::: "memory");
+	delay(10);
 	for (unsigned i = 0; i < 1000; i++) {
 		uint32_t st = bt_spmi_rd(chan, 0x08u);
 		if (st & 1u) {
-			*out = (uint8_t)(bt_spmi_rd(chan, 0x14u) & 0xffu);
+			*out = (uint8_t)(bt_spmi_rd(chan, 0x18u) & 0xffu);
 			return (st & 0x0eu) == 0;
 		}
 		delay(1);
