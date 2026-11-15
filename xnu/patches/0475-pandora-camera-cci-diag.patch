@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..d5b01a3
+index 0000000..aacb08f
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,5823 @@
+@@ -0,0 +1,5837 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -4994,6 +4994,20 @@ index 0000000..d5b01a3
 +		if (v != 0u && v != 0xffffffffu)
 +			printf("PANDORA SLICEB: probe[%#x]=%#x\n", off, v);
 +	}
++	(void)pandora_log_sync();
++
++	/* cam_cc_pll0_config in camcc-canoe.ko says l=0x3e, alpha=0,
++	 * config_ctl=0x8000, user_ctl_val=0x8408 and post_div_val=2, with
++	 * post_div_table_pll0_out_odd = {val 2, div 3}. The live USER_CTL reads
++	 * 0x44003e, whose post-div field [11:8] is 0 - PLL0 is locked but the
++	 * ODD output (the csiNphytimer parent) runs a divider vendor never
++	 * programmed. Write the vendor word with the ODD post-div and confirm
++	 * MODE still shows lock. */
++	pc_wr(pc_camcc, 0x10u, 0x8408u | (2u << 8));
++	pc_sleep(1);
++	printf("PANDORA SLICEB: pll0 user=%#x mode=%#x postdiv=%#x\n",
++	    pc_rd(pc_camcc, 0x10u), pc_rd(pc_camcc, 0x0u),
++	    (unsigned)((pc_rd(pc_camcc, 0x10u) >> 8) & 0xfu));
 +	(void)pandora_log_sync();
 +
 +	struct pc_tpg_rcg p4t = { 0x20084u, 3u, 5u, "csi4phytimer" };
