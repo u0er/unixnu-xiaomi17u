@@ -50,3 +50,35 @@ registration/caller hunks不变，git patch解析通过。临时对象/plist已�
    下一独立观测为GPIO5 low/high的INPUT_OUTPUT MODE2/RT_STS数字采样，需保存、恢复并验证。
 
 本轮实现/准备未授权设备启动，没有追加手机状态切换。
+
+## 完整候选已就绪
+
+完整构建43668443548已成功，运行于既有候选分支`codex/bluetooth-no-analyzer-20261115`，
+main未更新。状态记录`work/bluetooth-source-audit/level11-build-status.json`。
+准备期间只读预检确认level10镜像的boot v4、payload/ADT、trust cache及90秒参数有效，
+exposed root16GiB、FW64MiB、log64MiB仍与手机实际映射相符且均为pinned。
+详见`level11-baseline-preflight.json`；真正启动前仍须重查。
+上述预检时未生成level11镜像；后续已完成主机打包，仍未启动手机。
+
+## Android运行态读数的限制
+
+准备期间只读sysfs报告S8F当前1800mV，同时UART处于suspended，dmesg已在12.110973秒
+进入Power Retention；蓝牙开关仍为1。其他共享轨也低于启动consumer范围。
+详见[电源审计补充](BLUETOOTH_POWER_RANGE_AUDIT_2026-11-15.md)。这不是反证启动请求范围，
+也不是实际电压测量，但意味着不能声称Android全程使用1876或1800必然无效。
+level11只验证冷启动请求对齐是否改变通信结果，不预设成功。
+
+## 最终主机准备结果
+
+完整内核：`D:/turnip-local/newboot/bt-no-analyzer-20261115/s8f1876-artifact/kernel.development.pandora`，
+17,738,112字节。S8F电压/使能诊断标记已核对。
+临时镜像：`D:/turnip-local/newboot/bt-no-analyzer-20261115/level11/loader/nezha-loader-boot.img`，
+17,285,120字节。`level11/trial.json`及`verification.json`记录未启动。
+
+boot v4、payload/ADT边界、root/FW/log映射、trust cache、内存基线与已实测level10一致，
+启动参数只从`pandora_bt=10`改为`11`，保留自动返回90秒。临时下载归档已删除。
+没有写固件容器、切换蓝牙或改变手机运行状态。
+
+下一步在新的明确独占许可窗口，重查映射/pinned并备份设备当前log.img，临时boot上述镜像，
+等90秒自动复位及Android返回后立即取回日志。启动会覆盖设备log.img；旧level2/7/8/9/10
+原始证据已经分别保存。没有level11结果前不得更新蓝牙恢复状态。

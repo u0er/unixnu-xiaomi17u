@@ -67,3 +67,21 @@ level10仍仅测试RFR_OPEN，**没有修正S8F请求值**。如果后续单独�
 [level10已完成实机](BLUETOOTH_LEVEL10_RESULT_2026-11-15.md)，RFR_OPEN读回成功，
 三次FD仍无回应，S8F仍请求1800mV。因此下一项应独立验证S8F1876mV修正；
 当前尚未实现新候选，没有将源码请求差异宣称为实测电压或已定位根因。
+
+## Level11准备期间的运行态对照
+
+只读采集`/sys/class/regulator/`的相关name/microvolts/state/opmode/num_users，
+保存在`work/bluetooth-source-audit/android-bt-regulator-sysfs.json`。
+当前Android的S8F报告1800000µV，S7F1224000、S2J500000、S1J400000、
+L6K1700000；L2G1800000、L3G1200000。不能忽略这些与启动consumer范围不同的值。
+
+同次只读上下文`android-bt-regulator-sysfs-context.json`确认：
+settings的bluetooth_on=1，但UART runtime_status为suspended；Android dmesg在
+10.077876秒请求Power ON，在12.110973秒请求Power Retention，采集uptime约975秒。
+同SoC源码`vreg_configure(...,retention=true)`会把consumer的最低请求设为0，
+允许provider或其他consumer采用不同值。因此当前休眠/保持态读数不等同于启动要求。
+这些只是驱动报告值，仍不代表模拟电气测量。
+
+上述对照进一步限制结论为“BT冷启动源码请求与active配置范围不一致”，
+不能写成“Android总是1876mV”或“1800mV必然无法通信”。
+[1876mV的level11独立候选](BLUETOOTH_LEVEL11_PLAN_2026-11-15.md)已完成完整构建与镜像准备；尚无其实机结果。
