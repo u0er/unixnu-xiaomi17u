@@ -1,54 +1,48 @@
-From: ZCode <agent@local>
-Subject: [PATCH] fuxi-keys: three-sample debounce for key state changes
-
-USB unplug perturbs the PMK8550 pon_hlos RT_STS for longer than the old
-two-poll (40 ms) debounce: the power bit read as pressed with 0x90 for
-two consecutive polls, SweetHID reported a phantom power key, and the
-lock sequence ran display-off + SpringBoard relaunch (reported by the
-user as "unplug hangs the phone": black screen, spinner, lock screen).
-Require three equal samples 20 ms apart (60 ms) before a key state
-flips; real presses are unaffected.
----
- bsd/dev/fuxi_keys.c | 27 ++++++++++++++++++---------
+diff --git a/bsd/dev/fuxi_keys.c b/bsd/dev/fuxi_keys.c
 --- a/bsd/dev/fuxi_keys.c
 +++ b/bsd/dev/fuxi_keys.c
-@@ -226,7 +226,7 @@
+@@ -604,7 +604,7 @@
  fk_thread(void *arg, wait_result_t result)
  {
  	static const char *names[3] = {"power", "volume-up", "volume-down"};
 -	int state[3] = {0, 0, 0}, last[3] = {0, 0, 0};
 +	int state[3] = {0, 0, 0}, last[3] = {0, 0, 0}, hold[3] = {0, 0, 0};
  	unsigned errors = 0;
- 	(void)arg;
- 	(void)result;
-@@ -249,12 +249,24 @@
+ #if defined(PANDORA)
+ 	bool shot_chord = false;
+@@ -648,17 +648,26 @@
  			errors = 0;
  		}
  		for (int k = 0; k < 3; ++k) {
 -			/* Two equal samples 20 ms apart before a change counts. */
 -			if (ok[k] && now[k] == last[k] && now[k] != state[k]) {
 -				state[k] = now[k];
--				printf("FUXI KEYS: %s %s (pon=%#x gpio6=%#x)\n", names[k],
+-				printf("FUXI KEYS: %s %s (pon=%#x gpio=%#x)\n", names[k],
 -				    state[k] ? "down" : "up", pon, gpio);
+-				fuxi_perf_input();
 -				sweet_hid_key(k, state[k]);
 +			/* Three equal samples 20 ms apart (60 ms) before a change counts: USB
 +			 * unplug perturbs the PMK8550 pon RT_STS for two polls and was seen as
 +			 * a phantom power key that restarted SpringBoard (unplug hang report). */
 +			if (!ok[k]) {
 +				continue;
-+			}
+ 			}
+-			if (ok[k]) {
+-				last[k] = now[k];
 +			if (now[k] != state[k]) {
 +				hold[k] = (now[k] == last[k]) ? hold[k] + 1 : 1;
 +				if (hold[k] >= 3) {
 +					state[k] = now[k];
 +					hold[k] = 0;
-+					printf("FUXI KEYS: %s %s (pon=%#x gpio6=%#x)\n", names[k],
++					printf("FUXI KEYS: %s %s (pon=%#x gpio=%#x)\n", names[k],
 +					    state[k] ? "down" : "up", pon, gpio);
++					fuxi_perf_input();
 +					sweet_hid_key(k, state[k]);
 +				}
 +			} else {
 +				hold[k] = 0;
-+			}
  			}
- 			if (ok[k]) {
- 				last[k] = now[k];
++			last[k] = now[k];
+ 		}
+ #if defined(PANDORA)
+ 		/* 0308: two keys held together: one screen shot (0309: any two; power + volume up is the iPhone's, power +
