@@ -24,6 +24,9 @@
  * Level 9 repeats level 8 with RX_TRANS_CFG bit1 cleared. That bit was
  * mistakenly copied from the TX-only CTS mask; keep level 8 as the measured
  * comparison. RX command parameters and all power settings stay the same.
+ * Level 10 keeps level 9's RX configuration and sets only RFR_OPEN in the
+ * RX command. Android's module also sets error-character filters; leave
+ * those separate so the effect of RFR_OPEN can be identified on device.
  *
  * Register map: Linux drivers/soc/qcom/qcom-geni-se.c, drivers/tty/serial/
  * msm_geni_serial.c and u-boot's drivers/serial/serial_msm_geni.c (GPL-2.0+,
@@ -140,6 +143,7 @@ void pandora_bt_init(void);
 #define S_RX_WM              (1u << 26)
 #define S_RX_LAST            (1u << 27)
 #define SER_CLK_EN           (1u << 0)
+#define UART_PARAM_RFR_OPEN  (1u << 7) /* keep receiver-ready asserted; Android start_rx_sequencer */
 
 /* HCI: packet type 0x01 command, opcode HCI_OP_RESET 0x0c03 (little endian). */
 #define HCI_RESET_LEN 4u
@@ -824,11 +828,11 @@ bt_uart_init(unsigned baud, bool loopback)
 	 * is zero and its module never sets RX bit1. Isolate removal of the
 	 * historical write in level 9; preserve the measured older levels. */
 	uint32_t rx_cfg = bt_rd(BT_W_SE, SE_RX_TRANS_CFG);
-	rx_cfg = bt_level == 9 ? rx_cfg & ~(1u << 1) : rx_cfg | (1u << 1);
+	rx_cfg = (bt_level == 9 || bt_level == 10) ? rx_cfg & ~(1u << 1) : rx_cfg | (1u << 1);
 	bt_wr(BT_W_SE, SE_RX_TRANS_CFG, rx_cfg);
-	if (bt_level == 9) {
+	if (bt_level == 9 || bt_level == 10) {
 		uint32_t actual = bt_rd(BT_W_SE, SE_RX_TRANS_CFG);
-		printf("PANDORA BT: level 9 RX bit1 comparison requested %#x readback %#x\n", rx_cfg, actual);
+		printf("PANDORA BT: level %d RX bit1 comparison requested %#x readback %#x\n", bt_level, rx_cfg, actual);
 		if (actual != rx_cfg) {
 			return EIO;
 		}
@@ -846,7 +850,20 @@ bt_uart_init(unsigned baud, bool loopback)
 	bt_wr(BT_W_SE, SE_SER_S_CLK, (div << 4) | SER_CLK_EN);
 
 	/* The secondary sequencer listens for the first byte. */
-	bt_wr(BT_W_SE, SE_S_CMD0, 1u << 27);
+	uint32_t rx_cmd = 1u << 27;
+	if (bt_level == 10) {
+		/* The local Android module writes 0x080000e0: RFR_OPEN plus
+		 * skip-frame/break flags. Isolate bit7 from the error filters. */
+		rx_cmd |= UART_PARAM_RFR_OPEN;
+	}
+	bt_wr(BT_W_SE, SE_S_CMD0, rx_cmd);
+	if (bt_level == 10) {
+		uint32_t actual = bt_rd(BT_W_SE, SE_S_CMD0);
+		printf("PANDORA BT: level 10 RFR_OPEN command requested %#x readback %#x\n", rx_cmd, actual);
+		if (actual != rx_cmd) {
+			return EIO;
+		}
+	}
 	return 0;
 }
 
@@ -1207,7 +1224,7 @@ bt_thread(void *arg, wait_result_t result)
 		if (bt_rf_clk()) {
 			goto out;
 		}
-		if (bt_level < 3 || bt_level == 6 || bt_level == 8 || bt_level == 9) {
+		if (bt_level < 3 || bt_level == 6 || bt_level == 8 || bt_level == 9 || bt_level == 10) {
 			/* level 6 also needs the SPMI windows mapped for its retries. */
 			if (bt_en_pulse()) {
 				goto out;
@@ -1247,7 +1264,7 @@ bt_thread(void *arg, wait_result_t result)
 			bt_report();
 			goto out;
 		}
-		if (bt_level == 8 || bt_level == 9) {
+		if (bt_level == 8 || bt_level == 9 || bt_level == 10) {
 			int err = bt_uart_init(115200, false);
 			if (!err) {
 				bt_uart_dump();
@@ -1306,8 +1323,8 @@ pandora_bt_init(void)
 	if (!bt_level) {
 		return;
 	}
-	if (bt_level < 1 || bt_level > 9) {
-		printf("PANDORA BT: unsupported pandora_bt=%d (expected 1..9)\n", bt_level);
+	if (bt_level < 1 || bt_level > 10) {
+		printf("PANDORA BT: unsupported pandora_bt=%d (expected 1..10)\n", bt_level);
 		return;
 	}
 	thread_t thread;

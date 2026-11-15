@@ -79,3 +79,11 @@ S_CMD0 parameters and PERI request stay as in level 8. Readback must match
 before sending FD. This comparison requires a kernel built with level 9 support.
 It does not test RFR_OPEN or PMIC input/output sampling; those are separate
 experiments. Prior level8 device evidence remains the baseline.
+
+`--level 10` keeps level 9's RX bit1 correction and sets only RFR_OPEN (bit7)
+in UART_START_READ: S_CMD0 changes from 0x08000000 to 0x08000080. Command
+readback must match before sending FD. The local Android module's
+0x080000e0 also filters framing/break errors; these bits are deliberately
+excluded from this comparison. Power, firmware, baud, FIFO packing and PERI
+handling follow level 9. Use a complete kernel with level 10 support and a
+new explicitly authorized trial window. No device operation is part of preparation.
