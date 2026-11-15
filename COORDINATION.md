@@ -494,3 +494,14 @@ synchronization points. Read it before acting; update your row after acting.
   build/trial-0479-0480-3898fdaf/nezha-loader-boot.img (staging the component update container
   first, same flow as the 8b1d557 acceptance). Other operators: wait for RELEASED.
 - Verification: unplug no phantom lock (0479), true-black screen-off (0480). Log capture on return.
+
+## ZCode GPU agent DEVICE RELEASED (2026-11-15 ~03:2xZ) — 0479/0480 trial logged, awaiting user eyeball
+- Authorized bounded 90-second boot of trial-0479-0480-3898fdaf (kernel 3898fdaf + accepted 8b1d557
+  metal components) completed; Android returned automatically after 112.8 s.
+- Kernel-side evidence (log device/private/logs/1794711727): SpringBoard relaunched 0 times
+  (old phantom-lock symptom absent); SWEET BL reached LEVEL 0 on the sleep request (0480 working;
+  old behavior clamps to BL_MIN 7); clean pandora_reboot_after=90 exit; crash profile matches the
+  acceptance baseline (FitnessWidget x3, PosterBoard x1, driverkitd x1; MobileSafari x4 stack-class
+  replaces the acceptance session's MapKit x2 — session-variable app crashes, not a kernel delta).
+- User visual confirmation (unplug behavior, screen-off black) still pending; kernel work concluded.
+  Device is back on Android and RELEASED for other operators.
