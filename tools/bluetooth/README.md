@@ -57,3 +57,10 @@ fixed eight-byte pattern and requires an exact return, without BT power/reset
 or TLMM programming. It does configure UART and QUP clocks. Its image requires
 a kernel built with level 7 support; do not change only the argument of the
 earlier level-2 kernel. A pass establishes the AP UART data path only.
+
+`uart_trace.py TRACE --out JSON` reads an already-captured Android `hsuart/trace`
+offline. It extracts baud settings and DMA Tx/Rx chunks with source line numbers,
+reported lengths and captured hex prefixes. It marks truncated dumps and does
+not reconstruct protocol frames or fill missing data. The 2026-11-15 capture
+provides direct FD/FC and PERI startup evidence; see
+`docs/BLUETOOTH_ANDROID_ROM_ROUTE_2026-11-15.md` before implementing a ROM probe.

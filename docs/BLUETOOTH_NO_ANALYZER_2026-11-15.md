@@ -1,5 +1,10 @@
 # 蓝牙：无需逻辑分析仪的软件排查路线（2026-11-15）
 
+> **最新：level 7 实机内部回环 PASS；随后读出 Android 已有 hsuart trace，
+> 确认实际是 FD/FC 唤醒和 PERI 初始化，且有 Ganges 家族响应。
+> 当前下一步以 [Android ROM 路线报告](BLUETOOTH_ANDROID_ROM_ROUTE_2026-11-15.md) 为准，
+> 不要仅凭 Hamilton 文件存在继续套用普通 H4 / WCN7850 初始化。**
+
 ## 结论与验证边界
 
 有可继续执行的软件路线。旧交接的“软件全部对齐、两个独立信号为零，所以只能接逻辑分析仪”不成立；源码、原始 w67 日志和当前 Android DT 已足以指出多处具体错误。
@@ -92,7 +97,7 @@ GPIO9 的其他用途，也没有重新做没有判据的唤醒极性试验。
 |---|---|---|---|
 | A | 源码 + 原始日志 + Android 只读 DT / 模块审计 | 是否真的已经排除软件错误 | 本轮已完成，发现上述错误 |
 | B | 完整构建候选；经用户明确同意，做一次 level 2 的 90 秒临时启动 | TYPE/SUBTYPE、正确 BT_EN、QUP sampling、pad / IOS、HCI | 最终完整构建和镜像准备已完成，尚未启动；level 2 单次初始化优先，避免混入重试因素 |
-| C | 若正常 HCI 仍无应答，单独加入 GENI 内部 loopback 并收回原字节 | AP FIFO / sequencer / packing / 接收是否工作 | 已实现独立 level 7、ARM64 单文件编译通过；尚未完整构建或实测；不能证明外部连线或绝对波特率 |
+| C | 若正常 HCI 仍无应答，单独加入 GENI 内部 loopback 并收回原字节 | AP FIFO / sequencer / packing / 接收是否工作 | level 7 完整构建和实机均通过，8/8 匹配；不能证明外部连线或绝对波特率 |
 | D | 对照 Android 的 PMIC 配置和上电事件 | kernel API 所用子类型、真实 pinconf、时钟/电源调用顺序 | 尚缺运行时寄存器快照；debugfs 未挂载，不能假称已抓到 |
 | E | 按 Qualcomm 初始化顺序发 `qca_read_soc_version`，验证匹配的 vendor / Command Complete 响应 | ROM 握手与通用 HCI Reset 行为是否不同 | 未实现；Linux 并不把通用 Reset 成功作为读取版本的唯一前提 |
 | F | ROM 通信成立后再移植 TLV / NVM 下载 | 固件加载、运行速率、后续栈接入 | 未开始，不能用盲灌固件解决链路问题 |
@@ -211,5 +216,6 @@ level 7 完整构建 **43653645421 成功**，仍在独立蓝牙分支，main �
 17,285,120 字节，90 秒自动返回。它继承 level 2 已实机使用的全部 root/FW/log 映射和
 trust cache，仅 boot-arg 的 BT level 改为 7；内核新增独立回环代码。
 记录在 `level7/trial.json` / `verification.json` 和审计目录的 `level7-preparation.json`。
-**尚未启动这份回环镜像**。下一步请求一个新的 90 秒 iOS 临时启动窗口；会覆盖
-设备日志，level 2 的原始日志已经保存。不得把 level 2 的 boot 成功当成 level 7 的结果。
+后续已获准启动该回环镜像，**实机 PASS，8/8 匹配**，并在内核 90.217 秒自动返回。
+结果在 `level7/result/`。返回后又读取了 Android 原有 hsuart trace；下一步改为先审计
+真实 FD/FC 与 PERI 协议，详见本页顶部链接。不能将回环 PASS 当作蓝牙控制器就绪。

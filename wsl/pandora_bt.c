@@ -1,12 +1,13 @@
 /*
- * PANDORA Bluetooth: the WCN786x BT core on QUPv3 wrapper 3 SE5 (0x01994000).
+ * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
  *
  * The combo chip's WLAN side is PCIe (pandora_wifi.c); Bluetooth is a plain
  * 4-wire HS-UART on this serial engine (live.dts qup_uart@1994000, pins
  * gpio24..27 function qup3_se5_l0..l3, wakeup byte 0xfd). Android's
- * android.hardware.bluetooth@aidl-service-qti opens /dev/ttyHS0 and downloads
- * /vendor/bt_firmware/image/hmtbtfw20.tlv + hmtnv20.bin itself; the ROM answers
- * HCI at 115200 before that.
+ * android.hardware.bluetooth@aidl-service-qti opens /dev/ttyHS0. Its observed
+ * cold-start trace uses FD/FC wake and PERI frames before normal HCI; finding
+ * Hamilton firmware in /vendor does not identify the selected image. This
+ * diagnostic driver does not implement that Ganges/PERI boot protocol yet.
  *
  * Boot-arg pandora_bt=1, read only: the wrapper votes and branch halts, the SE5
  * RCG, the SE identity and its pins. =2 also votes the BT rails from the DT's
@@ -22,6 +23,7 @@
  * msm_geni_serial.c and u-boot's drivers/serial/serial_msm_geni.c (GPL-2.0+,
  * same register facts), plus the captured DT.
  * See docs/BLUETOOTH_NO_ANALYZER_2026-11-15.md for evidence and trial criteria.
+ * See docs/BLUETOOTH_ANDROID_ROM_ROUTE_2026-11-15.md for Android's actual wire trace.
  * All mappings stay for the life of the kernel, including on failure.
  */
 #if defined(PANDORA)
