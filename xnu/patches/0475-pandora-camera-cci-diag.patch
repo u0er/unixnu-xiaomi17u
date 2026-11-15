@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..afaa154
+index 0000000..093d17c
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,5867 @@
+@@ -0,0 +1,5880 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -5076,6 +5076,19 @@ index 0000000..afaa154
 +	(void)pc_sensor_power_up();
 +	pc_sleep(20);
 +	(void)pc_sliceb_replay_cfg("wide-p4test");
++	/* The =16 probe proved both writes are accepted (0x4600 0xf read back,
++	 * 0x4800 0x64 -> 0x65) but it ran on csiphy0. The wide sensor sits on
++	 * csiphy4, so repeat them here, on the real path, before arming CSID. */
++	{
++		int r8 = 0;
++		uint8_t m = pc_sliceb_rd8(0x4800u, &r8);
++		pc_sliceb_wprobe(0x4600u, 0x000fu, 1u, "p4test-lanes-4");
++		pc_sliceb_wprobe(0x4800u, (uint16_t)(m | 0x01u), 1u, "p4test-mipi-en");
++		printf("PANDORA SLICEB: p4test mipi 4600=%#x 4610=%#x 4800=%#x\n",
++		    pc_sliceb_rd8(0x4600u, &r8), pc_sliceb_rd8(0x4610u, &r8),
++		    pc_sliceb_rd8(0x4800u, &r8));
++		(void)pandora_log_sync();
++	}
 +	uint32_t base = pc_sliceb_arm(csid0, 0x00432103u);
 +	if (base) {
 +		pc_sliceb_stream_on(1);
