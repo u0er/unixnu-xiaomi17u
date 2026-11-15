@@ -547,3 +547,6 @@ synchronization points. Read it before acting; update your row after acting.
 - REQUIRED before any next boot: re-run device_trial prepare so the ADT is rebuilt from the current device/private/storage/root-extents.json (454 segments), or reuse ZCode's build/trial-stackfix-e68dc7e0-d image. Old usb-cam-*/bt images on disk are all stale in this respect.
 - The deleted activation/setup state is NOT recoverable (catalog deletions are committed); the plan is to walk iOS Setup once and continue.
 - Last updated: 2026-11-15 ~16:5xZ by ZCode (URGENT stale-image warning after expansion surgery)
+## ZCode GPU agent DEVICE WINDOW (2026-11-15 ~17:1xZ, user consented): recovery/Setup session
+- Booting build/trial-stackfix-e68dc7e0-d/unlimited/nezha-loader-boot.img (UNLIMITED session: only the 608-byte cmdline field differs from the audited bounded trial - pandora_reboot_after removed; kernel/ADT/extents byte-identical). Purpose: user walks iOS Setup (activation state was deleted by the stale-image incident). PANDORA FILES will reinstall the full 29.5MB NativeAdrenoMetal (the truncated 4MiB copy self-heals). Other operators: wait for RELEASED; and per the URGENT note above, do NOT boot any pre-rebuild stale image at any time.
+- Last updated: 2026-11-15 ~17:1xZ by ZCode (holding device for user Setup walk)
