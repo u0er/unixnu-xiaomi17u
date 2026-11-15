@@ -1,0 +1,31 @@
+From: ZCode <agent@local>
+Subject: [PATCH] backlight: brightness 0 turns the panel off, not to BL_MIN
+
+sweet_bl_level() mapped brightness 0 to SWEET_PANEL_BL_MIN (7), and
+sweet_dsi_level() clamped every nonzero-or-zero value back up to that
+minimum - so "display off" kept the panel lit at its lowest level and
+the lock screen's last elements (the bottom bar) stayed visible, which
+the user saw as "a progress bar appears when the screen goes off".
+Allow true zero: brightness 0 sends panel level 0 (backlight off);
+a nonzero value below SWEET_PANEL_BL_MIN still clamps to the minimum.
+---
+ a/iokit/Kernel/arm/SweetFramebuffer.cpp | 10 ++++++++----
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -88,6 +88,9 @@ sweet_bl_level(uint32_t frac)
+ sweet_bl_level(uint32_t frac)
+ {
++	if (frac == 0) {
++		return 0;   /* display off: the backlight goes truly off, not to the panel's minimum */
++	}
+ 	return SWEET_PANEL_BL_MIN + (uint32_t)((uint64_t)(SWEET_PANEL_BL_MAX - SWEET_PANEL_BL_MIN) * frac * frac /
+ 	           (65536ULL * 65536ULL));
+ }
+@@ -150,7 +153,7 @@ static bool
+ sweet_dsi_level(uint32_t level, bool log)
+ {
+-	level = level < SWEET_PANEL_BL_MIN ? SWEET_PANEL_BL_MIN :
++	level = level != 0 && level < SWEET_PANEL_BL_MIN ? SWEET_PANEL_BL_MIN :
+ 	    (level > SWEET_PANEL_BL_MAX ? SWEET_PANEL_BL_MAX : level);
+ 	/* header: word count 3, 0, DCS long write 0x39, last + long; payload 51 hi lo, pad ff */
+ 	uint32_t cmd[2] = {0xc0390003u,
