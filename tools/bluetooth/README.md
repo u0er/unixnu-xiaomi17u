@@ -71,3 +71,11 @@ NVM, UWB initialization or baud-rate change. Wake ACK, complete framing and
 matching response fields are required. The result indicates only whether the
 PERI ROM inquiry worked; it is not a Bluetooth-ready result. Use a kernel built
 with level 8 support, then request a new device window for its first trial.
+
+`--level 9` repeats level 8 with only RX_TRANS_CFG bit1 cleared. The earlier
+code copied the TX CTS mask into this RX register; Android's trace reports
+RX_TRANS_CFG=0 and its module does not set that bit. The power sequence, baud,
+S_CMD0 parameters and PERI request stay as in level 8. Readback must match
+before sending FD. This comparison requires a kernel built with level 9 support.
+It does not test RFR_OPEN or PMIC input/output sampling; those are separate
+experiments. Prior level8 device evidence remains the baseline.

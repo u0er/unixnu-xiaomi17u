@@ -1,5 +1,7 @@
 # 蓝牙：Android 现有 UART trace 揭示的 ROM 路线（2026-11-15）
 
+> **最新实机：[level 8 结果与后续软件判据](BLUETOOTH_LEVEL8_RESULT_2026-11-15.md)。三次 FD 无 FC，未发送版本请求；90.221 秒自动返回。以下实现/就绪部分为试验前记录。**
+
 ## 当前结论
 
 **无需逻辑分析仪的路线已获得两类实机证据：GENI 内部回环通过，Android 既有 UART trace

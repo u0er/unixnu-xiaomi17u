@@ -14,6 +14,8 @@
 > level 7 已由完整构建 43653645421 生成并实机 PASS。Android 已有 UART trace 显示
 > FD/FC + PERI 初始化及 `BTFW.GAN` 响应，Hamilton 文件存在不代表被选用。下一步以
 > [Android ROM 路线报告](BLUETOOTH_ANDROID_ROM_ROUTE_2026-11-15.md) 为准。
+> 最新的 [level 8 实机结果](BLUETOOTH_LEVEL8_RESULT_2026-11-15.md)：FD 三次无 ACK，
+> 未发版本请求；仍有 BT_EN 数字采样及已由本机模块确认的 UART 参数差异可继续查。
 
 > 交接对象：任何接手 UniXNU 蓝牙的 agent。
 > 读这份文档可以**避免重复踩我在 2026-11-13 ~ 11-15 踩过的所有坑**。

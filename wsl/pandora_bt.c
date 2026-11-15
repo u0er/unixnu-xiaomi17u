@@ -21,6 +21,9 @@
  * programming. A loopback pass establishes AP FIFO/sequence operation only.
  * Level 8 cold-starts at 115200, requires FD/FC wake, and asks PERI version
  * once. It never sends HCI Reset, changes the baud, or downloads firmware.
+ * Level 9 repeats level 8 with RX_TRANS_CFG bit1 cleared. That bit was
+ * mistakenly copied from the TX-only CTS mask; keep level 8 as the measured
+ * comparison. RX command parameters and all power settings stay the same.
  *
  * Register map: Linux drivers/soc/qcom/qcom-geni-se.c, drivers/tty/serial/
  * msm_geni_serial.c and u-boot's drivers/serial/serial_msm_geni.c (GPL-2.0+,
@@ -817,7 +820,19 @@ bt_uart_init(unsigned baud, bool loopback)
 	bt_wr(BT_W_SE, SE_RX_PARITY, 0);
 	bt_wr(BT_W_SE, SE_RX_STALE, 0xf);
 	bt_wr(BT_W_SE, SE_TX_TRANS_CFG, bt_rd(BT_W_SE, SE_TX_TRANS_CFG) | (1u << 1)); /* mask external CTS */
-	bt_wr(BT_W_SE, SE_RX_TRANS_CFG, bt_rd(BT_W_SE, SE_RX_TRANS_CFG) | (1u << 1));
+	/* CTS_MASK belongs to TX_TRANS_CFG only. Android's observed RX value
+	 * is zero and its module never sets RX bit1. Isolate removal of the
+	 * historical write in level 9; preserve the measured older levels. */
+	uint32_t rx_cfg = bt_rd(BT_W_SE, SE_RX_TRANS_CFG);
+	rx_cfg = bt_level == 9 ? rx_cfg & ~(1u << 1) : rx_cfg | (1u << 1);
+	bt_wr(BT_W_SE, SE_RX_TRANS_CFG, rx_cfg);
+	if (bt_level == 9) {
+		uint32_t actual = bt_rd(BT_W_SE, SE_RX_TRANS_CFG);
+		printf("PANDORA BT: level 9 RX bit1 comparison requested %#x readback %#x\n", rx_cfg, actual);
+		if (actual != rx_cfg) {
+			return EIO;
+		}
+	}
 
 	bt_wr(BT_W_SE, SE_TX_WM, 2);
 	bt_wr(BT_W_SE, SE_RX_WM, 2);
@@ -1192,7 +1207,7 @@ bt_thread(void *arg, wait_result_t result)
 		if (bt_rf_clk()) {
 			goto out;
 		}
-		if (bt_level < 3 || bt_level == 6 || bt_level == 8) {
+		if (bt_level < 3 || bt_level == 6 || bt_level == 8 || bt_level == 9) {
 			/* level 6 also needs the SPMI windows mapped for its retries. */
 			if (bt_en_pulse()) {
 				goto out;
@@ -1232,7 +1247,7 @@ bt_thread(void *arg, wait_result_t result)
 			bt_report();
 			goto out;
 		}
-		if (bt_level == 8) {
+		if (bt_level == 8 || bt_level == 9) {
 			int err = bt_uart_init(115200, false);
 			if (!err) {
 				bt_uart_dump();
@@ -1291,8 +1306,8 @@ pandora_bt_init(void)
 	if (!bt_level) {
 		return;
 	}
-	if (bt_level < 1 || bt_level > 8) {
-		printf("PANDORA BT: unsupported pandora_bt=%d (expected 1..8)\n", bt_level);
+	if (bt_level < 1 || bt_level > 9) {
+		printf("PANDORA BT: unsupported pandora_bt=%d (expected 1..9)\n", bt_level);
 		return;
 	}
 	thread_t thread;

@@ -1,6 +1,8 @@
 # 蓝牙：无需逻辑分析仪的软件排查路线（2026-11-15）
 
-> **最新：level 7 实机内部回环 PASS；随后读出 Android 已有 hsuart trace，
+> **最新：[level 8 已完成实机](BLUETOOTH_LEVEL8_RESULT_2026-11-15.md)：三次 FD 无 FC，
+> 版本请求未发送，90.221 秒自动返回。已保留 BT_EN pad 采样和 UART 参数差异的软件排查路线。
+> level 7 实机内部回环 PASS；随后读出 Android 已有 hsuart trace，
 > 确认实际是 FD/FC 唤醒和 PERI 初始化，且有 Ganges 家族响应。
 > 当前下一步以 [Android ROM 路线报告](BLUETOOTH_ANDROID_ROM_ROUTE_2026-11-15.md) 为准，
 > 不要仅凭 Hamilton 文件存在继续套用普通 H4 / WCN7850 初始化。**
