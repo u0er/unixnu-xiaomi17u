@@ -84,4 +84,11 @@ settings的bluetooth_on=1，但UART runtime_status为suspended；Android dmesg�
 
 上述对照进一步限制结论为“BT冷启动源码请求与active配置范围不一致”，
 不能写成“Android总是1876mV”或“1800mV必然无法通信”。
-[1876mV的level11独立候选](BLUETOOTH_LEVEL11_PLAN_2026-11-15.md)已完成完整构建与镜像准备；尚无其实机结果。
+[1876mV的level11试验](BLUETOOTH_LEVEL11_RESULT_2026-11-15.md)已完成实机：电压/使能请求均返回0，但三次FD仍无回应。
+
+## Level11实机回填
+
+[level11](BLUETOOTH_LEVEL11_RESULT_2026-11-15.md)的1876mV电压请求与使能请求均返回0，
+RX0、RFR_OPEN0x08000080读回成功；三次FD仍无接收。请求值对齐没有恢复该次冷启动通信，
+不能将范围差异宣称为已定位根因，也不能把请求完成当实际电压测量或电源问题全部排除。
+下一项独立软件观测为BT_EN低/高的MODE2/RT_STS数字采样，尚未实现新候选。
