@@ -33,7 +33,7 @@ diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,6006 @@
+@@ -0,0 +1,6011 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -3530,9 +3530,15 @@ new file mode 100644
 +	/* self-check via the DRIVER read path: read each sensor's chip-id
 +	 * register (wide ovx10500 @ 0x300a, tele s5khpe @ 0x0000). */
 +	ret = pc_cci_read_reg16_timed(pc_cci[0], 1, 0x10u, 0x300au, &id);
-+	printf("PANDORA CAMERA: driver self-check wide chip_id=%#x ret=%d\n", id, ret);
++	if (ret)
++		printf("PANDORA CAMERA: driver self-check wide read failed ret=%d\n", ret);
++	else
++		printf("PANDORA CAMERA: driver self-check wide chip_id=%#x ret=0\n", id);
 +	ret = pc_cci_read_reg16_timed(pc_cci[0], 0, 0x2du, 0x0000u, &id);
-+	printf("PANDORA CAMERA: driver self-check tele chip_id=%#x ret=%d\n", id, ret);
++	if (ret)
++		printf("PANDORA CAMERA: driver self-check tele read failed ret=%d\n", ret);
++	else
++		printf("PANDORA CAMERA: driver self-check tele chip_id=%#x ret=0\n", id);
 +}
 +
 +/* ---------------------------------------------------------------------------
@@ -4557,7 +4563,6 @@ new file mode 100644
 +	static const unsigned cand[] = { 12u, 17u, 20u, 23u, 26u, 29u, 32u };
 +	vm_offset_t csid0;
 +	uint32_t seen_rdi;
-+	int ret = 0;
 +
 +	pc_csiphy_mark("stest start: map sensor bus + CSID");
 +	csid0 = ml_io_map_unmappable(PC_CSID0_PA, 0x5e80u, VM_WIMG_IO);
