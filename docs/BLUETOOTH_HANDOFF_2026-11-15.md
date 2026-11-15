@@ -1,5 +1,7 @@
 # Bluetooth 攻坚 Handoff（2026-11-15 06:30）
 
+> **最新：[level10结果](BLUETOOTH_LEVEL10_RESULT_2026-11-15.md)。RX命令0x08000080读回成功，FD仍无回应，设备已自动返回并释放；下一独立变量为S8F请求1876mV。**
+
 > **电源后续更正：[S8F范围复核](BLUETOOTH_POWER_RANGE_AUDIT_2026-11-15.md)。旧表1800mV低于live DT蓝牙consumer下限1876mV，不能再称电源全部对齐；尚未验证实机影响。**
 
 > **最新：[level 9 实机结果](BLUETOOTH_LEVEL9_RESULT_2026-11-15.md)。RX 配置读回0，FD仍无回应；设备已自动返回并释放。**

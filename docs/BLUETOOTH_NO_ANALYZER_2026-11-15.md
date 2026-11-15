@@ -1,6 +1,6 @@
 # 蓝牙：无需逻辑分析仪的软件排查路线（2026-11-15）
 
-> **level10 RFR_OPEN候选已准备好，尚未启动；另确认[S8F电源范围差异](BLUETOOTH_POWER_RANGE_AUDIT_2026-11-15.md)，未混入该候选。**
+> **最新：[level10已实机](BLUETOOTH_LEVEL10_RESULT_2026-11-15.md)，RFR_OPEN读回成功但FD仍无回应；下一独立候选应修正[S8F电源范围差异](BLUETOOTH_POWER_RANGE_AUDIT_2026-11-15.md)，尚未实现。**
 
 > **最新实机：[level 9 结果](BLUETOOTH_LEVEL9_RESULT_2026-11-15.md)。RX bit1 已清零并读回0，三次 FD 仍无回应，90.221秒自动返回。下一项独立软件判据为 RFR_OPEN，尚未实现新候选。**
 
@@ -19,7 +19,7 @@
 |---|---|---|
 | AP内部FIFO/收发sequencer不可用 | level7严格8字节内部回环PASS | 该内部路径可用；不覆盖外部线路 |
 | 仅清RX_TRANS_CFG bit1即可唤醒 | level9读回0，三次FD仍无RX | 本次冷启动对照为阴性，勿重复作为未测假设 |
-| 缺少RFR_OPEN影响接收ready | 本机Android RX命令带bit7，XNU此前未带 | [level10](BLUETOOTH_LEVEL10_PLAN_2026-11-15.md)完整构建及镜像检查通过，尚未实机 |
+| 缺少RFR_OPEN影响接收ready | 本机Android RX命令带bit7，XNU此前未带 | [level10实机](BLUETOOTH_LEVEL10_RESULT_2026-11-15.md)命令读回成功但FD仍无回应；结论限于现有S8F1800mV请求条件 |
 | S8F请求未达到BT consumer范围 | BT请求1800mV，live DT下限1876mV，Wi-Fi请求1876mV | [电源范围审计](BLUETOOTH_POWER_RANGE_AUDIT_2026-11-15.md)已确认源码/DT差异，未测电压或独立试验 |
 | BT_EN配置正确但pad未按预期变化 | LV/MV MODE/SOURCE已读回；输入采样尚未做 | 独立MODE2/RT_STS实验，必须保存与恢复，不把锁存读回当采样 |
 

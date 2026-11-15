@@ -1,5 +1,7 @@
 # Level 10：独立验证接收命令 RFR_OPEN
 
+> **已完成实机：[level10结果](BLUETOOTH_LEVEL10_RESULT_2026-11-15.md)。RX命令读回0x08000080，三次FD仍无回应；90.214秒自动返回。下文保留候选设计及准备记录。**
+
 ## 实验依据
 
 [level 9 实机](BLUETOOTH_LEVEL9_RESULT_2026-11-15.md) 已确认 RX_TRANS_CFG=0，
