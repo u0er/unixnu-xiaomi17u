@@ -31,10 +31,9 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..5114b24
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,5980 @@
+@@ -0,0 +1,6006 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -4135,6 +4134,14 @@ index 0000000..5114b24
 +#define PC_CPHY_CMN        0x1000u          /* common_regs_offset */
 +#define PC_CPHY_CTRL(n)    (PC_CPHY_CMN + 4u * (n))
 +#define PC_CPHY_STATUS(n)  (0x10b0u + 4u * (n))
++/* CSIPHY 2.4.0 interleaves DPHY and CPHY lane-enable bits. The wide
++ * sensor uses DPHY data positions 0/2/4/6 and clock position 7, as defined
++ * by vendor cam_csiphy_dev.h; a contiguous five-bit mask is incorrect. */
++#define PC_CSIPHY_V240_LANE_EN       0x1014u
++#define PC_CSIPHY_V240_DPHY4_MASK    ((1u << 0) | (1u << 2) | (1u << 4) | \
++                                    (1u << 6) | (1u << 7))
++#define PC_CSIPHY_V240_IRQ_STATUS(n) (0x1138u + 4u * (n))
++#define PC_CSIPHY_V240_IRQ_COUNT     11u
 +#define PC_CSIPHY0_CLK_CBCR    0x2001cu     /* csiphy0_clk branch */
 +#define PC_CSI0PHYTIMER_CBCR   0x20018u     /* csi0phytimer_clk branch */
 +#define PC_CSI0PHYTIMER_RCG    0x20000u     /* csi0phytimer_clk_src RCG */
@@ -4961,6 +4968,36 @@ index 0000000..5114b24
 +	pc_csiphy_mark("ctest done (sensor left in standby)");
 +}
 +
++/* Read-only CSIPHY 2.4.0 observations, before stream-on and while streaming.
++ * Vendor csiphy_v2_4_0 places interrupt status at 0x1138, not 0x102c:
++ * 0x102c..0x1054 are interrupt configuration registers. Do not clear status
++ * here or change IRQ masks; this probe polls CSID and owns no PHY IRQ handler.
++ * Raw PHY bits are evidence for comparison, not proof of a valid CSI packet. */
++static void
++pc_sliceb_p4_phy_status(vm_offset_t phy4, const char *phase)
++{
++	uint32_t irq[PC_CSIPHY_V240_IRQ_COUNT];
++
++	for (unsigned n = 0; n < PC_CSIPHY_V240_IRQ_COUNT; n++)
++		irq[n] = pc_rd(phy4, PC_CSIPHY_V240_IRQ_STATUS(n));
++	printf("PANDORA SLICEB: p4test v240 %s lane_en=%#x irq_mask0=%#x "
++	    "refgen1184=%#x\n", phase,
++	    pc_rd(phy4, PC_CSIPHY_V240_LANE_EN), pc_rd(phy4, 0x102cu),
++	    pc_rd(phy4, 0x1184u));
++	printf("PANDORA SLICEB: p4test v240 %s irq 1138=%#x 113c=%#x "
++	    "1140=%#x 1144=%#x 1148=%#x 114c=%#x 1150=%#x 1154=%#x "
++	    "1158=%#x 115c=%#x 1160=%#x\n", phase,
++	    irq[0], irq[1], irq[2], irq[3], irq[4], irq[5], irq[6], irq[7],
++	    irq[8], irq[9], irq[10]);
++	/* status_regs_2_4_0: DPHY status0=0xc0; lane stride=0x400;
++	 * the primary DPHY clock lane has its own window at 0xe00. */
++	printf("PANDORA SLICEB: p4test v240 %s dphy_status0 "
++	    "00c0=%#x 04c0=%#x 08c0=%#x 0cc0=%#x 0ec0=%#x\n", phase,
++	    pc_rd(phy4, 0x00c0u), pc_rd(phy4, 0x04c0u),
++	    pc_rd(phy4, 0x08c0u), pc_rd(phy4, 0x0cc0u), pc_rd(phy4, 0x0ec0u));
++	(void)pandora_log_sync();
++}
++
 +/* csiphy4 probe (pandora_csiphy=14). Android vendor logs (user opened the main
 + * camera) say:
 + *   cam_sensor_power_up: Setup for Main Camera with csiphy index: 4
@@ -5077,11 +5114,7 @@ index 0000000..5114b24
 +	pc_sleep(8);
 +	pc_wr(phy4, PC_CPHY_CTRL(0), 0u);
 +	pc_sleep(1);
-+	/* vendor csiphy_lane_en_reg_2_4_0: 0x1014 is the LANE ENABLE register,
-+	 * not a control register. mainline writes (1 << (lanes+1)) - 1, i.e.
-+	 * 0x1F for four data lanes plus the clock lane. We had been writing the
-+	 * x1e80100 ctrl5 value 0xD5 here, which enables the wrong lane bits. */
-+	pc_wr(phy4, PC_CPHY_CTRL(5), 0x1Fu);
++	pc_wr(phy4, PC_CSIPHY_V240_LANE_EN, PC_CSIPHY_V240_DPHY4_MASK);
 +	pc_wr(phy4, PC_CPHY_CTRL(6), 1u);
 +	pc_wr(phy4, PC_CPHY_CTRL(7), 2u);
 +	pc_wr(phy4, PC_CPHY_CTRL(0), 0u);
@@ -5102,11 +5135,7 @@ index 0000000..5114b24
 +				delay(r->delay_us);
 +		}
 +	}
-+	/* vendor csiphy_lane_en_reg_2_4_0: 0x1014 is the LANE ENABLE register,
-+	 * not a control register. mainline writes (1 << (lanes+1)) - 1, i.e.
-+	 * 0x1F for four data lanes plus the clock lane. We had been writing the
-+	 * x1e80100 ctrl5 value 0xD5 here, which enables the wrong lane bits. */
-+	pc_wr(phy4, PC_CPHY_CTRL(5), 0x1Fu);
++	pc_wr(phy4, PC_CSIPHY_V240_LANE_EN, PC_CSIPHY_V240_DPHY4_MASK);
 +	pc_wr(phy4, PC_CPHY_CTRL(6), 1u);
 +	pc_wr(phy4, PC_CPHY_CTRL(7), 0x7Au);
 +	printf("PANDORA SLICEB: p4test after lanes CTRL5=%#x CTRL6=%#x CTRL7=%#x"
@@ -5123,12 +5152,6 @@ index 0000000..5114b24
 +	    "ln3_ctrl0=%#x\n", pc_rd(phy4, 0x0E00u),
 +	    pc_rd(phy4, 0x0E00u + 0x0Cu), pc_rd(phy4, 0x0E00u + 0x38u),
 +	    pc_rd(phy4, 0xC00u));
-+	printf("PANDORA SLICEB: p4test irq 102c=%#x 1030=%#x 1034=%#x 1038=%#x "
-+	    "103c=%#x 1040=%#x 1044=%#x 1048=%#x 104c=%#x 1050=%#x\n",
-+	    pc_rd(phy4, 0x102Cu), pc_rd(phy4, 0x1030u), pc_rd(phy4, 0x1034u),
-+	    pc_rd(phy4, 0x1038u), pc_rd(phy4, 0x103Cu), pc_rd(phy4, 0x1040u),
-+	    pc_rd(phy4, 0x1044u), pc_rd(phy4, 0x1048u), pc_rd(phy4, 0x104Cu),
-+	    pc_rd(phy4, 0x1050u));
 +	(void)pandora_log_sync();
 +	for (unsigned n = 11; n <= 21; n++)
 +		pc_wr(phy4, PC_CPHY_CTRL(n), 0u);
@@ -5154,6 +5177,7 @@ index 0000000..5114b24
 +		(void)pandora_log_sync();
 +	}
 +	uint32_t base = pc_sliceb_arm(csid0, 0x00432103u);
++	pc_sliceb_p4_phy_status(phy4, "before-stream");
 +	if (base) {
 +		pc_sliceb_stream_on(1);
 +		pc_sleep(30);
@@ -5171,6 +5195,7 @@ index 0000000..5114b24
 +		}
 +		seen_rdi = pc_sliceb_poll(csid0, 800, NULL, NULL);
 +	}
++	pc_sliceb_p4_phy_status(phy4, "after-poll");
 +	printf("PANDORA SLICEB: p4test RESULT rdi=%#x sof=%u eof=%u arm=%#x "
 +	    "phy4_status0=%#x ctrl7=%#x\n", seen_rdi,
 +	    (seen_rdi & PC_RDIN_INPUT_SOF) ? 1u : 0u,
