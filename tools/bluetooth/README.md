@@ -87,3 +87,12 @@ readback must match before sending FD. The local Android module's
 excluded from this comparison. Power, firmware, baud, FIFO packing and PERI
 handling follow level 9. Use a complete kernel with level 10 support and a
 new explicitly authorized trial window. No device operation is part of preparation.
+
+`--level 11` keeps level 10's UART/PERI path and changes only the BT S8F_E0
+voltage request from 1800 to 1876 mV. This is the live DT BT consumer minimum
+and the value already used by the existing Wi-Fi driver for that resource.
+Voltage and enable request return codes are logged separately; either failure
+stops BT initialization. No shared rail is disabled on failure. The request
+result is not an analog measurement. No BT_EN sampling, error filters, firmware,
+baud change or extra power retry is added. A complete level 11 kernel and
+a newly authorized device window are required.
