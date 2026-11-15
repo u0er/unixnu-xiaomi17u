@@ -1,5 +1,7 @@
 # Level 9：隔离 RX_TRANS_CFG bit1 差异
 
+> **本次已完成实机：[level 9 结果](BLUETOOTH_LEVEL9_RESULT_2026-11-15.md)。RX 配置读回0，三次 FD 仍无 FC；09:53:56 自动返回 Android。下文为候选实施与准备记录。**
+
 ## 问题与修改
 
 level 8 已实机运行，三次 FD 无 FC，未发送版本请求；详见

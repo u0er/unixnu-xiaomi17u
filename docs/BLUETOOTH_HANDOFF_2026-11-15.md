@@ -1,5 +1,7 @@
 # Bluetooth 攻坚 Handoff（2026-11-15 06:30）
 
+> **最新：[level 9 实机结果](BLUETOOTH_LEVEL9_RESULT_2026-11-15.md)。RX 配置读回0，FD仍无回应；设备已自动返回并释放。**
+
 > **2026-11-15 后续审计更正：此页下文保留为历史记录。当前结论和候选修改见
 > [无需逻辑分析仪的软件排查路线](BLUETOOTH_NO_ANALYZER_2026-11-15.md)。**
 > §2.1 把 MODE_CTL bit1 当电平的写法仍然错误：legacy 电平是 bit0；LV/MV
