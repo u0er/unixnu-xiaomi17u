@@ -156,3 +156,17 @@ Android dmesg 的 `android-bt-startup.txt` 同时显示 BT_EN low/high 与 SW_CT
 改动文件为 `wsl/pandora_bt.c`、同步生成的 0476 patch、prepare_trial 的 level 范围
 和蓝牙说明。原 level 2/7 设备证据保留。完整候选准备好后，再向用户报告启动目标、
 90 秒期限和日志覆盖范围，取得这一次的明确同意。
+
+## Level 8 完整候选已就绪
+
+- 完整 DEVELOPMENT/PANDORA 构建 **43656524051 成功**；产物内的 wake ACK / PERI
+  请求和响应诊断标记已核对。ARM64 单文件编译、Clang static analyzer 均无诊断。
+- 内核：`D:/turnip-local/newboot/bt-no-analyzer-20261115/peri-artifact/kernel.development.pandora`。
+- 镜像：`D:/turnip-local/newboot/bt-no-analyzer-20261115/level8/loader/nezha-loader-boot.img`，
+  17,285,120 字节。`pandora_bt=8`，`pandora_reboot_after=90`。
+- 继承 level 7 已实机使用的 root/FW/log 映射、memory bases、trust cache 和其他启动参数。
+  主机结构检查通过；level 7 → 8 之外无其他 boot-arg 变化。
+- `level8/trial.json` / `verification.json` 和审计目录 `level8-preparation.json` 保留
+  准备记录。没有再写容器，没有试机，也没有把已有 level 7 PASS 当成 PERI 结果。
+- 下一步仅在明确同意的新独占窗口临时 boot 此镜像。iOS 阶段约 90 秒后自动返回，
+  立即只读取回日志；会覆盖设备 `log.img`，既有 level 2/7 原始证据已分别保存。
