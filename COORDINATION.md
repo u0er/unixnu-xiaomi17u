@@ -486,3 +486,11 @@ synchronization points. Read it before acting; update your row after acting.
 - Plan after the kernel lands: mkprelink -> device_trial prepare keeping the accepted 8b1d557
   Stage-1 metal components (single variable = kernel) -> explicit user consent boot to verify
   unplug-no-phantom-lock (0479) and true-black screen-off (0480). No device held.
+
+## ZCode GPU agent DEVICE WINDOW (2026-11-15 ~03:0xZ; user consented in this session)
+- Kernel 3898fdaf (0479+0480 applied, verified: CI log + same-compiler A/B binary + mkprelink PASS)
+  packed with the accepted 8b1d557 Stage-1 metal components (single variable = kernel).
+- Claiming the device for ONE bounded 90-second RAM boot of
+  build/trial-0479-0480-3898fdaf/nezha-loader-boot.img (staging the component update container
+  first, same flow as the 8b1d557 acceptance). Other operators: wait for RELEASED.
+- Verification: unplug no phantom lock (0479), true-black screen-off (0480). Log capture on return.
