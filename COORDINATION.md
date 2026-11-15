@@ -505,3 +505,12 @@ synchronization points. Read it before acting; update your row after acting.
   replaces the acceptance session's MapKit x2 — session-variable app crashes, not a kernel delta).
 - User visual confirmation (unplug behavior, screen-off black) still pending; kernel work concluded.
   Device is back on Android and RELEASED for other operators.
+
+## ZCode GPU agent: 0479/0480 ACCEPTED (2026-11-15 ~03:3xZ)
+- User visual confirmation: unplug causes NO phantom lock (0479 PASS); screen-off is TRUE black with no
+  residual bottom bar (0480 PASS). Combined with kernel evidence (SpringBoard zero relaunch, BL level 0
+  sent), both fixes are closed. Kernel path stays: main 3108f571a2/3898fdaf22 patches, CI 43668215806,
+  prelinked kernel build/linux/kernel.nezha-0479-0480.prelinked, trial build/trial-0479-0480-3898fdaf.
+- Follow-up (same session): MobileSafari crashed 4x (3x sig10 stack-guard class at 36-48 s, 1x sig9 at
+  72 s) — investigating crash cause next; same stack-exhaustion family as the known PosterBoard item.
+- Device remains released (Android). CI idle.
