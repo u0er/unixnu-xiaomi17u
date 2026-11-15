@@ -64,3 +64,10 @@ reported lengths and captured hex prefixes. It marks truncated dumps and does
 not reconstruct protocol frames or fill missing data. The 2026-11-15 capture
 provides direct FD/FC and PERI startup evidence; see
 `docs/BLUETOOTH_ANDROID_ROM_ROUTE_2026-11-15.md` before implementing a ROM probe.
+
+`--level 8` selects the bounded FD/FC + PERI version probe. It follows the
+validated cold-start power/UART path, but sends no ordinary HCI Reset, firmware,
+NVM, UWB initialization or baud-rate change. Wake ACK, complete framing and
+matching response fields are required. The result indicates only whether the
+PERI ROM inquiry worked; it is not a Bluetooth-ready result. Use a kernel built
+with level 8 support, then request a new device window for its first trial.

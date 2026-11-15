@@ -7,7 +7,8 @@
  * android.hardware.bluetooth@aidl-service-qti opens /dev/ttyHS0. Its observed
  * cold-start trace uses FD/FC wake and PERI frames before normal HCI; finding
  * Hamilton firmware in /vendor does not identify the selected image. This
- * diagnostic driver does not implement that Ganges/PERI boot protocol yet.
+ * Level 8 probes wake and PERI version only; firmware download and later
+ * Ganges/PERI initialization are not implemented here.
  *
  * Boot-arg pandora_bt=1, read only: the wrapper votes and branch halts, the SE5
  * RCG, the SE identity and its pins. =2 also votes the BT rails from the DT's
@@ -18,6 +19,8 @@
  * Level 6 retries cold initialization at 115200. Only level 5 uses 4 Mbps.
  * Level 7 runs the GENI internal loopback without BT power/reset or TLMM
  * programming. A loopback pass establishes AP FIFO/sequence operation only.
+ * Level 8 cold-starts at 115200, requires FD/FC wake, and asks PERI version
+ * once. It never sends HCI Reset, changes the baud, or downloads firmware.
  *
  * Register map: Linux drivers/soc/qcom/qcom-geni-se.c, drivers/tty/serial/
  * msm_geni_serial.c and u-boot's drivers/serial/serial_msm_geni.c (GPL-2.0+,
@@ -79,6 +82,7 @@ void pandora_bt_init(void);
 #define SE_FW_REV        0x068u
 #define SE_CLK_SEL       0x07cu
 #define SE_UART_LOOPBACK 0x22cu        /* bit0 RX/TX short, bit1 CTS/RTS short */
+#define SE_UART_IO_MACRO 0x240u        /* external signal routing; diagnostic read only */
 #define SE_TX_TRANS_CFG  0x25cu
 #define SE_TX_PACK0      0x260u
 #define SE_TX_PACK1      0x264u
@@ -92,6 +96,7 @@ void pandora_bt_init(void);
 #define SE_RX_STALE      0x294u
 #define SE_TX_PARITY     0x2a4u
 #define SE_RX_PARITY     0x2a8u
+#define SE_UART_RFR      0x2acu        /* manual RTS/RFR override; diagnostic read only */
 #define SE_DMA_MODE      0x258u
 #define SE_M_CMD0        0x600u
 #define SE_M_CMD_CTRL    0x604u
@@ -848,6 +853,8 @@ bt_uart_dump(void)
 	    bt_rd(BT_W_SE, SE_TX_FIFO_ST), bt_rd(BT_W_SE, SE_RX_FIFO_ST),
 	    bt_rd(BT_W_UART, 0x4) & BT_PIN_INPUT, bt_rd(BT_W_UART, 3 * 0x1000u + 0x4) & BT_PIN_INPUT);
 	printf("PANDORA BT: GENI IOS %#x (RX bit0, IO2/CTS bit1)\n", bt_rd(BT_W_SE, SE_IOS));
+	printf("PANDORA BT: UART routing loopback %#x io_macro %#x manual_rfr %#x\n",
+	    bt_rd(BT_W_SE, SE_UART_LOOPBACK), bt_rd(BT_W_SE, SE_UART_IO_MACRO), bt_rd(BT_W_SE, SE_UART_RFR));
 }
 
 /* Wait for up to MS, collecting RX FIFO words; returns bytes in OUT. */
@@ -1002,6 +1009,154 @@ bt_try_hci_reset(void)
 	return false;
 }
 
+/* Read a precise number of bytes against one absolute deadline. Unlike the
+ * legacy HCI helper, this never guesses frame type from partial payloads or
+ * drains bytes beyond the caller's current field. The one-byte FIFO packing
+ * is shared with the device-proven internal loopback. */
+static int
+bt_rx_exact(uint8_t *out, unsigned want, unsigned *got, uint64_t deadline)
+{
+	*got = 0;
+	while (*got < want && mach_absolute_time() < deadline) {
+		if (bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu) {
+			out[(*got)++] = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
+		} else {
+			bt_sleep(1000);
+		}
+	}
+	return *got == want ? 0 : ETIMEDOUT;
+}
+
+/* Android PeriPatchDLManager::WakeUpSoC / ReadHciPeriEvent and the captured
+ * UART trace both require FD -> FC before the version request. Peer FD is
+ * acknowledged with FC; FE is sleep indication. Bound retries and control
+ * traffic, reject any other byte, and never count peer wake as our ACK. */
+static int
+bt_peri_wake(void)
+{
+	static const uint8_t wake = 0xfd, ack = 0xfc;
+	unsigned controls = 0;
+	for (unsigned attempt = 1; attempt <= 3; attempt++) {
+		int err = bt_uart_tx(&wake, 1, "PERI wake FD");
+		if (err) {
+			return err;
+		}
+		uint64_t deadline;
+		clock_interval_to_deadline(200, NSEC_PER_MSEC, &deadline);
+		while (mach_absolute_time() < deadline) {
+			uint8_t byte;
+			unsigned got;
+			err = bt_rx_exact(&byte, 1, &got, deadline);
+			if (err) {
+				break;
+			}
+			printf("PANDORA BT: PERI wake attempt %u RX %#x\n", attempt, byte);
+			if (++controls > 32) {
+				return EOVERFLOW;
+			}
+			if (byte == ack) {
+				printf("PANDORA BT: PERI wake ACK FC received\n");
+				return 0;
+			}
+			if (byte == wake) {
+				err = bt_uart_tx(&ack, 1, "PERI peer wake ACK FC");
+				if (err) {
+					return err;
+				}
+			} else if (byte != 0xfe) {
+				printf("PANDORA BT: unexpected byte during PERI wake\n");
+				return EPROTO;
+			}
+		}
+	}
+	printf("PANDORA BT: PERI wake timed out; version request not sent\n");
+	return ETIMEDOUT;
+}
+
+/* Deliberately narrow ROM probe, not a general PERI transport. The exact
+ * request, 0x0034 event header and 25-byte success layout are evidenced by
+ * Android trace plus the owning HAL's framing/event handlers. Keep a strict
+ * length/opcode/subcommand/subsystem/status check; unsupported or truncated
+ * frames fail without replay, baud changes, firmware writes or a reset. */
+static int
+bt_peri_probe(void)
+{
+	static const uint8_t request[] = { 0x31, 0x00, 0xf0, 0xff, 0x02, 0x05, 0x00 };
+	static const uint8_t identity[] = { 0xf0, 0x01, 0x01, 0xf0, 0xff };
+	uint8_t rx[32] = {0};
+	unsigned got = 0, field = 0;
+	int err = bt_peri_wake();
+	if (err) {
+		return err;
+	}
+	err = bt_uart_tx(request, sizeof(request), "PERI version request");
+	if (err) {
+		return err;
+	}
+	uint64_t deadline;
+	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
+	/* Control bytes may occur only between frames; FD/FE inside the event
+	 * payload are data. Read them before selecting the fixed header. */
+	for (unsigned controls = 0; controls < 32; controls++) {
+		err = bt_rx_exact(rx, 1, &field, deadline);
+		got = field;
+		if (err) {
+			goto done;
+		}
+		if (rx[0] == 0x34) {
+			break;
+		}
+		printf("PANDORA BT: PERI between-frame byte %#x\n", rx[0]);
+		if (rx[0] == 0xfd) {
+			const uint8_t ack = 0xfc;
+			err = bt_uart_tx(&ack, 1, "PERI between-frame wake ACK FC");
+			if (err) {
+				goto done;
+			}
+		} else if (rx[0] != 0xfc && rx[0] != 0xfe) {
+			err = EPROTO;
+			goto done;
+		}
+		got = 0;
+	}
+	if (!got || rx[0] != 0x34) {
+		err = EOVERFLOW;
+		goto done;
+	}
+	err = bt_rx_exact(rx + 1, 3, &field, deadline);
+	got += field;
+	if (err) {
+		goto done;
+	}
+	if (rx[1] != 0 || rx[2] != 0xff) {
+		err = EPROTO;
+		goto done;
+	}
+	if ((unsigned)rx[3] > sizeof(rx) - 4) {
+		err = EMSGSIZE;
+		goto done;
+	}
+	err = bt_rx_exact(rx + 4, rx[3], &field, deadline);
+	got += field;
+	if (err) {
+		goto done;
+	}
+	if (got != 25 || rx[3] != 21 || memcmp(rx + 4, identity, sizeof(identity)) ||
+	    rx[10] != 0x05 || rx[11] != 0x00) {
+		err = EPROTO;
+		goto done;
+	}
+	printf("PANDORA BT: PERI version response status %u\n", rx[9]);
+	if (rx[9]) {
+		err = EIO;
+	}
+done:
+	bt_dump("PERI raw response", rx, got);
+	printf("PANDORA BT: PERI version probe %s (error %d); no Bluetooth-ready verdict\n",
+	    err ? "FAIL" : "PASS", err);
+	return err;
+}
+
 static void
 bt_thread(void *arg, wait_result_t result)
 {
@@ -1037,7 +1192,7 @@ bt_thread(void *arg, wait_result_t result)
 		if (bt_rf_clk()) {
 			goto out;
 		}
-		if (bt_level < 3 || bt_level == 6) {
+		if (bt_level < 3 || bt_level == 6 || bt_level == 8) {
 			/* level 6 also needs the SPMI windows mapped for its retries. */
 			if (bt_en_pulse()) {
 				goto out;
@@ -1074,6 +1229,18 @@ bt_thread(void *arg, wait_result_t result)
 			pandora_log_sync();
 		}
 		if (bt_clocks()) {
+			bt_report();
+			goto out;
+		}
+		if (bt_level == 8) {
+			int err = bt_uart_init(115200, false);
+			if (!err) {
+				bt_uart_dump();
+				err = bt_peri_probe();
+				bt_uart_dump();
+			}
+			int stop_err = bt_uart_stop();
+			printf("PANDORA BT: PERI probe ended (error %d, UART stop %d)\n", err, stop_err);
 			bt_report();
 			goto out;
 		}
@@ -1124,8 +1291,8 @@ pandora_bt_init(void)
 	if (!bt_level) {
 		return;
 	}
-	if (bt_level < 1 || bt_level > 7) {
-		printf("PANDORA BT: unsupported pandora_bt=%d (expected 1..7)\n", bt_level);
+	if (bt_level < 1 || bt_level > 8) {
+		printf("PANDORA BT: unsupported pandora_bt=%d (expected 1..8)\n", bt_level);
 		return;
 	}
 	thread_t thread;

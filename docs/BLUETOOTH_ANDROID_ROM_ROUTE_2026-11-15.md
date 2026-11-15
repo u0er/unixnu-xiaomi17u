@@ -123,6 +123,36 @@ Android dmesg 的 `android-bt-startup.txt` 同时显示 BT_EN low/high 与 SW_CT
 若 FD 仍完全无回应，继续用 AP 数字观测和 Android 对照检查外部线路/电源/唤醒，
 不是回头重复无条件 HCI Reset。若 FD/FC 通但版本帧失败，则边界已缩小到新协议。
 
-**上述下一 probe 尚未实现、构建或启动。** 已完成的 level 7 试验不授权新的启动，
-也不证明这个下一实验已成功。需要的全部现有证据都在主机，后续可先离线完成解析器
-与小范围实现，再提交完整候选供用户确认。
+**上述 probe 已实现为 level 8，单文件 ARM64 编译通过，完整构建和实机结果另行记录。**
+已完成的 level 7 试验不授权新的启动，也不证明 level 8 已成功。
+
+## Level 8 实现与失败边界
+
+`pandora_bt=8` 复用 level 2 已实机验证的 rail / BT_EN / UART 设置，设置外部传输，
+先打印 LOOPBACK、IO_MACRO_CTRL、manual RFR，再进入独立协议分支。
+从该分支直接退出，不会落入普通 HCI Reset 或 level 6 的 power-cycle 重试循环。
+
+- `bt_peri_wake` 最多三次 FD，每次等 ACK 200 ms。FC 才是本机请求的成功确认。
+  收到对端 FD 时回复 FC，FE 记为 sleep indication；其他字节报协议错误。
+  总控制字节数也有上限，不用对端流量无限延长等待。
+- `bt_rx_exact` 在同一个 absolute deadline 内逐字段读取，恰好读取需要的字节，
+  不靠 DMA chunk 边界，也不读走下一字段。版本帧整体期限 1 秒。
+- 只在帧边界识别 FD/FC/FE；帧 payload 内的同值字节作为普通数据。
+- 首个版本响应仅接受本机 HAL/trace 对应的 25 字节形式：header=`34 00 ff 15`，
+  payload 起始 `f0 01 01 f0 ff`，offset 9 为状态，offset 10 为子命令 05，
+  offset 11 为 subsystem 0。完整长度和匹配字段都成立、status=0 才记 probe PASS。
+  版本号内容暂时只以原始字节记录，不把未审计字段命名成芯片 SKU。
+- 使用 32 字节栈缓冲。header 声明长度超过容纳范围时返回 EMSGSIZE；短帧、
+  未知 event 或字段不匹配返回错误；不会把截断的 Android dump 补成“成功样本”。
+- 完成后停止 UART sequencer，打印停止结果；不降共享 rail、不写固件/NVM，
+  也不切到 Android 后续的 4 Mbps 阶段。
+
+进一步交叉检查过本机 HAL 的 `ReadHciPeriEvent`：0x129680..0x129724 识别 FC/FD/FE
+并对 FD 写 FC；0x129924..0x129988 读取 extended event 的两字节尾头和声明长度。
+`GetVsHciEvent` 从 raw offset 10 分派子命令，`ProcessPeriEdlPatchEvt` 以原始 buffer
+读取版本信息，支持当前 probe 对帧结构的限定。没有复用 HAL 中把超时最终返回 0
+等宽松结果路径，probe 必须有实际匹配响应。
+
+改动文件为 `wsl/pandora_bt.c`、同步生成的 0476 patch、prepare_trial 的 level 范围
+和蓝牙说明。原 level 2/7 设备证据保留。完整候选准备好后，再向用户报告启动目标、
+90 秒期限和日志覆盖范围，取得这一次的明确同意。
