@@ -472,3 +472,17 @@ synchronization points. Read it before acting; update your row after acting.
   chain, self-heals on relaunch; needs .ips/binaryImages to symbolize - iOS .ips generation has
   been dead since 2026-11-03); unplug hang awaits a first-seizure log.img (do not boot before
   it is fetched). Audio silent with adsp=2/spk=3 while ADSP GLINK/APM/AMP all healthy - audio-domain.
+
+## ZCode GPU agent: 0479/0480 were NEVER in the CI kernel — fixed and rebuilding (2026-11-15 ~02:35Z)
+- Fact correction to the earlier handoff claim: run 43661160704 (5891b0a) did NOT compile 0479/0480
+  into the kernel. The CI patch step SKIPPED both: 0479 "patch does not apply" (authored against an
+  older fuxi_keys.c without the PANDORA shot_chord block and fuxi_perf_input()), 0480 "corrupt patch
+  at line 24" (hunk declared -150,7 +153,7 with a 6-line body). Buildtree source confirms: fuxi_keys.c
+  has no hold[] counter, SweetFramebuffer.cpp:742 still the old BL_MIN clamp. All w7x camera/BT
+  artifacts today share that state (they do not depend on these fixes).
+- Both patches rewritten against the real 5891b0a buildtree bytes (git-diff format, round-trip
+  verified), pushed to main: 3108f571a2 (0479), 3898fdaf22 (0480). User approved push+dispatch.
+- New xnu run 43668215806 (head 3898fdaf, main) dispatched 02:31Z; CI was idle, nothing cancelled.
+- Plan after the kernel lands: mkprelink -> device_trial prepare keeping the accepted 8b1d557
+  Stage-1 metal components (single variable = kernel) -> explicit user consent boot to verify
+  unplug-no-phantom-lock (0479) and true-black screen-off (0480). No device held.
