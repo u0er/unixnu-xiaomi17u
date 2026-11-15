@@ -96,3 +96,42 @@ stops BT initialization. No shared rail is disabled on failure. The request
 result is not an analog measurement. No BT_EN sampling, error filters, firmware,
 baud change or extra power retry is added. A complete level 11 kernel and
 a newly authorized device window are required.
+
+`--level 12` keeps level 11's power and UART/PERI settings. At the end of
+the existing BT_EN low/high waits it temporarily selects normal pad input
+and LV/MV INPUT_OUTPUT MODE2, obtains three RT_STS bit0 samples, and restores
+the saved mode/input configuration with readback. It touches no source,
+VIN or drive setting during sampling. Only the confirmed GPIO5 subtype0x12
+and expected output configuration are accepted. Every attempted change is
+restored even if its write failed. Sample/config/restore failure stops the
+power sequence before UART; no FC is required for this diagnostic to provide
+new evidence. Passing samples establish PMIC digital input levels only.
+
+## Incremental local kernel preparation
+
+For one driver change, reuse buildtree, objects and linklibs from the **same**
+device-tested CI build; do not mix the workspace's older caches. Example in WSL:
+
+```sh
+python3 tools/bluetooth/compile_driver.py \
+  --buildtree /opt/nezha-bt-incremental/ci-43668443548/buildtree \
+  --source "$PWD/wsl/pandora_bt.c" --clang /usr/bin/clang \
+  --sdk-include /mnt/c/Users/1/Documents/Codex/2026-10-31/wo-x/work/toolchain/iPhoneOS16.5.sdk/usr/include \
+  --out /opt/nezha-bt-incremental/level12/pandora_bt.o
+python3 tools/relink_nezha_kernel.py \
+  --buildtree /opt/nezha-bt-incremental/ci-43668443548/buildtree \
+  --ci /opt/nezha-bt-incremental/ci-43668443548/ci \
+  --replace pandora_bt=/opt/nezha-bt-incremental/level12/pandora_bt.o \
+  --ld /opt/unixnu-lto-build/cctools/ld64/src/ld/ld \
+  --out /opt/nezha-bt-incremental/level12/kernel.development.pandora.unstripped
+```
+
+Run from the project root after converting the workspace path to WSL form.
+The local tools record compiler/linker arguments, return codes and diagnostics.
+Use cctools strip `-S` for this static Mach-O; the installed LLVM14 strip does
+not support it. Retain unstripped output and link records for debugging.
+Local ld64 may change layout and produce static absolute pointers instead of
+CI's chained fixups. Validate entry/segments, unresolved symbols, relocation
+format and packed image; report that linker change alongside the driver change.
+This path has passed host linking/packing for level12 but has not yet booted.
+Never label it a new successful CI build or a device-accepted kernel.

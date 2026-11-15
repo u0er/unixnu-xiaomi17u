@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..008e6a1
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,1347 @@
+@@ -0,0 +1,1450 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -50,6 +50,10 @@ index 0000000..008e6a1
 + * 1876 mV, the live DT BT consumer minimum also used by pandora_wifi.c.
 + * The earlier levels retain 1800 mV for comparison; votes are not a voltage
 + * measurement and a failed vote stops initialization without dropping shared rails.
++ * Level 12 keeps level 11's requests and samples the BT_EN pad in both
++ * settled reset phases. It temporarily enables normal input+output mode,
++ * restores the saved configuration on every modified path, and requires
++ * three matching RT_STS samples plus a verified restore before proceeding.
 + *
 + * Register map: Linux drivers/soc/qcom/qcom-geni-se.c, drivers/tty/serial/
 + * msm_geni_serial.c and u-boot's drivers/serial/serial_msm_geni.c (GPL-2.0+,
@@ -366,16 +370,16 @@ index 0000000..008e6a1
 +		{"S8F_E0", 1800}, {"S1J_E1", 892}, {"L6K_E1", 1800},
 +	};
 +	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
-+		bool s8f_trial = bt_level == 11 && !strcmp(rails[i].name, "S8F_E0");
++		bool s8f_trial = bt_level >= 11 && !strcmp(rails[i].name, "S8F_E0");
 +		unsigned mv = s8f_trial ? 1876u : rails[i].mv;
 +		int err = pandora_rpmh_resource(rails[i].name, 0, mv);
 +		if (s8f_trial) {
-+			printf("PANDORA BT: level 11 S8F_E0 voltage request %u mV -> %d\n", mv, err);
++			printf("PANDORA BT: level %d S8F_E0 voltage request %u mV -> %d\n", bt_level, mv, err);
 +		}
 +		if (!err) {
 +			err = pandora_rpmh_resource(rails[i].name, 4, 1);
 +			if (s8f_trial) {
-+				printf("PANDORA BT: level 11 S8F_E0 enable request -> %d\n", err);
++				printf("PANDORA BT: level %d S8F_E0 enable request -> %d\n", bt_level, err);
 +			}
 +		}
 +		if (err) {
@@ -711,6 +715,99 @@ index 0000000..008e6a1
 +	}
 +}
 +
++/* Ignore the changing sample/IRQ byte when checking configuration restoration. */
++static bool
++bt_gpio_same_config(const struct bt_gpio_state *a, const struct bt_gpio_state *b)
++{
++	return a->type == b->type && a->subtype == b->subtype && a->mode == b->mode &&
++	       a->vin == b->vin && a->pull == b->pull && a->in == b->in &&
++	       a->source == b->source && a->out == b->out && a->en == b->en;
++}
++
++/* PMH0104 GPIO5 is device-confirmed LV/VIN2. MODE1 disables the input
++ * buffer, so its RT_STS is not a pad measurement. MODE2 retains the output
++ * while enabling input; MODE3 would instead be analog pass-through. Keep
++ * SOURCE/VIN/drive unchanged, undo attempted writes even on bus failure,
++ * and distinguish a sample failure from a failed restoration. */
++static int
++bt_en_sample(unsigned level)
++{
++	vm_offset_t chan;
++	struct bt_gpio_state saved, wanted, active, restored;
++	uint8_t samples[3] = {0};
++	unsigned got = 0;
++	bool in_touched = false, mode_touched = false;
++	int restore_err = 0;
++	int err = bt_spmi_channel(bt_bus0, bt_bus1, BT_SPMI_GPIO_PPID, &chan);
++	if (err) {
++		printf("PANDORA BT: BT_EN pad sample channel failed (%d)\n", err);
++		return err;
++	}
++	err = bt_gpio_read(chan, &saved);
++	if (err) {
++		printf("PANDORA BT: BT_EN pad sample snapshot failed (%d)\n", err);
++		return err;
++	}
++	if (!saved.lv_mv || saved.subtype != 0x12 || saved.mode != 1 ||
++	    saved.source != (level ? 0x80 : 0) || saved.vin != 1 ||
++	    saved.en != 0x80 || saved.out != 3 || saved.pull != 5) {
++		bt_gpio_dump("BT_EN pad sample unsupported state", BT_SPMI_GPIO_PPID, &saved);
++		return ENOTSUP;
++	}
++	wanted = saved;
++	wanted.in = 0;       /* normal pad input, not a DTEST source */
++	wanted.mode = 2;     /* LV/MV DIGITAL_INPUT_OUTPUT */
++	if (saved.in != wanted.in) {
++		in_touched = true;
++		if (!bt_spmi_write(chan, BT_SPMI_REG_IN, wanted.in)) {
++			err = EIO;
++			goto restore;
++		}
++	}
++	mode_touched = true;
++	if (!bt_spmi_write(chan, BT_SPMI_REG_MODE, wanted.mode)) {
++		err = EIO;
++		goto restore;
++	}
++	err = bt_gpio_read(chan, &active);
++	if (err || !bt_gpio_same_config(&active, &wanted)) {
++		err = err ? err : EIO;
++		goto restore;
++	}
++	/* Bounded consecutive SPMI samples after configuration readback; do not
++	 * count the output latch or the earlier MODE1 status as observations. */
++	for (; got < sizeof(samples); got++) {
++		if (!bt_spmi_read8(chan, BT_SPMI_REG_STATUS, &samples[got])) {
++			err = EIO;
++			break;
++		}
++	}
++	if (!err) {
++		for (unsigned i = 0; i < got; i++) {
++			if ((samples[i] & 1u) != level) {
++				err = EIO;
++			}
++		}
++	}
++restore:
++	/* A timed-out write may have landed. Always undo every attempted
++	 * change; separate statements ensure one failure cannot skip another. */
++	if (mode_touched && !bt_spmi_write(chan, BT_SPMI_REG_MODE, saved.mode)) {
++		restore_err = EIO;
++	}
++	if (in_touched && !bt_spmi_write(chan, BT_SPMI_REG_IN, saved.in)) {
++		restore_err = EIO;
++	}
++	int read_err = bt_gpio_read(chan, &restored);
++	if (read_err || !bt_gpio_same_config(&restored, &saved)) {
++		restore_err = read_err ? read_err : EIO;
++	}
++	printf("PANDORA BT: BT_EN pad expected %u, %u/3 RT_STS %#x %#x %#x, sample error %d restore error %d\n",
++	    level, got, samples[0], samples[1], samples[2], err, restore_err);
++	pandora_log_sync();
++	return restore_err ? restore_err : err;
++}
++
 +static int
 +bt_en_pulse(void)
 +{
@@ -728,11 +825,17 @@ index 0000000..008e6a1
 +		return err;
 +	}
 +	bt_sleep(100 * 1000);
++	if (bt_level == 12 && (err = bt_en_sample(0)) != 0) {
++		return err;
++	}
 +	err = bt_spmi_gpio(bus0, bus1, BT_SPMI_GPIO_PPID, 0x01, 1, "BT_EN high");
 +	if (err) {
 +		return err;
 +	}
 +	bt_sleep(150 * 1000);	/* Linux qca_power_on: 150 ms after BT_EN */
++	if (bt_level == 12 && (err = bt_en_sample(1)) != 0) {
++		return err;
++	}
 +	/* There is no qcom,btwake_gpio binding on this board. In particular,
 +	 * mpm_wake_set_gpios[1] does not establish GPIO9 as a dev-wake output.
 +	 * Leave that unrelated pad in its inherited configuration. */
@@ -1354,8 +1457,8 @@ index 0000000..008e6a1
 +	if (!bt_level) {
 +		return;
 +	}
-+	if (bt_level < 1 || bt_level > 11) {
-+		printf("PANDORA BT: unsupported pandora_bt=%d (expected 1..11)\n", bt_level);
++	if (bt_level < 1 || bt_level > 12) {
++		printf("PANDORA BT: unsupported pandora_bt=%d (expected 1..12)\n", bt_level);
 +		return;
 +	}
 +	thread_t thread;

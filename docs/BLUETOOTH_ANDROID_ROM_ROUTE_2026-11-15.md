@@ -1,5 +1,7 @@
 # 蓝牙：Android 现有 UART trace 揭示的 ROM 路线（2026-11-15）
 
+> **下一项已准备：[level12 BT_EN数字采样](BLUETOOTH_LEVEL12_PLAN_2026-11-15.md)。采用匹配level11对象的本地增量链接，尚未实机；此前level11仍无回应。**
+
 > **最新：[level11结果](BLUETOOTH_LEVEL11_RESULT_2026-11-15.md)。S8F1876请求均成功，仍无FC/RX；设备已返回并释放，下一项独立观测是BT_EN数字采样。**
 
 > **最新：[level10实机结果](BLUETOOTH_LEVEL10_RESULT_2026-11-15.md)。RFR_OPEN命令读回成功但仍无RX，[level11](BLUETOOTH_LEVEL11_RESULT_2026-11-15.md)已验证S8F请求1876mV，返回均成功但仍无回应。**

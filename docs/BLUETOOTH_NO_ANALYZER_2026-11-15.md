@@ -1,5 +1,7 @@
 # 蓝牙：无需逻辑分析仪的软件排查路线（2026-11-15）
 
+> **下一项已准备：[level12 BT_EN数字采样](BLUETOOTH_LEVEL12_PLAN_2026-11-15.md)。采用匹配level11对象的本地增量链接，尚未实机；此前level11仍无回应。**
+
 > **最新：[level11实机结果](BLUETOOTH_LEVEL11_RESULT_2026-11-15.md)。S8F1876请求均成功，但FD仍无回应；下一项为BT_EN数字采样，尚未实现。**
 
 > **最新：[level10已实机](BLUETOOTH_LEVEL10_RESULT_2026-11-15.md)，RFR_OPEN读回成功但FD仍无回应；[level11 S8F试验](BLUETOOTH_LEVEL11_RESULT_2026-11-15.md)已实机，请求成功仍无回应。**
