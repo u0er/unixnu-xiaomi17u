@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """Adapt UniXNU AdrenoMetal (pinned 73d582fd4) to iOS 16.7 on the Adreno 840 (data-a-live).
+Stage-2 v1 (2026-11-15): edits 25-30 give every IOSurface import its own dirty-page log
+(DirtyPages, HostMemory::with_dirty_pages): the kernel SweetSurface per-surface seed
+(a write-unlock moves it; IOSurfaceGetSeed reads it without a trap) and the runtime
+reported writes, so each copy of the pages into memory of the device own copies in
+only what changed since its last copy (WorkCounts::copied_copy_in_bytes_skipped).
+
+
 Exact, asserted text edits in a NativeMetal checkout; run once on a fresh tree.
 
   adapt_ios16.py NATIVEMETAL_DIR
@@ -516,3 +523,316 @@ edit('NativeAdrenoMetalPlugin.mm',
                 device = nil;
             }
 """)
+
+# Stage-2 v1 (2026-11-15): the IOSurface dirty-page log, edits 25-30.
+# 1. The trait and its stamp, for the log the surface import attaches.
+edit('bridge/NativeMetalObjects.rs',
+     "    ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,",
+     "    ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, DirtyPages, DirtyStamp, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,")
+
+# 2. The dirty-page log itself, the no-copy entry's surface parameter, and the attachment.
+edit('bridge/NativeMetalObjects.rs',
+     """unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, options_word: u64, deallocator: Option<Deallocator>)
+                  -> *mut NmbBuffer {
+    guard(std::ptr::null_mut(), || {
+        let device = get(device)?;
+        // SAFETY: the caller's contract.
+        let base = NonNull::new(pointer as *mut u8).ok_or("null memory")?;
+        // SAFETY: the caller's contract.
+        let memory = unsafe { HostMemory::new(base) };""",
+     """// ---- data-a-live: the dirty-page log of an imported IOSurface (HostMemory::with_dirty_pages) ----
+
+// The kernel's SweetSurface keeps a per-surface seed in a state page every importer maps read-only
+// (the lookup result's +0x08); a write-unlock (IOSurfaceUnlock without kIOSurfaceLockReadOnly)
+// increments it in the kernel, and IOSurfaceGetSeed reads it back without a trap. The runtime
+// reports its own writes into the pages (a shadow's copy back, a merge, a replaceRegion) through
+// DirtyPages::wrote_runs, so a log over an IOSurface's pages = the seed's moves and those reports.
+// A process writing its mapped pages without the lock protocol is seen by neither: the periodic
+// whole-range answer covers it (the runtime then copies every byte of that surface once more).
+unsafe extern "C" {
+    fn IOSurfaceGetID(surface: *const c_void) -> u32;
+    fn IOSurfaceGetSeed(surface: *const c_void) -> u32;
+    fn CFRetain(cf: *const c_void) -> *const c_void;
+    fn CFRelease(cf: *const c_void);
+}
+
+/// How often a whole-range answer is made regardless of the records (a bounded window over CPU
+/// writes that touched the mapped pages with no lock protocol).
+const SURFACE_DIRTY_VALVE: u64 = 64;
+/// Records kept past a whole-range answer: the runtime's reported writes between two of them.
+const SURFACE_DIRTY_RECORDS: usize = 256;
+
+/// The bridge's IOSurface dirty-page answers: logs made, whole-range answers (a seed move, a watch
+/// restart, records outgrown), the runtime's recorded writes, and records consolidated away.
+static SURFACE_DIRTY: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+struct SurfaceDirtyPages {
+    /// The retained IOSurfaceRef: the seed's state page and the kernel's surface stay alive for it.
+    surface: *const c_void,
+    /// The bytes the log's offsets count (the import's length).
+    bytes: u64,
+    /// Every whole-range answer and every record carries the next publication's stamp.
+    stamp: std::sync::atomic::AtomicU64,
+    /// The kernel seed last observed: a move from it is a whole-range write.
+    seed_last: std::sync::atomic::AtomicU32,
+    /// The stamp of the last whole-range answer: a query at or before it takes the whole range.
+    watermark: std::sync::atomic::AtomicU64,
+    /// (start, end, stamp): the runtime's reported writes, every one later than the watermark.
+    runs: std::sync::Mutex<Vec<(u64, u64, u64)>>,
+    /// Answers of changed() made: every SURFACE_DIRTY_VALVE-th is whole-range.
+    changed_calls: std::sync::atomic::AtomicU64,
+    /// Live watches: a rise from zero restarts the continuous watch at a fresh watermark.
+    watches: std::sync::atomic::AtomicU64,
+    /// The log's own weak handle, for its watches.
+    self_weak: std::sync::OnceLock<std::sync::Weak<SurfaceDirtyPages>>,
+}
+
+// SAFETY: the surface pointer is a retained CF object the log's calls only read (its seed), and
+// every field's own locks and orderings carry the rest.
+unsafe impl Send for SurfaceDirtyPages {}
+unsafe impl Sync for SurfaceDirtyPages {}
+
+impl SurfaceDirtyPages {
+    fn new(surface: *const c_void, bytes: u64) -> SurfaceDirtyPages {
+        SurfaceDirtyPages {
+            surface,
+            bytes,
+            stamp: std::sync::atomic::AtomicU64::new(0),
+            seed_last: std::sync::atomic::AtomicU32::new(u32::MAX),
+            watermark: std::sync::atomic::AtomicU64::new(0),
+            runs: std::sync::Mutex::new(Vec::new()),
+            changed_calls: std::sync::atomic::AtomicU64::new(0),
+            watches: std::sync::atomic::AtomicU64::new(0),
+            self_weak: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// A whole-range write: the watermark moves to a fresh stamp and the records begin again, so
+    /// the log's memory stays bounded no matter how long the pages live.
+    fn whole_written(&self) {
+        let stamp = self.stamp.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        self.watermark.store(stamp, std::sync::atomic::Ordering::Release);
+        self.runs.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        SURFACE_DIRTY[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A write the runtime reported: a record after the watermark, cut to the log's bytes.
+    fn record(&self, range: std::ops::Range<u64>) {
+        if range.start >= self.bytes {
+            return;
+        }
+        let end = range.end.min(self.bytes);
+        let stamp = self.stamp.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        {
+            let mut runs = self.runs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if runs.len() < SURFACE_DIRTY_RECORDS {
+                runs.push((range.start, end, stamp));
+                SURFACE_DIRTY[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+        // The records outgrew their window: one whole-range answer stands for them all.
+        self.whole_written();
+        SURFACE_DIRTY[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The kernel's seed, observed: a move from the last value seen is a whole-range write.
+    fn sync_seed(&self) {
+        // SAFETY: the surface is retained for the log's life; the seed is a plain read of it.
+        let seed = unsafe { IOSurfaceGetSeed(self.surface) };
+        let last = self.seed_last.swap(seed, std::sync::atomic::Ordering::AcqRel);
+        if seed != last {
+            self.whole_written();
+        }
+    }
+}
+
+impl Drop for SurfaceDirtyPages {
+    fn drop(&mut self) {
+        // SAFETY: the log's own retain, taken in surface_dirty_log.
+        unsafe { CFRelease(self.surface) };
+    }
+}
+
+/// A watch of the log's pages, ended by its drop.
+struct SurfaceWatch(Option<std::sync::Arc<SurfaceDirtyPages>>);
+
+impl Drop for SurfaceWatch {
+    fn drop(&mut self) {
+        if let Some(log) = self.0.as_ref() {
+            log.watches.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+impl DirtyPages for SurfaceDirtyPages {
+    type Watch = SurfaceWatch;
+
+    fn watch(&self, _range: std::ops::Range<u64>) -> SurfaceWatch {
+        if self.watches.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+            // A continuous watch restarts: every stamp handed before its watermark answers whole.
+            self.whole_written();
+        }
+        SurfaceWatch(self.self_weak.get().and_then(std::sync::Weak::upgrade))
+    }
+
+    fn request(&self) -> DirtyStamp {
+        self.sync_seed();
+        DirtyStamp(self.stamp.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn wait(&self, _stamp: DirtyStamp) -> bool {
+        // Publications are synchronous (the seed is shared memory and the records are made in the
+        // call), so every stamp handed out is already published.
+        true
+    }
+
+    fn changed(&self, since: DirtyStamp, out: &mut Vec<std::ops::Range<u64>>) {
+        self.sync_seed();
+        let calls = self.changed_calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if calls % SURFACE_DIRTY_VALVE == SURFACE_DIRTY_VALVE - 1
+            || since.0 <= self.watermark.load(std::sync::atomic::Ordering::Acquire) {
+            out.push(0..self.bytes);
+            return;
+        }
+        let runs = self.runs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for &(start, end, stamp) in runs.iter() {
+            if stamp > since.0 {
+                out.push(start..end);
+            }
+        }
+    }
+
+    fn wrote(&self, range: std::ops::Range<u64>) {
+        self.record(range);
+    }
+}
+
+/// The bridge's IOSurface dirty-page logs, by the kernel's surface id: one log per surface, alive
+/// while any import of its pages is (the registry holds it weakly, so its stamps end with it).
+fn surface_dirty_log(surface: *const c_void, bytes: u64) -> Option<std::sync::Arc<SurfaceDirtyPages>> {
+    static LOGS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u32, std::sync::Weak<SurfaceDirtyPages>>>,
+    > = std::sync::OnceLock::new();
+    // SAFETY: the frontend's surface, valid for this call.
+    let id = unsafe { IOSurfaceGetID(surface) };
+    if id == 0 {
+        return None;    // no registry identity (the frontend's own import key checks the same)
+    }
+    let logs = LOGS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut logs = logs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(log) = logs.get(&id).and_then(std::sync::Weak::upgrade) {
+        return Some(log);
+    }
+    // SAFETY: the log's own reference, released in its drop (the import's deallocator has its own).
+    unsafe { CFRetain(surface) };
+    let log = std::sync::Arc::new(SurfaceDirtyPages::new(surface, bytes));
+    if log.self_weak.set(std::sync::Arc::downgrade(&log)).is_err() {
+        // SAFETY: undo the log's own retain (an empty OnceLock never fails, but stay correct).
+        unsafe { CFRelease(surface) };
+        return None;
+    }
+    logs.insert(id, std::sync::Arc::downgrade(&log));
+    SURFACE_DIRTY[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(log)
+}
+
+/// The dirty-page counters into the caller's twelve words: the runtime's copy-in bytes and the
+/// bytes a log's answer skipped, the copies gated by a log, answered whole and their bytes copied,
+/// stamps asked, waits and waits unanswered, then the bridge's own (logs made, whole-range
+/// answers, records, records consolidated away).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_dirty_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's twelve words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 12) };
+        out.fill(0);
+        if !device.is_null() {
+            let w = get(device)?.0.work_counts();
+            let words = [w.copied_copy_in_bytes, w.copied_copy_in_bytes_skipped, w.dirty_copies_in_gated,
+                         w.dirty_copies_in_whole, w.dirty_copy_in_bytes_copied, w.dirty_stamps_asked,
+                         w.dirty_waits, w.dirty_waits_unanswered];
+            out[..words.len()].copy_from_slice(&words);
+        }
+        out[8] = SURFACE_DIRTY[0].load(Relaxed);
+        out[9] = SURFACE_DIRTY[1].load(Relaxed);
+        out[10] = SURFACE_DIRTY[2].load(Relaxed);
+        out[11] = SURFACE_DIRTY[3].load(Relaxed);
+        Ok(true)
+    })
+}
+
+/// `nmb_buffer_new_no_copy_releasing` over an IOSurface, with the surface's own dirty-page log
+/// attached: the kernel's per-surface seed and the runtime's reported writes, by which every copy
+/// of these pages into memory of the device's own copies in only what changed since its last copy.
+///
+/// # Safety
+/// `surface` is an IOSurfaceRef the caller keeps alive until `release` runs; `pointer` as
+/// `nmb_buffer_new_no_copy_releasing`'s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_buffer_new_no_copy_surface_releasing(device: *mut NmbDevice, pointer: *mut c_void,
+                                                                  length: u64, options_word: u64, release: Option<NmbRelease>,
+                                                                  context: *mut c_void, surface: *const c_void) -> *mut NmbBuffer {
+    let deallocator = release.map(|release| {
+        let context = ReleaseContext(context);
+        Box::new(move |pointer: NonNull<u8>, length: u64| {
+            let context = context;
+            // SAFETY: the caller's contract.
+            unsafe { release(context.0, pointer.as_ptr() as *mut c_void, length) }
+        }) as Deallocator
+    });
+    let surface = if surface.is_null() { None } else { Some(surface) };
+    // SAFETY: the caller's contract.
+    unsafe { no_copy(device, pointer, length, options_word, deallocator, surface) }
+}
+
+unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, options_word: u64,
+                  deallocator: Option<Deallocator>, surface: Option<*const c_void>)
+                  -> *mut NmbBuffer {
+    guard(std::ptr::null_mut(), || {
+        let device = get(device)?;
+        // SAFETY: the caller's contract.
+        let base = NonNull::new(pointer as *mut u8).ok_or("null memory")?;
+        // SAFETY: the caller's contract. An IOSurface's import carries the surface's own
+        // dirty-page log, so every copy of its pages into memory of the device's own copies in
+        // only what changed since its last copy.
+        let memory = match surface.and_then(|surface| surface_dirty_log(surface, length)) {
+            Some(log) => unsafe { HostMemory::new(base).with_dirty_pages(log) },
+            None => unsafe { HostMemory::new(base) },
+        };""")
+
+# 3. The plain no-copy entry keeps no log.
+edit('bridge/NativeMetalObjects.rs',
+     "    unsafe { no_copy(device, pointer, length, options_word, None) }",
+     "    unsafe { no_copy(device, pointer, length, options_word, None, None) }")
+
+# 4. The deallocator entry of the plain frontend path keeps no log either.
+edit('bridge/NativeMetalObjects.rs',
+     "    unsafe { no_copy(device, pointer, length, options_word, deallocator) }",
+     "    unsafe { no_copy(device, pointer, length, options_word, deallocator, None) }")
+
+# 5. The C ABI: the surface variant and the counters.
+edit('bridge/NativeMetalObjects.h',
+     """NmbBuffer *nmb_buffer_new_no_copy_releasing(NmbDevice *, void *pointer, uint64_t length, uint64_t options,
+                                            void (*release)(void *context, void *pointer, uint64_t length), void *context);""",
+     """NmbBuffer *nmb_buffer_new_no_copy_releasing(NmbDevice *, void *pointer, uint64_t length, uint64_t options,
+                                            void (*release)(void *context, void *pointer, uint64_t length), void *context);
+/* data-a-live: the same, over an IOSurface: the pages carry the surface's own dirty-page log (the kernel's
+ * per-surface seed and the runtime's reported writes), so every copy of them into memory of the device's
+ * own copies in only what changed since its last copy. `surface` stays alive until the import is freed. */
+NmbBuffer *nmb_buffer_new_no_copy_surface_releasing(NmbDevice *, void *pointer, uint64_t length, uint64_t options,
+                                                    void (*release)(void *context, void *pointer, uint64_t length), void *context,
+                                                    const void *surface);
+/* data-a-live: dirty-page counters, twelve words: copy-in bytes and bytes skipped by a log's answer,
+ * copies gated by a log, answered whole and their bytes copied, stamps asked, waits, waits unanswered,
+ * then logs made, whole-range answers, recorded writes, records consolidated away. */
+bool nmb_device_dirty_counts(const NmbDevice *, uint64_t out[12]);""")
+
+# 6. The frontend's surface import carries the surface for the log.
+edit('NativeBridgeMetalFrontend.mm',
+     " NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));",
+     " NmbBuffer *handle=nmb_buffer_new_no_copy_surface_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface),(const void *)surface);")
