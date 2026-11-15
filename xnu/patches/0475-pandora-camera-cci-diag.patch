@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..3ec098e
+index 0000000..5114b24
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,5966 @@
+@@ -0,0 +1,5980 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -5077,7 +5077,11 @@ index 0000000..3ec098e
 +	pc_sleep(8);
 +	pc_wr(phy4, PC_CPHY_CTRL(0), 0u);
 +	pc_sleep(1);
-+	pc_wr(phy4, PC_CPHY_CTRL(5), 0xD5u);
++	/* vendor csiphy_lane_en_reg_2_4_0: 0x1014 is the LANE ENABLE register,
++	 * not a control register. mainline writes (1 << (lanes+1)) - 1, i.e.
++	 * 0x1F for four data lanes plus the clock lane. We had been writing the
++	 * x1e80100 ctrl5 value 0xD5 here, which enables the wrong lane bits. */
++	pc_wr(phy4, PC_CPHY_CTRL(5), 0x1Fu);
 +	pc_wr(phy4, PC_CPHY_CTRL(6), 1u);
 +	pc_wr(phy4, PC_CPHY_CTRL(7), 2u);
 +	pc_wr(phy4, PC_CPHY_CTRL(0), 0u);
@@ -5098,7 +5102,11 @@ index 0000000..3ec098e
 +				delay(r->delay_us);
 +		}
 +	}
-+	pc_wr(phy4, PC_CPHY_CTRL(5), 0xD5u);
++	/* vendor csiphy_lane_en_reg_2_4_0: 0x1014 is the LANE ENABLE register,
++	 * not a control register. mainline writes (1 << (lanes+1)) - 1, i.e.
++	 * 0x1F for four data lanes plus the clock lane. We had been writing the
++	 * x1e80100 ctrl5 value 0xD5 here, which enables the wrong lane bits. */
++	pc_wr(phy4, PC_CPHY_CTRL(5), 0x1Fu);
 +	pc_wr(phy4, PC_CPHY_CTRL(6), 1u);
 +	pc_wr(phy4, PC_CPHY_CTRL(7), 0x7Au);
 +	printf("PANDORA SLICEB: p4test after lanes CTRL5=%#x CTRL6=%#x CTRL7=%#x"
@@ -5115,6 +5123,12 @@ index 0000000..3ec098e
 +	    "ln3_ctrl0=%#x\n", pc_rd(phy4, 0x0E00u),
 +	    pc_rd(phy4, 0x0E00u + 0x0Cu), pc_rd(phy4, 0x0E00u + 0x38u),
 +	    pc_rd(phy4, 0xC00u));
++	printf("PANDORA SLICEB: p4test irq 102c=%#x 1030=%#x 1034=%#x 1038=%#x "
++	    "103c=%#x 1040=%#x 1044=%#x 1048=%#x 104c=%#x 1050=%#x\n",
++	    pc_rd(phy4, 0x102Cu), pc_rd(phy4, 0x1030u), pc_rd(phy4, 0x1034u),
++	    pc_rd(phy4, 0x1038u), pc_rd(phy4, 0x103Cu), pc_rd(phy4, 0x1040u),
++	    pc_rd(phy4, 0x1044u), pc_rd(phy4, 0x1048u), pc_rd(phy4, 0x104Cu),
++	    pc_rd(phy4, 0x1050u));
 +	(void)pandora_log_sync();
 +	for (unsigned n = 11; n <= 21; n++)
 +		pc_wr(phy4, PC_CPHY_CTRL(n), 0u);
