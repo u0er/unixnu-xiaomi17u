@@ -31,10 +31,10 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	sweet_usb_probe();
 diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
-index 0000000..f2c14e6
+index 0000000..08d744d
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,5898 @@
+@@ -0,0 +1,5906 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -59,7 +59,7 @@ index 0000000..f2c14e6
 + *       CAM_TOP_AHB (0x2137c), each with a bounded status poll and A/B prints,
 + *       then roll back in reverse order and bounded-poll POWER_DOWN_COMPLETE.
 + *       These were the first MMIO writes in this file. See
-+ *       CAMERA_C2B_WRITE_SEQUENCE.md 鎼?/鎼? and CAMERA_C2BW1_RESULT.md 鎼?.
++ *       CAMERA_C2B_WRITE_SEQUENCE.md 閹?/閹? and CAMERA_C2BW1_RESULT.md 閹?.
 + *       Verdict compares GDSCR *control bits only* ([23:0]); the high byte is
 + *       live hardware status and never reads back what was written. A CORE_AHB
 + *       enable bit that does not stick is printed as an unresolved observation,
@@ -69,7 +69,7 @@ index 0000000..f2c14e6
 + *       CLK_OFF, print its own A/B result and restore the CBCR. On this board
 + *       that write ALSO clears CMD_ROOT_OFF in hardware (HW_CLK_CTRL mode);
 + *       the RCG does NOT stay parked, and its clock is XO/div1, not 37.5 MHz
-+ *       -- see CAMERA_C2BW2_RESULT.md 鎼?. No PLL, RCG rate, rail, GPIO or CCI
++ *       -- see CAMERA_C2BW2_RESULT.md 閹?. No PLL, RCG rate, rail, GPIO or CCI
 + *       queue word is touched.
 + *     - C-2b-w3: read-only. Print the full CMD_RCGR / CFG_RCGR before, after
 + *       and after rollback, check whether the root re-parked, snapshot the CCI0
@@ -195,7 +195,7 @@ index 0000000..f2c14e6
 + *     NOT run the sensor path above and touches no rail/GPIO/CCI; the two GCC
 + *     camera AXI branches are deliberately skipped (direction C). This is a
 + *     separate flag, not a new pandora_camera level. See CAMERA_L2_CAMCC_P0
-+ *     鎼?2. Use a cmdline that swaps pandora_camera=1 for pandora_tpg=1.
++ *     閹?2. Use a cmdline that swaps pandora_camera=1 for pandora_tpg=1.
 + *   Use the 11-04 user-verified cmdline baseline plus this flag
 + *   (cmdline-good-plus-camera-reboot90.txt, 603/608 B). The older camera-only
 + *   cmdline (cmdline-camera-reboot90.txt) crash-loops SpringBoard at 49 s for
@@ -249,7 +249,7 @@ index 0000000..f2c14e6
 +#define PC_GPIO(n)    ((uint32_t)(n) * 0x1000u)
 +#define PC_CCI_PA(n)  (0x0941b000u + (uint32_t)(n) * 0x1000u)
 +/* TPG P0 (pandora_tpg=1) block apertures, from the live base.dtb and v24 dtsi
-+ * (CAMERA_L2_CAMCC_P0 鎼?2 / TPG_IMPL 鎼?.3). tpg2 pairs with CSID MUX_SEL=3. */
++ * (CAMERA_L2_CAMCC_P0 閹?2 / TPG_IMPL 閹?.3). tpg2 pairs with CSID MUX_SEL=3. */
 +#define PC_TPG2_PA    0x093ff000u
 +#define PC_CSID0_PA   0x09253000u
 +#define PC_VFE0_PA    0x09151000u
@@ -260,7 +260,7 @@ index 0000000..f2c14e6
 +#define PC_GCC_CAM_AXI_PA  0x00126000u
 +#define PC_GCC_HF_AXI_OFF  0x14u
 +#define PC_GCC_SF_AXI_OFF  0x28u
-+/* Camera frame-buffer SMMU = apps-smmu@15000000 (REGFACTS 鎼?; the SAME instance
++/* Camera frame-buffer SMMU = apps-smmu@15000000 (REGFACTS 閹?; the SAME instance
 + * WiFi/touch/DPU use, NOT the GPU kgsl-smmu@3da0000). IFE write-master SID
 + * 0x1c00 (EXIDS), IOVA window 0x100000..+0xffe00000, both confirmed by live
 + * base.dtb and mainline v24. Lease a free bank via the WiFi template. */
@@ -276,7 +276,7 @@ index 0000000..f2c14e6
 +
 +/* CAMCC GDSC / AHB registers used by C-2b-w1. Offsets and bit meanings come
 + * from upstream camcc-kaanapali.c, gdsc.c and clk-branch.c; see
-+ * CAMERA_C2B_WRITE_SEQUENCE.md 鎼?. TITAN_TOP_GDSC sets POLL_CFG_GDSCR, so
++ * CAMERA_C2B_WRITE_SEQUENCE.md 閹?. TITAN_TOP_GDSC sets POLL_CFG_GDSCR, so
 + * POWER_UP_COMPLETE is polled in CFG_GDSCR (gdscr + 0x4), not in GDSCR. */
 +#define PC_GDSCR               0x21334u
 +#define PC_CFG_GDSCR           0x21338u
@@ -662,11 +662,11 @@ index 0000000..f2c14e6
 +}
 +
 +/* C-2b-w4: read-only TAYCAN_ELU PLL0 + CCI0 RCG state snapshot. This is the
-+ * device-side read of PLL0's runtime state that 鎼? of
++ * device-side read of PLL0's runtime state that 閹? of
 + * CAMERA_C2B_RCG_CCI_INPUTS.md lists as still open. The authoritative
 + * clk_taycan_elu_pll_configure() body is NOT in torvalds/linux (only the enum
 + * /regs table / dispatch case are), and the PLL bit masks live in clk-regmap.h
-+ * which is not cached, so this probe does NOT write any PLL register 閳?it only
++ * which is not cached, so this probe does NOT write any PLL register 闁?it only
 + * reads and prints the raw values alongside the known config values for
 + * comparison. Decoding the MODE/STATE/STATUS bits is best-effort until those
 + * masks are located; the raw hex is the deliverable. No clock is voted. */
@@ -1105,7 +1105,7 @@ index 0000000..f2c14e6
 +
 +/* C-2b-w7 (Path A): I2C bus probe on the XO/div1 CCI0 clock. No PLL write.
 + *
-+ * Rationale (see CAMERA_C2B_RCG_CCI_INPUTS.md 鎼?.1): the 37.5 MHz
++ * Rationale (see CAMERA_C2B_RCG_CCI_INPUTS.md 閹?.1): the 37.5 MHz
 + * PLL0_OUT_EVEN source is gated off (PLL0 outputs disabled), so the RCG
 + * source switch cannot succeed yet. Instead of touching the PLL, use the
 + * CCI clock that is already running (XO/div1, 19.2 MHz) with the upstream
@@ -3168,8 +3168,8 @@ index 0000000..f2c14e6
 +	pc_step("w1 rollback", PC_CAMCC_PA + PC_GDSCR);
 +	if (w2_ran) {
 +		pc_wr(pc_camcc, PC_CCI0_CBCR, cci0_0);
-+		/* Read while the GDSC is still up 閳?the same condition as the
-+		 * before/after reads 閳?so the RCG comparison is meaningful.
++		/* Read while the GDSC is still up 闁?the same condition as the
++		 * before/after reads 闁?so the RCG comparison is meaningful.
 +		 * w2 never writes CMD_RCGR; if the hardware does not re-park the
 +		 * root on branch disable, the probe has left state behind and
 +		 * must say so rather than claiming a clean rollback. */
@@ -3538,7 +3538,7 @@ index 0000000..f2c14e6
 +
 +/* ---------------------------------------------------------------------------
 + * TPG P0 resource bring-up (boot arg pandora_tpg=1). Implements
-+ * CAMERA_L2_CAMCC_P0_2026-11-12.md 鎼?2 steps S1-S8 + S11, direction C: the two
++ * CAMERA_L2_CAMCC_P0_2026-11-12.md 閹?2 steps S1-S8 + S11, direction C: the two
 + * GCC camera AXI branches (0x26014/0x26028) are deliberately NOT touched, so
 + * "can TPG produce a frame without gcc_axi_hf/sf" becomes a first-hand datum.
 + *
@@ -3547,16 +3547,16 @@ index 0000000..f2c14e6
 + * the CAMSS TPG clock/power tree, reads the TPG/CSID/VFE HW version, then powers
 + * down in reverse. Read-back-first, bounded polls (PC_POLL_STEPS), a missing
 + * status bit is never reported as success. Offsets/bits are the cached
-+ * camcc-kaanapali.c / gdsc.c / clk-rcg2.c facts cross-checked in 鎼?2; the RCG
-+ * divider field is hid = 2*div - 1 (verified CCI0 0x0010021f, 鎼?2.2).
++ * camcc-kaanapali.c / gdsc.c / clk-rcg2.c facts cross-checked in 閹?2; the RCG
++ * divider field is hid = 2*div - 1 (verified CCI0 0x0010021f, 閹?2.2).
 + * ------------------------------------------------------------------------- */
 +
-+/* GDSCR offsets (鎼?.1). TITAN_TOP is PC_GDSCR; CFG_GDSCR is always gdscr+4. */
++/* GDSCR offsets (閹?.1). TITAN_TOP is PC_GDSCR; CFG_GDSCR is always gdscr+4. */
 +#define PC_TFE0_GDSCR   0x21004u
 +#define PC_TFE1_GDSCR   0x21080u
 +#define PC_TFE2_GDSCR   0x210e4u
 +
-+/* S7/S8 branch CBCRs (鎼?), in enable order. CORE_AHB (0x21348) is handled
++/* S7/S8 branch CBCRs (閹?), in enable order. CORE_AHB (0x21348) is handled
 + * separately: BRANCH_HALT_DELAY has no halt bit, so it is enable+delay only. */
 +static const uint32_t pc_tpg_branches[] = {
 +	0x2137cu, 0x2136cu, 0x212f8u, 0x212e4u, 0x21330u, /* cpas_ahb/fast_ahb/nrt/rt/qdss */
@@ -3565,7 +3565,7 @@ index 0000000..f2c14e6
 +};
 +#define PC_TPG_NBRANCH  (sizeof(pc_tpg_branches) / sizeof(pc_tpg_branches[0]))
 +
-+/* S6 RCGs: cmd_rcgr, SRC_SEL, hid (=2*div-1). 鎼?2.3. */
++/* S6 RCGs: cmd_rcgr, SRC_SEL, hid (=2*div-1). 閹?2.3. */
 +struct pc_tpg_rcg { uint32_t cmd; unsigned sel; unsigned hid; const char *name; };
 +static const struct pc_tpg_rcg pc_tpg_rcgs[] = {
 +	{ 0x21064u, 1u, 5u,  "cphy_rx" },       /* PLL0_MAIN/3   = 400 MHz */
@@ -3598,7 +3598,7 @@ index 0000000..f2c14e6
 +		return 0;
 +	}
 +	/* Clear only SW_COLLAPSE; the read-back value keeps the EN_REST/EN_FEW/
-+	 * CLK_DIS_WAIT fields (鎼?.1) intact. */
++	 * CLK_DIS_WAIT fields (閹?.1) intact. */
 +	pc_wr(pc_camcc, gdscr, g & ~PC_GDSC_SW_COLLAPSE);
 +	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
 +		if (pc_rd(pc_camcc, gdscr + 4) & PC_CFG_GDSC_PWR_UP) {
@@ -3920,8 +3920,8 @@ index 0000000..f2c14e6
 +
 +/* Increment 2a: drive the TPG->CSID RDI0 path far enough to observe frame
 + * events at the CSID, without VFE yet (VFE DMA is increment 2b). Spec:
-+ * CAMERA_L2_TPG_IMPL_2026-11-12.md 鎼? (TPG v2.4.0), 鎼? (CSID 1080 reset/RX/RDI),
-+ * 鎼?.2 (tpg2 @0x93ff000 <-> MUX_SEL=3 <-> RX_CFG0=0x38000003). Offsets/values
++ * CAMERA_L2_TPG_IMPL_2026-11-12.md 閹? (TPG v2.4.0), 閹? (CSID 1080 reset/RX/RDI),
++ * 閹?.2 (tpg2 @0x93ff000 <-> MUX_SEL=3 <-> RX_CFG0=0x38000003). Offsets/values
 + * are factual register data; the sequence is rewritten in C. 640x480 RAW10,
 + * 4 lane. Every block is marked+synced so a bus hang on any MMIO write is
 + * pinpointed on disk. Caller gates on confirmed TPG/CSID HW versions. */
@@ -3939,7 +3939,7 @@ index 0000000..f2c14e6
 +		(void)pandora_log_sync();
 +	}
 +
-+	/* ---- P2: CSID reset (鎼?.1), bounded poll of INFO_RST_DONE ---- */
++	/* ---- P2: CSID reset (閹?.1), bounded poll of INFO_RST_DONE ---- */
 +	pc_tpg_mark("P2: CSID reset begin");
 +	pc_wr(csid0, 0x188, 0x9u);        /* TOP_IRQ_CLEAR: RST_DONE|BUF_DONE */
 +	pc_wr(csid0, 0x184, 0x9u);        /* TOP_IRQ_MASK */
@@ -3962,7 +3962,7 @@ index 0000000..f2c14e6
 +		return;
 +	}
 +
-+	/* ---- P3: TPG v2.4.0 config (鎼?), 640x480 RAW10 / 4 lane ---- */
++	/* ---- P3: TPG v2.4.0 config (閹?), 640x480 RAW10 / 4 lane ---- */
 +	pc_tpg_mark("P3: TPG config begin");
 +	pc_wr(tpg2, 0x1f4, 0x1u);         /* CTRL_CMD: HW_RESET (v2.4.0 reset) */
 +	pc_sleep(1);
@@ -3986,7 +3986,7 @@ index 0000000..f2c14e6
 +	    pc_rd(tpg2, 0x70), pc_rd(tpg2, 0x74), pc_rd(tpg2, 0x78), pc_rd(tpg2, 0x4));
 +	(void)pandora_log_sync();
 +
-+	/* ---- P4: CSID RX mux + RDI0 (鎼?.2/鎼?.3), adaptive RDI page ---- */
++	/* ---- P4: CSID RX mux + RDI0 (閹?.2/閹?.3), adaptive RDI page ---- */
 +	pc_tpg_mark("P4: CSID RX/RDI begin");
 +	pc_wr(csid0, 0x880, 0x38032103u); /* RX_CFG0: tpg2 mux_en+sel=3, lane_assign=0x3210<<4, 4 lane */
 +	pc_wr(csid0, 0x884, 0x1u);        /* RX_CFG1: ECC_CORRECTION_EN */
@@ -4031,7 +4031,7 @@ index 0000000..f2c14e6
 +	    pc_rd(csid0, rdi_base), pc_rd(csid0, rdi_base + 0x8), pc_rd(csid0, 0x880), pc_rd(csid0, 0x1b0));
 +	(void)pandora_log_sync();
 +
-+	/* ---- P5: VFE0 write-master wm=0x17 (鎼?), DMA dest = SMMU IOVA ----
++	/* ---- P5: VFE0 write-master wm=0x17 (閹?), DMA dest = SMMU IOVA ----
 +	 * The CSID RDI buffer address is supplied by the VFE WM (2a had no
 +	 * destination, so no buf_done). BUS=0x1000, wm=0x17 -> 0x2Cxx. */
 +	pc_tpg_mark("P5: VFE0 WM config begin");
@@ -4050,7 +4050,7 @@ index 0000000..f2c14e6
 +	pc_wr(vfe0, 0x2c04, (uint32_t)(PC_CAM_IOVA >> 8)); /* IMAGE_ADDR = iova>>8 */
 +	pc_tpg_mark("P5: about to enable VFE WM (WM_CFG)");
 +	pc_wr(vfe0, 0x2c00, 0x10001u);     /* WM_CFG: EN bit0 | MODE bit16 */
-+	/* VFE reg_update forwards to CSID RUP (鎼?.2): commit the address. */
++	/* VFE reg_update forwards to CSID RUP (閹?.2): commit the address. */
 +	pc_wr(csid0, 0x114, 0x100u);       /* CSID_RUP_CMD: RDI0 */
 +	pc_wr(csid0, 0x11c, 0x1u);         /* CSID_RUP_AUP_CMD: RUP_SET */
 +	pc_sleep(2);
@@ -4168,7 +4168,7 @@ index 0000000..f2c14e6
 + * =1 keeps slice A byte-for-byte unchanged, so the single-variable A/B stays
 + * intact and a negative result is attributable to B1 alone.
 + *
-+ * Facts (CAMERA_L2_TPG_IMPL 鎼?.2/鎼?.3 + mainline camss-csid.c):
++ * Facts (CAMERA_L2_TPG_IMPL 閹?.2/閹?.3 + mainline camss-csid.c):
 + *   RX_CFG0 real mux = PHY_NUM_SEL BIT(20) | lane_assign 0x3210 << 4 |
 + *   (lane_cnt-1)=3 -> 0x00132103. No TPG_MUX_EN BIT(27) / TPG_MUX_SEL.
 + *   RDI_CFG0 is resolution independent: 0x002BF160, enabled by readback |
@@ -4732,7 +4732,7 @@ index 0000000..f2c14e6
 + * first stream-on entry is at index 9720 and thousands of entries follow it,
 + * so a full replay ends in whatever state the last entries leave. This replays
 + * only the configuration up to (but not including) the first 0x0100=1, then
-+ * arms CSID, then streams 閳?the "source last" order 閳?and polls for SOF/EOF. */
++ * arms CSID, then streams 闁?the "source last" order 闁?and polls for SOF/EOF. */
 +static unsigned
 +pc_sliceb_replay_cfg(const char *name)
 +{
@@ -5066,7 +5066,7 @@ index 0000000..f2c14e6
 +		for (unsigned i = 0; i < PC_CSIPHY_LANE_REGS_N; i++) {
 +			const struct pc_csiphy_lane_reg *r =
 +			    &pc_csiphy_lane_regs_x1e80100[i];
-+			if (r->type == 2)
++			if (r->type == 2 || r->addr >= 0x1000u)
 +				continue;
 +			uint32_t val = (r->type == 1) ? (settle & 0xffu) : r->val;
 +			pc_wr(phy4, pc_lane_off[l] + r->addr, val);
@@ -5074,6 +5074,14 @@ index 0000000..f2c14e6
 +				delay(r->delay_us);
 +		}
 +	}
++	pc_wr(phy4, PC_CPHY_CTRL(5), 0xD5u);
++	pc_wr(phy4, PC_CPHY_CTRL(6), 1u);
++	pc_wr(phy4, PC_CPHY_CTRL(7), 0x7Au);
++	printf("PANDORA SLICEB: p4test after lanes CTRL5=%#x CTRL6=%#x CTRL7=%#x"
++	    " ln0_14=%#x ln0_1c=%#x\n", pc_rd(phy4, PC_CPHY_CTRL(5)),
++	    pc_rd(phy4, PC_CPHY_CTRL(6)), pc_rd(phy4, PC_CPHY_CTRL(7)),
++	    pc_rd(phy4, 0x0014u), pc_rd(phy4, 0x001Cu));
++
 +	/* vendor cam_csiphy_2_4_0_hwreg.h csiphy_2ph_v2_4_0_clk_ln_reg[] */
 +	pc_wr(phy4, 0x0E00u + 0x0028u, 0x00u);
 +	pc_wr(phy4, 0x0E00u + 0x0000u, 0x80u);
@@ -5683,7 +5691,7 @@ index 0000000..f2c14e6
 +		pll_ok++;
 +	(void)pandora_log_sync();
 +
-+	/* S6: RCG rates before enabling the branches (鎼?2 discipline). */
++	/* S6: RCG rates before enabling the branches (閹?2 discipline). */
 +	for (unsigned i = 0; i < PC_TPG_NRCG; i++) {
 +		pc_tpg_mark(pc_tpg_rcgs[i].name);
 +		if (pc_tpg_rcg_set(&pc_tpg_rcgs[i]) == 0)
