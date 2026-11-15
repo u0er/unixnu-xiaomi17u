@@ -514,3 +514,19 @@ synchronization points. Read it before acting; update your row after acting.
 - Follow-up (same session): MobileSafari crashed 4x (3x sig10 stack-guard class at 36-48 s, 1x sig9 at
   72 s) — investigating crash cause next; same stack-exhaustion family as the known PosterBoard item.
 - Device remains released (Android). CI idle.
+
+## ZCode GPU agent: metal cold-start stack-overflow fix building (2026-11-15 ~03:50Z)
+- Root cause closed for the crash family (Safari 3x / PosterBoard / MapKit 2x in one session, identical
+  9-frame plugin bt under _MTLRegisterDevices): a client's first Metal device discovery runs on a default
+  512 KiB pthread and the open's own chain (Vulkan init + warm + compiles) recurses ~358 KiB deeper
+  through frameless functions - guard-page SIGBUS. The runtime guards compile calls only
+  (compiles.rs compiles_here >= 2 MiB), not the open itself. Stack math from three crashes: ~169 KiB
+  registration chain + ~358 KiB frameless recursion = 527 KiB > 512 KiB, all consistent.
+- Fix pushed to fork branch metal2vulkan-555b13d5 (e68dc7e087): adapt_ios16.py edit 8, openOnBigStack()
+  runs native_bridge_metal_open on an 8 MiB pthread (the plugin's own primer pattern) and waits; all
+  three open call sites (clientDevice x2, deviceForPort render-server) replaced. Dry-run verified on a
+  pristine 73d582fd4 tree: 24 edits clean, braces balanced.
+- turnip CI run 43673871806 dispatched on the branch (group-isolated; nothing cancelled). Device NOT
+  held; a verification boot (new bundle + verified kernel 3898fdaf, single variable = metal) will ask
+  for consent when the bundle lands.
+- Not fixed by this (separate families): FitnessWidget sig9 (jetsam ns1 code7, memory), driverkitd sig9.
