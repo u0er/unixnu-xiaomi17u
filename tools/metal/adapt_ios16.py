@@ -525,6 +525,7 @@ edit('NativeAdrenoMetalPlugin.mm',
 """)
 
 # Stage-2 v1 (2026-11-15): the IOSurface dirty-page log, edits 25-30.
+# Edit 31 (2026-11-15): the DP telemetry row - the log's counters ride the existing 30 s table.
 # 1. The trait and its stamp, for the log the surface import attaches.
 edit('bridge/NativeMetalObjects.rs',
      "    ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,",
@@ -836,3 +837,20 @@ bool nmb_device_dirty_counts(const NmbDevice *, uint64_t out[12]);""")
 edit('NativeBridgeMetalFrontend.mm',
      " NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));",
      " NmbBuffer *handle=nmb_buffer_new_no_copy_surface_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface),(const void *)surface);")
+edit('NativeBridgeMetalFrontend.mm',
+     """  uint64_t tc[8]={};
+  if(nmb_device_texture_counts(gDevice,tc))
+   row("L inp %llu/%llu rf %llu/%llu sh %llu cp %llu bk %llu rt %llu",(ull)tc[0],(ull)tc[1],(ull)tc[2],
+    (ull)tc[3],(ull)tc[4],(ull)tc[5],(ull)tc[6],(ull)tc[7]);""",
+     """  uint64_t tc[8]={};
+  if(nmb_device_texture_counts(gDevice,tc))
+   row("L inp %llu/%llu rf %llu/%llu sh %llu cp %llu bk %llu rt %llu",(ull)tc[0],(ull)tc[1],(ull)tc[2],
+    (ull)tc[3],(ull)tc[4],(ull)tc[5],(ull)tc[6],(ull)tc[7]);
+  // data-a-live: the IOSurface dirty-page log's answers (nmb_device_dirty_counts): copy-in bytes the
+  // log skipped vs copied, dirty-gated copies and whole answers, stamps and waits; the bridge's own
+  // logs, whole-range answers, records and consolidations.
+  uint64_t dp[12]={};
+  if(nmb_device_dirty_counts(gDevice,dp))
+   row("DP cb %llu skip %llu gated %llu whole %llu dbc %llu stamps %llu waits %llu/%llu | logs %llu wr %llu rec %llu cons %llu",
+    (ull)dp[0],(ull)dp[1],(ull)dp[2],(ull)dp[3],(ull)dp[4],(ull)dp[5],(ull)dp[6],(ull)dp[7],
+    (ull)dp[8],(ull)dp[9],(ull)dp[10],(ull)dp[11]);""")
