@@ -163,7 +163,7 @@ def main():
     parser.add_argument('--build-root', type=Path, required=True)
     parser.add_argument('--llvm', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--level', type=int, choices=range(1, 13), default=2)
+    parser.add_argument('--level', type=int, choices=range(1, 14), default=2)
     parser.add_argument('--ci-run', help='optional full-kernel CI run number')
     parser.add_argument('--fw-extents', type=Path,
                         help='optional current pinned firmware map; updates ADT only, never the container')

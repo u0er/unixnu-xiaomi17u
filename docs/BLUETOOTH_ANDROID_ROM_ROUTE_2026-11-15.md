@@ -1,14 +1,9 @@
 # 蓝牙：Android 现有 UART trace 揭示的 ROM 路线（2026-11-15）
 
-> **下一项已准备：[level12 BT_EN数字采样](BLUETOOTH_LEVEL12_PLAN_2026-11-15.md)。采用匹配level11对象的本地增量链接，尚未实机；此前level11仍无回应。**
+> **已完成[Pad6S Pro上游复用审计](BLUETOOTH_SHENG_UPSTREAM_REUSE_2026-11-15.md)：确认可适配GENI/时钟/原生传输，不能照搬WCN7850固件启动。当前level13未启动。**
 
-> **最新：[level11结果](BLUETOOTH_LEVEL11_RESULT_2026-11-15.md)。S8F1876请求均成功，仍无FC/RX；设备已返回并释放，下一项独立观测是BT_EN数字采样。**
-
-> **最新：[level10实机结果](BLUETOOTH_LEVEL10_RESULT_2026-11-15.md)。RFR_OPEN命令读回成功但仍无RX，[level11](BLUETOOTH_LEVEL11_RESULT_2026-11-15.md)已验证S8F请求1876mV，返回均成功但仍无回应。**
-
-> **最新实机：[level 9 结果](BLUETOOTH_LEVEL9_RESULT_2026-11-15.md)。RX bit1 已清零并读回0，三次 FD 仍无回应，90.221秒自动返回。[level10 RFR_OPEN试验](BLUETOOTH_LEVEL10_RESULT_2026-11-15.md)已完成，结果仍无回应。**
-
-> **最新实机：[level 8 结果与后续软件判据](BLUETOOTH_LEVEL8_RESULT_2026-11-15.md)。三次 FD 无 FC，未发送版本请求；90.221 秒自动返回。以下实现/就绪部分为试验前记录。**
+> **当前：蓝牙仍无回应；[level12实机](BLUETOOTH_LEVEL12_RESULT_2026-11-15.md)已验证BT_EN低0/高1及配置恢复。**
+> **新发现：[SM8850时钟审计](BLUETOOTH_SM8850_CLOCK_AUDIT_2026-11-15.md)确认旧RCG编码/频率解码错误，撤回64MHz已验证的说法。[level13](BLUETOOTH_LEVEL13_PLAN_2026-11-15.md)已修正并准备验证，尚未实机。下文各候选阶段记录按其发生时间理解。**
 
 ## 当前结论
 

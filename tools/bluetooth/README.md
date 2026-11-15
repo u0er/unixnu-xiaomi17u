@@ -135,3 +135,15 @@ CI's chained fixups. Validate entry/segments, unresolved symbols, relocation
 format and packed image; report that linker change alongside the driver change.
 This path has passed host linking/packing for level12 but has not yet booted.
 Never label it a new successful CI build or a device-accepted kernel.
+
+
+`--level 13` replaces the known-invalid legacy RCG encoding/decoder with the
+SM8850 gcc-canoe/clk-rcg2 representation, using7.3728MHz and divider4 for115200,
+consistent with the phone's Android trace. It first logs CMD_DFSR: if DFS is
+active, it dumps8 performance entries and stops without direct clock writes or
+FD. Otherwise it applies the vendor M/N/D complement encoding, mode2, half-HID
+and HW_CLK_CTRL, checks update completion/readback, and decodes nominal rate.
+No PLL writes. Parent rates remain nominal, not measured. BT_EN samples and
+level11 power requests are retained. See the SM8850 clock audit and level13 plan.
+The local build route actually booted in level12; level13 itself is not yet
+booted. Historical level2..12 clock estimates are explicitly unverified.

@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..008e6a1
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,1450 @@
+@@ -0,0 +1,1551 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -54,6 +54,10 @@ index 0000000..008e6a1
 + * settled reset phases. It temporarily enables normal input+output mode,
 + * restores the saved configuration on every modified path, and requires
 + * three matching RT_STS samples plus a verified restore before proceeding.
++ * Level 13 replaces the invalid legacy RCG encoding with the SM8850
++ * clk-rcg2 representation at 7.3728 MHz, giving UART divider4 at115200.
++ * It first reports DFS state and stops if firmware owns DFS; direct RCG
++ * writes are only supported when DFS is disabled. See the SM8850 audit.
 + *
 + * Register map: Linux drivers/soc/qcom/qcom-geni-se.c, drivers/tty/serial/
 + * msm_geni_serial.c and u-boot's drivers/serial/serial_msm_geni.c (GPL-2.0+,
@@ -104,6 +108,10 @@ index 0000000..008e6a1
 +#define BT_RCG_M         0x08u
 +#define BT_RCG_N         0x0cu
 +#define BT_RCG_D         0x10u
++#define BT_RCG_DFS       0x14u         /* CMD_DFSR: bit0 firmware DFS enabled, bits4:1 level */
++#define BT_RCG_MND_MASK  0xffffu       /* gcc-canoe: mnd_width=16 */
++#define BT_RCG_DUAL_EDGE (2u << 12)
++#define BT_RCG_HW_CTRL   (1u << 20)    /* HW_CLK_CTRL; not a parked-state bit */
 +#define BT_CBCR_OFF      (1u << 31)
 +
 +/* GENI serial engine (0x01994000). Offsets shared with the SPI/I2C protocol
@@ -192,6 +200,7 @@ index 0000000..008e6a1
 +
 +static int bt_level, bt_wait;
 +static unsigned bt_rate;
++static int bt_uart_stop(void);
 +
 +static uint32_t
 +bt_rd(unsigned w, uint32_t off)
@@ -280,13 +289,38 @@ index 0000000..008e6a1
 +	unsigned pre = (cfg & 0x1fu) + 1u;
 +	unsigned src = (cfg >> 8) & 7u, mode = (cfg >> 12) & 3u;
 +	uint64_t rate = 0;
++	if (bt_level >= 13) {
++		/* clk-rcg2.c calc_rate: HID is a half divider; only mode2
++		 * applies M/N, whose N register stores ~(N-M). Parent rates
++		 * here are the nominal fixed GPLL0/TCXO rates of gcc-canoe. */
++		uint32_t dfs = bt_rd(BT_W_RCG, BT_RCG + BT_RCG_DFS);
++		unsigned hid = cfg & 0x1fu;
++		m &= BT_RCG_MND_MASK;
++		n = ((~n) & BT_RCG_MND_MASK) + m;
++		rate = src == 6 ? 300000000ull : src == 1 ? 600000000ull :
++		    src == 0 ? 19200000ull : 0;
++		if (hid) {
++			rate = rate * 2 / (hid + 1u);
++		}
++		if (mode == 2 && m && n >= m) {
++			rate = rate * m / n;
++		} else if (mode != 0) {
++			rate = 0;
++		}
++		if (dfs & 1u) {
++			rate = 0; /* selected DFS table, not CFG/M/N, would own rate */
++		}
++		printf("PANDORA BT: SM8850 RCG cfg %#x M %u decoded N %u mode %u HID %u DFS %#x nominal %llu Hz (not a frequency measurement)\n",
++		    cfg, m, n, mode, hid, dfs, rate);
++		return (unsigned)rate;
++	}
 +
 +	if (mode == 0 && n && m) {
 +		rate = 300000000ull * m / n / pre;
 +	} else if (mode == 0 && m == 0) {
 +		rate = 19200000ull / pre;
 +	}
-+	printf("PANDORA BT: SE5 RCG cfg %#x m %u n %u d %u (src %u mode %u pre %u) -> %llu Hz\n",
++	printf("PANDORA BT: legacy unverified RCG estimate cfg %#x m %u n %u d %u (src %u mode %u pre %u) -> %llu Hz\n",
 +	    cfg, m, n, d, src, mode, pre, rate);
 +	pandora_log_sync();
 +	return (unsigned)rate;
@@ -391,17 +425,14 @@ index 0000000..008e6a1
 +	return 0;
 +}
 +
-+/* ftbl_gcc_qupv3_wrap3_s5_clk_src[] in clk_gcc-kaanapali.c:
-+ * F(64000000, P_GCC_GPLL0_OUT_EVEN, 1, 16, 75) = 300 MHz * 16 / 75, src index 6
-+ * (gcc_parent_map_0), MN mode (0) and pre-divider 1. iBoot leaves the RCG parked
-+ * on the TCXO with the branch gated; Android programs this entry before it opens
-+ * the UART. */
++/* Historical level2..12 direct writes, retained only for comparison against
++ * their archived images. This is NOT clk-rcg2 fractional encoding: N/D need
++ * complement encoding, mode2 enables M/N, and bit20 is HW_CLK_CTRL. The
++ * SM8850 path in bt_clocks() replaces it for level13 onward. */
 +static void
 +bt_rcg_set(unsigned m, unsigned n)
 +{
-+	/* Read-modify-write the same way pandora_amp.c does: 0x371f covers
-+	 * src/mode/pre-divider, bit 20 is the parked-state bit iBoot leaves
-+	 * set. Source 6, MN mode, pre-divider 1 (encoded 0). */
++	/* Legacy behavior, intentionally not used by the SM8850 clock path. */
 +	uint32_t cfg = bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CFG);
 +	cfg &= ~(0x371fu | (1u << 20));
 +	cfg |= 6u << 8;
@@ -825,7 +856,7 @@ index 0000000..008e6a1
 +		return err;
 +	}
 +	bt_sleep(100 * 1000);
-+	if (bt_level == 12 && (err = bt_en_sample(0)) != 0) {
++	if (bt_level >= 12 && (err = bt_en_sample(0)) != 0) {
 +		return err;
 +	}
 +	err = bt_spmi_gpio(bus0, bus1, BT_SPMI_GPIO_PPID, 0x01, 1, "BT_EN high");
@@ -833,7 +864,7 @@ index 0000000..008e6a1
 +		return err;
 +	}
 +	bt_sleep(150 * 1000);	/* Linux qca_power_on: 150 ms after BT_EN */
-+	if (bt_level == 12 && (err = bt_en_sample(1)) != 0) {
++	if (bt_level >= 12 && (err = bt_en_sample(1)) != 0) {
 +		return err;
 +	}
 +	/* There is no qcom,btwake_gpio binding on this board. In particular,
@@ -848,6 +879,76 @@ index 0000000..008e6a1
 +	uint32_t vote = bt_rd(BT_W_VOTE, BT_VOTE);
 +	if ((vote & BT_VOTE_BITS) != BT_VOTE_BITS) {
 +		bt_wr(BT_W_VOTE, BT_VOTE, vote | BT_VOTE_BITS);
++	}
++	if (bt_level >= 13) {
++		/* Match the vendor's path before touching M/N/D. With DFS
++		 * active, CMD/CFG is not the selected serial clock; do not
++		 * silently overwrite firmware tables or report a made-up rate. */
++		uint32_t dfs = bt_rd(BT_W_RCG, BT_RCG + BT_RCG_DFS);
++		printf("PANDORA BT: SM8850 pre-config CMD %#x CFG %#x M %#x N %#x D %#x DFS %#x\n",
++		    bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CMD), bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CFG),
++		    bt_rd(BT_W_RCG, BT_RCG + BT_RCG_M), bt_rd(BT_W_RCG, BT_RCG + BT_RCG_N),
++		    bt_rd(BT_W_RCG, BT_RCG + BT_RCG_D), dfs);
++		if (dfs & 1u) {
++			for (unsigned i = 0; i < 8; i++) {
++				printf("PANDORA BT: DFS level%u CFG %#x M %#x N %#x\n", i,
++				    bt_rd(BT_W_RCG, BT_RCG + 0x1cu + 4u * i),
++				    bt_rd(BT_W_RCG, BT_RCG + 0x5cu + 4u * i),
++				    bt_rd(BT_W_RCG, BT_RCG + 0x9cu + 4u * i));
++			}
++			printf("PANDORA BT: DFS active; direct RCG path unsupported, no UART or FD\n");
++			return ENOTSUP;
++		}
++		bt_wr(BT_W_RCG, BT_SE5_HALT, bt_rd(BT_W_RCG, BT_SE5_HALT) | 1u);
++		if (bt_wait_on(BT_W_HALT, BT_HALT_M_AHB, "m_ahb") ||
++		    bt_wait_on(BT_W_HALT, BT_HALT_S_AHB, "s_ahb") ||
++		    bt_wait_on(BT_W_HALT, BT_HALT_CORE, "core") ||
++		    bt_wait_on(BT_W_HALT, BT_HALT_CORE2X, "core_2x") ||
++		    bt_wait_on(BT_W_RCG, BT_SE5_HALT, "se5")) {
++			return ETIMEDOUT;
++		}
++		int err = bt_uart_stop();
++		if (err) {
++			return err;
++		}
++		/* Vendor F(7372800, GPLL0_EVEN,1,384,15625):
++		 * M=384, N=~(15625-384), D=~15625; HID=1, mode2.
++		 * Do not write any PLL register. Preserve unrelated RCG bits. */
++		const uint32_t m = 384, n = 15625;
++		const uint32_t nm = (~(n - m)) & BT_RCG_MND_MASK;
++		const uint32_t nd = (~n) & BT_RCG_MND_MASK;
++		bt_wr(BT_W_RCG, BT_RCG + BT_RCG_M,
++		    (bt_rd(BT_W_RCG, BT_RCG + BT_RCG_M) & ~BT_RCG_MND_MASK) | m);
++		bt_wr(BT_W_RCG, BT_RCG + BT_RCG_N,
++		    (bt_rd(BT_W_RCG, BT_RCG + BT_RCG_N) & ~BT_RCG_MND_MASK) | nm);
++		bt_wr(BT_W_RCG, BT_RCG + BT_RCG_D,
++		    (bt_rd(BT_W_RCG, BT_RCG + BT_RCG_D) & ~BT_RCG_MND_MASK) | nd);
++		uint32_t cfg = bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CFG);
++		const uint32_t mask = 0x371fu | BT_RCG_HW_CTRL;
++		cfg = (cfg & ~mask) | (6u << 8) | BT_RCG_DUAL_EDGE | BT_RCG_HW_CTRL | 1u;
++		bt_wr(BT_W_RCG, BT_RCG + BT_RCG_CFG, cfg);
++		bt_wr(BT_W_RCG, BT_RCG + BT_RCG_CMD,
++		    bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CMD) | 1u);
++		unsigned waited;
++		for (waited = 0; waited < 5000; waited++) {
++			if (!(bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CMD) & 1u)) {
++				break;
++			}
++			delay(1);
++		}
++		if (waited == 5000 || (bt_rd(BT_W_RCG, BT_RCG + BT_RCG_CFG) & mask) != (cfg & mask) ||
++		    (bt_rd(BT_W_RCG, BT_RCG + BT_RCG_M) & BT_RCG_MND_MASK) != m ||
++		    (bt_rd(BT_W_RCG, BT_RCG + BT_RCG_N) & BT_RCG_MND_MASK) != nm ||
++		    (bt_rd(BT_W_RCG, BT_RCG + BT_RCG_D) & BT_RCG_MND_MASK) != nd) {
++			printf("PANDORA BT: SM8850 RCG update/readback failed; no UART\n");
++			return EIO;
++		}
++		bt_rate = bt_rcg_rate();
++		if (bt_rate != 7372800u) {
++			printf("PANDORA BT: SM8850 nominal rate unexpected %u; no UART\n", bt_rate);
++			return EIO;
++		}
++		return 0;
 +	}
 +	/* level 5 takes over a chip that Android already trained to 4 Mbps:
 +	 * 128 MHz RCG (M 32 / N 75) gives divider 1. Everything else stays at
@@ -922,7 +1023,7 @@ index 0000000..008e6a1
 +		printf("PANDORA BT: UART divider %u out of range\n", div);
 +		return EINVAL;
 +	}
-+	printf("PANDORA BT: QUP version %#x sampling %u; UART %u baud from %u Hz: divider %u (actual %u)\n",
++	printf("PANDORA BT: QUP version %#x sampling %u; UART %u baud from %u Hz: divider %u (computed %u, not wire-measured)\n",
 +	    ver, sampling, baud, bt_rate, div, bt_rate / (div * sampling));
 +	/* The receiver is a persistent secondary command. Stop inherited or
 +	 * previous-attempt commands before changing their clock and format. */
@@ -1457,8 +1558,8 @@ index 0000000..008e6a1
 +	if (!bt_level) {
 +		return;
 +	}
-+	if (bt_level < 1 || bt_level > 12) {
-+		printf("PANDORA BT: unsupported pandora_bt=%d (expected 1..12)\n", bt_level);
++	if (bt_level < 1 || bt_level > 13) {
++		printf("PANDORA BT: unsupported pandora_bt=%d (expected 1..13)\n", bt_level);
 +		return;
 +	}
 +	thread_t thread;

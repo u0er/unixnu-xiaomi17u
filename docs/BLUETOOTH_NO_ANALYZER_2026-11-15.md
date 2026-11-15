@@ -1,19 +1,9 @@
 # 蓝牙：无需逻辑分析仪的软件排查路线（2026-11-15）
 
-> **下一项已准备：[level12 BT_EN数字采样](BLUETOOTH_LEVEL12_PLAN_2026-11-15.md)。采用匹配level11对象的本地增量链接，尚未实机；此前level11仍无回应。**
+> **已完成[Pad6S Pro上游复用审计](BLUETOOTH_SHENG_UPSTREAM_REUSE_2026-11-15.md)：确认可适配GENI/时钟/原生传输，不能照搬WCN7850固件启动。当前level13未启动。**
 
-> **最新：[level11实机结果](BLUETOOTH_LEVEL11_RESULT_2026-11-15.md)。S8F1876请求均成功，但FD仍无回应；下一项为BT_EN数字采样，尚未实现。**
-
-> **最新：[level10已实机](BLUETOOTH_LEVEL10_RESULT_2026-11-15.md)，RFR_OPEN读回成功但FD仍无回应；[level11 S8F试验](BLUETOOTH_LEVEL11_RESULT_2026-11-15.md)已实机，请求成功仍无回应。**
-
-> **最新实机：[level 9 结果](BLUETOOTH_LEVEL9_RESULT_2026-11-15.md)。RX bit1 已清零并读回0，三次 FD 仍无回应，90.221秒自动返回。下一项独立软件判据为 RFR_OPEN，尚未实现新候选。**
-
-> **最新：[level 8 已完成实机](BLUETOOTH_LEVEL8_RESULT_2026-11-15.md)：三次 FD 无 FC，
-> 版本请求未发送，90.221 秒自动返回。已保留 BT_EN pad 采样和 UART 参数差异的软件排查路线。
-> level 7 实机内部回环 PASS；随后读出 Android 已有 hsuart trace，
-> 确认实际是 FD/FC 唤醒和 PERI 初始化，且有 Ganges 家族响应。
-> 当前下一步以 [Android ROM 路线报告](BLUETOOTH_ANDROID_ROM_ROUTE_2026-11-15.md) 为准，
-> 不要仅凭 Hamilton 文件存在继续套用普通 H4 / WCN7850 初始化。**
+> **当前：蓝牙仍无回应；[level12实机](BLUETOOTH_LEVEL12_RESULT_2026-11-15.md)已验证BT_EN低0/高1及配置恢复。**
+> **新发现：[SM8850时钟审计](BLUETOOTH_SM8850_CLOCK_AUDIT_2026-11-15.md)确认旧RCG编码/频率解码错误，撤回64MHz已验证的说法。[level13](BLUETOOTH_LEVEL13_PLAN_2026-11-15.md)已修正并准备验证，尚未实机。下文各候选阶段记录按其发生时间理解。**
 
 ## 结论与验证边界
 
@@ -25,7 +15,8 @@
 | 仅清RX_TRANS_CFG bit1即可唤醒 | level9读回0，三次FD仍无RX | 本次冷启动对照为阴性，勿重复作为未测假设 |
 | 缺少RFR_OPEN影响接收ready | 本机Android RX命令带bit7，XNU此前未带 | [level10实机](BLUETOOTH_LEVEL10_RESULT_2026-11-15.md)命令读回成功但FD仍无回应；结论限于现有S8F1800mV请求条件 |
 | S8F请求未达到BT consumer范围 | BT请求1800mV，live DT下限1876mV，Wi-Fi请求1876mV | [电源范围审计](BLUETOOTH_POWER_RANGE_AUDIT_2026-11-15.md)确认源码/DT差异；level11请求均成功仍无RX；未测实际电压 |
-| BT_EN配置正确但pad未按预期变化 | LV/MV MODE/SOURCE已读回；输入采样尚未做 | 独立MODE2/RT_STS实验，必须保存与恢复，不把锁存读回当采样 |
+| BT_EN配置正确但pad未按预期变化 | level12 low三次0/high三次1，恢复成功 | PMIC数字采样通过；不等于模拟电气测量 |
+| UART时钟编码/解码错误 | 同SoC clk-rcg2规则与旧CFG/M/N/D及算法不符，DFS未检查 | level13修正普通RCG路径；DFS开启则先读表停止 |
 
 有可继续执行的软件路线。旧交接的“软件全部对齐、两个独立信号为零，所以只能接逻辑分析仪”不成立；源码、原始 w67 日志和当前 Android DT 已足以指出多处具体错误。
 

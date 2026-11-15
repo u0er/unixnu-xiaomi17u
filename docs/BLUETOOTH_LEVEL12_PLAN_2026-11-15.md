@@ -1,5 +1,7 @@
 # Level12：直接观测BT_EN数字状态，采用本地增量构建
 
+> **已完成：[level12结果](BLUETOOTH_LEVEL12_RESULT_2026-11-15.md)。BT_EN数字低/高及恢复通过，仍无RX；本地增量内核实际启动。时钟缺陷另见SM8850审计。**
+
 ## 为什么改变排查方式
 
 level8..11都在FD阶段没有收到任何字节；RX bit1、RFR_OPEN和S8F请求的修正

@@ -1,14 +1,7 @@
 # Bluetooth 攻坚 Handoff（2026-11-15 06:30）
 
-> **下一项已准备：[level12 BT_EN数字采样](BLUETOOTH_LEVEL12_PLAN_2026-11-15.md)。采用匹配level11对象的本地增量链接，尚未实机；此前level11仍无回应。**
-
-> **最新：[level11结果](BLUETOOTH_LEVEL11_RESULT_2026-11-15.md)。S8F1876电压/使能请求均成功仍无回应；不能排除实际供电/外部信号问题。下一项为BT_EN数字采样，未实现。**
-
-> **最新：[level10结果](BLUETOOTH_LEVEL10_RESULT_2026-11-15.md)。RX命令0x08000080读回成功，FD仍无回应，设备已自动返回并释放；下一独立变量为S8F请求1876mV。**
-
-> **电源后续更正：[S8F范围复核](BLUETOOTH_POWER_RANGE_AUDIT_2026-11-15.md)。旧表1800mV低于live DT蓝牙consumer下限1876mV，不能再称电源全部对齐；尚未验证实机影响。**
-
-> **最新：[level 9 实机结果](BLUETOOTH_LEVEL9_RESULT_2026-11-15.md)。RX 配置读回0，FD仍无回应；设备已自动返回并释放。**
+> **当前：蓝牙仍无回应；[level12实机](BLUETOOTH_LEVEL12_RESULT_2026-11-15.md)已验证BT_EN低0/高1及配置恢复。**
+> **新发现：[SM8850时钟审计](BLUETOOTH_SM8850_CLOCK_AUDIT_2026-11-15.md)确认旧RCG编码/频率解码错误，撤回64MHz已验证的说法。[level13](BLUETOOTH_LEVEL13_PLAN_2026-11-15.md)已修正并准备验证，尚未实机。下文各候选阶段记录按其发生时间理解。**
 
 > **2026-11-15 后续审计更正：此页下文保留为历史记录。当前结论和候选修改见
 > [无需逻辑分析仪的软件排查路线](BLUETOOTH_NO_ANALYZER_2026-11-15.md)。**
