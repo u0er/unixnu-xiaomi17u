@@ -1,5 +1,7 @@
 # 蓝牙：无需逻辑分析仪的软件排查路线（2026-11-15）
 
+> **下一候选：[level 9 RX bit1 对照](BLUETOOTH_LEVEL9_PLAN_2026-11-15.md) 完整构建和主机镜像检查已通过，尚未启动。**
+
 > **最新：[level 8 已完成实机](BLUETOOTH_LEVEL8_RESULT_2026-11-15.md)：三次 FD 无 FC，
 > 版本请求未发送，90.221 秒自动返回。已保留 BT_EN pad 采样和 UART 参数差异的软件排查路线。
 > level 7 实机内部回环 PASS；随后读出 Android 已有 hsuart trace，

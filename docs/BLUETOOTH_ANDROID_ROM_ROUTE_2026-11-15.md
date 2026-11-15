@@ -1,5 +1,7 @@
 # 蓝牙：Android 现有 UART trace 揭示的 ROM 路线（2026-11-15）
 
+> **下一候选：[level 9 RX bit1 对照](BLUETOOTH_LEVEL9_PLAN_2026-11-15.md) 完整构建和主机镜像检查已通过，尚未启动。**
+
 > **最新实机：[level 8 结果与后续软件判据](BLUETOOTH_LEVEL8_RESULT_2026-11-15.md)。三次 FD 无 FC，未发送版本请求；90.221 秒自动返回。以下实现/就绪部分为试验前记录。**
 
 ## 当前结论

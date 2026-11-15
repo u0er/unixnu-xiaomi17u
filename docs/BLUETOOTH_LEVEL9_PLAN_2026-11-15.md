@@ -36,3 +36,26 @@ ARM64 单文件编译及 Clang analyzer 已通过，无诊断。
 - 若仍无 RX，下一候选可独立验证本机模块已确认的 RFR_OPEN 参数，或先做 BT_EN pad 数字采样。
 
 后续启动需要新的明确独占窗口。本轮“继续”用于候选实现和主机准备，未执行设备启动。
+
+## 完整候选已就绪
+
+候选分支 `codex/bluetooth-no-analyzer-20261115` 的完整构建编号为
+43663459546 已成功；main 未更新。源码、0476 patch 和主机工具/说明已保存到该候选分支。
+`level9-build-status.json` 记录成功状态；产物中的 level 9 诊断标记已核对。
+
+准备期间只读预检确认 level 8 的 exposed root16GiB、FW64MiB、log64MiB 映射仍匹配
+手机且为 pinned；时间和结果在 `work/bluetooth-source-audit/level9-baseline-preflight.json`。
+这不是对未来启动窗口的预检替代，启动前需重读。
+
+完整内核：`D:/turnip-local/newboot/bt-no-analyzer-20261115/rx-bit1-artifact/kernel.development.pandora`，
+17,738,024 字节。临时镜像：
+`D:/turnip-local/newboot/bt-no-analyzer-20261115/level9/loader/nezha-loader-boot.img`，
+17,285,120 字节。`level9/trial.json` 与 `verification.json` 均记录未启动。
+
+主机结构验证通过：boot v4、payload/ADT 边界，root/FW/log 全部映射、trust cache 和
+内存基线与 level 8 一致，启动参数仅 `pandora_bt=8 -> 9`。保留自动返回90秒。
+没有写容器或操作设备运行状态；临时下载归档、编译对象及 analyzer 输出已删除，检查记录保留。
+
+下一步只需用户明确同意这一次独占窗口：保存现有日志，再临时 boot 上述镜像，
+等待内核90秒自动复位并在 Android 返回后立即取回日志。该启动会覆盖设备 log.img；
+旧 level2/7/8 原始证据已分别保存。仍需在真正启动前重做只读映射/pinned 预检。
