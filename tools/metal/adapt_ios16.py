@@ -44,6 +44,16 @@ What remains is the iOS 16 client path the pinned tree has no equivalent for:
 7. The backboardd telemetry thread (refused surfaces, last problems, every
    30 s for 10 rounds) is kept: native_bridge_metal_telemetry is the pinned
    frontend's own function.
+8. NativeAdrenoMetalPlugin.mm: the open itself (Vulkan instance and device,
+   the warm pass, whatever it compiles then) runs on the registration thread,
+   which for a client's first Metal device is a default 512 KiB pthread. The
+   runtime's own guard (device/compiles.rs compiles_here) only covers calls
+   that may compile, not the open: MobileSafari, PosterBoard and MapKit all
+   died in the stack's guard page under _MTLRegisterDevices (the frameless
+   part of the open's chain consumed ~358 KiB below the last frame pointer,
+   ~90 levels; the plugin's own primer comment says the translator recurses
+   deeply). The open now runs on a pthread with the primer's 8 MiB stack and
+   the discovery thread only waits for the device.
 """
 import pathlib
 import sys
@@ -416,3 +426,93 @@ edit('NativeBridgeMetalFrontend.mm',
      """ NSLog(@"pandora-metal open3 subclass begin");
  Class cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);if(!cls)return nil;""")
 
+# ---- data-a-live: the open on a big stack (the client cold-start stack overflow) --------
+# The 8b1d557 bundle's first device of a cold client process crashed in the stack's guard page
+# under _MTLRegisterDevices (MobileSafari 3x, PosterBoard, MapKit 2x, identical 9-frame plugin
+# backtrace): the discovery thread is a default 512 KiB pthread and the open's own chain
+# recurses deeper through frameless functions (358 KiB below the last frame pointer). The
+# runtime hands compile calls over from small threads (compiles.rs) but nothing guards the
+# open itself. Run it on the primer's 8 MiB stack (PrimeShaders.h precedent) and wait.
+edit('NativeAdrenoMetalPlugin.mm',
+     """    gpu->port = port;
+    return gpu;
+}
+""",
+     """    gpu->port = port;
+    return gpu;
+}
+
+// data-a-live (iOS 16, Adreno 840): the open itself runs the runtime's whole device bring-up inline -
+// Vulkan instance and device, the warm pass, whatever it compiles then - and that chain recurses deeply
+// through frameless functions, below the last frame pointer: on the default 512 KiB pthread that a
+// client's Metal discovery runs on it reached the stack's guard page (MobileSafari, PosterBoard and
+// MapKit all died there under _MTLRegisterDevices, every first device of a cold process). The primer
+// already runs the same translator on an 8 MiB stack; the open runs on one too, and the discovery
+// thread only waits and takes the device back.
+static id openOnBigStack(const char *turnip, const char *cache, uint64_t registryID) {
+    struct Open { const char *turnip; const char *cache; uint64_t registryID; id device; };
+    Open open = {turnip, cache, registryID, nil};
+    pthread_t thread;
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    pthread_attr_setstacksize(&attributes, 8u << 20);
+    const int made = pthread_create(&thread, &attributes, [](void *arg) -> void * {
+        Open *o = static_cast<Open *>(arg);
+        @autoreleasepool {
+            @try { o->device = native_bridge_metal_open(o->turnip, o->cache, o->registryID, nullptr); }
+            @catch (NSException *exception) { o->device = nil; }
+        }
+        return nullptr;
+    }, &open);
+    pthread_attr_destroy(&attributes);
+    if (made != 0) {
+        @autoreleasepool {
+            @try { return native_bridge_metal_open(turnip, cache, registryID, nullptr); }
+            @catch (NSException *exception) { return nil; }
+        }
+    }
+    (void)pthread_join(thread, nullptr);
+    return open.device;
+}
+""")
+
+edit('NativeAdrenoMetalPlugin.mm',
+     """        @try {
+            device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
+            NSLog(@"pandora-metal client3 open returned %@", device ? @"device" : @"nil");
+        } @catch (NSException *exception) {""",
+     """        @try {
+            // data-a-live: on the 8 MiB stack (the 512 KiB discovery thread reached its guard page).
+            device = openOnBigStack(turnip, candidates[i], registryID);
+            NSLog(@"pandora-metal client3 open returned %@", device ? @"device" : @"nil");
+        } @catch (NSException *exception) {""")
+
+edit('NativeAdrenoMetalPlugin.mm',
+     """        @try {
+            device = native_bridge_metal_open(turnip, path, registryID, nullptr);
+        } @catch (NSException *exception) {
+            device = nil;
+            lastError = "exception";
+        }
+""",
+     """        @try {
+            device = openOnBigStack(turnip, path, registryID);
+        } @catch (NSException *exception) {
+            device = nil;
+            lastError = "exception";
+        }
+""")
+
+edit('NativeAdrenoMetalPlugin.mm',
+     """            @try {
+                device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
+            } @catch (NSException *exception) {
+                device = nil;
+            }
+""",
+     """            @try {
+                device = openOnBigStack(turnip, candidates[i], registryID);
+            } @catch (NSException *exception) {
+                device = nil;
+            }
+""")
