@@ -625,3 +625,27 @@ synchronization points. Read it before acting; update your row after acting.
 - Net effect: the kernel resolves catalog tail blocks THROUGH the overflow tree; with the overflow tree now scrambled, the kernel reads catalog nodes 29376/29379 at WRONG blocks (still aborting: 3 data aborts, SpringBoard x5 in the last boot). The host reader (ioslog_fetch) is ALSO broken for catalog assembly right now ('file 4: extents missing at block 57984') because its overflow walk from firstLeaf=9 fails.
 - NEXT AGENT'S FIX (priority): rebuild the overflow tree at the CORRECT 4096 stride - read the ext fork RAW (VH primary extent (2178,1280) covers all 5242880 bytes, no self-overflow needed), inventory real nodes at 4096, assess the mis-stride damage, then rebuild chain + index levels at 4096 addressing with sha guards (ZCode's apply pattern, ns split per tree). Once the kernel can resolve the catalog tail, the already-fixed catalog nodes become reachable and SpringBoard should pass. Full details in Handoff-2026-11-16.md (wo-x root).
 - DEVICE RELEASED (Android). NO BOOT until the overflow tree is rebuilt - every boot in this state churns the damaged trees further.
+
+## Disk agent: overflow-tree surgery v4 APPLIED + reader-verified; boot re-verification pending user consent (2026-11-16)
+- The extents-overflow tree (fileID 3) nodeSize is 4096 (its own header + kernel log blockSize 0x1000);
+  v2/v3 wrote it at the 8192 fiction = 2x offsets. TRUE pre-surgery state exists only in the v1 package
+  (hfs-surgery/ pre-images, manifest sha-validated un-refreshed); hfs-surgery2 pres were refreshed
+  post-write by refresh_preimages and do NOT hold S0.
+- Applied 89 x 4KiB blocks (sha-guarded write with OLD_SHA256 semantics, per-block read-back, then full
+  5 MiB re-read == target): restore real nodes 0..67/68/69/92..141 from v1 pres + v3 ext-34.pre; chain
+  fix 63.flink=60 and 60.blink=63 (S0-zeroed nodes 61/68 are NOT index children - the kernel can no
+  longer reach them; that was the fileID3 node61 abort path); keep leaf-34 byte 429 from v3pre (kernel's
+  last legit extent-length write for fileID 1190867 during the f034db1b boot).
+- Recovered 126 live records v2/v3 had destroyed (leaves 50/60/69; fids 1373248/1373260/1373261/
+  1391686/1393376/... and 322764-family). Catalog tree untouched (v2 fix stands).
+- Reader acceptance: catalog assembles end-to-end (274,202,624 B, walk 376,796 entries, components
+  resolve: NativeAdrenoMetal bundle / NezhaStatusBar / libvulkan_freedreno.dylib / diagnostics /
+  uuidtext). Catalog tail extents (4,57984)+(4,58752) resolve via search path [3->18], 8960 blocks.
+- Boot plan (single variable = disk fix): re-boot the UNCHANGED verified trial-dirtypages-f034db1b
+  image. Pre-checked: device.adt fuxi-root-extents = 454 entries x 24 B (fix in place), payload-embedded
+  ADT identical, staged 6-extent fw container sha == trial firmware-update.img (20194def...), root/fw/log
+  pinning + signatures OK, installed NativeAdrenoMetal = 29,466,704 B sha 7b8e9f3b (f034db1b).
+- Criteria: hfs_swap_BTNode invalid lines 0, data abort 0, exec SpringBoard exactly once, desktop.
+  The c4562b4f no-boot ban stays until the user explicitly approves this boot; no other agent should
+  touch the device in the meantime. Assets: .temp/hfs-surgery4/, .temp/ext4096_*.bin,
+  .temp/ext4096_v4_*.py, .temp/apply_surgery_v4.py.
