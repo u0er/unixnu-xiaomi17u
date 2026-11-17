@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..3a21ac82ce872f5681cfee0def52f46beb53b870
+index 0000000..3e86adcf445117e72c28f96f2551bb009687cbe6
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,2892 @@
+@@ -0,0 +1,3010 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2669,10 +2669,128 @@ index 0000000..3a21ac82ce872f5681cfee0def52f46beb53b870
 +		return err;
 +	}
 +	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
-+	/* The scan discards stale sub-06 ACKs (the trace's extra ACK at
-+	 * t=9.921419 shows the ROM can emit one in this phase) before the
-+	 * sub-09 build-info event is taken. */
-+	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x09, "PERI build info");
++	/* Level 19.8 - after the download the ROM speaks HCI: the 19.7 run
++	 * PROVED it (VSC at +153 ms drew a reply starting with 0x04 - an HCI
++	 * event packet, msi the 04 0e-family Command Complete events Android
++	 * reads at 11.7 s). The old EDL-only reader aborted EPROTO on the
++	 * first 0x04. This reader accepts BOTH framings: 0x34 opens the EDL
++	 * VSE event (sub-09 = the build-info push Android captured at
++	 * t=9.927686), 0x04 opens an HCI event (read code+len, then the
++	 * payload; the build string is printable ASCII inside, detected by
++	 * the B,TFW,. signature). Padding bytes (ff/fd/fc/fe) are logged and
++	 * skipped; any other leader byte is logged and skipped too (bounded)
++	 * - evidence first, verdict second. */
++	for (unsigned leaders = 0; leaders < 16; leaders++) {
++		uint8_t lead = 0;
++		unsigned field = 0;
++
++		err = bt_rx_exact(&lead, 1, &field, deadline);
++		if (err) {
++			break;
++		}
++		if (lead == 0x34) {
++			got = 1;
++			rx[0] = lead;
++			err = bt_rx_exact(rx + 1, 3, &field, deadline);
++			got += field;
++			if (err || got < 4u) {
++				break;
++			}
++			if ((unsigned)rx[3] > sizeof(rx) - 4u) {
++				printf("PANDORA BT: build info: oversized EDL event (plen %u), draining\n",
++				    rx[3]);
++				uint8_t sink[32];
++				unsigned dropped = 0;
++				while (dropped < (unsigned)rx[3] &&
++				    dropped < 255u) {
++					unsigned take = (unsigned)rx[3] - dropped > sizeof(sink)
++					    ? sizeof(sink) : (unsigned)rx[3] - dropped;
++					err = bt_rx_exact(sink, take, &field, deadline);
++					if (err) {
++						break;
++					}
++					dropped += field;
++				}
++				continue;
++			}
++			err = bt_rx_exact(rx + 4, rx[3], &field, deadline);
++			got += field;
++			if (err) {
++				break;
++			}
++			if (got >= 11u && rx[10] == 0x09) {
++				goto parse;
++			}
++			printf("PANDORA BT: build info: EDL event subcmd %u (%u bytes), keep scanning\n",
++			    rx[10], got);
++			bt_dump("PERI build info EDL event", rx, got);
++			pandora_log_sync();
++			continue;
++		}
++		if (lead == 0x04) {
++			uint8_t hdr[2];
++			unsigned evlen;
++
++			err = bt_rx_exact(hdr, 2, &field, deadline);
++			if (err) {
++				break;
++			}
++			evlen = hdr[1];
++			printf("PANDORA BT: build info: HCI event 04 %02x len %u\n",
++			    hdr[0], evlen);
++			if (evlen > sizeof(rx)) {
++				uint8_t sink[32];
++				unsigned dropped = 0;
++				while (dropped < evlen) {
++					unsigned take = evlen - dropped > sizeof(sink)
++					    ? sizeof(sink) : evlen - dropped;
++					err = bt_rx_exact(sink, take, &field, deadline);
++					if (err) {
++						break;
++					}
++					dropped += field;
++				}
++				continue;
++			}
++			err = bt_rx_exact(rx, evlen, &field, deadline);
++			got = field;
++			if (err) {
++				break;
++			}
++			bt_dump("PERI build info HCI event", rx, got);
++			/* Extract printable runs; the build string carries the
++			 * B,TFW,. signature ("BTFW.GAN..." in every observed
++			 * form, EDL push and HCI complete alike). */
++			for (unsigned i = 0; i + 4u < got; i++) {
++				if (rx[i] == 'B' && rx[i + 1u] == 'T' &&
++				    rx[i + 2u] == 'F' && rx[i + 3u] == 'W' &&
++				    rx[i + 4u] == '.') {
++					unsigned end = i;
++					while (end < got &&
++					    ((rx[end] >= 0x20 && rx[end] < 0x7f) || rx[end] == '\n')) {
++						end++;
++					}
++						printf("PANDORA BT: build info (HCI) status %u, %u chars: ",
++						    got >= 4u ? rx[3] : 0xffu, end - i);
++					for (unsigned k = i; k < end && k - i < 120u; k++) {
++						printf("%c", rx[k]);
++					}
++					printf("\n");
++					pandora_log_sync();
++					return 0;
++				}
++			}
++			printf("PANDORA BT: build info: HCI event carries no BTFW signature, keep scanning\n");
++			pandora_log_sync();
++			continue;
++		}
++		printf("PANDORA BT: build info: leader byte %#x, keep scanning\n", lead);
++		pandora_log_sync();
++	}
++	if (err == 0) {
++		err = ETIMEDOUT;
++	}
++	got = 0;
 +	if (err) {
 +		printf("PANDORA BT: build info: no response (error %d) - HAL init failure reason 63\n",
 +		    err);
