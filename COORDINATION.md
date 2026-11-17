@@ -326,3 +326,14 @@ synchronization points. Read it before acting; update your row after acting.
   old root.img/metal-update image names and old ADT mappings in this file are historical only.
 - Before any later device trial, use the current active-root configuration, refresh, verify the
   candidate's embedded ADT, and obtain the current conversation's explicit boot approval.
+
+
+## Codex GPU contract build completed (2026-11-17)
+- CI 44047865730: complete, SUCCESS; Metal plugin step explicitly SUCCESS.
+- macOS contract checks: 10 passed; full Rust iOS bridge and ObjC++ bundle compiled and signed.
+- Downloaded NativeAdrenoMetal: 29,483,264 bytes, arm64 bundle, iOS 16.0 deployment target;
+  both original and v2 dirty-count exports are present. Full job log and candidate retained locally.
+- Preparing a separate 120-second candidate, changing only Metal; accepted kernel's 15 loaded
+  segments were compared byte-for-byte and match. Current Turnip/shim/audio remain the baseline.
+- Device NOT HELD; still Android. No stage/install/boot performed. Physical-device validation
+  remains pending explicit current-conversation boot approval and embedded-ADT preflight.
