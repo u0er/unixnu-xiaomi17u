@@ -346,3 +346,24 @@ synchronization points. Read it before acting; update your row after acting.
 - Saving the previous ring before staging/boot. One boot attempt, no partition flash, no forced
   reset on timeout. Capture logs and verify installed bytes after the automatic Android return.
 - Device is HELD by this conversation until this trial's result/release is recorded.
+
+
+## Codex GPU 120s trial FAILED; device back in Android (2026-11-17)
+- One explicitly approved RAM boot completed; automatic reset at console 120.222s, full ring saved.
+- User observed frequent SpringBoard restarts. backboardd actually crashed three times with text
+  page corruption (43.124/74.019/104.987s), causing four SpringBoard execs. No kernel panic/data abort.
+- Metal byte readback FAILED: 20 code pages at offsets 0x300000..0x314000 contain Widget/database
+  data. Turnip/shim/error responder match the prepared combination. New DP telemetry never printed.
+- Stable metadata capture PROVES Metal extents overlap diagnostics and Duet WAL extents. Full
+  allocation audit: 20,197 referenced-but-free blocks and seven overlapping extent pairs.
+- Even the previously accepted 128GiB capture has 4,090 referenced-but-free blocks (no overlaps
+  then). Prior tree/desktop acceptance did not prove allocation ownership consistency.
+- Current root pair is unchanged but MUST NOT BOOT pending storage repair. No extra boot or
+  hidden rollback; installed root Metal and firmware still hold this failed candidate. Host copies
+  of original Metal/firmware/rollback pack and all source/build work are preserved.
+- Source gap: bounded pl_thread resets without normal sync/unmount while non-journaled HFS bitmap
+  updates use delayed writes. This is a persistence hypothesis requiring repair and verification,
+  not a proven explanation of every damaged block. Do not clear volume flags to hide errors.
+- Device window RELEASED in Android, with a storage no-boot condition. Root AGENTS.md and active
+  storage docs now lead with the observed failure. Next is storage ownership/persistence repair,
+  not GPU tuning or a repeat of this trial. Evidence: local device-trial-120s/ under the GPU folder.
