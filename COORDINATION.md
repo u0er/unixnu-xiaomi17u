@@ -686,3 +686,13 @@ synchronization points. Read it before acting; update your row after acting.
   refused. Runtime/user acceptance PENDING a new explicit current-conversation temporary boot OK.
 - Device RELEASED in Android. Durable local report: docs/HFS_ALLOCATION_REPAIR_2026-11-17.md;
   full transaction/capture evidence: D:/turnip-local/hfs-allocation-repair-20261117/.
+
+
+## Codex repaired-root + orderly-shutdown device window HELD (2026-11-17)
+- User explicitly approved this prepared repair candidate's 120-second temporary RAM trial.
+- Device starts in Android; stable repaired header and empty firmware install list checked.
+- Preserve the previous log, refresh/verify the actual embedded root/fw mappings, then ONE boot.
+- Kernel includes 0481 orderly shutdown; accepted Metal/Turnip/shim remain installed, no installs.
+- At 120 seconds request normal shutdown; do not force reset if shutdown/Android return stalls.
+- After automatic return capture the whole valid console, fresh HFS metadata and component bytes.
+- Device HELD by this conversation until result/release is recorded; no parallel device work.
