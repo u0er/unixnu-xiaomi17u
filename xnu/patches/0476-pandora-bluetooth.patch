@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
+index 0000000..3e86adcf445117e72c28f96f2551bb009687cbe6
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,2591 @@
+@@ -0,0 +1,3010 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -104,6 +104,12 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 + * recorded inside). Frames larger than the SE TX FIFO use
 + * watermark-chunked TX sized by SE_HW_PARAM0. No reset and
 + * no ActivateSS: those belong to level 20; the link ends still at 4 Mbps.
++ * Device run 2026-11-17 (90 s bounded): ram patch 142/142 streamed in
++ * 118 ms with last-segment ACK status 0 (ROM commit latency 11 ms);
++ * the NVM then met total silence at ~0.7-1.0 ms segment spacing, so
++ * level 19.1 paces the NVM segments at 1.5 ms and gives its last ACK
++ * 3 s (Android's NVM cadence is 1.0-1.5 ms and its ROM ACKs in 5.6 ms;
++ * the NVM TLV is flash-programmed, unlike the RAM patch).
 + *
 + * Register map: Linux drivers/soc/qcom/qcom-geni-se.c, drivers/tty/serial/
 + * msm_geni_serial.c and u-boot's drivers/serial/serial_msm_geni.c (GPL-2.0+,
@@ -1924,6 +1930,17 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +#define BT_FW_SEG_MAX 243u
 +#define BT_PERI_EVT_MAX 264u   /* HAL ReadHciEvent uses a 260-byte buffer; 4 + 255 + slack */
 +
++/* NVM pacing and last-ACK budget, from the 2026-11-17 device run: the ram
++ * patch streams at full speed (142 segments in 118 ms; the ROM ACKed the
++ * last segment in 11 ms), but the NVM's last segment met TOTAL silence
++ * (RX FIFO empty after 1000 ms, rx_fifo 0 in the exit dump) when its
++ * segments went out ~0.7-1.0 ms apart. The NVM TLV is flash-programmed by
++ * the ROM (unlike the RAM patch), and Android's working trace paces the NVM
++ * segments ~1.0-1.5 ms apart. Level 19.1 matches that with 1.5 ms and gives
++ * the last ACK 3 s for erase/commit latency; the ram patch stays unpaced. */
++#define BT_PERI_NVM_PACE_US 1500u
++#define BT_PERI_NVM_LAST_ACK_MS 3000u
++
 +/* DownloadAndCmdExeStatus: 0 is silent success; 1..37 have fixed names. */
 +static const char *
 +bt_peri_edl_status_name(unsigned status)
@@ -2064,7 +2081,16 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +			if (err) {
 +				return err;
 +			}
-+		} else if (rx[0] != 0xfc && rx[0] != 0xfe) {
++		} else if (rx[0] != 0xfc && rx[0] != 0xfe && rx[0] != 0xff) {
++			/* 0xff joins the ignorable set (level 19.4): every healthy EDL
++			 * event pads its payload with a trailing 0xff (the version
++			 * reply ends 40 ff, plen counts it), and BOTH level 19.1 and
++			 * 19.3 device runs observed stray 0xff bytes OUTSIDE the NVM
++			 * reply - ROM line padding, not data. The pre-19.4 reader
++			 * aborted EPROTO on the first 0xff within 0.1 ms of the last
++			 * segment, so the 3 s last-ACK budget never actually ran and
++			 * the real ACK (Android's arrives ~5.6 ms in) was never given
++			 * a chance. */
 +			return EPROTO;
 +		}
 +		*got = 0;
@@ -2079,6 +2105,78 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +	}
 +	if (rx[1] != 0 || rx[2] != 0xff) {
 +		return EPROTO;
++	}
++	/* Stray-header resync (level 19.2). The 2026-11-17 level 19.1 device
++	 * run captured the NVM last-segment reply as
++	 *     34 00 ff 08 | 34 00 ff 08 f0 01 01 f0
++	 * a complete four-byte header whose "payload" begins with another
++	 * header: the ROM (or the link) left a stray header in front of the
++	 * real event. A healthy EDL payload always starts with 0xf0
++	 * (Arbitrate, both TLV last-ACKs and the board-id reply all do), so a
++	 * payload beginning 34 00 ff can only be a repeated header. Treat it
++	 * as the new header and re-read (at most twice) instead of swallowing
++	 * the real event and desynchronising the rest of the stream. */
++	if (rx[3] >= 4u) {
++		uint8_t peek[4];
++		unsigned got2 = 0;
++		unsigned resyncs = 0;
++
++		err = bt_rx_exact(peek, 4, &got2, deadline);
++		if (err) {
++			return err;
++		}
++		while (resyncs < 2u && peek[0] == 0x34 && peek[1] == 0x00 &&
++		    peek[2] == 0xff) {
++			printf("PANDORA BT: PERI event stray header 34 00 ff %u discarded, resyncing\n",
++			    rx[3]);
++			rx[0] = peek[0];
++			rx[1] = peek[1];
++			rx[2] = peek[2];
++			rx[3] = peek[3];
++			*got = 4;
++			resyncs++;
++
++			if (rx[3] < 4u) {
++				return EPROTO;
++			}
++			err = bt_rx_exact(peek, 4, &got2, deadline);
++			if (err) {
++				return err;
++			}
++		}
++		if ((unsigned)rx[3] > cap - 4u) {
++			/* Oversized: four payload bytes are already in peek, so
++			 * drain only the remainder. The caller discards it. */
++			uint8_t sink[32];
++			unsigned dropped = 0;
++			unsigned want = (unsigned)rx[3] - 4u;
++			int e2;
++
++			while (dropped < want) {
++				unsigned take = want - dropped > sizeof(sink)
++				    ? sizeof(sink) : want - dropped;
++				unsigned got3 = 0;
++				e2 = bt_rx_exact(sink, take, &got3, deadline);
++				if (e2) {
++					return e2;
++				}
++				dropped += got3;
++			}
++			printf("PANDORA BT: PERI event oversized (%u B payload), drained\n",
++			    rx[3]);
++			return EMSGSIZE;
++		}
++		rx[4] = peek[0];
++		rx[5] = peek[1];
++		rx[6] = peek[2];
++		rx[7] = peek[3];
++		*got = 8;
++		if (rx[3] > 4u) {
++			err = bt_rx_exact(rx + 8, (unsigned)rx[3] - 4u, &field, deadline);
++			*got += field;
++			return err;
++		}
++		return 0;
 +	}
 +	if ((unsigned)rx[3] > cap - 4u) {
 +		/* The event is larger than the caller's buffer. Drain its payload
@@ -2196,14 +2294,146 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +	return 0;
 +}
 +
++/* Bounded non-blocking RX drain, paced-download phases only (level 19.3).
++ * The 2026-11-17 level 19.1 run proved the ROM ACKs interim NVM segments
++ * once they are paced (Android's trace had the same stray sub-06 ACK at
++ * t=9.921419): sender sleeps 1.5 ms between segments while ACKs pile up
++ * behind it, the RX FIFO (depth 32) overruns mid-event, and the NVM
++ * last-segment reply arrives as a byte-fragmented stream
++ * (34 00 ff 08 | 34 00 ff 08 f0 01 01 f0 | ff, overrun-class IRQ bits
++ * set, rx_fifo 1). Interim ACKs carry no gate value - the last-segment
++ * ACK is the verdict - so the pacing gaps drain and count them, keeping
++ * the FIFO below overflow at the moment the decisive reply lands. Full-
++ * speed phases never call this: the ROM is silent there (trace: zero RX
++ * IRQs across the 93 ms ram patch; level 18/19.1 device runs agree). */
++/* Collect (not discard) RX bytes during a paced download phase, level 19.5.
++ * The 2026-11-18 level 19.4 run PROVED the ROM emits its NVM last-segment
++ * ACK spread across the whole phase - 2 bytes per segment interval
++ * (34 00 / ff 08 / f0 01 / 01 f0 during the gaps, ff 00 + 06 ff around the
++ * last segment) - and the 19.3/19.4 drain-and-discard design threw the
++ * ACK's first 8 bytes away. Android's HAL survives the same trickle
++ * because its reader thread accumulates every byte and parses the event
++ * once complete. This mirrors that: each pacing gap COLLECTS arriving
++ * bytes into the accumulator; the last segment's ACK parser consumes the
++ * accumulator first (bt_peri_tlv_last_ack), so no ACK byte is ever
++ * dropped. Bounded by cap; overflow is counted and logged, never fatal.
++ * Full-speed phases never call this: their ACKs arrive complete. */
++static unsigned
++bt_peri_rx_collect(const char *what, uint8_t *acc, unsigned *acc_len, unsigned cap,
++    unsigned limit)
++{
++	unsigned taken = 0;
++	uint8_t seen[16];
++	unsigned shown = 0;
++
++	while (taken < limit && (bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
++		uint8_t byte = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++
++		if (shown < sizeof(seen)) {
++			seen[shown++] = byte;
++		}
++		if (*acc_len < cap) {
++			acc[(*acc_len)++] = byte;
++		}
++		taken++;
++	}
++	if (taken) {
++		printf("PANDORA BT: PERI collect (%s): %u byte(s)", what, taken);
++		if (*acc_len > taken) {
++			printf(", acc %u", *acc_len);
++		}
++		printf(":");
++		for (unsigned i = 0; i < shown; i++) {
++			printf(" %02x", seen[i]);
++		}
++		if (taken > shown) {
++			printf(" ...");
++		}
++		if (*acc_len >= cap) {
++			printf(" (acc full)");
++		}
++		printf("\n");
++	}
++	return taken;
++}
++
++/* Seeded last-segment ACK parse (level 19.5): consume the bytes collected
++ * during the paced phase first, complete the 12-byte sub-06 event from
++ * the FIFO after the last segment's TX, then validate it exactly like
++ * the full-speed path does. pad bytes collected before the 0x34 header
++ * are skipped with a bound; the event shape is checked byte-for-byte. */
++static int
++bt_peri_tlv_last_ack(const uint8_t *seed, unsigned seed_len, unsigned seg,
++    const char *what, unsigned ack_ms)
++{
++	static const uint8_t identity[] = { 0xf0, 0x01, 0x01, 0xf0, 0xff };
++	uint8_t rx[64];
++	unsigned got = 0;
++	unsigned have = seed_len < sizeof(rx) ? seed_len : sizeof(rx);
++	uint64_t deadline;
++	int err;
++
++	for (unsigned i = 0; i < have; i++) {
++		rx[got++] = seed[i];
++	}
++	/* skip collected pad bytes before the event header (bounded) */
++	unsigned start = 0;
++	while (start + 4u <= got &&
++	    !(rx[start] == 0x34 && rx[start + 1u] == 0x00 && rx[start + 2u] == 0xff)) {
++		start++;
++	}
++	if (start) {
++		printf("PANDORA BT: %s: seeded reader skipped %u leading byte(s)\n", what, start);
++		for (unsigned i = 0; i + start < got; i++) {
++			rx[i] = rx[i + start];
++		}
++		got -= start;
++	}
++	clock_interval_to_deadline(ack_ms, NSEC_PER_MSEC, &deadline);
++	/* complete at least the 12-byte event, then any declared payload */
++	while (got < 12u && got < sizeof(rx)) {
++		unsigned field = 0;
++
++		err = bt_rx_exact(rx + got, 1, &field, deadline);
++		if (err) {
++			printf("PANDORA BT: TLV last segment %u: no ACK (error %d, %u of 12 bytes)\n",
++			    seg, err, got);
++			bt_dump("PERI TLV last-segment raw", rx, got);
++			pandora_log_sync();
++			return err;
++		}
++		got++;
++	}
++	if (rx[0] != 0x34 || rx[1] != 0 || rx[2] != 0xff || rx[3] != 8u ||
++	    memcmp(rx + 4, identity, sizeof(identity)) ||
++	    rx[9] != 0 || rx[10] != 0x06) {
++		if (rx[0] == 0x34 && rx[1] == 0 && rx[2] == 0xff) {
++			printf("PANDORA BT: TLV last segment %u rejected (seeded): status %u (%s) subcmd %u, plen %u, %u bytes\n",
++			    seg, rx[9], bt_peri_edl_status_name(rx[9]), rx[10], rx[3], got);
++		} else {
++			printf("PANDORA BT: TLV last segment %u rejected (seeded): bad event shape, %u bytes\n",
++			    seg, got);
++		}
++		bt_dump("PERI TLV last-segment ACK", rx, got);
++		pandora_log_sync();
++		return EPROTO;
++	}
++	printf("PANDORA BT: TLV last segment %u ACK status 0 subcmd 6 (%u bytes, %u collected)\n",
++	    seg, got, seed_len);
++	return 0;
++}
++
 +/* TlvDnldSegment: one segment frame; only the LAST segment of a file
 + * reads its command-complete event. The trace shows 142 streamed
 + * segments with zero RX interrupts in between (the ROM is silent for
 + * non-last segments; the HAL's no_value property path is SKIP_EVT_VSE_CC,
 + * and btqca.c's loop behaves the same). The last-segment ACK carries
-+ * status at offset 9 (0 = success) and subcommand 6 at offset 10. */
++ * status at offset 9 (0 = success) and subcommand 6 at offset 10; the
++ * caller sets the ACK budget (1000 ms proved enough for the ram patch's
++ * 11 ms commit; the NVM gets 3 s for flash erase/commit latency). */
 +static int
-+bt_peri_tlv_segment(unsigned seg, const uint8_t *data, unsigned seglen, bool is_last)
++bt_peri_tlv_segment(unsigned seg, const uint8_t *data, unsigned seglen, bool is_last,
++    unsigned ack_ms, const uint8_t *seed, unsigned seed_len)
 +{
 +	static const uint8_t identity[] = { 0xf0, 0x01, 0x01, 0xf0, 0xff };
 +	uint8_t frame[BT_FW_SEG_MAX + 8];
@@ -2213,6 +2443,9 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +	int err;
 +
 +	if (seglen == 0u || seglen > BT_FW_SEG_MAX) {
++		return EINVAL;
++	}
++	if (!ack_ms) {
 +		return EINVAL;
 +	}
 +	frame[0] = 0x31;
@@ -2231,11 +2464,17 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +		return err;
 +	}
 +	if (!is_last) {
-+		/* SKIP_EVT_VSE_CC: no ACK wait, no read; the ROM stays silent
-+		 * for non-last segments (trace: zero RX irqs across 93 ms). */
++		/* SKIP_EVT_VSE_CC: no ACK wait, no read; full-speed phases are
++		 * silent between segments (trace: zero RX irqs across 93 ms).
++		 * Paced phases read only via the caller's collect - their ACK
++		 * trickles 2 bytes per segment (level 19.4 device evidence). */
 +		return 0;
 +	}
-+	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
++	if (seed_len) {
++		return bt_peri_tlv_last_ack(seed, seed_len, seg, "PERI TLV last segment",
++		    ack_ms);
++	}
++	clock_interval_to_deadline(ack_ms, NSEC_PER_MSEC, &deadline);
 +	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x06, "PERI TLV last segment");
 +	if (err) {
 +		printf("PANDORA BT: TLV last segment %u: no ACK (error %d)\n", seg, err);
@@ -2258,22 +2497,39 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +	return 0;
 +}
 +
-+/* TlvDnldReq: the full-file segment loop. */
++/* TlvDnldReq: the full-file segment loop. pace_us is the gap inserted
++ * between NON-last segments (0 = stream at full speed, proven for the
++ * RAM patch; the NVM uses the flash-friendly cadence above). last_ack_ms
++ * is the last segment's ACK budget. */
 +static int
-+bt_peri_tlv_download(const uint8_t *fw, unsigned size, const char *what)
++bt_peri_tlv_download(const uint8_t *fw, unsigned size, const char *what, unsigned pace_us,
++    unsigned last_ack_ms)
 +{
 +	unsigned full = size / BT_FW_SEG_MAX;
 +	unsigned rem = size % BT_FW_SEG_MAX;
 +	unsigned nseg = full + (rem ? 1u : 0u);
 +	unsigned sent = 0;
++	/* Level 19.5 accumulator: paced phases COLLECT every arriving byte
++	 * (the ROM's ACK trickles 2 bytes per segment - level 19.4 device
++	 * evidence - so discarding them destroyed the first 8 ACK bytes);
++	 * the last-segment parser seeds itself from this. */
++	uint8_t acc[128];
++	unsigned acc_len = 0;
 +
-+	printf("PANDORA BT: %s: %u bytes -> %u segments (last %u)\n", what, size,
-+	    nseg, rem ? rem : BT_FW_SEG_MAX);
++	printf("PANDORA BT: %s: %u bytes -> %u segments (last %u, pace %u us)%s\n", what, size,
++	    nseg, rem ? rem : BT_FW_SEG_MAX, pace_us,
++	    pace_us ? ", flash-friendly cadence" : ", full speed");
 +	pandora_log_sync();
 +	for (unsigned seg = 0; seg < nseg; seg++) {
 +		bool is_last = seg + 1u == nseg;
 +		unsigned seglen = (is_last && rem) ? rem : BT_FW_SEG_MAX;
-+		int err = bt_peri_tlv_segment(seg, fw + seg * BT_FW_SEG_MAX, seglen, is_last);
++		int err;
++
++		if (pace_us && is_last && seg > 0u) {
++			(void)bt_peri_rx_collect(what, acc, &acc_len, sizeof(acc), 64u);
++		}
++		err = bt_peri_tlv_segment(seg, fw + seg * BT_FW_SEG_MAX, seglen, is_last,
++		    last_ack_ms, pace_us ? acc : NULL, pace_us ? acc_len : 0u);
 +		if (err) {
 +			printf("PANDORA BT: %s: segment %u/%u failed (error %d) after %u bytes; download aborted\n",
 +			    what, seg + 1u, nseg, err, sent);
@@ -2281,6 +2537,15 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +			return err;
 +		}
 +		sent += seglen;
++		if (pace_us && !is_last) {
++			/* Give the ROM time to drain and start any flash operation
++			 * before the next frame arrives (device evidence), then collect
++			 * whatever it ticked out this interval (flood-safety bound stays
++			 * 64 per gap; collected, never discarded). */
++			bt_sleep(pace_us);
++			(void)bt_peri_rx_collect(what, acc, &acc_len, sizeof(acc), 64u);
++			pandora_log_sync();
++		}
 +		if ((seg & 15u) == 15u || is_last) {
 +			pandora_log_sync();
 +		}
@@ -2345,34 +2610,187 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +}
 +
 +/* GetBuildInfoReq: Android's own post-download gate (failure = init
-+ * reason 63). Frame 31 00 f0 ff 02 09 00, seven bytes; evt[12] is the
-+ * build-info string length, evt[13..] the ASCII text. The trace's real
-+ * response (t=9.9277) is 115 bytes total with 102 chars "BTFW.GAN...",
-+ * so the buffer is sized for the HAL's 260-byte event read and the
-+ * length bound is evt[12] <= got - 13 (evt[13..12+len] must fit in what
-+ * actually arrived). The status byte at offset 9 is logged but not
++ * reason 63). Level 19.6 sends the REAL request the HAL sends
++ * (PatchDLManager::GetBuildInfoReq, disasm dd8a8): the HCI vendor
++ * command 01 00 fc 01 20 - opcode 0xFC00, param len 1, param 0x20 - via
++ * HciSendVsCmd(.., 5); the trace carries the sibling sub-ops verbatim
++ * (01 00 fc 01 19 at t=10.199, the 0xFC00 large-data frames
++ * 01 00 fc f5 ...). The reply is the 115-byte EDL VSE event
++ * 34 00 ff 6f f0 01 01 f0 ff 00 09 00 <len> <ASCII...>: status at [9]
++ * (0), subcmd 9 at [10], evt[12] = the ASCII string length, evt[13..]
++ * the text ("BTFW.GAN...", 102 chars in the trace). The buffer is
++ * sized for the HAL's 260-byte event read and the length bound is
++ * evt[12] <= got - 13. The status byte at offset 9 is logged but not
 + * enforced, matching the HAL, which only requires the event read to
-+ * succeed; Android's own trace shows the ROM may also emit this event
-+ * on its own right after the NVM last-segment ACK. */
++ * succeed. The scan also absorbs a spontaneously pushed sub-09 event
++ * (the ROM's reply can land right after the NVM last-segment ACK. */
 +static int
 +bt_peri_build_info(void)
 +{
-+	static const uint8_t request[] = { 0x31, 0x00, 0xf0, 0xff, 0x02, 0x09, 0x00 };
++	/* Level 19.6: the REAL request. The 2026-11-18 00:11 device run sent
++	 * the fabricated EDL frame 31 00 f0 ff 02 09 00 and the ROM answered
++	 * with a diagnostic dump stream instead (f0 05 timestamped, f0 04
++	 * sequenced) - that frame never existed in the protocol. The HAL
++	 * (PatchDLManager::GetBuildInfoReq, disasm dd8a8) builds the HCI
++	 * vendor command 01 00 fc 01 20 (opcode 0xFC00, param len 1, param
++	 * 0x20) and sends it via HciSendVsCmd(.., 5); the trace shows the
++	 * sibling sub-op 01 00 fc 01 19 (t=10.199) and the 0xFC00 large-data
++	 * frames (01 00 fc f5 ...) verbatim. */
++	static const uint8_t request[] = { 0x01, 0x00, 0xfc, 0x01, 0x20 };
 +	static const uint8_t identity[] = { 0xf0, 0x01, 0x01, 0xf0, 0xff };
 +	uint8_t rx[BT_PERI_EVT_MAX] = {0};
 +	unsigned got = 0;
 +	uint64_t deadline;
 +	int err;
 +
-+	err = bt_uart_tx(request, sizeof(request), "PERI build info request");
++	/* Level 19.7 - wait FIRST. The 19.6 run proved the ROM parses the
++	 * VSC (generic sub-06 ACK status 0 at +10 ms) but attaches no build
++	 * info; Android's own reply lands +0.6 ms after the NVM ACK with a
++	 * lost TX burst in between. If the event is a spontaneous
++	 * download-complete push, both our request TXs (sent +1 ms after the
++	 * ACK) suppressed it. So first observe with NO transmit at all: any
++	 * sub-9 event inside the observe window is the push. Any other
++	 * result of the window (timeout, junk events, overflow) falls
++	 * through to the request attempt. */
++	printf("PANDORA BT: build info observe window (150 ms, no TX)\n");
++	pandora_log_sync();
++	clock_interval_to_deadline(150, NSEC_PER_MSEC, &deadline);
++	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x09,
++	    "PERI build info (observe)");
++	if (err == 0) {
++		printf("PANDORA BT: build info spontaneous event captured\n");
++		goto parse;
++	}
++	printf("PANDORA BT: observe window ended (error %d, %u bytes); sending the VS command\n",
++	    err, got);
++	pandora_log_sync();
++	err = bt_uart_tx(request, sizeof(request), "PERI build info VS command");
 +	if (err) {
 +		return err;
 +	}
 +	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
-+	/* The scan discards stale sub-06 ACKs (the trace's extra ACK at
-+	 * t=9.921419 shows the ROM can emit one in this phase) before the
-+	 * sub-09 build-info event is taken. */
-+	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x09, "PERI build info");
++	/* Level 19.8 - after the download the ROM speaks HCI: the 19.7 run
++	 * PROVED it (VSC at +153 ms drew a reply starting with 0x04 - an HCI
++	 * event packet, msi the 04 0e-family Command Complete events Android
++	 * reads at 11.7 s). The old EDL-only reader aborted EPROTO on the
++	 * first 0x04. This reader accepts BOTH framings: 0x34 opens the EDL
++	 * VSE event (sub-09 = the build-info push Android captured at
++	 * t=9.927686), 0x04 opens an HCI event (read code+len, then the
++	 * payload; the build string is printable ASCII inside, detected by
++	 * the B,TFW,. signature). Padding bytes (ff/fd/fc/fe) are logged and
++	 * skipped; any other leader byte is logged and skipped too (bounded)
++	 * - evidence first, verdict second. */
++	for (unsigned leaders = 0; leaders < 16; leaders++) {
++		uint8_t lead = 0;
++		unsigned field = 0;
++
++		err = bt_rx_exact(&lead, 1, &field, deadline);
++		if (err) {
++			break;
++		}
++		if (lead == 0x34) {
++			got = 1;
++			rx[0] = lead;
++			err = bt_rx_exact(rx + 1, 3, &field, deadline);
++			got += field;
++			if (err || got < 4u) {
++				break;
++			}
++			if ((unsigned)rx[3] > sizeof(rx) - 4u) {
++				printf("PANDORA BT: build info: oversized EDL event (plen %u), draining\n",
++				    rx[3]);
++				uint8_t sink[32];
++				unsigned dropped = 0;
++				while (dropped < (unsigned)rx[3] &&
++				    dropped < 255u) {
++					unsigned take = (unsigned)rx[3] - dropped > sizeof(sink)
++					    ? sizeof(sink) : (unsigned)rx[3] - dropped;
++					err = bt_rx_exact(sink, take, &field, deadline);
++					if (err) {
++						break;
++					}
++					dropped += field;
++				}
++				continue;
++			}
++			err = bt_rx_exact(rx + 4, rx[3], &field, deadline);
++			got += field;
++			if (err) {
++				break;
++			}
++			if (got >= 11u && rx[10] == 0x09) {
++				goto parse;
++			}
++			printf("PANDORA BT: build info: EDL event subcmd %u (%u bytes), keep scanning\n",
++			    rx[10], got);
++			bt_dump("PERI build info EDL event", rx, got);
++			pandora_log_sync();
++			continue;
++		}
++		if (lead == 0x04) {
++			uint8_t hdr[2];
++			unsigned evlen;
++
++			err = bt_rx_exact(hdr, 2, &field, deadline);
++			if (err) {
++				break;
++			}
++			evlen = hdr[1];
++			printf("PANDORA BT: build info: HCI event 04 %02x len %u\n",
++			    hdr[0], evlen);
++			if (evlen > sizeof(rx)) {
++				uint8_t sink[32];
++				unsigned dropped = 0;
++				while (dropped < evlen) {
++					unsigned take = evlen - dropped > sizeof(sink)
++					    ? sizeof(sink) : evlen - dropped;
++					err = bt_rx_exact(sink, take, &field, deadline);
++					if (err) {
++						break;
++					}
++					dropped += field;
++				}
++				continue;
++			}
++			err = bt_rx_exact(rx, evlen, &field, deadline);
++			got = field;
++			if (err) {
++				break;
++			}
++			bt_dump("PERI build info HCI event", rx, got);
++			/* Extract printable runs; the build string carries the
++			 * B,TFW,. signature ("BTFW.GAN..." in every observed
++			 * form, EDL push and HCI complete alike). */
++			for (unsigned i = 0; i + 4u < got; i++) {
++				if (rx[i] == 'B' && rx[i + 1u] == 'T' &&
++				    rx[i + 2u] == 'F' && rx[i + 3u] == 'W' &&
++				    rx[i + 4u] == '.') {
++					unsigned end = i;
++					while (end < got &&
++					    ((rx[end] >= 0x20 && rx[end] < 0x7f) || rx[end] == '\n')) {
++						end++;
++					}
++						printf("PANDORA BT: build info (HCI) status %u, %u chars: ",
++						    got >= 4u ? rx[3] : 0xffu, end - i);
++					for (unsigned k = i; k < end && k - i < 120u; k++) {
++						printf("%c", rx[k]);
++					}
++					printf("\n");
++					pandora_log_sync();
++					return 0;
++				}
++			}
++			printf("PANDORA BT: build info: HCI event carries no BTFW signature, keep scanning\n");
++			pandora_log_sync();
++			continue;
++		}
++		printf("PANDORA BT: build info: leader byte %#x, keep scanning\n", lead);
++		pandora_log_sync();
++	}
++	if (err == 0) {
++		err = ETIMEDOUT;
++	}
++	got = 0;
 +	if (err) {
 +		printf("PANDORA BT: build info: no response (error %d) - HAL init failure reason 63\n",
 +		    err);
@@ -2380,6 +2798,7 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +		pandora_log_sync();
 +		return err;
 +	}
++parse:
 +	if (got < 14u || rx[12] > got - 13u || rx[12] > sizeof(rx) - 14u ||
 +	    memcmp(rx + 4, identity, sizeof(identity)) || rx[10] != 0x09) {
 +		printf("PANDORA BT: build info event rejected: status %u subcmd %u len %u, %u bytes\n",
@@ -2421,7 +2840,7 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +		return err;
 +	}
 +	err = bt_peri_tlv_download(pandora_peri_fw_mbn, sizeof(pandora_peri_fw_mbn),
-+	    "PERI ram patch");
++	    "PERI ram patch", 0u, 1000u);
 +	if (err) {
 +		return err;
 +	}
@@ -2435,7 +2854,7 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +		pandora_log_sync();
 +	}
 +	err = bt_peri_tlv_download(pandora_peri_nvm_bin, sizeof(pandora_peri_nvm_bin),
-+	    "PERI NVM");
++	    "PERI NVM", BT_PERI_NVM_PACE_US, BT_PERI_NVM_LAST_ACK_MS);
 +	if (err) {
 +		return err;
 +	}
