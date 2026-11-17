@@ -337,3 +337,12 @@ synchronization points. Read it before acting; update your row after acting.
   segments were compared byte-for-byte and match. Current Turnip/shim/audio remain the baseline.
 - Device NOT HELD; still Android. No stage/install/boot performed. Physical-device validation
   remains pending explicit current-conversation boot approval and embedded-ADT preflight.
+
+
+## Codex GPU device window HELD (2026-11-17, current user conversation)
+- User explicitly approved the proposed single 120-second RAM trial. Device initially Android.
+- Only Metal is selected for installation. Preserve current kernel/Turnip/shim/audio and both
+  restored root containers. Preflight checks embedded ADT against fresh active mappings.
+- Saving the previous ring before staging/boot. One boot attempt, no partition flash, no forced
+  reset on timeout. Capture logs and verify installed bytes after the automatic Android return.
+- Device is HELD by this conversation until this trial's result/release is recorded.
