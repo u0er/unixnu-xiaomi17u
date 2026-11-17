@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..563306481d89ca49e7eee5455d2c2726277205bb
+index 0000000..81c5785fa2fdbc1eca5636ee622468674b661c8c
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,2696 @@
+@@ -0,0 +1,2748 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2126,6 +2126,7 @@ index 0000000..563306481d89ca49e7eee5455d2c2726277205bb
 +			rx[3] = peek[3];
 +			*got = 4;
 +			resyncs++;
++
 +			if (rx[3] < 4u) {
 +				return EPROTO;
 +			}
@@ -2284,6 +2285,30 @@ index 0000000..563306481d89ca49e7eee5455d2c2726277205bb
 +	return 0;
 +}
 +
++/* Bounded non-blocking RX drain, paced-download phases only (level 19.3).
++ * The 2026-11-17 level 19.1 run proved the ROM ACKs interim NVM segments
++ * once they are paced (Android's trace had the same stray sub-06 ACK at
++ * t=9.921419): sender sleeps 1.5 ms between segments while ACKs pile up
++ * behind it, the RX FIFO (depth 32) overruns mid-event, and the NVM
++ * last-segment reply arrives as a byte-fragmented stream
++ * (34 00 ff 08 | 34 00 ff 08 f0 01 01 f0 | ff, overrun-class IRQ bits
++ * set, rx_fifo 1). Interim ACKs carry no gate value - the last-segment
++ * ACK is the verdict - so the pacing gaps drain and count them, keeping
++ * the FIFO below overflow at the moment the decisive reply lands. Full-
++ * speed phases never call this: the ROM is silent there (trace: zero RX
++ * IRQs across the 93 ms ram patch; level 18/19.1 device runs agree). */
++static unsigned
++bt_peri_rx_drain(unsigned limit)
++{
++	unsigned drained = 0;
++
++	while (drained < limit && (bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
++		(void)bt_rd(BT_W_SE, SE_RX_FIFO);
++		drained++;
++	}
++	return drained;
++}
++
 +/* TlvDnldSegment: one segment frame; only the LAST segment of a file
 + * reads its command-complete event. The trace shows 142 streamed
 + * segments with zero RX interrupts in between (the ROM is silent for
@@ -2372,7 +2397,22 @@ index 0000000..563306481d89ca49e7eee5455d2c2726277205bb
 +	for (unsigned seg = 0; seg < nseg; seg++) {
 +		bool is_last = seg + 1u == nseg;
 +		unsigned seglen = (is_last && rem) ? rem : BT_FW_SEG_MAX;
-+		int err = bt_peri_tlv_segment(seg, fw + seg * BT_FW_SEG_MAX, seglen, is_last,
++		int err;
++
++		if (pace_us && is_last && seg > 0u) {
++			unsigned drained = bt_peri_rx_drain(64u);
++
++			/* Same protection at the decisive read: empty the FIFO right
++			 * before the last segment goes out, so the only bytes that can
++			 * share it with the last-segment ACK are ones arriving during
++			 * that one 20-byte frame (~0.05 ms of line time at 4 Mbps). */
++			if (drained) {
++				printf("PANDORA BT: %s pre-last drained %u interim byte(s)\n",
++				    what, drained);
++				pandora_log_sync();
++			}
++		}
++		err = bt_peri_tlv_segment(seg, fw + seg * BT_FW_SEG_MAX, seglen, is_last,
 +		    last_ack_ms);
 +		if (err) {
 +			printf("PANDORA BT: %s: segment %u/%u failed (error %d) after %u bytes; download aborted\n",
@@ -2382,9 +2422,21 @@ index 0000000..563306481d89ca49e7eee5455d2c2726277205bb
 +		}
 +		sent += seglen;
 +		if (pace_us && !is_last) {
++			unsigned drained;
++
 +			/* Give the ROM time to drain and start any flash operation
-+		 * before the next frame arrives (device evidence above). */
++			 * before the next frame arrives (device evidence above), then
++			 * drain any interim ACK that landed behind the sender so the
++			 * FIFO cannot overrun while later segments stream (level 19.1
++			 * failure mechanism). Bounded; interim ACKs are counted, not
++			 * parsed - the last-segment ACK is the verdict. */
 +			bt_sleep(pace_us);
++			drained = bt_peri_rx_drain(64u);
++			if (drained) {
++				printf("PANDORA BT: %s segment %u/%u gap drained %u interim byte(s)\n",
++				    what, seg + 1u, nseg, drained);
++				pandora_log_sync();
++			}
 +		}
 +		if ((seg & 15u) == 15u || is_last) {
 +			pandora_log_sync();
