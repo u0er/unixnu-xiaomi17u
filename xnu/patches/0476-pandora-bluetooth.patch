@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
+index 0000000..febb9ffcd3120086c06081cec2d4c5712a1bfd44
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,2591 @@
+@@ -0,0 +1,2625 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -104,6 +104,12 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 + * recorded inside). Frames larger than the SE TX FIFO use
 + * watermark-chunked TX sized by SE_HW_PARAM0. No reset and
 + * no ActivateSS: those belong to level 20; the link ends still at 4 Mbps.
++ * Device run 2026-11-17 (90 s bounded): ram patch 142/142 streamed in
++ * 118 ms with last-segment ACK status 0 (ROM commit latency 11 ms);
++ * the NVM then met total silence at ~0.7-1.0 ms segment spacing, so
++ * level 19.1 paces the NVM segments at 1.5 ms and gives its last ACK
++ * 3 s (Android's NVM cadence is 1.0-1.5 ms and its ROM ACKs in 5.6 ms;
++ * the NVM TLV is flash-programmed, unlike the RAM patch).
 + *
 + * Register map: Linux drivers/soc/qcom/qcom-geni-se.c, drivers/tty/serial/
 + * msm_geni_serial.c and u-boot's drivers/serial/serial_msm_geni.c (GPL-2.0+,
@@ -1924,6 +1930,17 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +#define BT_FW_SEG_MAX 243u
 +#define BT_PERI_EVT_MAX 264u   /* HAL ReadHciEvent uses a 260-byte buffer; 4 + 255 + slack */
 +
++/* NVM pacing and last-ACK budget, from the 2026-11-17 device run: the ram
++ * patch streams at full speed (142 segments in 118 ms; the ROM ACKed the
++ * last segment in 11 ms), but the NVM's last segment met TOTAL silence
++ * (RX FIFO empty after 1000 ms, rx_fifo 0 in the exit dump) when its
++ * segments went out ~0.7-1.0 ms apart. The NVM TLV is flash-programmed by
++ * the ROM (unlike the RAM patch), and Android's working trace paces the NVM
++ * segments ~1.0-1.5 ms apart. Level 19.1 matches that with 1.5 ms and gives
++ * the last ACK 3 s for erase/commit latency; the ram patch stays unpaced. */
++#define BT_PERI_NVM_PACE_US 1500u
++#define BT_PERI_NVM_LAST_ACK_MS 3000u
++
 +/* DownloadAndCmdExeStatus: 0 is silent success; 1..37 have fixed names. */
 +static const char *
 +bt_peri_edl_status_name(unsigned status)
@@ -2201,9 +2218,12 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 + * segments with zero RX interrupts in between (the ROM is silent for
 + * non-last segments; the HAL's no_value property path is SKIP_EVT_VSE_CC,
 + * and btqca.c's loop behaves the same). The last-segment ACK carries
-+ * status at offset 9 (0 = success) and subcommand 6 at offset 10. */
++ * status at offset 9 (0 = success) and subcommand 6 at offset 10; the
++ * caller sets the ACK budget (1000 ms proved enough for the ram patch's
++ * 11 ms commit; the NVM gets 3 s for flash erase/commit latency). */
 +static int
-+bt_peri_tlv_segment(unsigned seg, const uint8_t *data, unsigned seglen, bool is_last)
++bt_peri_tlv_segment(unsigned seg, const uint8_t *data, unsigned seglen, bool is_last,
++    unsigned ack_ms)
 +{
 +	static const uint8_t identity[] = { 0xf0, 0x01, 0x01, 0xf0, 0xff };
 +	uint8_t frame[BT_FW_SEG_MAX + 8];
@@ -2213,6 +2233,9 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +	int err;
 +
 +	if (seglen == 0u || seglen > BT_FW_SEG_MAX) {
++		return EINVAL;
++	}
++	if (!ack_ms) {
 +		return EINVAL;
 +	}
 +	frame[0] = 0x31;
@@ -2235,7 +2258,7 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +		 * for non-last segments (trace: zero RX irqs across 93 ms). */
 +		return 0;
 +	}
-+	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
++	clock_interval_to_deadline(ack_ms, NSEC_PER_MSEC, &deadline);
 +	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x06, "PERI TLV last segment");
 +	if (err) {
 +		printf("PANDORA BT: TLV last segment %u: no ACK (error %d)\n", seg, err);
@@ -2258,22 +2281,28 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +	return 0;
 +}
 +
-+/* TlvDnldReq: the full-file segment loop. */
++/* TlvDnldReq: the full-file segment loop. pace_us is the gap inserted
++ * between NON-last segments (0 = stream at full speed, proven for the
++ * RAM patch; the NVM uses the flash-friendly cadence above). last_ack_ms
++ * is the last segment's ACK budget. */
 +static int
-+bt_peri_tlv_download(const uint8_t *fw, unsigned size, const char *what)
++bt_peri_tlv_download(const uint8_t *fw, unsigned size, const char *what, unsigned pace_us,
++    unsigned last_ack_ms)
 +{
 +	unsigned full = size / BT_FW_SEG_MAX;
 +	unsigned rem = size % BT_FW_SEG_MAX;
 +	unsigned nseg = full + (rem ? 1u : 0u);
 +	unsigned sent = 0;
 +
-+	printf("PANDORA BT: %s: %u bytes -> %u segments (last %u)\n", what, size,
-+	    nseg, rem ? rem : BT_FW_SEG_MAX);
++	printf("PANDORA BT: %s: %u bytes -> %u segments (last %u, pace %u us)%s\n", what, size,
++	    nseg, rem ? rem : BT_FW_SEG_MAX, pace_us,
++	    pace_us ? ", flash-friendly cadence" : ", full speed");
 +	pandora_log_sync();
 +	for (unsigned seg = 0; seg < nseg; seg++) {
 +		bool is_last = seg + 1u == nseg;
 +		unsigned seglen = (is_last && rem) ? rem : BT_FW_SEG_MAX;
-+		int err = bt_peri_tlv_segment(seg, fw + seg * BT_FW_SEG_MAX, seglen, is_last);
++		int err = bt_peri_tlv_segment(seg, fw + seg * BT_FW_SEG_MAX, seglen, is_last,
++		    last_ack_ms);
 +		if (err) {
 +			printf("PANDORA BT: %s: segment %u/%u failed (error %d) after %u bytes; download aborted\n",
 +			    what, seg + 1u, nseg, err, sent);
@@ -2281,6 +2310,11 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +			return err;
 +		}
 +		sent += seglen;
++		if (pace_us && !is_last) {
++			/* Give the ROM time to drain and start any flash operation
++		 * before the next frame arrives (device evidence above). */
++			bt_sleep(pace_us);
++		}
 +		if ((seg & 15u) == 15u || is_last) {
 +			pandora_log_sync();
 +		}
@@ -2421,7 +2455,7 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +		return err;
 +	}
 +	err = bt_peri_tlv_download(pandora_peri_fw_mbn, sizeof(pandora_peri_fw_mbn),
-+	    "PERI ram patch");
++	    "PERI ram patch", 0u, 1000u);
 +	if (err) {
 +		return err;
 +	}
@@ -2435,7 +2469,7 @@ index 0000000..449bbc7d1e3465cfc3f465bdb28bd85450c5876f
 +		pandora_log_sync();
 +	}
 +	err = bt_peri_tlv_download(pandora_peri_nvm_bin, sizeof(pandora_peri_nvm_bin),
-+	    "PERI NVM");
++	    "PERI NVM", BT_PERI_NVM_PACE_US, BT_PERI_NVM_LAST_ACK_MS);
 +	if (err) {
 +		return err;
 +	}
