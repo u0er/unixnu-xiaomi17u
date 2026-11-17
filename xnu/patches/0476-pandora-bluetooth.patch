@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..9da68bbab4dfef3c87913b406ea1c4c806f8ad56
+index 0000000..18253878210360fd05700c791ef03eacc44925ef
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,2769 @@
+@@ -0,0 +1,2856 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2306,32 +2306,121 @@ index 0000000..9da68bbab4dfef3c87913b406ea1c4c806f8ad56
 + * the FIFO below overflow at the moment the decisive reply lands. Full-
 + * speed phases never call this: the ROM is silent there (trace: zero RX
 + * IRQs across the 93 ms ram patch; level 18/19.1 device runs agree). */
++/* Collect (not discard) RX bytes during a paced download phase, level 19.5.
++ * The 2026-11-18 level 19.4 run PROVED the ROM emits its NVM last-segment
++ * ACK spread across the whole phase - 2 bytes per segment interval
++ * (34 00 / ff 08 / f0 01 / 01 f0 during the gaps, ff 00 + 06 ff around the
++ * last segment) - and the 19.3/19.4 drain-and-discard design threw the
++ * ACK's first 8 bytes away. Android's HAL survives the same trickle
++ * because its reader thread accumulates every byte and parses the event
++ * once complete. This mirrors that: each pacing gap COLLECTS arriving
++ * bytes into the accumulator; the last segment's ACK parser consumes the
++ * accumulator first (bt_peri_tlv_last_ack), so no ACK byte is ever
++ * dropped. Bounded by cap; overflow is counted and logged, never fatal.
++ * Full-speed phases never call this: their ACKs arrive complete. */
 +static unsigned
-+bt_peri_rx_drain(const char *what, unsigned limit)
++bt_peri_rx_collect(const char *what, uint8_t *acc, unsigned *acc_len, unsigned cap,
++    unsigned limit)
 +{
-+	unsigned drained = 0;
++	unsigned taken = 0;
 +	uint8_t seen[16];
 +	unsigned shown = 0;
 +
-+	while (drained < limit && (bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
++	while (taken < limit && (bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
 +		uint8_t byte = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
 +
 +		if (shown < sizeof(seen)) {
 +			seen[shown++] = byte;
 +		}
-+		drained++;
++		if (*acc_len < cap) {
++			acc[(*acc_len)++] = byte;
++		}
++		taken++;
 +	}
-+	if (drained) {
-+		/* The 19.3 run drained exactly 2 bytes per gap without recording
-+		 * WHAT they were; that value decides the next diagnosis step, so
-+		 * every drain now logs its bytes (first 16). */
-+		printf("PANDORA BT: PERI drain (%s): %u byte(s):", what, drained);
++	if (taken) {
++		printf("PANDORA BT: PERI collect (%s): %u byte(s)", what, taken);
++		if (*acc_len > taken) {
++			printf(", acc %u", *acc_len);
++		}
++		printf(":");
 +		for (unsigned i = 0; i < shown; i++) {
 +			printf(" %02x", seen[i]);
 +		}
-+		printf("%s\n", drained > shown ? " ..." : "");
++		if (taken > shown) {
++			printf(" ...");
++		}
++		if (*acc_len >= cap) {
++			printf(" (acc full)");
++		}
++		printf("\n");
 +	}
-+	return drained;
++	return taken;
++}
++
++/* Seeded last-segment ACK parse (level 19.5): consume the bytes collected
++ * during the paced phase first, complete the 12-byte sub-06 event from
++ * the FIFO after the last segment's TX, then validate it exactly like
++ * the full-speed path does. pad bytes collected before the 0x34 header
++ * are skipped with a bound; the event shape is checked byte-for-byte. */
++static int
++bt_peri_tlv_last_ack(const uint8_t *seed, unsigned seed_len, unsigned seg,
++    const char *what, unsigned ack_ms)
++{
++	static const uint8_t identity[] = { 0xf0, 0x01, 0x01, 0xf0, 0xff };
++	uint8_t rx[64];
++	unsigned got = 0;
++	unsigned have = seed_len < sizeof(rx) ? seed_len : sizeof(rx);
++	uint64_t deadline;
++	int err;
++
++	for (unsigned i = 0; i < have; i++) {
++		rx[got++] = seed[i];
++	}
++	/* skip collected pad bytes before the event header (bounded) */
++	unsigned start = 0;
++	while (start + 4u <= got &&
++	    !(rx[start] == 0x34 && rx[start + 1u] == 0x00 && rx[start + 2u] == 0xff)) {
++		start++;
++	}
++	if (start) {
++		printf("PANDORA BT: %s: seeded reader skipped %u leading byte(s)\n", what, start);
++		for (unsigned i = 0; i + start < got; i++) {
++			rx[i] = rx[i + start];
++		}
++		got -= start;
++	}
++	clock_interval_to_deadline(ack_ms, NSEC_PER_MSEC, &deadline);
++	/* complete at least the 12-byte event, then any declared payload */
++	while (got < 12u && got < sizeof(rx)) {
++		unsigned field = 0;
++
++		err = bt_rx_exact(rx + got, 1, &field, deadline);
++		if (err) {
++			printf("PANDORA BT: TLV last segment %u: no ACK (error %d, %u of 12 bytes)\n",
++			    seg, err, got);
++			bt_dump("PERI TLV last-segment raw", rx, got);
++			pandora_log_sync();
++			return err;
++		}
++		got++;
++	}
++	if (rx[0] != 0x34 || rx[1] != 0 || rx[2] != 0xff || rx[3] != 8u ||
++	    memcmp(rx + 4, identity, sizeof(identity)) ||
++	    rx[9] != 0 || rx[10] != 0x06) {
++		if (rx[0] == 0x34 && rx[1] == 0 && rx[2] == 0xff) {
++			printf("PANDORA BT: TLV last segment %u rejected (seeded): status %u (%s) subcmd %u, plen %u, %u bytes\n",
++			    seg, rx[9], bt_peri_edl_status_name(rx[9]), rx[10], rx[3], got);
++		} else {
++			printf("PANDORA BT: TLV last segment %u rejected (seeded): bad event shape, %u bytes\n",
++			    seg, got);
++		}
++		bt_dump("PERI TLV last-segment ACK", rx, got);
++		pandora_log_sync();
++		return EPROTO;
++	}
++	printf("PANDORA BT: TLV last segment %u ACK status 0 subcmd 6 (%u bytes, %u collected)\n",
++	    seg, got, seed_len);
++	return 0;
 +}
 +
 +/* TlvDnldSegment: one segment frame; only the LAST segment of a file
@@ -2344,7 +2433,7 @@ index 0000000..9da68bbab4dfef3c87913b406ea1c4c806f8ad56
 + * 11 ms commit; the NVM gets 3 s for flash erase/commit latency). */
 +static int
 +bt_peri_tlv_segment(unsigned seg, const uint8_t *data, unsigned seglen, bool is_last,
-+    unsigned ack_ms)
++    unsigned ack_ms, const uint8_t *seed, unsigned seed_len)
 +{
 +	static const uint8_t identity[] = { 0xf0, 0x01, 0x01, 0xf0, 0xff };
 +	uint8_t frame[BT_FW_SEG_MAX + 8];
@@ -2375,9 +2464,15 @@ index 0000000..9da68bbab4dfef3c87913b406ea1c4c806f8ad56
 +		return err;
 +	}
 +	if (!is_last) {
-+		/* SKIP_EVT_VSE_CC: no ACK wait, no read; the ROM stays silent
-+		 * for non-last segments (trace: zero RX irqs across 93 ms). */
++		/* SKIP_EVT_VSE_CC: no ACK wait, no read; full-speed phases are
++		 * silent between segments (trace: zero RX irqs across 93 ms).
++		 * Paced phases read only via the caller's collect - their ACK
++		 * trickles 2 bytes per segment (level 19.4 device evidence). */
 +		return 0;
++	}
++	if (seed_len) {
++		return bt_peri_tlv_last_ack(seed, seed_len, seg, "PERI TLV last segment",
++		    ack_ms);
 +	}
 +	clock_interval_to_deadline(ack_ms, NSEC_PER_MSEC, &deadline);
 +	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x06, "PERI TLV last segment");
@@ -2414,6 +2509,12 @@ index 0000000..9da68bbab4dfef3c87913b406ea1c4c806f8ad56
 +	unsigned rem = size % BT_FW_SEG_MAX;
 +	unsigned nseg = full + (rem ? 1u : 0u);
 +	unsigned sent = 0;
++	/* Level 19.5 accumulator: paced phases COLLECT every arriving byte
++	 * (the ROM's ACK trickles 2 bytes per segment - level 19.4 device
++	 * evidence - so discarding them destroyed the first 8 ACK bytes);
++	 * the last-segment parser seeds itself from this. */
++	uint8_t acc[128];
++	unsigned acc_len = 0;
 +
 +	printf("PANDORA BT: %s: %u bytes -> %u segments (last %u, pace %u us)%s\n", what, size,
 +	    nseg, rem ? rem : BT_FW_SEG_MAX, pace_us,
@@ -2425,18 +2526,10 @@ index 0000000..9da68bbab4dfef3c87913b406ea1c4c806f8ad56
 +		int err;
 +
 +		if (pace_us && is_last && seg > 0u) {
-+			unsigned drained = bt_peri_rx_drain(what, 64u);
-+
-+			/* Same protection at the decisive read: empty the FIFO right
-+			 * before the last segment goes out, so the only bytes that can
-+			 * share it with the last-segment ACK are ones arriving during
-+			 * that one 20-byte frame (~0.05 ms of line time at 4 Mbps). */
-+			if (drained) {
-+				pandora_log_sync();
-+			}
++			(void)bt_peri_rx_collect(what, acc, &acc_len, sizeof(acc), 64u);
 +		}
 +		err = bt_peri_tlv_segment(seg, fw + seg * BT_FW_SEG_MAX, seglen, is_last,
-+		    last_ack_ms);
++		    last_ack_ms, pace_us ? acc : NULL, pace_us ? acc_len : 0u);
 +		if (err) {
 +			printf("PANDORA BT: %s: segment %u/%u failed (error %d) after %u bytes; download aborted\n",
 +			    what, seg + 1u, nseg, err, sent);
@@ -2445,19 +2538,13 @@ index 0000000..9da68bbab4dfef3c87913b406ea1c4c806f8ad56
 +		}
 +		sent += seglen;
 +		if (pace_us && !is_last) {
-+			unsigned drained;
-+
 +			/* Give the ROM time to drain and start any flash operation
-+			 * before the next frame arrives (device evidence above), then
-+			 * drain any interim ACK that landed behind the sender so the
-+			 * FIFO cannot overrun while later segments stream (level 19.1
-+			 * failure mechanism). Bounded; interim ACKs are counted, not
-+			 * parsed - the last-segment ACK is the verdict. */
++			 * before the next frame arrives (device evidence), then collect
++			 * whatever it ticked out this interval (flood-safety bound stays
++			 * 64 per gap; collected, never discarded). */
 +			bt_sleep(pace_us);
-+			drained = bt_peri_rx_drain(what, 64u);
-+			if (drained) {
-+				pandora_log_sync();
-+			}
++			(void)bt_peri_rx_collect(what, acc, &acc_len, sizeof(acc), 64u);
++			pandora_log_sync();
 +		}
 +		if ((seg & 15u) == 15u || is_last) {
 +			pandora_log_sync();
