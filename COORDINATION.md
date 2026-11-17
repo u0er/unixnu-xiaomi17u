@@ -665,3 +665,24 @@ synchronization points. Read it before acting; update your row after acting.
 - Patch 0481 routes bounded trial exit through existing reboot_kernel process-stop/sync/unmount,
   leaving panic/emergency reset intact. Compile on this isolated branch, no main changes.
 - Current active root must not boot until offline ownership/data repair and audit pass.
+
+
+## Codex offline allocation repair completed; orderly-shutdown trial ready (2026-11-17)
+- User requested repair. Phone stayed Android throughout; no post-repair boot performed.
+- Preserved conflicted allocated payloads and metadata preimages. Relocated 11 affected data
+  forks into exclusive new runs in the second 64GiB half; retained all old allocation bits.
+- Restored accepted Metal; Turnip/shim/error responder read back equal to pretrial accepted bytes.
+  Active firmware has empty files.txt; failed GPU candidate cannot reinstall automatically.
+- Fresh independent capture: allocation audit PASS (zero referenced-free blocks, zero overlap),
+  catalog PASS and attributes PASS. File/directory identities and settings were retained.
+- analyticsd/state.sqlite-wal had only 299,008 allocated bytes for a 4,132,392-byte logical claim;
+  retained all existing bytes and repaired length. Missing tail 3,833,384 bytes was not invented.
+  Isolating database/WAL conflicts does not prove all lost transactions recovered.
+- Kernel CI 44056628434 SUCCESS; 0481 applied. Actual pl_thread machine code calls reboot_kernel
+  and has no direct SMC. Prelink checks PASS. Panic reset hook is unchanged.
+- Candidate: outputs/data-a-live-nezha/build/trial-hfs-allocation-repair-20261117-120s/nezha-loader-boot.img
+  no component installs, current two trust modules; embedded ADT/live mapping preflight PASS.
+- Only this candidate is allowed by active-root.json.current_health; old timed-reset images are
+  refused. Runtime/user acceptance PENDING a new explicit current-conversation temporary boot OK.
+- Device RELEASED in Android. Durable local report: docs/HFS_ALLOCATION_REPAIR_2026-11-17.md;
+  full transaction/capture evidence: D:/turnip-local/hfs-allocation-repair-20261117/.
