@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..81c5785fa2fdbc1eca5636ee622468674b661c8c
+index 0000000..9da68bbab4dfef3c87913b406ea1c4c806f8ad56
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,2748 @@
+@@ -0,0 +1,2769 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2081,7 +2081,16 @@ index 0000000..81c5785fa2fdbc1eca5636ee622468674b661c8c
 +			if (err) {
 +				return err;
 +			}
-+		} else if (rx[0] != 0xfc && rx[0] != 0xfe) {
++		} else if (rx[0] != 0xfc && rx[0] != 0xfe && rx[0] != 0xff) {
++			/* 0xff joins the ignorable set (level 19.4): every healthy EDL
++			 * event pads its payload with a trailing 0xff (the version
++			 * reply ends 40 ff, plen counts it), and BOTH level 19.1 and
++			 * 19.3 device runs observed stray 0xff bytes OUTSIDE the NVM
++			 * reply - ROM line padding, not data. The pre-19.4 reader
++			 * aborted EPROTO on the first 0xff within 0.1 ms of the last
++			 * segment, so the 3 s last-ACK budget never actually ran and
++			 * the real ACK (Android's arrives ~5.6 ms in) was never given
++			 * a chance. */
 +			return EPROTO;
 +		}
 +		*got = 0;
@@ -2298,13 +2307,29 @@ index 0000000..81c5785fa2fdbc1eca5636ee622468674b661c8c
 + * speed phases never call this: the ROM is silent there (trace: zero RX
 + * IRQs across the 93 ms ram patch; level 18/19.1 device runs agree). */
 +static unsigned
-+bt_peri_rx_drain(unsigned limit)
++bt_peri_rx_drain(const char *what, unsigned limit)
 +{
 +	unsigned drained = 0;
++	uint8_t seen[16];
++	unsigned shown = 0;
 +
 +	while (drained < limit && (bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
-+		(void)bt_rd(BT_W_SE, SE_RX_FIFO);
++		uint8_t byte = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++
++		if (shown < sizeof(seen)) {
++			seen[shown++] = byte;
++		}
 +		drained++;
++	}
++	if (drained) {
++		/* The 19.3 run drained exactly 2 bytes per gap without recording
++		 * WHAT they were; that value decides the next diagnosis step, so
++		 * every drain now logs its bytes (first 16). */
++		printf("PANDORA BT: PERI drain (%s): %u byte(s):", what, drained);
++		for (unsigned i = 0; i < shown; i++) {
++			printf(" %02x", seen[i]);
++		}
++		printf("%s\n", drained > shown ? " ..." : "");
 +	}
 +	return drained;
 +}
@@ -2400,15 +2425,13 @@ index 0000000..81c5785fa2fdbc1eca5636ee622468674b661c8c
 +		int err;
 +
 +		if (pace_us && is_last && seg > 0u) {
-+			unsigned drained = bt_peri_rx_drain(64u);
++			unsigned drained = bt_peri_rx_drain(what, 64u);
 +
 +			/* Same protection at the decisive read: empty the FIFO right
 +			 * before the last segment goes out, so the only bytes that can
 +			 * share it with the last-segment ACK are ones arriving during
 +			 * that one 20-byte frame (~0.05 ms of line time at 4 Mbps). */
 +			if (drained) {
-+				printf("PANDORA BT: %s pre-last drained %u interim byte(s)\n",
-+				    what, drained);
 +				pandora_log_sync();
 +			}
 +		}
@@ -2431,10 +2454,8 @@ index 0000000..81c5785fa2fdbc1eca5636ee622468674b661c8c
 +			 * failure mechanism). Bounded; interim ACKs are counted, not
 +			 * parsed - the last-segment ACK is the verdict. */
 +			bt_sleep(pace_us);
-+			drained = bt_peri_rx_drain(64u);
++			drained = bt_peri_rx_drain(what, 64u);
 +			if (drained) {
-+				printf("PANDORA BT: %s segment %u/%u gap drained %u interim byte(s)\n",
-+				    what, seg + 1u, nseg, drained);
 +				pandora_log_sync();
 +			}
 +		}
