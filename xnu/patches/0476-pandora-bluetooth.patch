@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..18253878210360fd05700c791ef03eacc44925ef
+index 0000000..6d547d12f60658ffe2989c4b3e712f9fe428fcc2
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,2856 @@
+@@ -0,0 +1,2870 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2610,26 +2610,40 @@ index 0000000..18253878210360fd05700c791ef03eacc44925ef
 +}
 +
 +/* GetBuildInfoReq: Android's own post-download gate (failure = init
-+ * reason 63). Frame 31 00 f0 ff 02 09 00, seven bytes; evt[12] is the
-+ * build-info string length, evt[13..] the ASCII text. The trace's real
-+ * response (t=9.9277) is 115 bytes total with 102 chars "BTFW.GAN...",
-+ * so the buffer is sized for the HAL's 260-byte event read and the
-+ * length bound is evt[12] <= got - 13 (evt[13..12+len] must fit in what
-+ * actually arrived). The status byte at offset 9 is logged but not
++ * reason 63). Level 19.6 sends the REAL request the HAL sends
++ * (PatchDLManager::GetBuildInfoReq, disasm dd8a8): the HCI vendor
++ * command 01 00 fc 01 20 - opcode 0xFC00, param len 1, param 0x20 - via
++ * HciSendVsCmd(.., 5); the trace carries the sibling sub-ops verbatim
++ * (01 00 fc 01 19 at t=10.199, the 0xFC00 large-data frames
++ * 01 00 fc f5 ...). The reply is the 115-byte EDL VSE event
++ * 34 00 ff 6f f0 01 01 f0 ff 00 09 00 <len> <ASCII...>: status at [9]
++ * (0), subcmd 9 at [10], evt[12] = the ASCII string length, evt[13..]
++ * the text ("BTFW.GAN...", 102 chars in the trace). The buffer is
++ * sized for the HAL's 260-byte event read and the length bound is
++ * evt[12] <= got - 13. The status byte at offset 9 is logged but not
 + * enforced, matching the HAL, which only requires the event read to
-+ * succeed; Android's own trace shows the ROM may also emit this event
-+ * on its own right after the NVM last-segment ACK. */
++ * succeed. The scan also absorbs a spontaneously pushed sub-09 event
++ * (the ROM's reply can land right after the NVM last-segment ACK. */
 +static int
 +bt_peri_build_info(void)
 +{
-+	static const uint8_t request[] = { 0x31, 0x00, 0xf0, 0xff, 0x02, 0x09, 0x00 };
++	/* Level 19.6: the REAL request. The 2026-11-18 00:11 device run sent
++	 * the fabricated EDL frame 31 00 f0 ff 02 09 00 and the ROM answered
++	 * with a diagnostic dump stream instead (f0 05 timestamped, f0 04
++	 * sequenced) - that frame never existed in the protocol. The HAL
++	 * (PatchDLManager::GetBuildInfoReq, disasm dd8a8) builds the HCI
++	 * vendor command 01 00 fc 01 20 (opcode 0xFC00, param len 1, param
++	 * 0x20) and sends it via HciSendVsCmd(.., 5); the trace shows the
++	 * sibling sub-op 01 00 fc 01 19 (t=10.199) and the 0xFC00 large-data
++	 * frames (01 00 fc f5 ...) verbatim. */
++	static const uint8_t request[] = { 0x01, 0x00, 0xfc, 0x01, 0x20 };
 +	static const uint8_t identity[] = { 0xf0, 0x01, 0x01, 0xf0, 0xff };
 +	uint8_t rx[BT_PERI_EVT_MAX] = {0};
 +	unsigned got = 0;
 +	uint64_t deadline;
 +	int err;
 +
-+	err = bt_uart_tx(request, sizeof(request), "PERI build info request");
++	err = bt_uart_tx(request, sizeof(request), "PERI build info VS command");
 +	if (err) {
 +		return err;
 +	}
