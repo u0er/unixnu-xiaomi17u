@@ -1,0 +1,17 @@
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -1524,8 +1524,12 @@ ring_kick(void)
+ 		if (!(gmu_rd(GMU_AHB_FENCE_STATUS) & 1)) {
+ 			break;
+ 		}
+ 		delay(10);
+ 	} while (++tries < 200);
+-	printf("PANDORA GPU: WPTR %u written%s (fence status %08x)\n", ring_wptr, tries ? " after retries" : "",
+-	    gmu_rd(GMU_AHB_FENCE_STATUS));
++	uint32_t fence_status = gmu_rd(GMU_AHB_FENCE_STATUS);
++	/* Routine submits are summarized every 500; keep per-submit output for retries/fence faults. */
++	if (tries || fence_status) {
++		printf("PANDORA GPU: WPTR %u written%s (fence status %08x)\n", ring_wptr,
++		    tries ? " after retries" : "", fence_status);
++	}
+ }
