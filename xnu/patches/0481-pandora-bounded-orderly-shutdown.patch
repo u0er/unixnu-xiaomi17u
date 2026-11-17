@@ -1,0 +1,33 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -26,6 +26,7 @@
+ #include <sys/disk.h>
+ #include <sys/errno.h>
+ #include <sys/proc.h>
++#include <sys/reboot.h>
+ #include <sys/uio.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+@@ -2226,12 +2227,16 @@
+ 			return;
+ 		}
+ 		if (limit && mach_absolute_time() - start >= limit) {
+-			printf("PANDORA: pandora_reboot_after=%u reached, resetting\n", reboot_after);
+-			pandora_amp_final("pandora_reboot_after");      /* 0298: the speaker amps down first */
+-			lck_mtx_lock(&sweet_ufs_lock);
+-			(void)pl_flush();
+-			lck_mtx_unlock(&sweet_ufs_lock);
+-			pl_psci_reset();
++			printf("PANDORA: pandora_reboot_after=%u reached, shutting down cleanly\n", reboot_after);
++			/* A bounded trial is a normal shutdown, not a panic. Non-journaled HFS
++			 * bitmap buffers use delayed writes: resetting here can persist catalog
++			 * extents without their allocation bits and let the next boot reuse live data.
++			 * Use the existing process-stop/sync/unmount/buffer-drain path without the
++			 * UFS lock held. Its final PE_halt_restart still drains the console and resets.
++			 * Never fall back to an unsynced reset if another shutdown owns the system. */
++			int shutdown_error = reboot_kernel(RB_AUTOBOOT, NULL);
++			printf("PANDORA: orderly timed shutdown returned %d; no forced reset\n", shutdown_error);
++			limit = 0; /* do not repeat a shutdown request; retain console evidence */
+ 		}
+ 	}
+ }
