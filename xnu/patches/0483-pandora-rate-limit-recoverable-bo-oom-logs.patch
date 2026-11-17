@@ -1,0 +1,23 @@
+diff --git a/iokit/Kernel/arm/PandoraAdrenoGpu.cpp b/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
+--- a/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
++++ b/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
+@@ -433,6 +433,19 @@ AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+ 			IOLog("PANDORA GPU UC: client %d fence %llu not reached within %llu ms (%u long waits so far)\n",
+ 			    client_, w.fence, w.timeout_ns / 1000000ull, waits);
+ 		}
++	} else if (ret == kIOReturnNoMemory && m == NativeAdrenoMethodBoAlloc) {
++		/* The runtime can retry a pool-growth OOM at the resource size; bound repeated failure logs per client. */
++		NativeAdrenoAbiBoAlloc request = { 0 };
++		if (in_len >= sizeof(request)) {
++			memcpy(&request, in, sizeof(request));
++		}
++		static uint32_t failures[64];
++		const unsigned slot = client_ >= 0 && client_ < 64 ? (unsigned)client_ : 63;
++		const uint32_t count = __atomic_add_fetch(&failures[slot], 1, __ATOMIC_RELAXED);
++		if (count <= 8 || (count % 1000) == 0) {
++			IOLog("PANDORA GPU UC: client %d BO allocation %#llx bytes returned no memory (%u failures)\n",
++			    client_, request.bytes, count);
++		}
+ 	} else if (ret != kIOReturnSuccess) {
+ 		IOLog("PANDORA GPU UC: client %d method %u in %u out %u -> 0x%x\n", client_, m, in_len, out_len, ret);
+ 	}

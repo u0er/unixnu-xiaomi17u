@@ -54,11 +54,11 @@ index 94a1fd2..47a3343 100644
 +int
 +pandora_scanout_irq(void)
 +{
-+	sc_irq_count++;
++	__atomic_add_fetch(&sc_irq_count, 1, __ATOMIC_RELAXED);
 +	const uint32_t st = sc.ready ? dpu_rd(SC_INTR2_STATUS) & SC_CTL0_START : 0;
 +	if (st == 0) {
-+		sc_irq_empty++;
-+		if (++sc_irq_empty_run >= 1000) {
++		__atomic_add_fetch(&sc_irq_empty, 1, __ATOMIC_RELAXED);
++		if (__atomic_add_fetch(&sc_irq_empty_run, 1, __ATOMIC_RELAXED) >= 1000) {
 +			__atomic_store_n(&sc_irq_on, false, __ATOMIC_RELEASE);
 +			if (sc.ready) {
 +				dpu_wr(SC_INTR2_EN, 0);
@@ -68,10 +68,10 @@ index 94a1fd2..47a3343 100644
 +		}
 +		return 0;
 +	}
-+	sc_irq_empty_run = 0;
++	__atomic_store_n(&sc_irq_empty_run, 0, __ATOMIC_RELAXED);
 +	dpu_wr(SC_INTR2_EN, 0);
 +	dpu_wr(SC_INTR2_CLEAR, st);
-+	sc_irq_starts++;
++	__atomic_add_fetch(&sc_irq_starts, 1, __ATOMIC_RELAXED);
 +	thread_wakeup((event_t)&sc_frame_chan);
 +	return 0;
 +}
@@ -154,8 +154,8 @@ index 94a1fd2..47a3343 100644
 +void
 +pandora_scanout_irq_counts(uint64_t out[5])
 +{
-+	out[0] = sc_irq_count;
-+	out[1] = sc_irq_starts;
++	out[0] = __atomic_load_n(&sc_irq_count, __ATOMIC_RELAXED);
++	out[1] = __atomic_load_n(&sc_irq_starts, __ATOMIC_RELAXED);
 +	out[2] = sc_wait_slept;
 +	out[3] = sc_wait_missed;
 +	out[4] = sc_wait_polled;
