@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..6d547d12f60658ffe2989c4b3e712f9fe428fcc2
+index 0000000..3a21ac82ce872f5681cfee0def52f46beb53b870
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,2870 @@
+@@ -0,0 +1,2892 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2643,6 +2643,27 @@ index 0000000..6d547d12f60658ffe2989c4b3e712f9fe428fcc2
 +	uint64_t deadline;
 +	int err;
 +
++	/* Level 19.7 - wait FIRST. The 19.6 run proved the ROM parses the
++	 * VSC (generic sub-06 ACK status 0 at +10 ms) but attaches no build
++	 * info; Android's own reply lands +0.6 ms after the NVM ACK with a
++	 * lost TX burst in between. If the event is a spontaneous
++	 * download-complete push, both our request TXs (sent +1 ms after the
++	 * ACK) suppressed it. So first observe with NO transmit at all: any
++	 * sub-9 event inside the observe window is the push. Any other
++	 * result of the window (timeout, junk events, overflow) falls
++	 * through to the request attempt. */
++	printf("PANDORA BT: build info observe window (150 ms, no TX)\n");
++	pandora_log_sync();
++	clock_interval_to_deadline(150, NSEC_PER_MSEC, &deadline);
++	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x09,
++	    "PERI build info (observe)");
++	if (err == 0) {
++		printf("PANDORA BT: build info spontaneous event captured\n");
++		goto parse;
++	}
++	printf("PANDORA BT: observe window ended (error %d, %u bytes); sending the VS command\n",
++	    err, got);
++	pandora_log_sync();
 +	err = bt_uart_tx(request, sizeof(request), "PERI build info VS command");
 +	if (err) {
 +		return err;
@@ -2659,6 +2680,7 @@ index 0000000..6d547d12f60658ffe2989c4b3e712f9fe428fcc2
 +		pandora_log_sync();
 +		return err;
 +	}
++parse:
 +	if (got < 14u || rx[12] > got - 13u || rx[12] > sizeof(rx) - 14u ||
 +	    memcmp(rx + 4, identity, sizeof(identity)) || rx[10] != 0x09) {
 +		printf("PANDORA BT: build info event rejected: status %u subcmd %u len %u, %u bytes\n",
