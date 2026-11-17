@@ -656,3 +656,12 @@ synchronization points. Read it before acting; update your row after acting.
 - Census (post-boot, kernel-equivalent swap validation incl. link/offset checks): 106 referenced-but-invalid catalog nodes (103 zeroed-offsets + 3 kind-garbage incl. index-slot 29382), all OFF the live chain (18,868 leaves, 0 invalid). The kernel-named 29473/29476 are no longer referenced (session relinked their index records).
 - v5 APPLIED (212 x 4KiB blocks, OLD_SHA256-guarded writes, per-block read-back + full re-verify): all 106 neutralized as valid empty leaves. Post-v5: zero reachable-invalid nodes; reader walk 376,850 entries IDENTICAL before/after (no readable data touched). Assets: .temp/hfs-surgery5/, catalog_v5_write_set.json, catalog_postboot.bin.
 - NEXT: second single-variable boot (same f034db1b image) after explicit user consent; criteria unchanged (BTNode invalid lines 0, data abort 0, exec SpringBoard x1, desktop). If a new node class surfaces, iterate the census->neutralize loop (now scripted and fast).
+
+
+## Codex storage repair following failed GPU trial (2026-11-17)
+- User requested repair in the active conversation. Phone remains Android; no new boot approved.
+- Actual post-GPU capture: referenced blocks marked free and seven overlapping extent pairs;
+  Metal code was overwritten. Preserve all conflict payloads before any allocation repair.
+- Patch 0481 routes bounded trial exit through existing reboot_kernel process-stop/sync/unmount,
+  leaving panic/emergency reset intact. Compile on this isolated branch, no main changes.
+- Current active root must not boot until offline ownership/data repair and audit pass.
