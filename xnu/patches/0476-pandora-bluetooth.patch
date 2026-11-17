@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..febb9ffcd3120086c06081cec2d4c5712a1bfd44
+index 0000000..563306481d89ca49e7eee5455d2c2726277205bb
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,2625 @@
+@@ -0,0 +1,2696 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2096,6 +2096,77 @@ index 0000000..febb9ffcd3120086c06081cec2d4c5712a1bfd44
 +	}
 +	if (rx[1] != 0 || rx[2] != 0xff) {
 +		return EPROTO;
++	}
++	/* Stray-header resync (level 19.2). The 2026-11-17 level 19.1 device
++	 * run captured the NVM last-segment reply as
++	 *     34 00 ff 08 | 34 00 ff 08 f0 01 01 f0
++	 * a complete four-byte header whose "payload" begins with another
++	 * header: the ROM (or the link) left a stray header in front of the
++	 * real event. A healthy EDL payload always starts with 0xf0
++	 * (Arbitrate, both TLV last-ACKs and the board-id reply all do), so a
++	 * payload beginning 34 00 ff can only be a repeated header. Treat it
++	 * as the new header and re-read (at most twice) instead of swallowing
++	 * the real event and desynchronising the rest of the stream. */
++	if (rx[3] >= 4u) {
++		uint8_t peek[4];
++		unsigned got2 = 0;
++		unsigned resyncs = 0;
++
++		err = bt_rx_exact(peek, 4, &got2, deadline);
++		if (err) {
++			return err;
++		}
++		while (resyncs < 2u && peek[0] == 0x34 && peek[1] == 0x00 &&
++		    peek[2] == 0xff) {
++			printf("PANDORA BT: PERI event stray header 34 00 ff %u discarded, resyncing\n",
++			    rx[3]);
++			rx[0] = peek[0];
++			rx[1] = peek[1];
++			rx[2] = peek[2];
++			rx[3] = peek[3];
++			*got = 4;
++			resyncs++;
++			if (rx[3] < 4u) {
++				return EPROTO;
++			}
++			err = bt_rx_exact(peek, 4, &got2, deadline);
++			if (err) {
++				return err;
++			}
++		}
++		if ((unsigned)rx[3] > cap - 4u) {
++			/* Oversized: four payload bytes are already in peek, so
++			 * drain only the remainder. The caller discards it. */
++			uint8_t sink[32];
++			unsigned dropped = 0;
++			unsigned want = (unsigned)rx[3] - 4u;
++			int e2;
++
++			while (dropped < want) {
++				unsigned take = want - dropped > sizeof(sink)
++				    ? sizeof(sink) : want - dropped;
++				unsigned got3 = 0;
++				e2 = bt_rx_exact(sink, take, &got3, deadline);
++				if (e2) {
++					return e2;
++				}
++				dropped += got3;
++			}
++			printf("PANDORA BT: PERI event oversized (%u B payload), drained\n",
++			    rx[3]);
++			return EMSGSIZE;
++		}
++		rx[4] = peek[0];
++		rx[5] = peek[1];
++		rx[6] = peek[2];
++		rx[7] = peek[3];
++		*got = 8;
++		if (rx[3] > 4u) {
++			err = bt_rx_exact(rx + 8, (unsigned)rx[3] - 4u, &field, deadline);
++			*got += field;
++			return err;
++		}
++		return 0;
 +	}
 +	if ((unsigned)rx[3] > cap - 4u) {
 +		/* The event is larger than the caller's buffer. Drain its payload
