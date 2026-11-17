@@ -48,6 +48,10 @@ for p in "${PATCHES[@]}"; do
 	echo "   $(basename "$p")"
 	git -C "$M2V" apply "$p"
 done
+echo '   Nezha: resource-sized retry after a fragmented pool growth allocation fails'
+# This patch is maintained against the pinned runtime AFTER AdrenoMetal's series.
+# The older tools/metal/m2v stack remains disabled; do not reapply it wholesale.
+git -C "$M2V" apply "$ROOT/tools/metal/m2v-555b13d5/0001-resource-sized-oom-fallback.patch"
 LLVM_AS=$(brew --prefix llvm)/bin/llvm-as
 "$LLVM_AS" -o "$B/runtime_examples.air" "$M2V/crates/metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll"
 "$LLVM_AS" -o "$B/function_constant.air" "$M2V/crates/metal2vulkan-validation/fixtures/public/kernel_function_constant_gate_fold.ll"
