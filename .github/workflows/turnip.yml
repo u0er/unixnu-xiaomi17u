@@ -154,6 +154,8 @@ jobs:
           }
           fetch nativemetal https://github.com/UniXNU/NativeMetal.git "$NATIVEMETAL_SHA"
           fetch metal2vulkan https://github.com/steelbrain/metal2vulkan.git "$M2V_SHA"
+          python3 tools/metal/tests/check_surface_dirty_pages.py metal2vulkan \
+            --rustc "$(rustup which --toolchain 1.98.0 rustc)"
           rm -rf unixnu/kits/AdrenoPM4   # a submodule of UniXNU, not in its plain checkout
           fetch unixnu/kits/AdrenoPM4 https://github.com/UniXNU/AdrenoPM4.git "$ADRENOPM4_SHA"
           # NativeMetal includes ../NativeMobileDisplay/ (its sibling under UniXNU's drivers/)

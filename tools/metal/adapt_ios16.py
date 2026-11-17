@@ -6,6 +6,10 @@ Stage-2 v1 (2026-11-15): edits 25-30 give every IOSurface import its own dirty-p
 reported writes, so each copy of the pages into memory of the device own copies in
 only what changed since its last copy (WorkCounts::copied_copy_in_bytes_skipped).
 
+2026-11-17 contract correction: stamps and records publish under one lock, an equal
+watermark is already included in a hold, and an incomplete cross-process write source
+answers wait(false). CPU-unlock seeds cannot authorize skipping external GPU writes.
+Dirty telemetry separates CPU copies from GPU shadow bytes in bounded rows.
 
 Exact, asserted text edits in a NativeMetal checkout; run once on a fresh tree.
 
@@ -548,8 +552,10 @@ edit('bridge/NativeMetalObjects.rs',
 // increments it in the kernel, and IOSurfaceGetSeed reads it back without a trap. The runtime
 // reports its own writes into the pages (a shadow's copy back, a merge, a replaceRegion) through
 // DirtyPages::wrote_runs, so a log over an IOSurface's pages = the seed's moves and those reports.
-// A process writing its mapped pages without the lock protocol is seen by neither: the periodic
-// whole-range answer covers it (the runtime then copies every byte of that surface once more).
+// A process writing its mapped pages without the lock protocol is seen by neither. In particular,
+// another process's GPU writes do not necessarily advance this CPU-unlock seed. Until those writes
+// have a shared publication source, wait() must refuse to authorize skipping any copy. A periodic
+// whole copy cannot make the intervening stale frames correct.
 unsafe extern "C" {
     fn IOSurfaceGetID(surface: *const c_void) -> u32;
     fn IOSurfaceGetSeed(surface: *const c_void) -> u32;
@@ -557,9 +563,6 @@ unsafe extern "C" {
     fn CFRelease(cf: *const c_void);
 }
 
-/// How often a whole-range answer is made regardless of the records (a bounded window over CPU
-/// writes that touched the mapped pages with no lock protocol).
-const SURFACE_DIRTY_VALVE: u64 = 64;
 /// Records kept past a whole-range answer: the runtime's reported writes between two of them.
 const SURFACE_DIRTY_RECORDS: usize = 256;
 
@@ -576,12 +579,12 @@ struct SurfaceDirtyPages {
     stamp: std::sync::atomic::AtomicU64,
     /// The kernel seed last observed: a move from it is a whole-range write.
     seed_last: std::sync::atomic::AtomicU32,
-    /// The stamp of the last whole-range answer: a query at or before it takes the whole range.
+    /// The stamp of the last whole-range answer: a query before it takes the whole range.
     watermark: std::sync::atomic::AtomicU64,
-    /// (start, end, stamp): the runtime's reported writes, every one later than the watermark.
+    /// Publication lock for ALL log state, including seed, stamps and watch transitions. A request
+    /// must never return the stamp of a writer still waiting to append its record.
+    /// Records are (start, end, stamp), every one later than the watermark.
     runs: std::sync::Mutex<Vec<(u64, u64, u64)>>,
-    /// Answers of changed() made: every SURFACE_DIRTY_VALVE-th is whole-range.
-    changed_calls: std::sync::atomic::AtomicU64,
     /// Live watches: a rise from zero restarts the continuous watch at a fresh watermark.
     watches: std::sync::atomic::AtomicU64,
     /// The log's own weak handle, for its watches.
@@ -602,7 +605,6 @@ impl SurfaceDirtyPages {
             seed_last: std::sync::atomic::AtomicU32::new(u32::MAX),
             watermark: std::sync::atomic::AtomicU64::new(0),
             runs: std::sync::Mutex::new(Vec::new()),
-            changed_calls: std::sync::atomic::AtomicU64::new(0),
             watches: std::sync::atomic::AtomicU64::new(0),
             self_weak: std::sync::OnceLock::new(),
         }
@@ -610,40 +612,39 @@ impl SurfaceDirtyPages {
 
     /// A whole-range write: the watermark moves to a fresh stamp and the records begin again, so
     /// the log's memory stays bounded no matter how long the pages live.
-    fn whole_written(&self) {
+    /// Caller holds runs, including while advancing the publication stamp.
+    fn whole_written_locked(&self, runs: &mut Vec<(u64, u64, u64)>) {
         let stamp = self.stamp.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
         self.watermark.store(stamp, std::sync::atomic::Ordering::Release);
-        self.runs.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        runs.clear();
         SURFACE_DIRTY[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// A write the runtime reported: a record after the watermark, cut to the log's bytes.
     fn record(&self, range: std::ops::Range<u64>) {
-        if range.start >= self.bytes {
+        let end = range.end.min(self.bytes);
+        if range.start >= end {
             return;
         }
-        let end = range.end.min(self.bytes);
-        let stamp = self.stamp.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-        {
-            let mut runs = self.runs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if runs.len() < SURFACE_DIRTY_RECORDS {
-                runs.push((range.start, end, stamp));
-                SURFACE_DIRTY[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
+        let mut runs = self.runs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if runs.len() < SURFACE_DIRTY_RECORDS && runs.try_reserve(1).is_ok() {
+            let stamp = self.stamp.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+            runs.push((range.start, end, stamp));
+            SURFACE_DIRTY[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
         }
-        // The records outgrew their window: one whole-range answer stands for them all.
-        self.whole_written();
+        // Exhaustion, including allocation failure, discards no write: publish the whole range.
+        self.whole_written_locked(&mut runs);
         SURFACE_DIRTY[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The kernel's seed, observed: a move from the last value seen is a whole-range write.
-    fn sync_seed(&self) {
+    fn sync_seed_locked(&self, runs: &mut Vec<(u64, u64, u64)>) {
         // SAFETY: the surface is retained for the log's life; the seed is a plain read of it.
         let seed = unsafe { IOSurfaceGetSeed(self.surface) };
         let last = self.seed_last.swap(seed, std::sync::atomic::Ordering::AcqRel);
         if seed != last {
-            self.whole_written();
+            self.whole_written_locked(runs);
         }
     }
 }
@@ -661,6 +662,7 @@ struct SurfaceWatch(Option<std::sync::Arc<SurfaceDirtyPages>>);
 impl Drop for SurfaceWatch {
     fn drop(&mut self) {
         if let Some(log) = self.0.as_ref() {
+            let _runs = log.runs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             log.watches.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         }
     }
@@ -670,33 +672,37 @@ impl DirtyPages for SurfaceDirtyPages {
     type Watch = SurfaceWatch;
 
     fn watch(&self, _range: std::ops::Range<u64>) -> SurfaceWatch {
+        let mut runs = self.runs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.watches.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
             // A continuous watch restarts: every stamp handed before its watermark answers whole.
-            self.whole_written();
+            self.whole_written_locked(&mut runs);
         }
         SurfaceWatch(self.self_weak.get().and_then(std::sync::Weak::upgrade))
     }
 
     fn request(&self) -> DirtyStamp {
-        self.sync_seed();
+        let mut runs = self.runs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.sync_seed_locked(&mut runs);
         DirtyStamp(self.stamp.load(std::sync::atomic::Ordering::Acquire))
     }
 
     fn wait(&self, _stamp: DirtyStamp) -> bool {
-        // Publications are synchronous (the seed is shared memory and the records are made in the
-        // call), so every stamp handed out is already published.
-        true
+        // Local records are synchronous, but CPU-unlock seeds do not cover other processes' GPU
+        // writes. DirtyPages requires EVERY writer; false makes the runtime copy every byte.
+        false
     }
 
     fn changed(&self, since: DirtyStamp, out: &mut Vec<std::ops::Range<u64>>) {
-        self.sync_seed();
-        let calls = self.changed_calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        if calls % SURFACE_DIRTY_VALVE == SURFACE_DIRTY_VALVE - 1
-            || since.0 <= self.watermark.load(std::sync::atomic::Ordering::Acquire) {
+        let mut runs = self.runs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.sync_seed_locked(&mut runs);
+        // A hold AT the whole-write stamp includes that publication already. Only an older hold
+        // lacks it. An unwatched range or a stamp outside this source's history is unknown.
+        if self.watches.load(std::sync::atomic::Ordering::Acquire) == 0
+            || since.0 < self.watermark.load(std::sync::atomic::Ordering::Acquire)
+            || since.0 > self.stamp.load(std::sync::atomic::Ordering::Acquire) {
             out.push(0..self.bytes);
             return;
         }
-        let runs = self.runs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         for &(start, end, stamp) in runs.iter() {
             if stamp > since.0 {
                 out.push(start..end);
@@ -723,14 +729,17 @@ fn surface_dirty_log(surface: *const c_void, bytes: u64) -> Option<std::sync::Ar
     let logs = LOGS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut logs = logs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(log) = logs.get(&id).and_then(std::sync::Weak::upgrade) {
-        return Some(log);
+        // Offsets belong to one import length; never silently truncate a larger alias's writes.
+        return (log.bytes == bytes).then_some(log);
     }
+    // Dead weak entries otherwise retain one allocation each for the process's entire life.
+    logs.retain(|_, log| log.strong_count() != 0);
+    logs.try_reserve(1).ok()?; // no log on allocation failure: the import still works conservatively
     // SAFETY: the log's own reference, released in its drop (the import's deallocator has its own).
     unsafe { CFRetain(surface) };
     let log = std::sync::Arc::new(SurfaceDirtyPages::new(surface, bytes));
     if log.self_weak.set(std::sync::Arc::downgrade(&log)).is_err() {
-        // SAFETY: undo the log's own retain (an empty OnceLock never fails, but stay correct).
-        unsafe { CFRelease(surface) };
+        // Dropping log releases its retain; a second explicit CFRelease would double-release it.
         return None;
     }
     logs.insert(id, std::sync::Arc::downgrade(&log));
@@ -738,19 +747,20 @@ fn surface_dirty_log(surface: *const c_void, bytes: u64) -> Option<std::sync::Ar
     Some(log)
 }
 
-/// The dirty-page counters into the caller's twelve words: the runtime's copy-in bytes and the
+/// The dirty-page counters into the caller's sixteen words: the runtime's copy-in bytes and the
 /// bytes a log's answer skipped, the copies gated by a log, answered whole and their bytes copied,
 /// stamps asked, waits and waits unanswered, then the bridge's own (logs made, whole-range
-/// answers, records, records consolidated away).
+/// answers, records, records consolidated away), shadow bytes if whole, skipped shadow copies,
+/// wait nanoseconds and withheld holds. The v2 name keeps older twelve-word callers valid.
 #[unsafe(no_mangle)]
-pub extern "C" fn nmb_device_dirty_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+pub extern "C" fn nmb_device_dirty_counts_v2(device: *const NmbDevice, out: *mut u64) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     guard(false, || {
         if out.is_null() {
             return Err("null counts".into());
         }
-        // SAFETY: the header's twelve words.
-        let out = unsafe { std::slice::from_raw_parts_mut(out, 12) };
+        // SAFETY: the header's sixteen words; bridge and frontend are built together.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 16) };
         out.fill(0);
         if !device.is_null() {
             let w = get(device)?.0.work_counts();
@@ -758,6 +768,10 @@ pub extern "C" fn nmb_device_dirty_counts(device: *const NmbDevice, out: *mut u6
                          w.dirty_copies_in_whole, w.dirty_copy_in_bytes_copied, w.dirty_stamps_asked,
                          w.dirty_waits, w.dirty_waits_unanswered];
             out[..words.len()].copy_from_slice(&words);
+            out[12] = w.dirty_copy_in_bytes_whole;
+            out[13] = w.dirty_copies_in_skipped;
+            out[14] = w.dirty_wait_nanos;
+            out[15] = w.dirty_holds_withheld;
         }
         out[8] = SURFACE_DIRTY[0].load(Relaxed);
         out[9] = SURFACE_DIRTY[1].load(Relaxed);
@@ -765,6 +779,21 @@ pub extern "C" fn nmb_device_dirty_counts(device: *const NmbDevice, out: *mut u6
         out[11] = SURFACE_DIRTY[3].load(Relaxed);
         Ok(true)
     })
+}
+
+/// The original twelve-word ABI remains usable by existing diagnostics.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_dirty_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    if out.is_null() {
+        return guard(false, || Err("null counts".into()));
+    }
+    let mut counts = [0u64; 16];
+    if !nmb_device_dirty_counts_v2(device, counts.as_mut_ptr()) {
+        return false; // preserve the v2 call's error
+    }
+    // SAFETY: the original ABI provides twelve writable words; the local array cannot alias it.
+    unsafe { std::ptr::copy_nonoverlapping(counts.as_ptr(), out, 12) };
+    true
 }
 
 /// `nmb_buffer_new_no_copy_releasing` over an IOSurface, with the surface's own dirty-page log
@@ -828,10 +857,14 @@ edit('bridge/NativeMetalObjects.h',
 NmbBuffer *nmb_buffer_new_no_copy_surface_releasing(NmbDevice *, void *pointer, uint64_t length, uint64_t options,
                                                     void (*release)(void *context, void *pointer, uint64_t length), void *context,
                                                     const void *surface);
-/* data-a-live: dirty-page counters, twelve words: copy-in bytes and bytes skipped by a log's answer,
+/* data-a-live: original dirty-page counters: twelve writable words, unchanged layout. */
+bool nmb_device_dirty_counts(const NmbDevice *, uint64_t out[12]);
+/* v2 dirty-page counters, sixteen words: copy-in bytes and bytes skipped by a log's answer,
  * copies gated by a log, answered whole and their bytes copied, stamps asked, waits, waits unanswered,
- * then logs made, whole-range answers, recorded writes, records consolidated away. */
-bool nmb_device_dirty_counts(const NmbDevice *, uint64_t out[12]);""")
+ * then logs made, whole-range answers, recorded writes, records consolidated away;
+ * shadow whole-copy bytes, skipped shadow copies, wait nanoseconds, withheld holds.
+ * The caller provides all sixteen words. */
+bool nmb_device_dirty_counts_v2(const NmbDevice *, uint64_t out[16]);""")
 
 # 6. The frontend's surface import carries the surface for the log.
 edit('NativeBridgeMetalFrontend.mm',
@@ -846,11 +879,15 @@ edit('NativeBridgeMetalFrontend.mm',
   if(nmb_device_texture_counts(gDevice,tc))
    row("L inp %llu/%llu rf %llu/%llu sh %llu cp %llu bk %llu rt %llu",(ull)tc[0],(ull)tc[1],(ull)tc[2],
     (ull)tc[3],(ull)tc[4],(ull)tc[5],(ull)tc[6],(ull)tc[7]);
-  // data-a-live: the IOSurface dirty-page log's answers (nmb_device_dirty_counts): copy-in bytes the
-  // log skipped vs copied, dirty-gated copies and whole answers, stamps and waits; the bridge's own
-  // logs, whole-range answers, records and consolidations.
-  uint64_t dp[12]={};
-  if(nmb_device_dirty_counts(gDevice,dp))
-   row("DP cb %llu skip %llu gated %llu whole %llu dbc %llu stamps %llu waits %llu/%llu | logs %llu wr %llu rec %llu cons %llu",
-    (ull)dp[0],(ull)dp[1],(ull)dp[2],(ull)dp[3],(ull)dp[4],(ull)dp[5],(ull)dp[6],(ull)dp[7],
-    (ull)dp[8],(ull)dp[9],(ull)dp[10],(ull)dp[11]);""")
+  // Each row must fit telemetry's 90-character limit even at UINT64_MAX. CPU copied-buffer
+  // traffic and GPU shadow traffic are distinct; cb=0 alone says nothing about shadow copy-in.
+  uint64_t dp[16]={};
+  if(nmb_device_dirty_counts_v2(gDevice,dp)) {
+   row("DP cpu %llu skip %llu",(ull)dp[0],(ull)dp[1]);
+   row("DG gated %llu whole %llu skip %llu",(ull)dp[2],(ull)dp[3],(ull)dp[13]);
+   row("DB whole %llu copied %llu",(ull)dp[12],(ull)dp[4]);
+   row("DW stamps %llu waits %llu unknown %llu",(ull)dp[5],(ull)dp[6],(ull)dp[7]);
+   row("DH ns %llu withheld %llu",(ull)dp[14],(ull)dp[15]);
+   row("DL logs %llu whole %llu",(ull)dp[8],(ull)dp[9]);
+   row("DR records %llu compact %llu",(ull)dp[10],(ull)dp[11]);
+  }""")

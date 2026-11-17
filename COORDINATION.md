@@ -311,3 +311,18 @@ synchronization points. Read it before acting; update your row after acting.
   checked; wait_irq only waits on REPORT bit16 and clears it).
 - Images already built from this kernel: usb-cam-sliceb-wtest-w56-ext.img (=6 probe) and
   usb-cam-sliceb-b2-w56-ext.img (=2 real-frame attempt, unrun). Device released.
+
+
+## Codex GPU DirtyPages contract build (2026-11-17)
+- Branch codex/gpu-dirtypages-contract-20261117, based on the accepted Stage-2 GPU branch.
+- Serializes stamp/record publication, fixes equal-watermark semantics and import-length reuse,
+  preserves the original counter ABI and adds bounded CPU/GPU shadow telemetry.
+- CPU-unlock seeds cannot cover external GPU writes: wait(false) preserves full-copy correctness
+  pending a complete shared write-publication source. No performance improvement is claimed.
+- Ten isolated host contract checks passed; complete iOS bundle build pending. User authorized
+  pushing this batch and running macOS CI in the current conversation.
+- Device NOT HELD; no boot/reboot or installation authorized or performed in this build step.
+- Current storage is the accepted 128GiB double-container root restored on 2026-11-17;
+  old root.img/metal-update image names and old ADT mappings in this file are historical only.
+- Before any later device trial, use the current active-root configuration, refresh, verify the
+  candidate's embedded ADT, and obtain the current conversation's explicit boot approval.
