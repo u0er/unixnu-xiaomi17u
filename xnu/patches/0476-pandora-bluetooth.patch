@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..21922c8f05c01bd203c067f436c36cff6092b809
+index 0000000..1c010d283e7f7aaed6dc1856244e7217b186e837
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,3319 @@
+@@ -0,0 +1,3335 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2152,7 +2152,15 @@ index 0000000..21922c8f05c01bd203c067f436c36cff6092b809
 +		if ((unsigned)rx[3] > cap - 4u) {
 +			/* Oversized: four payload bytes are already in peek, so
 +			 * drain only the remainder. The caller discards it. */
-+			uint8_t sink[32];
++			/* Level 20.5: the ROM answers this phase with 250-256 byte
++			 * events (status 2 at level 20.2, the 256 B patch notification
++			 * at level 20.4) and retransmits them. A 32 byte sink dropped
++			 * the body, so this phase's single-variable observation is the
++			 * capture capacity itself: read the whole payload and dump it,
++			 * then still report EMSGSIZE (the caller treats that as a
++			 * discardable stale event, exactly as before). Nothing the
++			 * driver transmits changes. */
++			uint8_t sink[512];
 +			unsigned dropped = 0;
 +			unsigned want = (unsigned)rx[3] - 4u;
 +			int e2;
@@ -2167,6 +2175,7 @@ index 0000000..21922c8f05c01bd203c067f436c36cff6092b809
 +				}
 +				dropped += got3;
 +			}
++			bt_dump("PERI oversized event payload", sink, dropped);
 +			printf("PANDORA BT: PERI event oversized (%u B payload), drained\n",
 +			    rx[3]);
 +			return EMSGSIZE;
@@ -2190,7 +2199,10 @@ index 0000000..21922c8f05c01bd203c067f436c36cff6092b809
 +		 * queued (they would corrupt every later event read). Bounded:
 +		 * plen is one byte, so at most 255 bytes. The caller (wait_sub)
 +		 * treats EMSGSIZE as a discardable stale event. */
-+		uint8_t sink[32];
++		/* Level 20.5: capture the whole oversized payload (see the same
++		 * change in the peek path above) so the ROM's 250-256 byte events
++		 * reach the log instead of being thrown away in a 32 byte sink. */
++		uint8_t sink[512];
 +		unsigned dropped = 0;
 +		int e2;
 +		while (dropped < (unsigned)rx[3]) {
@@ -2203,6 +2215,7 @@ index 0000000..21922c8f05c01bd203c067f436c36cff6092b809
 +			}
 +			dropped += got2;
 +		}
++		bt_dump("PERI oversized event payload", sink, dropped);
 +		printf("PANDORA BT: PERI event oversized (%u B payload), drained\n",
 +		    rx[3]);
 +		return EMSGSIZE;
@@ -3055,7 +3068,7 @@ index 0000000..21922c8f05c01bd203c067f436c36cff6092b809
 +	 * is full. Nothing here transmits a request. */
 +	clock_interval_to_deadline(BT_PERI_POST_DRAIN_MS, NSEC_PER_MSEC, &deadline);
 +	while (mach_absolute_time() < deadline && *acc_len < cap) {
-+		(void)bt_peri_rx_collect(what, acc, acc_len, cap, 128u);
++		(void)bt_peri_rx_collect(what, acc, acc_len, cap, 512u);
 +		if (*acc_len >= cap) {
 +			break;
 +		}
@@ -3098,7 +3111,10 @@ index 0000000..21922c8f05c01bd203c067f436c36cff6092b809
 +	    sizeof(pandora_peri_tmel_elf), "PERI TME-L", 0u,
 +	    BT_PERI_NVM_LAST_ACK_MS, 0x03);
 +	{
-+		uint8_t drain[128] = {0};
++		/* Level 20.5: the buffer is 512 so a full 256 byte event (the
++		 * size the ROM actually sends here) lands in one piece; a 128
++		 * byte buffer stopped at half the frame and the body was lost. */
++		uint8_t drain[512] = {0};
 +		unsigned drain_len = 0;
 +
 +		/* Observability only - runs whether or not the download itself
