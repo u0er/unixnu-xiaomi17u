@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..89f4a7c2c7f02ce543be876c3070606c8603a6b4
+index 0000000..85c1c0201f9afec5411e9c6552283a0f48a3074e
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,3255 @@
+@@ -0,0 +1,3264 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2859,9 +2859,12 @@ index 0000000..89f4a7c2c7f02ce543be876c3070606c8603a6b4
 + *            (sub-op 06 03 = TME-L; the file is tmel_peach_20.elf, 68,952 B
 + *             = 284 segments with a 183-byte tail. The map table carries two
 + *             builds and the platform key BRAHMA_VER_2_0 - this Nezha is
-+ *             Ganges 2.0 - selects the 20 file; the 1.1 tmel_peach_10.elf
-+ *             (63,096 B / 260 segments) makes the ROM answer the last segment
-+ *             with status 2 "invalid patch version argument".)
++ *             Ganges 2.0 - selects the 20 file. Level 20.2 proved the file is
++ *             NOT the discriminator: the 1.1 file (63,096 B / 260 segments)
++ *             and the 2.0 file get the SAME 63-byte status-2 event, byte for
++ *             byte, so it is the request cadence/arguments that the ROM
++ *             rejects, not the payload. Level 20.3 therefore streams the map
++ *             at full speed like Android does.)
 + *   10.199460 TX 5 01 00 fc 01 19               license prerequisite VSC
 + *   10.202237.. TX 249 01 00 fc f5 1e <243B>   license VSC segments (sub-op 1e)
 + * Each license segment is answered by a 04 0e 05 Command Complete
@@ -3016,9 +3019,15 @@ index 0000000..89f4a7c2c7f02ce543be876c3070606c8603a6b4
 +}
 +
 +/* TlvDnldSegment sub-op 06 03 (the TME-L map download) is reached via
-+ * bt_peri_tlv_download_sub(.., 0x03); the seeded last-ACK parser and the
-+ * collect accumulator handle the paced trickle exactly like the NVM
-+ * phase (the map is flash-programmed too). */
++ * bt_peri_tlv_download_sub(.., 0x03).
++ *
++ * Level 20.3 single variable: pace 1500 us -> 0 us (stream at full speed,
++ * exactly as the RAM patch already does and as the Android HAL streams the
++ * map: the trace shows the whole 68,952 B map going out inside ~250 ms with
++ * zero per-segment read). Level 20.1 and 20.2 both returned the same 63-byte
++ * status-2 event on the last segment while Android's own run had no RX at all
++ * between its map start and its PatchVerReq - so the paced cadence itself is
++ * now the suspect, not the file. */
 +
 +/* Level 20 orchestrator: after the level-19 download chain passes,
 + * reset the PERI and load the TME-L patch map table. */
@@ -3043,7 +3052,7 @@ index 0000000..89f4a7c2c7f02ce543be876c3070606c8603a6b4
 +		return err;
 +	}
 +	err = bt_peri_tlv_download_sub(pandora_peri_tmel_elf,
-+	    sizeof(pandora_peri_tmel_elf), "PERI TME-L", BT_PERI_NVM_PACE_US,
++	    sizeof(pandora_peri_tmel_elf), "PERI TME-L", 0u,
 +	    BT_PERI_NVM_LAST_ACK_MS, 0x03);
 +	if (err) {
 +		return err;
