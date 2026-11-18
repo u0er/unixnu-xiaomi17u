@@ -1,0 +1,48 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -3797,6 +3797,30 @@
+ 	}
+ 	gpu_fault_fsr = fsr;
+ 	gpu_fault_far = far_lo;
++
++	/* 0484: attribute the faulting address. gpu_fault_check runs on the DCVS thread without
++	 * gpu_lock, but gpu_bos[] and the SMMU tables it walks are protected by that lock. Take a
++	 * snapshot under the lock (faults are rare: 1-3 per 90 s), then print after dropping it.
++	 * This only adds diagnostics; no ring/BO/rendering state is changed. */
++	const uint64_t fault_iova = ((uint64_t)gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x64) << 32) | far_lo;
++	uint64_t fault_leaf = 0;
++	int owner_client = -1;
++	uint32_t owner_gen = 0, owner_mapseq = 0;
++	uint64_t owner_iova = 0, owner_bytes = 0;
++	bool owner_imported = false;
++	lck_mtx_lock(&gpu_lock);
++	fault_leaf = smmu_leaf(&gpu_smmu, fault_iova);
++	const struct gpu_bo *owner = gpu_bo_at(fault_iova, 4);
++	if (owner) {
++		owner_client = owner->client;
++		owner_gen = owner->gen;
++		owner_mapseq = owner->map_seq;
++		owner_iova = owner->iova;
++		owner_bytes = owner->bytes;
++		owner_imported = owner->pages != NULL;
++	}
++	lck_mtx_unlock(&gpu_lock);
++
+ 	const volatile uint32_t *mem = (const volatile uint32_t *)(gpu_bufs[2].va + MEMPTRS_OFF);
+ 	flush_dcache64((addr64_t)gpu_bufs[2].pa + MEMPTRS_OFF, 16, TRUE);
+ 	const uint32_t ring = mem[1];
+@@ -3807,6 +3831,11 @@
+ 	    gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x64), far_lo, gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x68),
+ 	    gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x6c), gr(UCHE_CLIENT_PF_A8XX), ring, gpu_seqno, h->seq, h->client,
+ 	    known ? gpu_clients[h->client].name : "?", h->thread, h->n, (unsigned long long)h->ib0, h->dw0);
++	printf("PANDORA GPU FAULT ATTR: iova %llx leaf %s owner %s client %d gen %u mapseq %u iova %llx+%llx %s\n",
++		(unsigned long long)fault_iova, fault_leaf ? "mapped" : "none",
++		owner_client >= 0 ? "yes" : "no", owner_client, owner_gen, owner_mapseq,
++		(unsigned long long)owner_iova, (unsigned long long)owner_bytes,
++		owner_client >= 0 ? (owner_imported ? "imported" : "pool") : "-");
+ }
+ 
+ static uint64_t
