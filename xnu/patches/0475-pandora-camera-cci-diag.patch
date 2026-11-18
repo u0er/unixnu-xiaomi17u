@@ -33,7 +33,7 @@ diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/pandora_camera.c
-@@ -0,0 +1,6269 @@
+@@ -0,0 +1,6287 @@
 +/*
 + * NEZHA camera subsystem: Stage C-1/C-2a/C-2b-p/C-2b-w0 read-only diagnostics,
 + * plus the Stage C-2b-w1 GDSC/AHB bring-up probe (writes three CAMCC
@@ -5543,6 +5543,21 @@ new file mode 100644
 +	}
 +	pc_csiphy0_va = phy0;
 +
++	/* The PHY's 0.9 V analog rail is a camera-gated RPMh regulator.
++	 * DT `qcom,csiphy0@9523000`: csi-vdd-0p9-supply -> phandle 0x383 ->
++	 * /soc/rsc@18900000/drv@2/rpmh-regulator-l3i-e0 (regulator-name
++	 * pmh0110_i_l3, 880000-920000 uV, 151 mA), csi-vdd-1p2-supply ->
++	 * phandle 0x40 -> rpmh-regulator-l1d-e0 (pmh0110_d_l1, 1.2 V, already
++	 * enabled). The Android regulator class shows i_l3 DISABLED while the
++	 * camera is closed, and neither w79..w83 nor this probe's clock path
++	 * votes it. Without it the PHY keeps its register file readable over
++	 * AHB but cannot bring the lanes up. Vote it before touching the PHY. */
++	printf("PANDORA SLICEB: cphytest vdd0p9 vote %d %d\n",
++	    pandora_rpmh_resource("L3I_E0", 0, 880),
++	    pandora_rpmh_resource("L3I_E0", 4, 1));
++	pc_sleep(2);
++	(void)pandora_log_sync();
++
 +	/* Clock state copied from the streaming golden dump. The PLL0 is not
 +	 * touched: L_VAL lives at 0x10 (0x0044003e) and USER_CTL at 0x18
 +	 * (0x840f); w80 wrote 0x8608 into 0x10, which is not a clock control. */
@@ -5672,6 +5687,9 @@ new file mode 100644
 +	    pc_rd(csid2, 0x1b0u));
 +	(void)pandora_log_sync();
 +	pc_sliceb_stream_on(0);
++	/* Drop the camera-gated 0.9 V analog vote again. */
++	printf("PANDORA SLICEB: cphytest vdd0p9 release %d\n",
++	    pandora_rpmh_resource("L3I_E0", 4, 0));
 +	pc_csiphy_mark("cphytest done (sensor left in standby)");
 +}
 +
