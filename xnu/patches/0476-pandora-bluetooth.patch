@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..ad99eb17b91284062dae8173d9f22e61dd3bea18
+index 0000000..1516c8294be8908220fe9bcba3b8c715c6b8105b
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,3195 @@
+@@ -0,0 +1,3250 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2325,12 +2325,26 @@ index 0000000..ad99eb17b91284062dae8173d9f22e61dd3bea18
 +	unsigned taken = 0;
 +	uint8_t seen[16];
 +	unsigned shown = 0;
++	unsigned answered = 0;
 +
 +	while (taken < limit && (bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
 +		uint8_t byte = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
 +
 +		if (shown < sizeof(seen)) {
 +			seen[shown++] = byte;
++		}
++		if (byte == 0xfd) {
++			/* Level 20.1: during the paced TME-L phase the ROM re-issues
++			 * its fd wake request per segment (the 2026-11-18 12:0x run
++			 * collected 188 fd bytes, never answered). The wake handshake
++			 * answers fd with fc - the same rule every between-frame
++			 * loop applies. Bounded by the limit itself. */
++			const uint8_t fc = 0xfc;
++
++			(void)bt_uart_tx(&fc, 1, "PERI collect wake ACK FC");
++			answered++;
++			taken++;
++			continue;
 +		}
 +		if (*acc_len < cap) {
 +			acc[(*acc_len)++] = byte;
@@ -2341,6 +2355,9 @@ index 0000000..ad99eb17b91284062dae8173d9f22e61dd3bea18
 +		printf("PANDORA BT: PERI collect (%s): %u byte(s)", what, taken);
 +		if (*acc_len > taken) {
 +			printf(", acc %u", *acc_len);
++		}
++		if (answered) {
++			printf(", fd->fc x%u", answered);
 +		}
 +		printf(":");
 +		for (unsigned i = 0; i < shown; i++) {
@@ -2959,6 +2976,40 @@ index 0000000..ad99eb17b91284062dae8173d9f22e61dd3bea18
 +	return 0;
 +}
 +
++/* Version re-check after the reset, verbatim t=9.930829:
++ * 31 00 f0 ff 02 05 03. The 2026-11-18 12:0x level-20 run skipped this
++ * frame and the ROM rejected the TME-L segments with status 2
++ * (invalid patch version argument) - this gate is what it demanded. The
++ * reply is the version family (subcmd 5 at offset 10, like the
++ * 115200-phase version exchange). */
++static int
++bt_peri_version_v3(void)
++{
++	static const uint8_t request[] = { 0x31, 0x00, 0xf0, 0xff, 0x02, 0x05, 0x03 };
++	uint8_t rx[BT_PERI_EVT_MAX] = {0};
++	unsigned got = 0;
++	uint64_t deadline;
++	int err;
++
++	err = bt_uart_tx(request, sizeof(request), "PERI version v3 request");
++	if (err) {
++		return err;
++	}
++	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
++	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x05,
++	    "PERI version v3");
++	if (err) {
++		printf("PANDORA BT: version v3: no reply (error %d, %u bytes)\n", err, got);
++		bt_dump("PERI version v3 raw", rx, got);
++		pandora_log_sync();
++		return err;
++	}
++	printf("PANDORA BT: version v3 reply (subcmd 5, %u bytes)\n", got);
++	bt_dump("PERI version v3 reply", rx, got);
++	pandora_log_sync();
++	return 0;
++}
++
 +/* TlvDnldSegment sub-op 06 03 (the TME-L map download) is reached via
 + * bt_peri_tlv_download_sub(.., 0x03); the seeded last-ACK parser and the
 + * collect accumulator handle the paced trickle exactly like the NVM
@@ -2979,6 +3030,10 @@ index 0000000..ad99eb17b91284062dae8173d9f22e61dd3bea18
 +		return err;
 +	}
 +	err = bt_peri_arbitrate_v3();
++	if (err) {
++		return err;
++	}
++	err = bt_peri_version_v3();
 +	if (err) {
 +		return err;
 +	}
