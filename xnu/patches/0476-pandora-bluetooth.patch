@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..f859948d598c525de6c0a57c205426c75012c423
+index 0000000..21922c8f05c01bd203c067f436c36cff6092b809
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,3299 @@
+@@ -0,0 +1,3319 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -1940,6 +1940,11 @@ index 0000000..f859948d598c525de6c0a57c205426c75012c423
 + * the last ACK 3 s for erase/commit latency; the ram patch stays unpaced. */
 +#define BT_PERI_NVM_PACE_US 1500u
 +#define BT_PERI_NVM_LAST_ACK_MS 3000u
++/* Level 20.3/20.4: observation window after the TME-L map download. The ROM's
++ * 63-byte status-2 event arrived ~185 ms into the phase in both earlier runs,
++ * so the post-download drain keeps reading for this long (bounded, no
++ * transmission) instead of sampling once. */
++#define BT_PERI_POST_DRAIN_MS 1000u
 +
 +/* DownloadAndCmdExeStatus: 0 is silent success; 1..37 have fixed names. */
 +static const char *
@@ -3040,13 +3045,28 @@ index 0000000..f859948d598c525de6c0a57c205426c75012c423
 +bt_peri_post_download_drain(const char *what, uint8_t *acc, unsigned *acc_len, unsigned cap)
 +{
 +	unsigned before = *acc_len;
++	uint64_t deadline;
 +
-+	(void)bt_peri_rx_collect(what, acc, acc_len, cap, 128u);
++	/* Bounded, not instantaneous: in both level 20.1 and 20.2 runs the ROM
++	 * emitted its 63-byte status-2 event ~185 ms after the TME-L phase
++	 * began, i.e. well after the phase start and clearly not on the last
++	 * segment. An immediate one-shot read would miss exactly that event, so
++	 * keep collecting for a bounded window and stop early when the buffer
++	 * is full. Nothing here transmits a request. */
++	clock_interval_to_deadline(BT_PERI_POST_DRAIN_MS, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline && *acc_len < cap) {
++		(void)bt_peri_rx_collect(what, acc, acc_len, cap, 128u);
++		if (*acc_len >= cap) {
++			break;
++		}
++		bt_sleep(1000u);
++	}
 +	if (*acc_len == before) {
-+		printf("PANDORA BT: %s: no unsolicited event after the download\n", what);
++		printf("PANDORA BT: %s: no unsolicited event in the %u ms after the download\n",
++		    what, (unsigned)BT_PERI_POST_DRAIN_MS);
 +	} else {
-+		printf("PANDORA BT: %s: %u unsolicited byte(s) after the download\n",
-+		    what, *acc_len - before);
++		printf("PANDORA BT: %s: %u unsolicited byte(s) in the %u ms after the download\n",
++		    what, *acc_len - before, (unsigned)BT_PERI_POST_DRAIN_MS);
 +		bt_dump("PERI post-download drain", acc + before, *acc_len - before);
 +	}
 +	pandora_log_sync();
