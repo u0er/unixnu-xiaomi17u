@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..85c1c0201f9afec5411e9c6552283a0f48a3074e
+index 0000000..f859948d598c525de6c0a57c205426c75012c423
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,3264 @@
+@@ -0,0 +1,3299 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3029,6 +3029,29 @@ index 0000000..85c1c0201f9afec5411e9c6552283a0f48a3074e
 + * between its map start and its PatchVerReq - so the paced cadence itself is
 + * now the suspect, not the file. */
 +
++/* Level 20.3: drain the UART RX FIFO once after the TME-L download.
++ * Observability only - it issues no request and changes no transmission
++ * cadence, so the single variable (pace) stays clean. What it records is
++ * whatever the ROM sends unsolicited once the map is down: the HAL waits for
++ * the TME-L patch notification (ConfigureTMESoC, "Patch Ntf success" /
++ * "Patch Ntf failed"), and an unread notification would otherwise sit in the
++ * FIFO and pollute the next phase. */
++static void
++bt_peri_post_download_drain(const char *what, uint8_t *acc, unsigned *acc_len, unsigned cap)
++{
++	unsigned before = *acc_len;
++
++	(void)bt_peri_rx_collect(what, acc, acc_len, cap, 128u);
++	if (*acc_len == before) {
++		printf("PANDORA BT: %s: no unsolicited event after the download\n", what);
++	} else {
++		printf("PANDORA BT: %s: %u unsolicited byte(s) after the download\n",
++		    what, *acc_len - before);
++		bt_dump("PERI post-download drain", acc + before, *acc_len - before);
++	}
++	pandora_log_sync();
++}
++
 +/* Level 20 orchestrator: after the level-19 download chain passes,
 + * reset the PERI and load the TME-L patch map table. */
 +static int
@@ -3054,6 +3077,18 @@ index 0000000..85c1c0201f9afec5411e9c6552283a0f48a3074e
 +	err = bt_peri_tlv_download_sub(pandora_peri_tmel_elf,
 +	    sizeof(pandora_peri_tmel_elf), "PERI TME-L", 0u,
 +	    BT_PERI_NVM_LAST_ACK_MS, 0x03);
++	{
++		uint8_t drain[128] = {0};
++		unsigned drain_len = 0;
++
++		/* Observability only - runs whether or not the download itself
++		 * ended in an error, and issues no request: record what the ROM
++		 * sends after the map lands (the TME-L patch notification the
++		 * HAL waits for in ConfigureTMESoC) instead of letting it sit
++		 * in the FIFO and pollute the next phase. */
++		bt_peri_post_download_drain("PERI TME-L", drain, &drain_len,
++		    sizeof(drain));
++	}
 +	if (err) {
 +		return err;
 +	}
