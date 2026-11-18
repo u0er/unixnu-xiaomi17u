@@ -20,9 +20,9 @@ synchronization points. Read it before acting; update your row after acting.
 | agent | app | task | latest main contribution | CI run | device | next |
 |-------|-----|------|--------------------------|--------|--------|------|
 | Qoder | Qoder | Camera: mainline CAMCC offsets + root-enable applied, branch still CLK_OFF | 0e4c2a46 (0475) | 43646938964 SUCCESS | released | next: PLL0 post-div/ODD output or branch halt config |
-| CodeArts | CodeArts | BT_EN 150ms (Linux align) | 374428b2 (150ms) | 43567040764 in_progress | not held | w59 wake ok but silent; trying Linux 150ms boot delay |
+| CodeArts | CodeArts | BT_EN / PERI firmware levels 19.8 complete | 68a83b3 (level 19.8) | 44142532860 SUCCESS | released (Android; audits PASS) | no device hold |
 | ZCode | ZCode | GPU Stage-1 DONE: pin 555b13d5/73d582fd4 live, desktop verified (ABI 528/536 fix 8b1d557), shadow copies -86..94% + copy-back 0 | 8b1d557 on metal2vulkan-555b13d5 | 43602780936 SUCCESS | released | next: PosterBoard cold-boot sig10 (needs .ips fix, see RUNTIME_SHADOW_CACHE.md 0.5), unplug hang needs first-seizure log |
-| Codex | Codex | GPU frame pacing: 0482 WPTR log reduction + 0483 bounded BO OOM diagnostics; IRQ scanout counters made atomic | f117612 (published GPU branch; 0483 included) | 44077374491 SUCCESS; 44106182360 SUCCESS; BT build 44115701928 in_progress | BT Level 19.3 owns the device window; no GPU device access | keep branch ready; wait for BT 19.3 return/audit before any GPU candidate |
+| Codex | Codex | GPU frame pacing: scanout IRQ candidate, 0482 baseline | f117612 (published GPU branch; 0483 local, no CI artifact) | 44077374491 SUCCESS; 44106182360 SUCCESS; BT 19.8 44142532860 SUCCESS | HOLDING DEVICE (Android) for GPU scanout IRQ trial; no other agent may stage/boot | preflight, stage, boot 90s, audit, release device |
 
 ## Notes
 - 2026-11-14 ~09:10Z CodeArts: 0476 121716fe (BT_EN low 100 ms, high 200 ms) is pushed and verified locally; needs exactly one dispatch (no cancel) when CI is idle. Earlier w53 fault was bt_sleep() units on the low side too (10 us).
@@ -556,7 +556,7 @@ synchronization points. Read it before acting; update your row after acting.
 - RESIDUAL (harmless, from the stale-image incident): ~899 catalog-vs-extents marks (hfs_catalog.c:985 silent path - files whose fork ca_blocks > extents sum from the incident's failed truncations) + 22 BlockMarkFreeInternal free-unallocated events. Kernel runtime-adjusts (cf_blocks=validblks) on each lookup. The kHFSVolumeInconsistentMask bit (0x4000) re-sets whenever damaged files are touched - it does NOT block root-volume mounts (hfs_vfsops.c:343 allows MNT_ROOTFS) - ZCode cleared it post-session for a clean starting VH; expect it to reappear, this is cosmetic for this rig (no fsck_hfs available).
 - Device RELEASED. Reminder to all: rebuild trials (device_trial prepare) before ANY boot - stale prebuilt images carry the 53-segment ADT and WILL damage the expanded volume again.
 - Last updated: 2026-11-15 by ZCode (recovery verified, device released)
-- Last updated: 2026-11-17 by Codex (f117612 published; BT Level 19.3 trial is now the active device hold)
+- Last updated: 2026-11-18 by Codex (BT 19.8 PASS; GPU scanout IRQ window claimed)
 ## ZCode GPU agent: Stage-2 DirtyPages v1 building (2026-11-15 ~16:4xZ, user approved push)
 - adapt_ios16.py v3 (30 edits, commit ee1fa1c8) pushed to metal2vulkan-555b13d5; turnip run 43695514612 auto-started (CI was idle, nothing cancelled). First bridge-side DirtyPages implementation anywhere: every IOSurface import gets its own dirty-page log (kernel SweetSurface per-surface seed via IOSurfaceGetSeed + the runtime's wrote_runs reports) attached through HostMemory::with_dirty_pages; new ABI nmb_buffer_new_no_copy_surface_releasing + nmb_device_dirty_counts. Kernel/shim/m2v-pin unchanged - single variable = metal bundle.
 - Verification plan when the bundle lands: assemble trial (single-variable metal), bounded 90 s boot after user consent, judge by WorkCounts copied_copy_in_bytes_skipped (skipped copy-in bytes) rising sharply vs copied_copy_in_bytes, desktop/Safari no regression.
