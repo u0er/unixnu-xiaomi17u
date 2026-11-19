@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..795f2785f3b33916fa92263c9eba563edcfa4e18
+index 0000000..5d39e88e4d0e6d105a60785de37fb647705cfe06
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,3704 @@
+@@ -0,0 +1,3793 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2531,9 +2531,12 @@ index 0000000..795f2785f3b33916fa92263c9eba563edcfa4e18
 +	if (seglen == 0u || seglen > BT_FW_SEG_MAX) {
 +		return EINVAL;
 +	}
-+	if (!ack_ms) {
-+		return EINVAL;
-+	}
++	/* Level 20.12: ack_ms == 0 now means "SKIP_EVT_VSE_CC, last segment too".
++	 * The reference HAL's TME-L path never waits for a VSE CC - its trace has
++	 * zero 34-prefixed RX across the whole 68,952 B map, and TlvDnldReq sets
++	 * the per-segment skip flag before the loop - so this phase must not
++	 * invent a wait for the last segment either. Every other caller still
++	 * passes a non-zero budget and keeps the original gate. */
 +	frame[0] = 0x31;
 +	frame[1] = 0x00;
 +	frame[2] = 0xf0;
@@ -2554,6 +2557,12 @@ index 0000000..795f2785f3b33916fa92263c9eba563edcfa4e18
 +		 * silent between segments (trace: zero RX irqs across 93 ms).
 +		 * Paced phases read only via the caller's collect - their ACK
 +		 * trickles 2 bytes per segment (level 19.4 device evidence). */
++		return 0;
++	}
++	if (!ack_ms) {
++		/* Level 20.12: TME-L path - the ROM answers nothing, and the HAL
++		 * does not read either. Return success without touching RX so the
++		 * phase ends at the last byte on the wire, exactly like Android. */
 +		return 0;
 +	}
 +	if (seed_len) {
@@ -2649,8 +2658,13 @@ index 0000000..795f2785f3b33916fa92263c9eba563edcfa4e18
 +			pandora_log_sync();
 +		}
 +	}
-+	printf("PANDORA BT: %s: %u segments streamed (%u bytes), last-segment ACK status 0\n",
-+	    what, nseg, sent);
++	if (last_ack_ms) {
++		printf("PANDORA BT: %s: %u segments streamed (%u bytes), last-segment ACK status 0\n",
++		    what, nseg, sent);
++	} else {
++		printf("PANDORA BT: %s: %u segments streamed (%u bytes), last-segment ACK skipped (SKIP_EVT_VSE_CC)\n",
++		    what, nseg, sent);
++	}
 +	pandora_log_sync();
 +	return 0;
 +}
@@ -3121,38 +3135,45 @@ index 0000000..795f2785f3b33916fa92263c9eba563edcfa4e18
 + * has no cnss_softsku_peach.pfm, so the probe sends the 0x23 command alone and
 + * records whatever answers it. Observation only: one 5-byte TX, no cadence
 + * change, no retry. */
++/* Level 20.11/20.12: send one 0xfc00 vendor command the way the HAL's
++ * HciSendVsCmd does and record the answer window. The reference trace uses
++ * this exact shape for four different sub-ops - 0x19 (start patch download,
++ * answered 04 0e 05 01 00 fc 00 1e), the 245-byte data packets, 0x23
++ * (answered 04 0e 08 01 00 fc 00 23 02 00 00) and 0x20 (end/verify) - so the
++ * sender is parameterised here and the caller names the phase. Observation
++ * only: one 5-byte TX, no retry, no cadence change. */
 +static void
-+bt_peri_tme_status_probe(void)
++bt_peri_tme_vs_cmd(uint8_t param, unsigned window_ms, const char *what)
 +{
-+	static const uint8_t request[] = { 0x01, 0x00, 0xfc, 0x01, 0x23 };
++	uint8_t request[5] = { 0x01, 0x00, 0xfc, 0x01, param };
 +	uint8_t rx[BT_PERI_EVT_MAX] = {0};
 +	unsigned got = 0;
 +	uint64_t deadline;
 +	unsigned packets = 0;
 +	int err;
 +
-+	printf("PANDORA BT: PERI TME-L: status probe VS command 01 00 fc 01 23\n");
++	printf("PANDORA BT: PERI TME-L: %s VS command 01 00 fc 01 %02x\n", what, param);
 +	pandora_log_sync();
-+	err = bt_uart_tx(request, sizeof(request), "PERI TME-L status probe");
++	err = bt_uart_tx(request, sizeof(request), "PERI TME-L VS command");
 +	if (err) {
-+		printf("PANDORA BT: PERI TME-L: status probe TX failed (error %d)\n", err);
++		printf("PANDORA BT: PERI TME-L: %s TX failed (error %d)\n", what, err);
 +		pandora_log_sync();
 +		return;
 +	}
-+	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
++	clock_interval_to_deadline(window_ms, NSEC_PER_MSEC, &deadline);
 +	while (packets < 64u && mach_absolute_time() < deadline) {
 +		uint8_t lead = 0;
 +		unsigned field = 0;
 +
 +		err = bt_rx_exact(&lead, 1, &field, deadline);
 +		if (err) {
-+			printf("PANDORA BT: PERI TME-L: status probe read ends (error %d) after %u packet(s)\n",
-+			    err, packets);
++			printf("PANDORA BT: PERI TME-L: %s read ends (error %d) after %u packet(s)\n",
++			    what, err, packets);
 +			pandora_log_sync();
 +			return;
 +		}
 +		if (lead == 0xfc || lead == 0xfe || lead == 0xff) {
-+			printf("PANDORA BT: PERI TME-L: status probe control byte %#x\n", lead);
++			printf("PANDORA BT: PERI TME-L: %s control byte %#x\n", what, lead);
 +			pandora_log_sync();
 +			continue;
 +		}
@@ -3174,12 +3195,12 @@ index 0000000..795f2785f3b33916fa92263c9eba563edcfa4e18
 +			if (err) {
 +				break;
 +			}
-+			printf("PANDORA BT: PERI TME-L: status probe HCI event %02x len %u\n",
-+			    eh[0], evlen);
++			printf("PANDORA BT: PERI TME-L: %s HCI event %02x len %u\n",
++			    what, eh[0], evlen);
 +			bt_dump("PERI TME-L probe HCI event", rx, got);
 +			if (eh[0] == 0x0eu && got >= 3u) {
-+				printf("PANDORA BT: PERI TME-L: status probe CC status %u opcode %02x %02x rest %02x %02x %02x %02x\n",
-+				    rx[0], rx[2], rx[1],
++				printf("PANDORA BT: PERI TME-L: %s CC status %u opcode %02x %02x rest %02x %02x %02x %02x\n",
++				    what, rx[0], rx[2], rx[1],
 +				    got > 3u ? rx[3] : 0xffu, got > 4u ? rx[4] : 0xffu,
 +				    got > 5u ? rx[5] : 0xffu, got > 6u ? rx[6] : 0xffu);
 +			}
@@ -3203,18 +3224,85 @@ index 0000000..795f2785f3b33916fa92263c9eba563edcfa4e18
 +			if (err) {
 +				break;
 +			}
-+			printf("PANDORA BT: PERI TME-L: status probe frame %02x %02x %02x len %u\n",
-+			    lead, fh[0], fh[1], plen);
++			printf("PANDORA BT: PERI TME-L: %s frame %02x %02x %02x len %u\n",
++			    what, lead, fh[0], fh[1], plen);
 +			bt_dump("PERI TME-L probe frame", rx, got);
 +			pandora_log_sync();
 +			continue;
 +		}
-+		printf("PANDORA BT: PERI TME-L: status probe stray byte %#x\n", lead);
++		printf("PANDORA BT: PERI TME-L: %s stray byte %#x\n", what, lead);
 +		pandora_log_sync();
 +	}
-+	printf("PANDORA BT: PERI TME-L: status probe window closed after %u packet(s)\n",
-+	    packets);
++	printf("PANDORA BT: PERI TME-L: %s window closed after %u packet(s)\n",
++	    what, packets);
 +	pandora_log_sync();
++}
++
++/* Level 20.12: the HAL's Stage B. ConfigureTMESoC first calls
++ * TMEPatchDownload() - which for TME-L sends only the peri map and returns
++ * ("tmel doesn't support nvm download") - and then blocks in
++ * ReadHciEvent(buf, 260) waiting for the Patch Ntf. The trace shows what
++ * fills that gap on the wire: 01 00 fc 01 19 (start), a stream of
++ * 01 00 fc f5 1e f3 <243 B> packets (~69 KB, first packet again ELF magic),
++ * one 01 00 fc 01 23 about 82 % in, then 01 00 fc 01 20 to close. This
++ * replays that sequence verbatim; 0x23 is NOT a post-map handshake.
++ *
++ * Payload note: the local tmel_peach_20.elf matches the trace's first 16 B
++ * (ELF header) but not the interior chunks - samples from 10.247/10.273/
++ *10.318/10.593 s are absent from the file - so the true Stage-B file is
++ * still unidentified. The same array is used provisionally; when the device
++ * is free the real file is pulled from /vendor/etc/bluetooth or
++ * /bt_firmware and only this pointer changes. */
++static int
++bt_peri_tme_hci_download(const uint8_t *fw, unsigned size, const char *what)
++{
++	uint8_t frame[6u + BT_FW_SEG_MAX];
++	unsigned sent = 0;
++	unsigned seg = 0;
++	unsigned nseg = (size + BT_FW_SEG_MAX - 1u) / BT_FW_SEG_MAX;
++	unsigned probe_at = (nseg * 82u) / 100u;
++	int err;
++
++	printf("PANDORA BT: %s: HCI 0xfc00 stage, %u bytes -> %u packets, 0x23 probe at %u\n",
++	    what, size, nseg, probe_at);
++	pandora_log_sync();
++	bt_peri_tme_vs_cmd(0x19, 500u, "TME-L patch begin");
++	while (sent < size) {
++		unsigned len = size - sent;
++
++		if (len > BT_FW_SEG_MAX) {
++			len = BT_FW_SEG_MAX;
++		}
++		frame[0] = 0x01;
++		frame[1] = 0x00;
++		frame[2] = 0xfc;
++		frame[3] = (uint8_t)(len + 2u);
++		frame[4] = 0x1e;
++		frame[5] = (uint8_t)len;
++		for (unsigned i = 0; i < len; i++) {
++			frame[6u + i] = fw[sent + i];
++		}
++		err = bt_uart_tx_long(frame, len + 6u, "PERI TME-L HCI packet");
++		if (err) {
++			printf("PANDORA BT: %s: HCI packet %u/%u failed (error %d) after %u bytes\n",
++			    what, seg + 1u, nseg, err, sent);
++			pandora_log_sync();
++			return err;
++		}
++		sent += len;
++		seg++;
++		if (seg == probe_at) {
++			bt_peri_tme_vs_cmd(0x23, 200u, "TME-L patch mid");
++		}
++		if ((seg & 15u) == 0u) {
++			pandora_log_sync();
++		}
++	}
++	bt_peri_tme_vs_cmd(0x20, 1000u, "TME-L patch end");
++	printf("PANDORA BT: %s: %u packets sent (%u bytes), end command issued\n",
++	    what, seg, sent);
++	pandora_log_sync();
++	return 0;
 +}
 +
 +/* Level 20.9: watch long enough to see where the dump stops, and stop trusting
@@ -3448,14 +3536,15 @@ index 0000000..795f2785f3b33916fa92263c9eba563edcfa4e18
 +	pandora_log_sync();
 +}
 +
-+/* Level 20 orchestrator: after the level-19 download chain passes,
-+ * reset the PERI and load the TME-L patch map table. */
++/* Level 20 orchestrator: after the level-19 download chain passes, reset
++ * the PERI, load the TME-L patch map table (peri stage), then replay the
++ * HAL's HCI 0xfc00 download stage and observe the Patch Ntf window. */
 +static int
 +bt_peri_level20(void)
 +{
 +	int err;
 +
-+	printf("PANDORA BT: level 20: TME-L map %u B, PeriReset + arbitrate v3 + segments\n",
++	printf("PANDORA BT: level 20: TME-L %u B, PeriReset + arbitrate v3 + peri map + HCI stage B\n",
 +	    (unsigned)sizeof(pandora_peri_tmel_elf));
 +	pandora_log_sync();
 +	err = bt_peri_reset();
@@ -3471,33 +3560,33 @@ index 0000000..795f2785f3b33916fa92263c9eba563edcfa4e18
 +		return err;
 +	}
 +	err = bt_peri_tlv_download_sub(pandora_peri_tmel_elf,
-+	    sizeof(pandora_peri_tmel_elf), "PERI TME-L", 0u,
-+	    BT_PERI_NVM_LAST_ACK_MS, 0x03);
-+	/* Level 20.11: the map phase ends with the ROM answering the host (or
-+	 * not); either way the HAL's next step after the map is a 0xfc00 vendor
-+	 * command. Send that command once and record the answer before the
-+	 * observation window opens, so the two phases stay separable. */
-+	bt_peri_tme_status_probe();
++	    sizeof(pandora_peri_tmel_elf), "PERI TME-L", 0u, 0u, 0x03);
++	/* Level 20.11 -> 20.12. The map phase ends with the ROM answering the
++	 * host or not; the reference HAL's next move after the map is not a
++	 * single vendor "probe" but the whole HCI 0xfc00 download stage: 0x19,
++	 * 243-byte data packets (1e f3 + payload), 0x20 to close, and only then
++	 * ReadHciEvent(260) for the Patch Ntf. 20.11 sent 0x23 alone; the trace
++	 * puts that command at ~82 % of the download, not at the map boundary. */
++	if (!err) {
++		err = bt_peri_tme_hci_download(pandora_peri_tmel_elf,
++		    sizeof(pandora_peri_tmel_elf), "PERI TME-L stage B");
++	}
 +	/* Level 20.8: observation depth. l207 named every record but kept only
 +	 * 32 bytes of each 248-byte body, so the stream could not be decoded and
 +	 * its end was never seen. The watch reads whole frames, prints every
 +	 * byte, and stops on silence - it sends no request. */
 +	bt_peri_record_watch("PERI TME-L");
 +	if (err) {
-+		/* Level 20.6: the reference HAL's TMEL path never waits for an
-+		 * event - PeriPatchDLManager::TlvDnldReq reads nothing and
-+		 * TlvDnldSegment only compares the HCI write length. A silent
-+		 * ROM is therefore not a phase failure there. Here the whole map
-+		 * did leave the host; what is missing is a verdict, not the
-+		 * transfer, so record the absence instead of failing the level.
-+		 * The original "last-segment ACK status 0" gate stays on record
-+		 * as unmet in the handoff - this is a criterion change, not a
-+		 * pass. */
-+		printf("PANDORA BT: level 20 TME-L streamed %u bytes, no ACK-shaped response (error %d); verdict absent, not fatal\n",
-+		    (unsigned)sizeof(pandora_peri_tmel_elf), err);
++		/* Level 20.12: the map phase no longer has an ACK gate (the ROM
++		 * sends none, and the HAL reads none), so a non-zero err here is a
++		 * real transmit failure, not a missing verdict. The verdict itself
++		 * now has a defined source: the HCI event the HAL's ConfigureTMESoC
++		 * reads after the 0x19/.../0x20 stage. */
++		printf("PANDORA BT: level 20 peri map phase failed (error %d); HCI stage B skipped, verdict absent\n",
++		    err);
 +		pandora_log_sync();
 +	}
-+	printf("PANDORA BT: level 20 TME-L streamed; license phase skipped (no cnss_softsku_peach.pfm on this device - HAL does the same)\n");
++	printf("PANDORA BT: level 20 TME-L done; license phase skipped (no cnss_softsku_peach.pfm on this device - HAL does the same)\n");
 +	pandora_log_sync();
 +	return 0;
 +}
