@@ -2182,15 +2182,19 @@ edit('NativeBridgeMetalFrontend.mm',
   const char *at=strstr(args,token);
   return at && (at==args || at[-1]==' ') && (at[sizeof(token)-1]==0 || at[sizeof(token)-1]==' ');
  }();
+ if(on){static bool once=false;if(!once){once=true;NSLog(@"pandora-metal: flush split ON (nezha_flush_split=1)");}}
  return on;
 }
-static NSSet *gpuWritableSurfaces(NSSet *surfaces) {
+static NSMutableSet *gpuWritableSurfaces(NSMutableSet *surfaces) {
+ static uint64_t calls=0,kept=0,all=0;
  if(!surfaces.count)return surfaces;
  NSMutableSet *w=[NSMutableSet setWithCapacity:surfaces.count];
  for(id t in surfaces) {
   NBTexture *tex=[t isKindOfClass:[NBTexture class]]?(NBTexture *)t:nil;
   if(tex && (tex.usage&(MTLTextureUsageRenderTarget|MTLTextureUsageShaderWrite))) [w addObject:t];
  }
+ ++calls;kept+=w.count;all+=surfaces.count;
+ if(calls==1||calls%200==0) NSLog(@"pandora-metal: flush split keeping %u of %u surfaces (cum %llu/%llu, %llu calls)",(unsigned)w.count,(unsigned)surfaces.count,kept,all,calls);
  return w;
 }
 static void flushWrapped(NSSet *owners) {''')
