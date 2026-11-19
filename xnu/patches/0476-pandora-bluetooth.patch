@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..18cefa6e4d4ca25d37b562d757e674466c281a05
+index 0000000..795f2785f3b33916fa92263c9eba563edcfa4e18
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,3585 @@
+@@ -0,0 +1,3704 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3113,6 +3113,110 @@ index 0000000..18cefa6e4d4ca25d37b562d757e674466c281a05
 + * the TME-L patch notification (ConfigureTMESoC, "Patch Ntf success" /
 + * "Patch Ntf failed"), and an unread notification would otherwise sit in the
 + * FIFO and pollute the next phase. */
++/* Level 20.11: ask the ROM for the TME-L patch verdict the way the HAL does.
++ * Android's trace after the map runs 01 00 fc 01 19 (license prerequisite,
++ * answered 04 0e 05 01 00 fc 00 1e), the license segments, then
++ * 01 00 fc 01 23, answered 04 0e 08 01 00 fc 00 23 02 00 00 - the only place
++ * in the capture where the ROM reports a status word after the map. This unit
++ * has no cnss_softsku_peach.pfm, so the probe sends the 0x23 command alone and
++ * records whatever answers it. Observation only: one 5-byte TX, no cadence
++ * change, no retry. */
++static void
++bt_peri_tme_status_probe(void)
++{
++	static const uint8_t request[] = { 0x01, 0x00, 0xfc, 0x01, 0x23 };
++	uint8_t rx[BT_PERI_EVT_MAX] = {0};
++	unsigned got = 0;
++	uint64_t deadline;
++	unsigned packets = 0;
++	int err;
++
++	printf("PANDORA BT: PERI TME-L: status probe VS command 01 00 fc 01 23\n");
++	pandora_log_sync();
++	err = bt_uart_tx(request, sizeof(request), "PERI TME-L status probe");
++	if (err) {
++		printf("PANDORA BT: PERI TME-L: status probe TX failed (error %d)\n", err);
++		pandora_log_sync();
++		return;
++	}
++	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
++	while (packets < 64u && mach_absolute_time() < deadline) {
++		uint8_t lead = 0;
++		unsigned field = 0;
++
++		err = bt_rx_exact(&lead, 1, &field, deadline);
++		if (err) {
++			printf("PANDORA BT: PERI TME-L: status probe read ends (error %d) after %u packet(s)\n",
++			    err, packets);
++			pandora_log_sync();
++			return;
++		}
++		if (lead == 0xfc || lead == 0xfe || lead == 0xff) {
++			printf("PANDORA BT: PERI TME-L: status probe control byte %#x\n", lead);
++			pandora_log_sync();
++			continue;
++		}
++		packets++;
++		if (lead == 0x04u) {
++			uint8_t eh[2];
++			unsigned evlen;
++
++			err = bt_rx_exact(eh, 2, &field, deadline);
++			if (err) {
++				break;
++			}
++			evlen = eh[1];
++			if (evlen > sizeof(rx)) {
++				break;
++			}
++			got = 0;
++			err = bt_rx_exact(rx, evlen, &got, deadline);
++			if (err) {
++				break;
++			}
++			printf("PANDORA BT: PERI TME-L: status probe HCI event %02x len %u\n",
++			    eh[0], evlen);
++			bt_dump("PERI TME-L probe HCI event", rx, got);
++			if (eh[0] == 0x0eu && got >= 3u) {
++				printf("PANDORA BT: PERI TME-L: status probe CC status %u opcode %02x %02x rest %02x %02x %02x %02x\n",
++				    rx[0], rx[2], rx[1],
++				    got > 3u ? rx[3] : 0xffu, got > 4u ? rx[4] : 0xffu,
++				    got > 5u ? rx[5] : 0xffu, got > 6u ? rx[6] : 0xffu);
++			}
++			pandora_log_sync();
++			continue;
++		}
++		if (lead == 0x34u) {
++			uint8_t fh[3];
++			unsigned plen;
++
++			err = bt_rx_exact(fh, 3, &field, deadline);
++			if (err) {
++				break;
++			}
++			plen = fh[2];
++			if (plen > sizeof(rx)) {
++				break;
++			}
++			got = 0;
++			err = bt_rx_exact(rx, plen, &got, deadline);
++			if (err) {
++				break;
++			}
++			printf("PANDORA BT: PERI TME-L: status probe frame %02x %02x %02x len %u\n",
++			    lead, fh[0], fh[1], plen);
++			bt_dump("PERI TME-L probe frame", rx, got);
++			pandora_log_sync();
++			continue;
++		}
++		printf("PANDORA BT: PERI TME-L: status probe stray byte %#x\n", lead);
++		pandora_log_sync();
++	}
++	printf("PANDORA BT: PERI TME-L: status probe window closed after %u packet(s)\n",
++	    packets);
++	pandora_log_sync();
++}
++
 +/* Level 20.9: watch long enough to see where the dump stops, and stop trusting
 + * a frame length that was not seen at a header boundary. l208 read 378 records
 + * (seq 20..397, ~99 KB) in 55 s and the window, not the ROM, ended it, so the
@@ -3143,6 +3247,11 @@ index 0000000..18cefa6e4d4ca25d37b562d757e674466c281a05
 +	 * through as noise, so count and print it here. */
 +	unsigned hci_evts = 0;
 +	unsigned hci_ccs = 0;
++	/* Level 20.11: keep the bytes the resync walk discards. l209/l210 only
++	 * counted them (108 bytes at t_ms 62), and that run is exactly the ROM's
++	 * first answer to the last segment - it has to be read, not counted. */
++	uint8_t lost[128];
++	unsigned lost_len = 0;
 +	unsigned first_seq = 0xffffu;
 +	unsigned last_seq = 0xffffu;
 +	unsigned span_ms;
@@ -3189,6 +3298,9 @@ index 0000000..18cefa6e4d4ca25d37b562d757e674466c281a05
 +				why = "no header in 128 bytes";
 +				ok = false;
 +				break;
++			}
++			if (lost_len < sizeof(lost)) {
++				lost[lost_len++] = hdr[0];
 +			}
 +			hdr[0] = hdr[1];
 +			hdr[1] = hdr[2];
@@ -3263,6 +3375,8 @@ index 0000000..18cefa6e4d4ca25d37b562d757e674466c281a05
 +			printf("PANDORA BT: %s: resync dropped %u byte(s) before record %u at t_ms %llu, header now %02x %02x %02x %02x\n",
 +			    what, shifted, records + 1u, gap_ns / 1000000ULL,
 +			    hdr[0], hdr[1], hdr[2], hdr[3]);
++			bt_dump("PERI TME-L dropped bytes", lost, lost_len);
++			lost_len = 0;
 +			pandora_log_sync();
 +		}
 +		/* plen is one byte, so 255 is the largest body asked for here
@@ -3359,6 +3473,11 @@ index 0000000..18cefa6e4d4ca25d37b562d757e674466c281a05
 +	err = bt_peri_tlv_download_sub(pandora_peri_tmel_elf,
 +	    sizeof(pandora_peri_tmel_elf), "PERI TME-L", 0u,
 +	    BT_PERI_NVM_LAST_ACK_MS, 0x03);
++	/* Level 20.11: the map phase ends with the ROM answering the host (or
++	 * not); either way the HAL's next step after the map is a 0xfc00 vendor
++	 * command. Send that command once and record the answer before the
++	 * observation window opens, so the two phases stay separable. */
++	bt_peri_tme_status_probe();
 +	/* Level 20.8: observation depth. l207 named every record but kept only
 +	 * 32 bytes of each 248-byte body, so the stream could not be decoded and
 +	 * its end was never seen. The watch reads whole frames, prints every
