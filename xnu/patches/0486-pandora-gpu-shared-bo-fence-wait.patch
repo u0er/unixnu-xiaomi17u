@@ -1,0 +1,49 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -2817,13 +2817,40 @@
+ int
+ pandora_gpu_bo_free(int client, uint64_t handle)
+ {
+-	const uint32_t own = gpu_clients[client].fence;
+-	if (own != 0 && pandora_gpu_wait(own, 2000000000ull)) {
+-		return EBUSY;
+-	}
++	/* 0486: decide which fence to wait for under the lock. A pool BO (b->pages
++	 * NULL) is this client's alone (0318): wait only its own fence. An imported
++	 * or shared BO may still be referenced by another client's in-flight
++	 * submission through the shared SMMU window, so wait for the newest fence
++	 * of every used client before unmapping its IOVA. fence values are the same
++	 * global gpu_seqno space, so waiting for the max covers all of them. */
+ 	int err = 0;
+ 	lck_mtx_lock(&gpu_lock);
+ 	struct gpu_bo *b = gpu_bo_get(client, handle);
++	if (!b) {
++		lck_mtx_unlock(&gpu_lock);
++		return EINVAL;
++	}
++	uint64_t wait_fence;
++	if (b->pages) {
++		uint32_t newest = 0;
++		for (unsigned i = 0; i < GPU_MAX_CLIENTS; i++) {
++			if (gpu_clients[i].fence > newest) {
++				newest = gpu_clients[i].fence;
++			}
++		}
++		wait_fence = newest;
++	} else {
++		wait_fence = gpu_clients[client].fence;
++	}
++	lck_mtx_unlock(&gpu_lock);
++
++	/* Sleeping is not allowed under gpu_lock; wait outside it. */
++	if (wait_fence != 0 && pandora_gpu_wait(wait_fence, 2000000000ull)) {
++		return EBUSY;
++	}
++
++	lck_mtx_lock(&gpu_lock);
++	b = gpu_bo_get(client, handle);
+ 	if (!b) {
+ 		err = EINVAL;
+ 	} else if (b->leases) {
