@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..417970259f7c621856566d3210b9735c2a1f7e13
+index 0000000..18cefa6e4d4ca25d37b562d757e674466c281a05
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,3529 @@
+@@ -0,0 +1,3585 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3136,6 +3136,13 @@ index 0000000..417970259f7c621856566d3210b9735c2a1f7e13
 +	unsigned f005 = 0;
 +	unsigned other = 0;
 +	unsigned resync = 0;
++	/* Level 20.10: count HCI event packets seen in the window. The Android
++	 * HAL's post-map exchange on 0xfc00 comes back as 04 0e Command Complete
++	 * (04 0e 05 01 00 fc 00 1e, then 04 0e 08 01 00 fc 00 23 02 00 00), not as
++	 * the 34 00 ff family; a verdict delivered that way used to be shifted
++	 * through as noise, so count and print it here. */
++	unsigned hci_evts = 0;
++	unsigned hci_ccs = 0;
 +	unsigned first_seq = 0xffffu;
 +	unsigned last_seq = 0xffffu;
 +	unsigned span_ms;
@@ -3176,7 +3183,8 @@ index 0000000..417970259f7c621856566d3210b9735c2a1f7e13
 +		/* A stream that was interrupted mid-frame leaves a partial payload
 +		 * in front of the next header; walk the window to a byte boundary
 +		 * (bounded) instead of giving up on the first odd byte. */
-+		while (!(hdr[0] == 0x34u && hdr[1] == 0x00u && hdr[2] == 0xffu)) {
++		while (!((hdr[0] == 0x34u && hdr[1] == 0x00u && hdr[2] == 0xffu) ||
++		    hdr[0] == 0x04u)) {
 +			if (bad++ >= 128u) {
 +				why = "no header in 128 bytes";
 +				ok = false;
@@ -3197,6 +3205,54 @@ index 0000000..417970259f7c621856566d3210b9735c2a1f7e13
 +		}
 +		if (!ok) {
 +			break;
++		}
++		/* Level 20.10: HCI event packet (04 <evt> <plen> <first param..>).
++	 * The 4-byte read above already holds type, event code, length and the
++	 * first parameter byte, so only len-1 more bytes remain. Consume them,
++	 * print the whole event, and decode Command Complete (04 0e) far enough
++	 * to name the 0xfc00 answer: status, opcode, and the trailing sub-op
++	 * bytes Android's own run got (00 fc 00 1e / 00 fc 00 23 02 00 00). */
++		if (hdr[0] == 0x04u) {
++		unsigned evlen = hdr[2];
++		unsigned params = 0;
++
++		absolutetime_to_nanoseconds(mach_absolute_time() - start,
++		    &gap_ns);
++		hci_evts++;
++		printf("PANDORA BT: %s: HCI event %02x len %u at t_ms %llu (resync %u)\n",
++		    what, hdr[1], evlen, gap_ns / 1000000ULL, shifted);
++		pandora_log_sync();
++		if (evlen == 0u) {
++			continue;
++		}
++		body[0] = hdr[3];
++		params = 1;
++		if (evlen > 1u) {
++			got = 0;
++			err = bt_rx_exact(body + 1, evlen - 1u, &got, deadline);
++			if (err) {
++				printf("PANDORA BT: %s: HCI event %02x body short (%u of %u)\n",
++				    what, hdr[1], params + got, evlen);
++				why = "short HCI event";
++				break;
++			}
++			params += got;
++		}
++		bt_dump_wide("PERI HCI event", body, params);
++		if (hdr[1] == 0x0eu && params >= 3u && body[1] == 0xfcu &&
++		    body[2] == 0x00u) {
++			hci_ccs++;
++			printf("PANDORA BT: %s: 0xfc00 Command Complete status %u, %u trailing byte(s): %02x %02x %02x %02x %02x %02x\n",
++			    what, body[0], params - 3u,
++			    params > 3u ? body[3] : 0xffu, params > 4u ? body[4] : 0xffu,
++			    params > 5u ? body[5] : 0xffu, params > 6u ? body[6] : 0xffu,
++			    params > 7u ? body[7] : 0xffu, params > 8u ? body[8] : 0xffu);
++		} else if (hdr[1] == 0x0eu && params >= 3u) {
++			printf("PANDORA BT: %s: Command Complete status %u opcode %02x %02x\n",
++			    what, body[0], body[2], body[1]);
++		}
++		pandora_log_sync();
++		continue;
 +		}
 +		/* Level 20.9: a run of shifted bytes is where l208 lost alignment;
 +		 * name it once, with the header the run landed on, so the drift can
@@ -3272,9 +3328,9 @@ index 0000000..417970259f7c621856566d3210b9735c2a1f7e13
 +
 +	absolutetime_to_nanoseconds(mach_absolute_time() - start, &total_ns);
 +	span_ms = (unsigned)(total_ns / 1000000ULL);
-+	printf("PANDORA BT: %s: watch ends (%s) after %u record(s), %u byte(s), seq %04x..%04x, class f0 04 %u / f0 05 %u / other %u, resync %u, %u ms\n",
++	printf("PANDORA BT: %s: watch ends (%s) after %u record(s), %u byte(s), seq %04x..%04x, class f0 04 %u / f0 05 %u / other %u, resync %u, HCI events %u (0xfc00 CC %u), %u ms\n",
 +	    what, why, records, bytes, first_seq, last_seq, f004, f005, other,
-+	    resync, span_ms);
++	    resync, hci_evts, hci_ccs, span_ms);
 +	pandora_log_sync();
 +}
 +
