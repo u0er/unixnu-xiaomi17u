@@ -1,0 +1,137 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -577,7 +577,7 @@ struct smmu_ctx {
+ 	ArmSmmu4KStreamState streams;
+ 	ArmSmmu4KStreamResult sres;
+ 	vm_offset_t tva;                /* table pool: kernel address, size in pages, next unused page */
+-	unsigned tpages, tnext;
++	unsigned tpages, tnext, tfree;
+ 	unsigned bank;
+ 	uint32_t cb;                    /* the context bank's page in the SMMU window (FSR at +0x58) */
+ };
+@@ -680,6 +680,7 @@ smmu_ctx_up(const char *who, struct smmu_ctx *c, struct gmu_buf *bufs, unsigned
+ 	c->tva = tva;
+ 	c->tpages = tpages;
+ 	c->tnext = (unsigned)c->tables.table_pages;
++	c->tfree = tpages;               /* 0485: free-page list head; tpages = empty */
+ 	c->bank = bank;
+ 
+ 	/* Context bank: must be disabled; ACTLR is the platform's part (the kit does not write it). */
+@@ -1874,12 +1875,23 @@ smmu_map_pages(struct smmu_ctx *c, uint64_t iova, uint64_t pa, const uint64_t *p
+ 				unsigned shift = 39 - 9 * level, width = level == start ? in - shift : 9;
+ 				uint64_t *e = &t[(va >> shift) & ((1u << width) - 1)];
+ 				if (!*e) {
+-					if (c->tnext >= c->tpages) {
+-						printf("PANDORA GPU: SMMU table pool full at iova %#llx\n", va);
+-						ok = false;
+-						break;
++					uint64_t idx;
++					if (c->tfree < c->tpages) {
++						/* 0485: reuse a page reclaimed by smmu_unmap. Entry 0 of a freed
++						 * page holds the free-list link; clear it before reuse. */
++						idx = c->tfree;
++						c->tfree = (unsigned)*(volatile uint64_t *)(c->tva + idx * 0x1000ull);
++						*(volatile uint64_t *)(c->tva + idx * 0x1000ull) = 0;
++						clean_dcache64((addr64_t)(pool + idx * 0x1000ull), 8, TRUE);
++					} else {
++						if (c->tnext >= c->tpages) {
++							printf("PANDORA GPU: SMMU table pool full at iova %#llx\n", va);
++							ok = false;
++							break;
++						}
++						idx = c->tnext++;
+ 					}
+-					*e = (pool + 0x1000ull * c->tnext++) | 3;
++					*e = (pool + 0x1000ull * idx) | 3;
+ 					clean_dcache64((addr64_t)(pool + ((vm_offset_t)e - c->tva)), 8, TRUE);
+ 				}
+ 				t = (uint64_t *)(c->tva + ((*e & 0xfffffffff000ull) - pool));
+@@ -2380,6 +2392,65 @@ pandora_gpu_chip_id(void)
+ 
+ /* Clear the leaves of [iova, iova + bytes), then invalidate them in the TLB (0224: smmu_tlb_inv);
+  * table pages stay. */
++static bool
++smmu_table_empty(const uint64_t *t)
++{
++	for (unsigned i = 0; i < 512; i++) {
++		if (t[i]) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* 0485: free-page list threaded through the pages themselves (entry 0 of a freed page
++ * holds the next index; c->tfree == c->tpages means empty). At free time the parent
++ * entry is already clear, so the link word is CPU-only state and needs no dcache op. */
++static void
++smmu_table_free(struct smmu_ctx *c, unsigned idx)
++{
++	*(volatile uint64_t *)(c->tva + (uint64_t)idx * 0x1000ull) = c->tfree;
++	c->tfree = idx;
++}
++
++/* 0485: reclaim the tables covering one 2 MiB block once all their leaves are zero,
++ * bottom-up toward (but never including) the root. The old bump-only pool leaked every
++ * table page of a churned mapping (smmu_unmap cleared leaves but never reclaimed), and
++ * a 2048-page pool ran dry in minutes under WebKit.GPU churn (see 2026-11-19 incident).
++ * Returns whether anything was freed. */
++static bool
++smmu_reclaim_block(struct smmu_ctx *c, uint64_t va)
++{
++	uint64_t pool = c->tables.root_physical;
++	unsigned in = c->tcfg.input_bits, start = c->tables.start_level;
++	uint64_t *ent[4], *tbl[4];
++	unsigned n = 0;
++	bool freed = false;
++
++	tbl[0] = (uint64_t *)c->tva;
++	for (unsigned level = start; level < 3; level++) {
++		unsigned shift = 39 - 9 * level, width = level == start ? in - shift : 9;
++		uint64_t *e = &tbl[n][(va >> shift) & ((1u << width) - 1)];
++		if (!*e) {
++			return freed;
++		}
++		ent[n] = e;
++		n++;
++		tbl[n] = (uint64_t *)(c->tva + ((*e & 0xfffffffff000ull) - pool));
++	}
++	for (int i = (int)n - 1; i >= 0; i--) {
++		if (!smmu_table_empty(tbl[i + 1])) {
++			break;
++		}
++		unsigned idx = (unsigned)(((*ent[i] & 0xfffffffff000ull) - pool) >> 12);
++		*ent[i] = 0;
++		clean_dcache64((addr64_t)(pool + ((vm_offset_t)ent[i] - c->tva)), 8, TRUE);
++		smmu_table_free(c, idx);
++		freed = true;
++	}
++	return freed;
++}
++
+ static void
+ smmu_unmap(struct smmu_ctx *c, uint64_t iova, uint64_t bytes)
+ {
+@@ -2411,7 +2482,20 @@ smmu_unmap(struct smmu_ctx *c, uint64_t iova, uint64_t bytes)
+ 	}
+ 	smmu_clean_run(run, run_end);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
++	/* 0485: hand fully-zeroed tables of the touched 2 MiB blocks back to the pool. */
++	bool reclaimed = false;
++	if (bytes) {
++		for (uint64_t b = iova >> 21; b <= (iova + bytes - 1) >> 21; b++) {
++			if (smmu_reclaim_block(c, b << 21)) {
++				reclaimed = true;
++			}
++		}
++	}
+ 	(void)smmu_tlb_inv(c, iova, bytes);
++	if (reclaimed) {
++		/* Cleared parent entries can leave stale walk-cache state: sync the context. */
++		(void)smmu_tlb_inv(c, 0, 1ull << c->tcfg.input_bits);
++	}
+ }
+ 
+ static struct gpu_bo *
