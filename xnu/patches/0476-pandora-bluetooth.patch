@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..82d0b2c3ddbcec62129d369a5a285f1405bcde0f
+index 0000000..02f0be1c7174cdc6e096e030520fa36a1335c359
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,3386 @@
+@@ -0,0 +1,3505 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -1329,6 +1329,25 @@ index 0000000..82d0b2c3ddbcec62129d369a5a285f1405bcde0f
 +	printf("\n");
 +}
 +
++/* Level 20.8: bt_dump stops at 32 bytes. That named a record but could not
++ * decode one, so the ROM's 248-byte bodies never reached the log in full.
++ * Print the whole payload in 84-byte rows (a 252-byte record is three rows)
++ * so the stream can be rebuilt offline as one image. */
++static void
++bt_dump_wide(const char *what, const uint8_t *buf, unsigned n)
++{
++	printf("PANDORA BT: %s: %u bytes\n", what, n);
++	for (unsigned i = 0; i < n; i += 84u) {
++		unsigned end = i + 84u < n ? i + 84u : n;
++
++		printf("PANDORA BT: %s[%u]:", what, i);
++		for (unsigned j = i; j < end; j++) {
++			printf(" %02x", buf[j]);
++		}
++		printf("\n");
++	}
++}
++
 +/* Isolate FIFO packing and both sequencers from the external controller.
 + * The fixed eight-byte input fits the SE5 TX FIFO and exercises low/high and
 + * alternating bits. Wait a bounded interval and reject extra/stale bytes.
@@ -2175,7 +2194,7 @@ index 0000000..82d0b2c3ddbcec62129d369a5a285f1405bcde0f
 +				}
 +				dropped += got3;
 +			}
-+			bt_dump("PERI oversized event payload", sink, dropped);
++			bt_dump_wide("PERI record body", sink, dropped);
 +			/* Level 20.7: name the record. peek holds payload[0..3]
 +			 * (class + sequence), sink holds the 248-byte body. A
 +			 * caller that waits for an ACK needs to see that this was
@@ -2219,7 +2238,7 @@ index 0000000..82d0b2c3ddbcec62129d369a5a285f1405bcde0f
 +			}
 +			dropped += got2;
 +		}
-+		bt_dump("PERI oversized event payload", sink, dropped);
++		bt_dump_wide("PERI record body", sink, dropped);
 +		/* Level 20.7: see the peek path above. Here sink starts at
 +		 * payload[0], so the class and sequence are sink[0..3]. */
 +		printf("PANDORA BT: PERI record plen %u class %02x %02x seq %02x %02x, body %u bytes\n",
@@ -3094,34 +3113,144 @@ index 0000000..82d0b2c3ddbcec62129d369a5a285f1405bcde0f
 + * the TME-L patch notification (ConfigureTMESoC, "Patch Ntf success" /
 + * "Patch Ntf failed"), and an unread notification would otherwise sit in the
 + * FIFO and pollute the next phase. */
-+static void
-+bt_peri_post_download_drain(const char *what, uint8_t *acc, unsigned *acc_len, unsigned cap)
-+{
-+	unsigned before = *acc_len;
-+	uint64_t deadline;
++/* Level 20.8: watch the ROM's record stream for a bounded window.
++ * Observation only - no request is transmitted. l207 proved the stream is
++ * indexed (34 00 ff fc f0 04 <seq>, seq 0..18 contiguous, 145 ms apart) but
++ * only 32 bytes of each 248-byte body reached the log and the stream was cut
++ * off by the host, so neither its content nor its end was seen. This reads
++ * whole frames, prints every byte, tracks the sequence, and reports which
++ * bound stopped it: silence, the record cap, or the window. */
++#define BT_PERI_RECORD_WINDOW_MS	55000u
++#define BT_PERI_RECORD_SILENCE_MS	4000u
++#define BT_PERI_RECORD_CAP		380u
 +
-+	/* Bounded, not instantaneous: in both level 20.1 and 20.2 runs the ROM
-+	 * emitted its 63-byte status-2 event ~185 ms after the TME-L phase
-+	 * began, i.e. well after the phase start and clearly not on the last
-+	 * segment. An immediate one-shot read would miss exactly that event, so
-+	 * keep collecting for a bounded window and stop early when the buffer
-+	 * is full. Nothing here transmits a request. */
-+	clock_interval_to_deadline(BT_PERI_POST_DRAIN_MS, NSEC_PER_MSEC, &deadline);
-+	while (mach_absolute_time() < deadline && *acc_len < cap) {
-+		(void)bt_peri_rx_collect(what, acc, acc_len, cap, 512u);
-+		if (*acc_len >= cap) {
++static void
++bt_peri_record_watch(const char *what)
++{
++	uint8_t hdr[4];
++	uint8_t body[256];
++	unsigned records = 0;
++	unsigned bytes = 0;
++	unsigned f004 = 0;
++	unsigned f005 = 0;
++	unsigned other = 0;
++	unsigned resync = 0;
++	unsigned first_seq = 0xffffu;
++	unsigned last_seq = 0xffffu;
++	unsigned span_ms;
++	uint64_t start = mach_absolute_time();
++	uint64_t prev = 0;
++	uint64_t until;
++	uint64_t total_ns = 0;
++	const char *why = "window";
++
++	printf("PANDORA BT: %s: record watch %u ms, silence %u ms, cap %u\n",
++	    what, BT_PERI_RECORD_WINDOW_MS, BT_PERI_RECORD_SILENCE_MS,
++	    BT_PERI_RECORD_CAP);
++	pandora_log_sync();
++	clock_interval_to_deadline(BT_PERI_RECORD_WINDOW_MS, NSEC_PER_MSEC, &until);
++
++	while (mach_absolute_time() < until && records < BT_PERI_RECORD_CAP) {
++		uint64_t deadline;
++		uint64_t now;
++		uint64_t gap_ns = 0;
++		uint64_t elapsed_ns = 0;
++		unsigned got = 0;
++		unsigned plen;
++		unsigned bad = 0;
++		bool ok = true;
++		int err;
++
++		clock_interval_to_deadline(BT_PERI_RECORD_SILENCE_MS,
++		    NSEC_PER_MSEC, &deadline);
++		if (deadline > until) {
++			deadline = until;
++		}
++		err = bt_rx_exact(hdr, 4, &got, deadline);
++		if (err) {
++			why = got ? "short header" : "silence";
 +			break;
 +		}
-+		bt_sleep(1000u);
++		/* A stream that was interrupted mid-frame leaves a partial payload
++		 * in front of the next header; walk the window to a byte boundary
++		 * (bounded) instead of giving up on the first odd byte. */
++		while (!(hdr[0] == 0x34u && hdr[1] == 0x00u && hdr[2] == 0xffu)) {
++			if (bad++ >= 128u) {
++				why = "no header in 128 bytes";
++				ok = false;
++				break;
++			}
++			hdr[0] = hdr[1];
++			hdr[1] = hdr[2];
++			hdr[2] = hdr[3];
++			got = 0;
++			err = bt_rx_exact(hdr + 3, 1, &got, deadline);
++			if (err) {
++				why = "silence";
++				ok = false;
++				break;
++			}
++			resync++;
++		}
++		if (!ok) {
++			break;
++		}
++		/* plen is one byte, so 255 is the largest body asked for here
++		 * and body[256] always covers it. */
++		plen = hdr[3];
++		if (plen == 0u) {
++			continue;
++		}
++		got = 0;
++		err = bt_rx_exact(body, plen, &got, deadline);
++		if (err) {
++			printf("PANDORA BT: %s: record body short (%u of %u bytes)\n",
++			    what, got, plen);
++			why = "short body";
++			break;
++		}
++		records++;
++		bytes += plen;
++		now = mach_absolute_time();
++		if (prev) {
++			absolutetime_to_nanoseconds(now - prev, &gap_ns);
++		}
++		prev = now;
++		absolutetime_to_nanoseconds(now - start, &elapsed_ns);
++		if (plen >= 4u && body[0] == 0xf0u) {
++			unsigned seq = (unsigned)body[2] |
++			    ((unsigned)body[3] << 8);
++
++			if (body[1] == 0x04u) {
++				f004++;
++			} else if (body[1] == 0x05u) {
++				f005++;
++			} else {
++				other++;
++			}
++			if (first_seq == 0xffffu) {
++				first_seq = seq;
++			}
++			last_seq = seq;
++			printf("PANDORA BT: %s: record %u plen %u class %02x %02x seq %04x body %u gap_us %llu t_ms %llu\n",
++			    what, records, plen, body[0], body[1], seq, plen - 4u,
++			    gap_ns / 1000ULL, elapsed_ns / 1000000ULL);
++			bt_dump_wide("PERI record body", body + 4, plen - 4u);
++		} else {
++			other++;
++			printf("PANDORA BT: %s: non-record frame plen %u head %02x %02x %02x %02x t_ms %llu\n",
++			    what, plen, body[0], body[1], body[2], body[3],
++			    elapsed_ns / 1000000ULL);
++			bt_dump_wide("PERI non-record frame", body, plen);
++		}
++		pandora_log_sync();
 +	}
-+	if (*acc_len == before) {
-+		printf("PANDORA BT: %s: no unsolicited event in the %u ms after the download\n",
-+		    what, (unsigned)BT_PERI_POST_DRAIN_MS);
-+	} else {
-+		printf("PANDORA BT: %s: %u unsolicited byte(s) in the %u ms after the download\n",
-+		    what, *acc_len - before, (unsigned)BT_PERI_POST_DRAIN_MS);
-+		bt_dump("PERI post-download drain", acc + before, *acc_len - before);
-+	}
++
++	absolutetime_to_nanoseconds(mach_absolute_time() - start, &total_ns);
++	span_ms = (unsigned)(total_ns / 1000000ULL);
++	printf("PANDORA BT: %s: watch ends (%s) after %u record(s), %u byte(s), seq %04x..%04x, class f0 04 %u / f0 05 %u / other %u, resync %u, %u ms\n",
++	    what, why, records, bytes, first_seq, last_seq, f004, f005, other,
++	    resync, span_ms);
 +	pandora_log_sync();
 +}
 +
@@ -3150,21 +3279,11 @@ index 0000000..82d0b2c3ddbcec62129d369a5a285f1405bcde0f
 +	err = bt_peri_tlv_download_sub(pandora_peri_tmel_elf,
 +	    sizeof(pandora_peri_tmel_elf), "PERI TME-L", 0u,
 +	    BT_PERI_NVM_LAST_ACK_MS, 0x03);
-+	{
-+		/* Level 20.5: the buffer is 512 so a full 256 byte event (the
-+		 * size the ROM actually sends here) lands in one piece; a 128
-+		 * byte buffer stopped at half the frame and the body was lost. */
-+		uint8_t drain[512] = {0};
-+		unsigned drain_len = 0;
-+
-+		/* Observability only - runs whether or not the download itself
-+		 * ended in an error, and issues no request: record what the ROM
-+		 * sends after the map lands (the TME-L patch notification the
-+		 * HAL waits for in ConfigureTMESoC) instead of letting it sit
-+		 * in the FIFO and pollute the next phase. */
-+		bt_peri_post_download_drain("PERI TME-L", drain, &drain_len,
-+		    sizeof(drain));
-+	}
++	/* Level 20.8: observation depth. l207 named every record but kept only
++	 * 32 bytes of each 248-byte body, so the stream could not be decoded and
++	 * its end was never seen. The watch reads whole frames, prints every
++	 * byte, and stops on silence - it sends no request. */
++	bt_peri_record_watch("PERI TME-L");
 +	if (err) {
 +		/* Level 20.6: the reference HAL's TMEL path never waits for an
 +		 * event - PeriPatchDLManager::TlvDnldReq reads nothing and
