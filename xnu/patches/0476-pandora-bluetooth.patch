@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..5d39e88e4d0e6d105a60785de37fb647705cfe06
+index 0000000..2131bbd910767ecec938ff4e4683b80b096c5595
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,3793 @@
+@@ -0,0 +1,4068 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3037,6 +3037,23 @@ index 0000000..5d39e88e4d0e6d105a60785de37fb647705cfe06
 +	return 0;
 +}
 +
++/* Level 20.13: state[4] names, from ConfigureTMESoC @0x12c494 and
++ * TmelSocInit @0x12bc54. GetVsHciEvent @0x12d4bc writes rsp[9] into
++ * this byte; the TME-L Patch Ntf path (ReadVsAsyncEvent) also sets 23
++ * on success. */
++static const char *
++bt_peri_tme_state_name(unsigned state)
++{
++	switch (state) {
++	case 0: return "unpatched/not done";
++	case 5:
++	case 6: return "TME-L unsupported or not patched by other SS";
++	case 11: return "patching in progress by other SS";
++	case 23: return "patched (Patch Ntf success)";
++	default: return "unknown state";
++	}
++}
++
 +/* Arbitrate variant + version re-check the trace shows AFTER the reset,
 + * verbatim: 31 00 f0 ff 03 08 03 00 (subcmd 8, the v3 flag byte 03 at
 + * offset 7) and 31 00 f0 ff 02 05 03 (version family, flag 03). */
@@ -3070,7 +3087,15 @@ index 0000000..5d39e88e4d0e6d105a60785de37fb647705cfe06
 +		pandora_log_sync();
 +		return EPROTO;
 +	}
-+	printf("PANDORA BT: arbitrate v3 ACK status 0 subcmd 8 (%u bytes)\n", got);
++	/* Level 20.13: rx[9] is not just the ACK status - the HAL's
++	 * GetVsHciEvent stores this same byte as state[4]
++	 * (str w8, [x0, #4]; w8 = rsp[9]) and ConfigureTMESoC then branches
++	 * on it: 0 = unpatched/not done, 23 = patched, 11 = another SS is
++	 * patching, 5..6 = TME-L unsupported/not patched. Print the raw
++	 * value and its meaning so the post-Stage-B re-query is decidable. */
++	printf("PANDORA BT: arbitrate v3 ACK status %u (%s) subcmd 8 (%u bytes), TME state %u (%s)\n",
++	    rx[9], bt_peri_tme_state_name(rx[9]), got, rx[9],
++	    bt_peri_tme_state_name(rx[9]));
 +	pandora_log_sync();
 +	return 0;
 +}
@@ -3103,10 +3128,252 @@ index 0000000..5d39e88e4d0e6d105a60785de37fb647705cfe06
 +		pandora_log_sync();
 +		return err;
 +	}
-+	printf("PANDORA BT: version v3 reply (subcmd 5, %u bytes)\n", got);
++	/* Level 20.13: TMEPatchVerReq @0x12c0f4 only accepts a reply whose
++	 * rsp[9] == 0 and rsp[11] == 3; print both plus the full frame so the
++	 * post-Stage-B re-query can be compared against this pre-map one. */
++	printf("PANDORA BT: version v3 reply: status %u subcmd %u ssid %u, %u bytes%s\n",
++	    got >= 10u ? rx[9] : 0xffu, got >= 11u ? rx[10] : 0xffu,
++	    got >= 12u ? rx[11] : 0xffu, got,
++	    (got >= 12u && rx[9] == 0u && rx[11] == 3u)
++	    ? " (TMEPatchVerReq gate PASS)" : " (TMEPatchVerReq gate not met)");
 +	bt_dump("PERI version v3 reply", rx, got);
 +	pandora_log_sync();
 +	return 0;
++}
++
++/* Level 20.13: one observation window that understands both framings the
++ * ROM uses around Stage B: 34 00 ff <plen> EDL events (what the HAL's
++ * PeriPatchDLManager reads) and 04 <evt> <plen> HCI events. The 34
++ * records whose body class is f0 04 / f0 05 are the ROM's resident
++ * notification stream (v213: 817 records, plen 252, ~144.7 ms apart);
++ * they are counted, never treated as ACKs. A 34 event carrying the EDL
++ * identity f0 01 01 f0 ff is decoded: status = rx[9], subcmd = rx[10],
++ * flag = rx[11]. Returns 0 when want_sub was seen, ETIMEDOUT otherwise. */
++static int
++bt_peri_tme_probe_wait(uint8_t *rx, unsigned cap, unsigned *got, uint64_t deadline,
++    uint8_t want_sub, const char *what)
++{
++	static const uint8_t identity[] = { 0xf0, 0x01, 0x01, 0xf0, 0xff };
++	uint8_t sink[32];
++	unsigned packets = 0;
++	unsigned records = 0;
++	unsigned f004 = 0;
++	unsigned f005 = 0;
++	unsigned patch = 0;
++	unsigned hci = 0;
++	unsigned stray = 0;
++	unsigned named = 0;
++	int err = 0;
++
++	*got = 0;
++	while (packets < 320u && mach_absolute_time() < deadline) {
++		uint8_t lead = 0;
++		unsigned field = 0;
++
++		err = bt_rx_exact(&lead, 1, &field, deadline);
++		if (err) {
++			break;
++		}
++		if (lead == 0xfd) {
++			const uint8_t ack = 0xfc;
++
++			(void)bt_uart_tx(&ack, 1, "TME probe wake ACK FC");
++			continue;
++		}
++		if (lead == 0xfc || lead == 0xfe || lead == 0xff) {
++			continue;
++		}
++		packets++;
++		if (lead == 0x34u) {
++			uint8_t fh[3];
++			unsigned plen;
++
++			err = bt_rx_exact(fh, 3, &field, deadline);
++			if (err) {
++				break;
++			}
++			plen = (unsigned)fh[2];
++			rx[0] = 0x34u;
++			rx[1] = fh[0];
++			rx[2] = fh[1];
++			rx[3] = fh[2];
++			if (plen > cap - 4u) {
++				unsigned dropped = 0;
++
++				while (dropped < plen) {
++					unsigned take = plen - dropped > sizeof(sink)
++					    ? (unsigned)sizeof(sink) : plen - dropped;
++
++					err = bt_rx_exact(sink, take, &field, deadline);
++					if (err) {
++						break;
++					}
++					dropped += field;
++				}
++				records++;
++				if (err) {
++					break;
++				}
++				continue;
++			}
++			err = bt_rx_exact(rx + 4, plen, &field, deadline);
++			if (err) {
++				break;
++			}
++			*got = 4u + plen;
++			if (*got >= 6u && rx[4] == 0xf0u && rx[5] == 0x04u) {
++				f004++;
++				continue;
++			}
++			if (*got >= 6u && rx[4] == 0xf0u && rx[5] == 0x05u) {
++				f005++;
++				continue;
++			}
++			if (*got >= 9u && memcmp(rx + 4, identity, sizeof(identity)) == 0) {
++				unsigned sub = *got >= 11u ? rx[10] : 0xffu;
++				unsigned status = *got >= 10u ? rx[9] : 0xffu;
++
++				if (sub == want_sub) {
++					return 0;
++				}
++				if (sub == 0x03u) {
++					patch++;
++					printf("PANDORA BT: %s: EDL patch event subcmd 3, status %u (%s), %u bytes\n",
++					    what, status, bt_peri_edl_status_name(status), *got);
++					bt_dump_wide("TME-L patch event", rx, *got);
++					pandora_log_sync();
++					continue;
++				}
++				if (named++ < 8u) {
++					printf("PANDORA BT: %s: EDL event subcmd %u status %u (%s), %u bytes\n",
++					    what, sub, status, bt_peri_edl_status_name(status), *got);
++					bt_dump("TME probe EDL event", rx, *got);
++					pandora_log_sync();
++				}
++				continue;
++			}
++			stray++;
++			if (named++ < 8u) {
++				printf("PANDORA BT: %s: unrecognized 34 record (%u bytes, plen %u)\n",
++				    what, *got, plen);
++				bt_dump("TME probe record", rx, *got);
++				pandora_log_sync();
++			}
++			continue;
++		}
++		if (lead == 0x04u) {
++			uint8_t eh[2];
++			unsigned plen;
++
++			err = bt_rx_exact(eh, 2, &field, deadline);
++			if (err) {
++				break;
++			}
++			plen = (unsigned)eh[1];
++			hci++;
++			if (plen > cap) {
++				unsigned dropped = 0;
++
++				while (dropped < plen) {
++					unsigned take = plen - dropped > sizeof(sink)
++					    ? (unsigned)sizeof(sink) : plen - dropped;
++
++					err = bt_rx_exact(sink, take, &field, deadline);
++					if (err) {
++						break;
++					}
++					dropped += field;
++				}
++				if (err) {
++					break;
++				}
++				continue;
++			}
++			err = bt_rx_exact(rx, plen, &field, deadline);
++			if (err) {
++				break;
++			}
++			*got = plen;
++			printf("PANDORA BT: %s: HCI event %02x len %u\n", what, eh[0], plen);
++			bt_dump_wide("TME probe HCI event", rx, plen);
++			if (eh[0] == 0x0eu && plen >= 3u) {
++				printf("PANDORA BT: %s: Command Complete status %u opcode %02x %02x trailing %02x %02x %02x %02x\n",
++				    what, rx[0], rx[2], rx[1],
++				    plen > 3u ? rx[3] : 0xffu, plen > 4u ? rx[4] : 0xffu,
++				    plen > 5u ? rx[5] : 0xffu, plen > 6u ? rx[6] : 0xffu);
++			}
++			pandora_log_sync();
++			continue;
++		}
++		stray++;
++		printf("PANDORA BT: %s: stray byte %#x\n", what, lead);
++	}
++	printf("PANDORA BT: %s: probe window ends after %u packet(s), f0 04 %u, f0 05 %u, patch evt %u, HCI %u, records %u, stray %u (error %d)\n",
++	    what, packets, f004, f005, patch, hci, records, stray, err);
++	pandora_log_sync();
++	return err ? err : ETIMEDOUT;
++}
++
++/* Level 20.13: re-issue TMEArbitrate after Stage B and print rsp[9], the
++ * byte the HAL's GetVsHciEvent stores as state[4]. The frame is the same
++ * 8-byte v3 arbitrate sent before the map; only the position is new. If
++ * the ROM accepted the download it should now answer 23 ("patched"),
++ * instead of the 0 it returned before the map. Observation only. */
++static void
++bt_peri_tme_state_probe(const char *what)
++{
++	static const uint8_t request[] = { 0x31, 0x00, 0xf0, 0xff, 0x03, 0x08, 0x03, 0x00 };
++	static const uint8_t identity[] = { 0xf0, 0x01, 0x01, 0xf0, 0xff };
++	uint8_t rx[BT_PERI_EVT_MAX] = {0};
++	unsigned got = 0;
++	uint64_t deadline;
++	int err;
++
++	printf("PANDORA BT: %s: post-stage-B TME state query 31 00 f0 ff 03 08 03 00\n",
++	    what);
++	pandora_log_sync();
++	err = bt_uart_tx(request, sizeof(request), "TME state query");
++	if (err) {
++		printf("PANDORA BT: %s: state query TX failed (error %d)\n", what, err);
++		pandora_log_sync();
++		return;
++	}
++	clock_interval_to_deadline(1500, NSEC_PER_MSEC, &deadline);
++	err = bt_peri_tme_probe_wait(rx, sizeof(rx), &got, deadline, 0x08, what);
++	if (err) {
++		printf("PANDORA BT: %s: no subcmd-8 answer (error %d, %u bytes)\n",
++		    what, err, got);
++		bt_dump("TME state query raw", rx, got);
++		pandora_log_sync();
++		return;
++	}
++	if (got < 11u || memcmp(rx + 4, identity, sizeof(identity)) != 0) {
++		printf("PANDORA BT: %s: subcmd-8 answer malformed (%u bytes)\n", what, got);
++		bt_dump("TME state query answer", rx, got);
++		pandora_log_sync();
++		return;
++	}
++	printf("PANDORA BT: %s: TME state %u (%s), subcmd %u, flag %u, %u bytes\n",
++	    what, rx[9], bt_peri_tme_state_name(rx[9]), rx[10],
++	    got >= 12u ? rx[11] : 0xffu, got);
++	bt_dump("TME state query answer", rx, got);
++	pandora_log_sync();
++}
++
++/* Level 20.13: read-only verdict window after the probes. No TX except the
++ * fd-answer rule. Every 34 event that is not the resident f0 04/f0 05
++ * stream is printed whole; a subcmd-3 EDL patch event is named as such. */
++static void
++bt_peri_tme_verdict_watch(unsigned window_ms, const char *what)
++{
++	uint8_t rx[BT_PERI_EVT_MAX] = {0};
++	unsigned got = 0;
++	uint64_t deadline;
++
++	printf("PANDORA BT: %s: verdict watch %u ms, no request\n", what, window_ms);
++	pandora_log_sync();
++	clock_interval_to_deadline(window_ms, NSEC_PER_MSEC, &deadline);
++	(void)bt_peri_tme_probe_wait(rx, sizeof(rx), &got, deadline, 0xffu, what);
 +}
 +
 +/* TlvDnldSegment sub-op 06 03 (the TME-L map download) is reached via
@@ -3302,6 +3569,14 @@ index 0000000..5d39e88e4d0e6d105a60785de37fb647705cfe06
 +	printf("PANDORA BT: %s: %u packets sent (%u bytes), end command issued\n",
 +	    what, seg, sent);
 +	pandora_log_sync();
++	/* Level 20.13: post-Stage-B verdict probes. Two observation frames
++	 * follow the end command - the same TME version query the HAL sends in
++	 * TmelSocInit (31 00 f0 ff 02 05 03) and the same 8-byte arbitrate
++	 * whose rsp[9] the HAL stores as state[4] - then a 3 s read-only
++	 * window for the Patch Ntf. Nothing before 0x20 changes. */
++	(void)bt_peri_version_v3();
++	bt_peri_tme_state_probe("PERI TME-L post-stage-B");
++	bt_peri_tme_verdict_watch(3000u, "PERI TME-L post-stage-B");
 +	return 0;
 +}
 +
