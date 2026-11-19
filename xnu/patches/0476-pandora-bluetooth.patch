@@ -13,11 +13,11 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..2131bbd910767ecec938ff4e4683b80b096c5595
+index 0000000..3135ba9c716e75fca62237c1e3ac9c40aafe1830
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4068 @@
-+/*
+@@ -0,0 +1,4110 @@
++﻿/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
 + * The combo chip's WLAN side is PCIe (pandora_wifi.c); Bluetooth is a plain
@@ -3149,6 +3149,7 @@ index 0000000..2131bbd910767ecec938ff4e4683b80b096c5595
 + * they are counted, never treated as ACKs. A 34 event carrying the EDL
 + * identity f0 01 01 f0 ff is decoded: status = rx[9], subcmd = rx[10],
 + * flag = rx[11]. Returns 0 when want_sub was seen, ETIMEDOUT otherwise. */
++#if 0 /* level 20.14: 20.13 post-Stage-B probes disabled */
 +static int
 +bt_peri_tme_probe_wait(uint8_t *rx, unsigned cap, unsigned *got, uint64_t deadline,
 +    uint8_t want_sub, const char *what)
@@ -3376,6 +3377,45 @@ index 0000000..2131bbd910767ecec938ff4e4683b80b096c5595
 +	(void)bt_peri_tme_probe_wait(rx, sizeof(rx), &got, deadline, 0xffu, what);
 +}
 +
++#endif
++
++/* Level 20.14: preserve the raw byte stream that follows the peri map,
++ * before any frame parser can drop or misalign it. The 20.10-20.13 runs
++ * all reported 108-120 "dropped" bytes at the first record boundary and
++ * never kept them; 20.13's Stage-B log showed the same class of unframed
++ * bytes (e4 28 47 ...). This reads bytes only (fd is answered with fc),
++ * prints the first 1024, and never treats a record as an ACK. */
++static void
++bt_peri_raw_dump(unsigned window_ms, const char *what)
++{
++	uint8_t buf[1024];
++	unsigned n = 0;
++	uint64_t deadline;
++
++	printf("PANDORA BT: %s: raw window %u ms, no frame parsing\n", what, window_ms);
++	pandora_log_sync();
++	clock_interval_to_deadline(window_ms, NSEC_PER_MSEC, &deadline);
++	while (n < sizeof(buf) && mach_absolute_time() < deadline) {
++		uint8_t byte = 0;
++		unsigned field = 0;
++		int err;
++
++		err = bt_rx_exact(&byte, 1, &field, deadline);
++		if (err) {
++			break;
++		}
++		if (byte == 0xfd) {
++			const uint8_t ack = 0xfc;
++
++			(void)bt_uart_tx(&ack, 1, "raw wake ACK FC");
++		}
++		buf[n++] = byte;
++	}
++	printf("PANDORA BT: %s: raw %u byte(s)\n", what, n);
++	bt_dump_wide("PERI TME-L raw stream", buf, n);
++	pandora_log_sync();
++}
++
 +/* TlvDnldSegment sub-op 06 03 (the TME-L map download) is reached via
 + * bt_peri_tlv_download_sub(.., 0x03).
 + *
@@ -3409,6 +3449,7 @@ index 0000000..2131bbd910767ecec938ff4e4683b80b096c5595
 + * (answered 04 0e 08 01 00 fc 00 23 02 00 00) and 0x20 (end/verify) - so the
 + * sender is parameterised here and the caller names the phase. Observation
 + * only: one 5-byte TX, no retry, no cadence change. */
++#if 0 /* level 20.14: 20.11-20.13 probes retained for reference; map-only build does not transmit them */
 +static void
 +bt_peri_tme_vs_cmd(uint8_t param, unsigned window_ms, const char *what)
 +{
@@ -3579,6 +3620,8 @@ index 0000000..2131bbd910767ecec938ff4e4683b80b096c5595
 +	bt_peri_tme_verdict_watch(3000u, "PERI TME-L post-stage-B");
 +	return 0;
 +}
++
++#endif /* level 20.14 probes */
 +
 +/* Level 20.9: watch long enough to see where the dump stops, and stop trusting
 + * a frame length that was not seen at a header boundary. l208 read 378 records
@@ -3819,7 +3862,7 @@ index 0000000..2131bbd910767ecec938ff4e4683b80b096c5595
 +{
 +	int err;
 +
-+	printf("PANDORA BT: level 20: TME-L %u B, PeriReset + arbitrate v3 + peri map + HCI stage B\n",
++	printf("PANDORA BT: level 20: TME-L %u B, PeriReset + arbitrate v3 + peri map + map-only raw stream (20.14)\n",
 +	    (unsigned)sizeof(pandora_peri_tmel_elf));
 +	pandora_log_sync();
 +	err = bt_peri_reset();
@@ -3836,15 +3879,15 @@ index 0000000..2131bbd910767ecec938ff4e4683b80b096c5595
 +	}
 +	err = bt_peri_tlv_download_sub(pandora_peri_tmel_elf,
 +	    sizeof(pandora_peri_tmel_elf), "PERI TME-L", 0u, 0u, 0x03);
-+	/* Level 20.11 -> 20.12. The map phase ends with the ROM answering the
-+	 * host or not; the reference HAL's next move after the map is not a
-+	 * single vendor "probe" but the whole HCI 0xfc00 download stage: 0x19,
-+	 * 243-byte data packets (1e f3 + payload), 0x20 to close, and only then
-+	 * ReadHciEvent(260) for the Patch Ntf. 20.11 sent 0x23 alone; the trace
-+	 * puts that command at ~82 % of the download, not at the map boundary. */
++/* Level 20.14: the map phase ends and the ROM immediately transmits a
++	 * byte stream that 20.10-20.13 parsed as a 108-120 byte resync and
++	 * never kept. This build deliberately does NOT send the HCI 0xfc00
++	 * Stage B (20.13 showed it is followed by the same stream) and instead
++	 * preserves the raw bytes first: that distinguishes "Patch Ntf exists
++	 * but the parser lost its boundary" from "the ROM rejects the map and
++	 * starts a diagnostic dump". */
 +	if (!err) {
-+		err = bt_peri_tme_hci_download(pandora_peri_tmel_elf,
-+		    sizeof(pandora_peri_tmel_elf), "PERI TME-L stage B");
++		bt_peri_raw_dump(2000u, "PERI TME-L map-only raw");
 +	}
 +	/* Level 20.8: observation depth. l207 named every record but kept only
 +	 * 32 bytes of each 248-byte body, so the stream could not be decoded and
@@ -3852,12 +3895,7 @@ index 0000000..2131bbd910767ecec938ff4e4683b80b096c5595
 +	 * byte, and stops on silence - it sends no request. */
 +	bt_peri_record_watch("PERI TME-L");
 +	if (err) {
-+		/* Level 20.12: the map phase no longer has an ACK gate (the ROM
-+		 * sends none, and the HAL reads none), so a non-zero err here is a
-+		 * real transmit failure, not a missing verdict. The verdict itself
-+		 * now has a defined source: the HCI event the HAL's ConfigureTMESoC
-+		 * reads after the 0x19/.../0x20 stage. */
-+		printf("PANDORA BT: level 20 peri map phase failed (error %d); HCI stage B skipped, verdict absent\n",
++		printf("PANDORA BT: level 20 peri map phase failed (error %d); raw/record watch skipped, verdict absent\n",
 +		    err);
 +		pandora_log_sync();
 +	}
@@ -4085,6 +4123,10 @@ index 0000000..2131bbd910767ecec938ff4e4683b80b096c5595
 +	}
 +}
 +#endif /* PANDORA */
++
++
++
++
 diff --git a/bsd/dev/pandora_bt_fw.h b/bsd/dev/pandora_bt_fw.h
 new file mode 100644
 index 0000000..b543073e92298b5222ac0bd2b22945ee625035fd
