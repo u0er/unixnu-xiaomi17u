@@ -2161,3 +2161,39 @@ edit('NativeBridgeMetalFrontend.mm',
 edit('NativeBridgeMetalFrontend.mm',
      '   if(fd<0)for(const char *path:paths){fd=open(path,O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd>=0)break;}',
      '   if(fd<0 && tracePath[0])fd=open(tracePath,O_WRONLY|O_CREAT|O_TRUNC,0644);')
+
+# ---- data-a-live: finish-phase flush split (2026-11-19, gpu-optimization/ACTION_PLAN.md 2.1) ------------------
+# At -finish the GPU has already executed. Input surfaces it only READ need no cache
+# maintenance there (the CPU's writes were cleaned at -commit); only surfaces the GPU
+# WRITES must be invalidated so CPU reads see fresh pixels. Today -finish re-flushes the
+# whole command's surface set (sys_dcache_flush over every IOSurface allocation), which is
+# redundant for the read-only majority of a frame's bindings. With nezha_flush_split=1 the
+# completion flush covers only GPU-writable textures (render targets / shader-write) and
+# the wrapped no-copy set (kept whole: small, and buffer write-sets are not tracked).
+# Default off: identical behavior. A/B on device with gWrappedFlushBytes + SWEET FB frame
+# windows + a visual stale-output check before this can become the default.
+edit('NativeBridgeMetalFrontend.mm',
+     'static void flushWrapped(NSSet *owners) {',
+     '''static bool flushSplit() {
+ static const bool on=[] {
+  char args[2048]={};size_t length=sizeof args-1;
+  if(sysctlbyname("kern.bootargs",args,&length,nullptr,0))return false;
+  static const char token[]="nezha_flush_split=1";
+  const char *at=strstr(args,token);
+  return at && (at==args || at[-1]==' ') && (at[sizeof(token)-1]==0 || at[sizeof(token)-1]==' ');
+ }();
+ return on;
+}
+static NSSet *gpuWritableSurfaces(NSSet *surfaces) {
+ if(!surfaces.count)return surfaces;
+ NSMutableSet *w=[NSMutableSet setWithCapacity:surfaces.count];
+ for(id t in surfaces) {
+  NBTexture *tex=[t isKindOfClass:[NBTexture class]]?(NBTexture *)t:nil;
+  if(tex && (tex.usage&(MTLTextureUsageRenderTarget|MTLTextureUsageShaderWrite))) [w addObject:t];
+ }
+ return w;
+}
+static void flushWrapped(NSSet *owners) {''')
+edit('NativeBridgeMetalFrontend.mm',
+     '- (void)finish {\n flushSurfaces(_surfaces);\n reportSurfaceOutputs(self,[(id<MTLCommandBuffer>)self status]);\n flushWrapped(_resourceOwners);   // data-a-live: no-copy memory too\n',
+     '- (void)finish {\n flushSurfaces(flushSplit()?gpuWritableSurfaces(_surfaces):_surfaces);\n reportSurfaceOutputs(self,[(id<MTLCommandBuffer>)self status]);\n flushWrapped(_resourceOwners);   // data-a-live: no-copy memory too\n')
