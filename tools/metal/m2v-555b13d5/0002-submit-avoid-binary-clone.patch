@@ -1,0 +1,18 @@
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -622,8 +622,12 @@
+         let mut start_stamp = slot.filter(|_| index == 0);
+         let batches = state.batches.all();
+         let (start, end) = (range.start, range.end);
+-        let binary_waits = batches[index].binary_waits.clone();
+-        let binary_signals = batches[index].binary_signals.clone();
++        // Borrow instead of cloning: `batches` outlives every use below and
++        // `batches[index]` is not mutated before the last use. Sparing these two
++        // Vec allocations on each submitted batch (several per frame) removes
++        // the only per-batch heap churn left on the submit path.
++        let binary_waits = &batches[index].binary_waits;
++        let binary_signals = &batches[index].binary_signals;
+         // Whether its `VkQueue` waits on the GPU for work of another `VkQueue`'s the host had not
+         // seen complete: an event's signal pending there (below, the tracker's and the first
+         // work's waits too), which holds the `VkQueue` until that work ends (`queue_share.rs`).

@@ -854,3 +854,26 @@ edit('NativeBridgeMetalFrontend.mm',
    row("DP cb %llu skip %llu gated %llu whole %llu dbc %llu stamps %llu waits %llu/%llu | logs %llu wr %llu rec %llu cons %llu",
     (ull)dp[0],(ull)dp[1],(ull)dp[2],(ull)dp[3],(ull)dp[4],(ull)dp[5],(ull)dp[6],(ull)dp[7],
     (ull)dp[8],(ull)dp[9],(ull)dp[10],(ull)dp[11]);""")
+
+# Stage-3 (2026-11-20): GPU command-buffer timestamp measurement lever.
+# boot arg pandora_m2v_gputimes=host -> env -> options.gpu_times_from_host.
+# Off by default (the env is unset unless the boot arg is present), so this is a
+# zero-change default path. Turning it on spares each command buffer its two GPU
+# timestamp writes (and avoids the wait on drivers whose timestamps wait for every
+# queue), but it forgoes queue sharing -- so it is an A/B measurement lever, not a
+# silent default. Both edits are simulated against the adapted export tree before
+# the CI compile; the Rust field is defined in runtime create.rs (gpu_times_from_host).
+edit('NativeAdrenoMetalPlugin.mm',
+     '        if (bootArgSet("wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);',
+     '        // data-a-live: GPU command-buffer timestamps from the host clock (measurement lever,\n'
+     '        // off by default). Sparing the two GPU timestamp writes per command buffer; on a\n'
+     '        // driver whose timestamps wait for every queue this also avoids that stall.\n'
+     '        if (bootArgSet("pandora_m2v_gputimes=host")) setenv("PANDORA_M2V_GPUTIMES", "host", 1);\n'
+     '        else unsetenv("PANDORA_M2V_GPUTIMES");\n'
+     '        if (bootArgSet("wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);')
+edit('bridge/NativeMetalObjects.rs',
+     '        options.messages = Some(MessageSink::new(observe_message));',
+     '        options.messages = Some(MessageSink::new(observe_message));\n'
+     '        // data-a-live: pandora_m2v_gputimes=host -> host-clocked GPU times (measurement\n'
+     '        // lever, default Metal timestamps). Note this forgoes queue sharing; measure A/B.\n'
+     '        options.gpu_times_from_host = std::env::var("PANDORA_M2V_GPUTIMES").as_deref() == Ok("host");')
