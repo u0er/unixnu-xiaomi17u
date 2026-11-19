@@ -22,6 +22,7 @@ synchronization points. Read it before acting; update your row after acting.
 | Qoder | Qoder | Camera: mainline CAMCC offsets + root-enable applied, branch still CLK_OFF | 0e4c2a46 (0475) | 43646938964 SUCCESS | released | next: PLL0 post-div/ODD output or branch halt config |
 | CodeArts | CodeArts | BT_EN 150ms (Linux align) | 374428b2 (150ms) | 43567040764 in_progress | not held | w59 wake ok but silent; trying Linux 150ms boot delay |
 | ZCode | ZCode | GPU Stage-1 DONE: pin 555b13d5/73d582fd4 live, desktop verified (ABI 528/536 fix 8b1d557), shadow copies -86..94% + copy-back 0 | 8b1d557 on metal2vulkan-555b13d5 | 43602780936 SUCCESS | released | next: PosterBoard cold-boot sig10 (needs .ips fix, see RUNTIME_SHADOW_CACHE.md 0.5), unplug hang needs first-seizure log |
+| WorkBuddy | WorkBuddy | GPU: finish-phase flush split gate `nezha_flush_split=1` in adapt_ios16 (default off); trustcache cdhash merge fix on packaging chain (AMFI no-CMS root cause) | 5423b7d (flush split, rebased over BT 19.x) | 44488888719 in_progress | released | next: CI metal -> staged A/B boot judged by tools/metal/fps_compare.py |
 
 ## Notes
 - 2026-11-14 ~09:10Z CodeArts: 0476 121716fe (BT_EN low 100 ms, high 200 ms) is pushed and verified locally; needs exactly one dispatch (no cancel) when CI is idle. Earlier w53 fault was bt_sleep() units on the low side too (10 us).
@@ -656,3 +657,7 @@ synchronization points. Read it before acting; update your row after acting.
 - Census (post-boot, kernel-equivalent swap validation incl. link/offset checks): 106 referenced-but-invalid catalog nodes (103 zeroed-offsets + 3 kind-garbage incl. index-slot 29382), all OFF the live chain (18,868 leaves, 0 invalid). The kernel-named 29473/29476 are no longer referenced (session relinked their index records).
 - v5 APPLIED (212 x 4KiB blocks, OLD_SHA256-guarded writes, per-block read-back + full re-verify): all 106 neutralized as valid empty leaves. Post-v5: zero reachable-invalid nodes; reader walk 376,850 entries IDENTICAL before/after (no readable data touched). Assets: .temp/hfs-surgery5/, catalog_v5_write_set.json, catalog_postboot.bin.
 - NEXT: second single-variable boot (same f034db1b image) after explicit user consent; criteria unchanged (BTNode invalid lines 0, data abort 0, exec SpringBoard x1, desktop). If a new node class surfaces, iterate the census->neutralize loop (now scripted and fast).
+
+- 2026-11-19 WorkBuddy: if `git-credential-manager.exe` pops "系统错误/绑定无效" during push, bypass it:
+  `git config --local credential.helper '' && git config --local --add credential.helper wincred`
+  (empty value resets the helper chain; `-c credential.helper=wincred` alone does NOT remove GCM).
