@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..8cfb5a8c509ed922a9f4f60de9e99c3eb34e5745
+index 0000000..82d0b2c3ddbcec62129d369a5a285f1405bcde0f
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,3362 @@
+@@ -0,0 +1,3386 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2176,8 +2176,12 @@ index 0000000..8cfb5a8c509ed922a9f4f60de9e99c3eb34e5745
 +				dropped += got3;
 +			}
 +			bt_dump("PERI oversized event payload", sink, dropped);
-+			printf("PANDORA BT: PERI event oversized (%u B payload), drained\n",
-+			    rx[3]);
++			/* Level 20.7: name the record. peek holds payload[0..3]
++			 * (class + sequence), sink holds the 248-byte body. A
++			 * caller that waits for an ACK needs to see that this was
++			 * a record, not a malformed ACK. */
++			printf("PANDORA BT: PERI record plen %u class %02x %02x seq %02x %02x, body %u bytes\n",
++			    rx[3], peek[0], peek[1], peek[2], peek[3], dropped);
 +			return EMSGSIZE;
 +		}
 +		rx[4] = peek[0];
@@ -2216,8 +2220,11 @@ index 0000000..8cfb5a8c509ed922a9f4f60de9e99c3eb34e5745
 +			dropped += got2;
 +		}
 +		bt_dump("PERI oversized event payload", sink, dropped);
-+		printf("PANDORA BT: PERI event oversized (%u B payload), drained\n",
-+		    rx[3]);
++		/* Level 20.7: see the peek path above. Here sink starts at
++		 * payload[0], so the class and sequence are sink[0..3]. */
++		printf("PANDORA BT: PERI record plen %u class %02x %02x seq %02x %02x, body %u bytes\n",
++		    rx[3], sink[0], sink[1], sink[2], sink[3],
++		    dropped >= 4u ? dropped - 4u : 0u);
 +		return EMSGSIZE;
 +	}
 +	err = bt_rx_exact(rx + 4, rx[3], &field, deadline);
@@ -2245,17 +2252,36 @@ index 0000000..8cfb5a8c509ed922a9f4f60de9e99c3eb34e5745
 +    uint8_t want_sub, const char *what)
 +{
 +	unsigned discarded = 0;
++	unsigned records = 0;
 +	int err;
 +
 +	for (;;) {
 +		err = bt_peri_next_event(rx, cap, got, deadline);
 +		if (err == EMSGSIZE) {
-+			/* payload already drained; treat as stale */
-+			err = 0;
-+		} else if (err) {
++			/* Level 20.7: the oversized payload is already drained and
++			 * reported by bt_peri_next_event as a record (plen, class,
++			 * seq). A record is not an ACK. Charging it against the
++			 * discard budget meant a ROM that streams records burned
++			 * the whole 3 s wait in 1.2 s and then reported "no ACK" -
++			 * true, but for the wrong reason, and with the stream cut
++			 * off after eight of them. Bound the records separately
++			 * (64 x 256 B) so the wait still cannot spin forever. */
++			if (++records > 64u) {
++				printf("PANDORA BT: %s: %u records and still no ACK-shaped response\n",
++				    what, records - 1u);
++				return EOVERFLOW;
++			}
++			if (records == 1u) {
++				printf("PANDORA BT: %s: ROM streams records while we wait for subcmd %u; a record is not an ACK\n",
++				    what, want_sub);
++			}
++			pandora_log_sync();
++			continue;
++		}
++		if (err) {
 +			return err;
 +		}
-+		if (err == 0 && *got >= 11u && rx[10] == want_sub) {
++		if (*got >= 11u && rx[10] == want_sub) {
 +			return 0;
 +		}
 +		if (++discarded > 8u) {
@@ -2263,11 +2289,9 @@ index 0000000..8cfb5a8c509ed922a9f4f60de9e99c3eb34e5745
 +			    what, discarded - 1u);
 +			return EOVERFLOW;
 +		}
-+		printf("PANDORA BT: %s: discarding stale event (subcmd %u, %u bytes)\n",
-+		    what, err == 0 && *got >= 11u ? rx[10] : 0xffu, err == 0 ? *got : 0u);
-+		if (err == 0) {
-+			bt_dump("PERI stale event", rx, *got);
-+		}
++		printf("PANDORA BT: %s: discarding stale ACK-shaped event (subcmd %u, %u bytes)\n",
++		    what, *got >= 11u ? rx[10] : 0xffu, *got);
++		bt_dump("PERI stale event", rx, *got);
 +		pandora_log_sync();
 +	}
 +}
