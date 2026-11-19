@@ -1,0 +1,52 @@
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -4785,6 +4785,25 @@
+     Err(failure)
+ }
+ 
++// Bounded Darwin diagnostics for the Nezha fragmentation experiment: distinguish an oversized
++// growth retry from an allocation that still cannot fit. No counters or API behavior are forged.
++fn note_resource_fallback(growth: u64, required: u64) {
++    #[cfg(target_vendor = "apple")]
++    {
++        use std::sync::atomic::{AtomicUsize, Ordering};
++        static REPORTED: AtomicUsize = AtomicUsize::new(0);
++        if REPORTED.fetch_add(1, Ordering::Relaxed) < 8 {
++            unsafe extern "C" {
++                fn syslog(priority: i32, format: *const std::ffi::c_char, ...);
++            }
++            // SAFETY: a static format with exactly the two unsigned 64-bit arguments it names.
++            unsafe { syslog(3, c"pandora-metal: resource fallback growth=%llu required=%llu".as_ptr(), growth, required) };
++        }
++    }
++    #[cfg(not(target_vendor = "apple"))]
++    let _ = (growth, required);
++}
++
+ /// [`allocate`], in a block with a buffer of addresses where `addressed` gives the counts of the
+ /// buffers of addresses made, of the blocks that hold `holds`, pooled or in a block of its own
+ /// as `fit` says. A new block is made with `memory`'s lock released: the device's other threads'
+@@ -4886,6 +4905,23 @@
+         let made = match make() {
+             Err(Error::OutOfMemory(_)) if make_room(memory, device, type_index) => make(),
+             made => made,
++        };
++        // A pool's growth target can exceed the driver's largest free run even when this
++        // resource fits. After the existing reclaim/drain attempt, retry its real Vulkan
++        // requirement once. Keep that block apart so an unlucky fragmented allocation does
++        // not become an oversized empty spare. Dedicated/host/lost-device failures do not retry.
++        let (block_size, dedicated, made, trace) = if !dedicated
++            && block_size > size
++            && matches!(&made, Err(Error::OutOfMemory(MemoryKind::Device)))
++        {
++            if trace != 0 {
++                crate::stage_trace::mark(trace, crate::stage_trace::Stage::MemoryAllocated, 0);
++            }
++            note_resource_fallback(block_size, size);
++            let trace = trace_memory(pool, size, available, 1);
++            (size, true, maker.make(device, pool, size, addressed), trace)
++        } else {
++            (block_size, dedicated, made, trace)
+         };
+         match made {
+             Ok(block) => {

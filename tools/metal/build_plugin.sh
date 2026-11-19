@@ -20,6 +20,13 @@ BASE=(-target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -g -fstack-protector-stro
 
 echo "== NativeMetal for iOS 16"
 python3 "$ROOT/tools/metal/adapt_ios16.py" "$NM"
+# Nezha: finish-phase flush split (default on; nezha_flush_split=0 opts out). Only
+# GPU-writable surfaces keep their completion dcache maintenance; the commit phase is
+# untouched. Device-verified on the acceptance lineage (epoch 1795084284, 2026-11-19).
+# The patch targets the post-adapter frontend; this is the same frontend-patch channel
+# as work/nezha-metal-memory-pressure/build_plugin.py --frontend-patch.
+echo "== flush-split frontend patch"
+git -C "$NM" apply "$ROOT/tools/metal/flush-split-defaulton.patch"
 
 echo "== smoke shaders (UniXNU gen-turnip-smoke-shaders.py)"
 {
@@ -38,19 +45,26 @@ print("};")' "$B/$n.spv" "$n"
 } > "$B/gen/NativeTurnipShaders.h"
 
 echo "== metal2vulkan bridge (UniXNU build-native-metal-bridge.py)"
-# Apply the original seven bridge patches, then the maintained local equivalents.
-# AdrenoMetal's later patches overlap the local padded-target and reuse changes.
-PATCHES=("$NM"/bridge/patches/000[1-7]-*.patch)
-for p in "$ROOT"/tools/metal/m2v/[0-9][0-9][0-9][0-9]-*.patch; do
-	[ -e "$p" ] && PATCHES+=("$p")
-done
+# Apply every NativeMetal bridge patch (the series is renumbered against m2v 555b13d5:
+# 0002..0041, where 0040 is the unixnu-runtime adaptation). The fork's local
+# tools/metal/m2v/*.patch stack targets m2v 720ef1c and does NOT apply at this pin
+# (2026-11-14 check: 0/23 apply, triage in gpu-optimization/RUNTIME_SHADOW_CACHE.md) --
+# re-port selectively, only where the new runtime counters show a gap.
+PATCHES=("$NM"/bridge/patches/*.patch)
 for p in "${PATCHES[@]}"; do
 	echo "   $(basename "$p")"
 	git -C "$M2V" apply "$p"
 done
+echo '   Nezha: resource-sized retry after a fragmented pool growth allocation fails'
+# This patch is maintained against the pinned runtime AFTER AdrenoMetal's series.
+# The older tools/metal/m2v stack remains disabled; do not reapply it wholesale.
+git -C "$M2V" apply "$ROOT/tools/metal/m2v-555b13d5/0001-resource-sized-oom-fallback.patch"
 LLVM_AS=$(brew --prefix llvm)/bin/llvm-as
 "$LLVM_AS" -o "$B/runtime_examples.air" "$M2V/crates/metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll"
 "$LLVM_AS" -o "$B/function_constant.air" "$M2V/crates/metal2vulkan-validation/fixtures/public/kernel_function_constant_gate_fold.ll"
+# The pinned tree's scanout half-float kernel (bridge/NativeMetalObjects.rs NMB_SCANOUT_AIR) is
+# hand-written AIR assembled at build time; the other include_bytes! fixtures are set below.
+"$LLVM_AS" -o "$B/scanout_convert.air" "$NM/shaders/scanout_convert.ll"
 cat > "$B/Cargo.toml" <<EOF
 [package]
 name = "native-metal-bridge"
@@ -71,7 +85,7 @@ panic = "unwind"
 debug = 1
 EOF
 RID=$( (git -C "$M2V" rev-parse HEAD; git -C "$M2V" diff HEAD) | shasum -a 256 | cut -c1-32)
-NMB_RUNTIME_ID=$RID NMB_FIXTURE_AIR=$B/runtime_examples.air NMB_FC_AIR=$B/function_constant.air \
+NMB_RUNTIME_ID=$RID NMB_FIXTURE_AIR=$B/runtime_examples.air NMB_FC_AIR=$B/function_constant.air NMB_SCANOUT_AIR=$B/scanout_convert.air \
 	IPHONEOS_DEPLOYMENT_TARGET=16.0 \
 	cargo +1.98.0 build --release --manifest-path "$B/Cargo.toml" --target aarch64-apple-ios --target-dir "$B/target"
 BRIDGE=$B/target/aarch64-apple-ios/release/libnative_metal_bridge.a

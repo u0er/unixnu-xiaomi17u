@@ -1,0 +1,42 @@
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1520,6 +1520,30 @@
+ #endif
+ // Diagnostic: while /private/var/ngpu/debug/no-surface-flush exists when the process starts, no surface is flushed here either.
+ static const bool gSkipSurfaceFlush=access("/private/var/ngpu/debug/no-surface-flush",F_OK)==0;
++static bool flushSplit() {
++ static const bool on=[] {
++  char args[2048]={};size_t length=sizeof args-1;
++  if(sysctlbyname("kern.bootargs",args,&length,nullptr,0))return true;
++  static const char token[]="nezha_flush_split=0";
++  const char *at=strstr(args,token);
++  const bool off=at && (at==args || at[-1]==' ') && (at[sizeof(token)-1]==0 || at[sizeof(token)-1]==' ');
++  return !off;
++ }();
++ if(on){static bool once=false;if(!once){once=true;NSLog(@"pandora-metal: flush split ON (default; nezha_flush_split=0 to opt out)");}}
++ return on;
++}
++static NSMutableSet *gpuWritableSurfaces(NSMutableSet *surfaces) {
++ static uint64_t calls=0,kept=0,all=0;
++ if(!surfaces.count)return surfaces;
++ NSMutableSet *w=[NSMutableSet setWithCapacity:surfaces.count];
++ for(id t in surfaces) {
++  NBTexture *tex=[t isKindOfClass:[NBTexture class]]?(NBTexture *)t:nil;
++  if(tex && (tex.usage&(MTLTextureUsageRenderTarget|MTLTextureUsageShaderWrite))) [w addObject:t];
++ }
++ ++calls;kept+=w.count;all+=surfaces.count;
++ if(calls==1||calls%200==0) NSLog(@"pandora-metal: flush split keeping %u of %u surfaces (cum %llu/%llu, %llu calls)",(unsigned)w.count,(unsigned)surfaces.count,kept,all,calls);
++ return w;
++}
+ static uint64_t flushSurfaces(NSMutableSet *surfaces) {
+  if(!kSurfaceFlush || !surfaces.count || gSkipSurfaceFlush)return 0;
+  std::vector<std::pair<uintptr_t,size_t>> ranges;
+@@ -3452,7 +3476,7 @@
+  DetailCommandScope commandScope(traceNumber);
+  traceThread(3);
+  frontStage(traceNumber,self.commitIndex,8);
+- const uint64_t flushed=flushSurfaces(_surfaces);
++ const uint64_t flushed=flushSurfaces(flushSplit()?gpuWritableSurfaces(_surfaces):_surfaces);
+  frontStage(traceNumber,self.commitIndex,9,flushed,(uint32_t)_surfaces.count);
+  if(freezeWallpaperOn() && !self.failedLocally && self.status==MTLCommandBufferStatusCompleted &&
+     self.wallpaperOutput && encodedWork.draws) {
