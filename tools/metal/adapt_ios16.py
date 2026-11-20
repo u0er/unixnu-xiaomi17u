@@ -877,3 +877,37 @@ edit('bridge/NativeMetalObjects.rs',
      '        // data-a-live: pandora_m2v_gputimes=host -> host-clocked GPU times (measurement\n'
      '        // lever, default Metal timestamps). Note this forgoes queue sharing; measure A/B.\n'
      '        options.gpu_times_from_host = std::env::var("PANDORA_M2V_GPUTIMES").as_deref() == Ok("host");')
+
+# Stage-4 (2026-11-20): restore the per-pass RP telemetry report (diagnostic only).
+# The CI turnip build already injects tu_pandora_render_stats (turnip.yml runs
+# tools/turnip/pandora_rpstats.py), but the CI frontend never grew the report block
+# the local rp-stats build carried, so RP lines vanished from the CI bundle. Re-add
+# it after the RM block of native_bridge_metal_telemetry: dlsym(RTLD_DEFAULT) finds
+# the driver however the runtime loaded it (the loader-path dlopen above binds
+# nothing in some processes, leaving TUC/RM empty there). Counting/reporting only;
+# no rendering change. Anchor verified unique in the adapted export tree.
+edit('NativeBridgeMetalFrontend.mm',
+     """    row("RM gmem %llu %lluM | sys auto %llu %lluM other %llu %lluM | exact %llu",(ull)rm[0],(ull)(rm[1]/1000),(ull)rm[2],
+     (ull)(rm[3]/1000),(ull)rm[4],(ull)(rm[5]/1000),(ull)rm[6]);
+   }
+  }""",
+     """    row("RM gmem %llu %lluM | sys auto %llu %lluM other %llu %lluM | exact %llu",(ull)rm[0],(ull)(rm[1]/1000),(ull)rm[2],
+     (ull)(rm[3]/1000),(ull)rm[4],(ull)(rm[5]/1000),(ull)rm[6]);
+   }
+  }
+  // data-a-live: how Turnip drew each render pass (tu_pandora_render_stats, tools/turnip/pandora_rpstats.py):
+  // GMEM passes vs sysmem and every gmem_disable_reason. dlsym(RTLD_DEFAULT) finds the driver however the
+  // runtime loaded it; the loader-path dlopen above binds nothing in some processes (TUC/RM stay empty).
+  {
+   static void (*rpStats)(char *,size_t);static bool looked=false;
+   if(!looked){looked=true;rpStats=(void (*)(char *,size_t))dlsym(RTLD_DEFAULT,"tu_pandora_render_stats");}
+   if(rpStats) {
+    char text[512]={};rpStats(text,sizeof text);
+    for(const char *at=text;*at;) {
+     size_t left=strlen(at);const char *end;
+     if(left<=84)end=at+left;else {end=at+84;while(end>at && *end!=' ')--end;if(end==at)end=at+84;}
+     char save=*(char *)end;*(char *)end=0;row("RP %s",at);*(char *)end=save;
+     at=(*end?end+1:end);
+    }
+   }
+  }""")
