@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..9781a1611db19dfa3bba3bbb6774d4150ef4701a
+index 0000000..55e882db7bb957829493989265c3101e88f55a1f
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4230 @@
+@@ -0,0 +1,4245 @@
 +﻿/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3971,13 +3971,13 @@ index 0000000..9781a1611db19dfa3bba3bbb6774d4150ef4701a
 +{
 +	int err;
 +
-+	printf("PANDORA BT: level 20: TME-L %u B, ActivateSS + PeriReset + arbitrate v3 + peri map + map-only raw stream (20.18)\n",
++	printf("PANDORA BT: level 20: TME-L %u B, ActivateSS in level 19 + reset + arbitrate v3 + paced peri map + map-only raw stream (20.19)\n",
 +	    (unsigned)sizeof(pandora_peri_tmel_elf));
 +	pandora_log_sync();
-+	/* Level 20.17: replay the PERI preamble in trace order - GetVer(00), then
-+	 * ActivateSS (20.15) - before the PeriReset that opens the TME-L session. */
-+	(void)bt_peri_getver_peri();
-+	(void)bt_peri_activate_ss();
++	/* Level 20.19: GetVer(00) and ActivateSS now happen in the level-19 chain
++	 * (trace order), so the TME-L phase starts with the same three frames
++	 * Android sends at 9.929180-9.930829: reset (31 00 f1 ff 01 03), the
++	 * fd wake, arbitrate v3, GetVer(03). No second ActivateSS. */
 +	err = bt_peri_reset();
 +	if (err) {
 +		return err;
@@ -3990,8 +3990,14 @@ index 0000000..9781a1611db19dfa3bba3bbb6774d4150ef4701a
 +	if (err) {
 +		return err;
 +	}
++	/* Level 20.19: the trace's map phase runs ~1.25 s (9.949244 .. 11.209
++	 * HCI up); the 20.14-20.18 builds blasted 68,952 B in ~0.22 s and the
++	 * ROM answered with its diagnostic dump within one byte of the last
++	 * segment. Pace the map at 4 ms/segment (~1.14 s) and let the pacing
++	 * collector answer the ROM's fd wake with fc - the same handshake the
++	 * NVM phase uses. */
 +	err = bt_peri_tlv_download_sub(pandora_peri_tmel_elf,
-+	    sizeof(pandora_peri_tmel_elf), "PERI TME-L", 0u, 0u, 0x03);
++	    sizeof(pandora_peri_tmel_elf), "PERI TME-L", 4000u, 0u, 0x03);
 +/* Level 20.14: the map phase ends and the ROM immediately transmits a
 +	 * byte stream that 20.10-20.13 parsed as a 108-120 byte resync and
 +	 * never kept. This build deliberately does NOT send the HCI 0xfc00
@@ -4036,6 +4042,15 @@ index 0000000..9781a1611db19dfa3bba3bbb6774d4150ef4701a
 +	 * the segment loop below (non-last segments do not wait). */
 +	printf("PANDORA BT: PatchConfigReq skipped (HAL no_value attribute path: non-last segments skip the ACK wait)\n");
 +	pandora_log_sync();
++	/* Level 20.19: the trace sends ActivateSS (31 00 f1 ff 02 02 0f) at
++	 * 9.773776, right after GetVer(00) and BEFORE Arbitrate + the ram patch.
++	 * 20.15-20.18 sent it after the patch (inside the level-20 phase); the
++	 * 20.18 device run then answered the (Android-proven) TLV end frame with
++	 * the ROM's diagnostic dump instead of the 12-byte ACK + sub-09 build
++	 * info push. The only known state difference at TLV end time was that
++	 * ActivateSS had never been sent, so replay the trace order here. */
++	(void)bt_peri_getver_peri();
++	(void)bt_peri_activate_ss();
 +	err = bt_peri_arbitrate();
 +	if (err) {
 +		return err;
