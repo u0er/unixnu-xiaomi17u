@@ -948,3 +948,10 @@ edit('NativeBridgeMetalFrontend.mm',
 edit('NativeBridgeMetalFrontend.mm',
      '   if(head<written+4)continue;',
      '   {static uint32_t lp=0;if(++lp%40==1)NSLog(@"pandora-metal TSW loop head=%u written=%u fd=%d",(unsigned)head,(unsigned)written,fd);}\n   if(head<written+4)continue;')
+
+# Stage-7 (2026-11-20): diagnostic-only NSLog inside bootArgSet. Stage-6 proved SHENG_DIAG/null in
+# backboardd+SpringBoard; bootArgSet("diag=1") false despite full 598-byte bootargs at launchd.
+# Suspect sysctlbyname("kern.bootargs") fails in guest. Log rc/errno/size/arglen/tail. No render change.
+edit('NativeAdrenoMetalPlugin.mm',
+     '    if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) != 0) return false;',
+     '    int baRc = sysctlbyname("kern.bootargs", args, &size, nullptr, 0);\n    {static uint32_t baN=0;uint32_t k=baN++;if(k<10)NSLog(@"pandora-metal BA key=%s rc=%d errno=%d size=%zu arglen=%zu tail=%.50s",key,baRc,errno,size,strlen(args),args+(strlen(args)>50?strlen(args)-50:0));}\n    if (baRc != 0) return false;')
