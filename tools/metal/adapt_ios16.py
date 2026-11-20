@@ -931,3 +931,20 @@ edit('NativeBridgeMetalFrontend.mm',
 edit('NativeBridgeMetalFrontend.mm',
      'static bool traceWanted() {static const bool on=diagOn() && nativeIsRenderServer();return on;}',
      'static bool traceWanted() {static bool on=false;if(!on)on=diagOn() && nativeIsRenderServer();return on;}')
+
+# Stage-6 (2026-11-20): diagnostic-only NSLog to locate why the frame-trace writer never writes in
+# backboardd even with Stage-5 applied and SHENG_DIAG set by publish::deviceForPort. Observed
+# 2026-11-20 flicker-trace3 (epoch 1795163371): gatefix metal installed (cdhash 7d22c767), yet the only
+# frames.trace on device stayed the previous boot's (sha 8fac7091, type0 wall 2026-11-03 pid57); the
+# writer thread never opened/truncated any of the 3 candidate paths. The static-cache root-cause model
+# is disproven; these logs reveal the actual gate state inside the render server. No rendering change.
+# Anchors are single lines verified unique in the export tree.
+edit('NativeBridgeMetalFrontend.mm',
+     ' if(!diagOn() || !render)return;',
+     ' {static std::atomic<uint32_t> tswN{0};uint32_t k=tswN.fetch_add(1);if(k<5||k%2000==0)NSLog(@"pandora-metal TSW n=%u diag=%d render=%d DIAG=%s GPUTRACE=%s started=%d",(unsigned)k,diagOn()?1:0,render?1:0,getenv("SHENG_DIAG")?:"null",getenv("SHENG_GPU_TRACE")?:"null",gTraceStarted.load()?1:0);}\n if(!diagOn() || !render)return;')
+edit('NativeBridgeMetalFrontend.mm',
+     '   if(render && fd<0)for(const char *path:paths){fd=open(path,O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd>=0)break;}',
+     '   if(render && fd<0)for(const char *path:paths){fd=open(path,O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd>=0){NSLog(@"pandora-metal TSW writer opened fd=%d path=%s",fd,path);break;}}')
+edit('NativeBridgeMetalFrontend.mm',
+     '   if(head<written+4)continue;',
+     '   {static uint32_t lp=0;if(++lp%40==1)NSLog(@"pandora-metal TSW loop head=%u written=%u fd=%d",(unsigned)head,(unsigned)written,fd);}\n   if(head<written+4)continue;')
