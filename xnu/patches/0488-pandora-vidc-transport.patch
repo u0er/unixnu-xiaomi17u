@@ -1,0 +1,716 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/pandora_vidc.c
+@@ -0,0 +1,679 @@
++/*
++ * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
++ *
++ * Target: Xiaomi 17 Ultra (nezha, SM8850-AC / canoe / kaanapali), video IP at
++ * /soc/qcom,vidc@2000000 (compatible qcom,canoe-vidc-v2), GIC SPI 174, 8 MiB
++ * carveout video_region@9a600000.  The only goal of this first revision is an
++ * HFI version handshake: power the block, load the firmware into the carveout,
++ * set up the shared command/message queues, send HFI_CMD_INIT and read back the
++ * HFI_PROP_IMAGE_VERSION response.  It deliberately does NOT create a session,
++ * encode a frame, or expose an IOKit user client.
++ *
++ * Design discipline (from WORK_ORDER_2026-11-19 item A1):
++ *  - Clean room.  Register offsets, HFI packet layouts and the queue protocol
++ *    below are protocol FACTS transcribed from public mainline Linux
++ *    drivers/media/platform/qcom/iris (GPL-2.0).  That source is physically
++ *    isolated in work/references/iris-hfi-spec-20261119/ and NO GPL code is
++ *    copied here: only numeric constants and wire layouts, each tagged with
++ *    its origin.  See docs/research/PANDORA-VIDC-DRAFT-SPEC.md section 6.1.
++ *  - Hardware unknowns are isolated, not guessed.  Anything that could not be
++ *    established offline is an explicit UNKNOWN step that logs and stops.
++ *    In particular: how the host publishes the qtable/SFR physical addresses
++ *    to the firmware, the videocc GDSC/clock programming, and bypassing the
++ *    (absent) TrustZone PAS reset.  A failed UNKNOWN must never be reported as
++ *    a successful handshake.
++ *  - Default off.  pandora_vidc=0 (default): do nothing.  =1: read-only MMIO
++ *    identity probe.  =2: power + firmware + queue setup + HFI handshake.
++ *
++ * Firmware note (2026-11-19 device evidence; VPU_FIRMWARE_RECON.md §0.1): the image
++ * actually loaded on this unit is /odm/firmware/vpu40_2v_v1.mbn (vfw-4.0:rel0060,
++ * IMAGE_VARIANT PROD, built 2026-04-13) -- the Android dmesg prints that exact version
++ * string.  The older /vendor/firmware venus_v7.mbn (video-firmware.2.6.2) is a
++ * legacy/alternate family and NOT the current image.  The image name comes from
++ * boot-arg pandora_vidc_fw (default "vpu40_2v_v1.mbn").
++ *
++ * INTEGRATION GAP (now a staging step): a candidate pack containing vpu40_2v_v1.mbn
++ * has been built offline at work/fwpack-vidc-20261119/firmware-update-vidc.img
++ * (19 entries, 50,479,104 B).  Before a device boot, regenerate the ADT
++ * pandora-fw-extents/blocks and write it through active_storage.write_firmware.
++ */
++
++#ifdef PANDORA
++
++#include <kern/thread.h>
++#include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++
++extern vm_map_t kernel_map;
++extern pmap_t kernel_pmap;
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern void clean_dcache64(addr64_t pa, unsigned len, boolean_t to_mem);
++extern void delay(int);
++
++/* MMIO mapping and firmware access helpers already present in this kernel. */
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++extern int pandora_firmware_pread(const char *name, uint64_t off, void *dst, size_t len, uint64_t *size);
++extern kern_return_t thread_terminate(thread_t);
++
++/* ------------------------------------------------------------------ */
++/* Hardware addresses (facts: live.dtb / Android base.dtb, draft spec 2) */
++/* ------------------------------------------------------------------ */
++#define VIDC_PA                 0x02000000u   /* /soc/qcom,vidc@2000000 reg[0] */
++#define VIDC_SIZE               0x000F0000u   /* reg size */
++#define VIDEO_REGION_PA         0x9A600000u   /* video_region@9a600000 (8 MiB) */
++#define VIDEO_REGION_SIZE       (8u * 1024u * 1024u)
++#define VIDC_IRQ                174u           /* GIC SPI, level */
++
++/* vpu4 register offsets, relative to VIDC_PA.
++ * Source: mainline iris_vpu_register_defines.h (generic vpu4).  Numeric values
++ * are protocol facts, not copied code.  The local canoe-vidc-v2 variant may
++ * differ; level 1 prints these registers so the mapping can be verified. */
++#define VCODEC_BASE_OFFS        0x00000000u
++#define AON_MVP_NOC_RESET       0x0001F000u
++#define CPU_BASE_OFFS           0x000A0000u
++#define WRAPPER_BASE_OFFS       0x000B0000u
++#define AON_BASE_OFFS           0x000E0000u
++
++#define R_VCODEC_SS_IDLE        (VCODEC_BASE_OFFS + 0x070u)
++#define R_WRAPPER_EFUSE         (WRAPPER_BASE_OFFS + 0x004u)   /* see iris_vpu4x.c: +0x08 */
++#define R_WRAPPER_INTR_STATUS   (WRAPPER_BASE_OFFS + 0x00Cu)
++#define R_WRAPPER_INTR_MASK     (WRAPPER_BASE_OFFS + 0x010u)
++#define R_WRAPPER_CORE_PWR      (WRAPPER_BASE_OFFS + 0x080u)
++#define R_WRAPPER_CORE_CLK      (WRAPPER_BASE_OFFS + 0x088u)
++#define R_CPU_A2HSOFTINTCLR     (CPU_BASE_OFFS + 0x01Cu)
++#define R_CPU_H2XSOFTINTEN      (CPU_BASE_OFFS + 0x148u)
++#define R_CPU_SOFTINT           (CPU_BASE_OFFS + 0x150u)
++#define R_CPU_AHB_BRIDGE_RESET  (CPU_BASE_OFFS + 0x160u)
++#define R_CPU_APV_BRIDGE_RESET  (CPU_BASE_OFFS + 0x174u)
++#define R_CPU_X2RPMH            (CPU_BASE_OFFS + 0x168u)
++#define R_AON_NOC_LPI_CTRL      (AON_BASE_OFFS + 0x000u)
++#define R_AON_NOC_LPI_STATUS    (AON_BASE_OFFS + 0x004u)
++#define R_AON_NOC_RESET_REQ     (AON_MVP_NOC_RESET + 0x000u)
++#define R_AON_NOC_RESET_ACK     (AON_MVP_NOC_RESET + 0x004u)
++
++/* Host->firmware queue-table publish, from msm_video.ko __boot_firmware_iris4
++ * (AArch64 disassembly, 2026-11-19; offsets are absolute in the disasm, mapped
++ * here onto the existing CPU_BASE_OFFS = 0xA0000).  Note that +0x148 collides
++ * with R_CPU_H2XSOFTINTEN above, which is consistent: the boot path enables
++ * the host->fw soft interrupt there. */
++#define R_CPU_QUEUE_TABLE_DA    (CPU_BASE_OFFS + 0x064u)  /* qtable physical addr */
++#define R_CPU_QUEUE_TABLE_SIZE  (CPU_BASE_OFFS + 0x068u)  /* 0x300000 (3 MiB) */
++#define R_CPU_QUEUE_TABLE_DA2   (CPU_BASE_OFFS + 0x054u)  /* second publish */
++#define R_CPU_QUEUE_TABLE_EN    (CPU_BASE_OFFS + 0x050u)  /* write 1 */
++#define R_CPU_QUEUE_TABLE_ADDR2 (CPU_BASE_OFFS + 0x060u)  /* core+0x13E8, suspect SFR */
++#define R_CPU_QUEUE_TABLE_STAT  (CPU_BASE_OFFS + 0x04Cu)  /* bit0 ready, bits1-3 err */
++#define R_CPU_BOOT_CTRL         (CPU_BASE_OFFS + 0x048u)  /* write 1 */
++#define R_CPU_BOOT_CLR1         (CPU_BASE_OFFS + 0x148u)  /* CPU_CS_H2XSOFTINTEN */
++#define R_CPU_BOOT_CLR0         (CPU_BASE_OFFS + 0x168u)  /* CPU_CS_X2RPMH; write-0 meaning [U] */
++#define R_WRAPPER_BOOT_CTRL     (WRAPPER_BASE_OFFS + 0x078u) /* WRAPPER_..._SPARE_0, not IRQ */
++
++#define BIT_A2H                 (1u << 2)    /* WRAPPER_INTR_STATUS / A2HSOFTINTCLR */
++#define BIT_A2HWD               (1u << 3)
++#define CORE_BRIDGE_SW_RESET    (1u << 0)
++#define CORE_BRIDGE_HW_RST_DIS  (1u << 1)
++#define REQ_POWER_DOWN_PREP     (1u << 0)
++#define VIDEO_NOC_RESET_REQ     ((1u << 0) | (1u << 1))
++
++/* ------------------------------------------------------------------ */
++/* HFI gen2 wire protocol constants.
++ * Source: mainline iris_hfi_gen2_defines.h / iris_hfi_queue.h (facts only). */
++/* ------------------------------------------------------------------ */
++#define HFI_CMD_INIT            0x01000001u
++#define HFI_CMD_POWER_COLLAPSE  0x01000002u
++#define HFI_CMD_OPEN            0x01000003u   /* session create */
++#define HFI_CMD_START           0x01000005u
++#define HFI_CMD_BUFFER          0x01000009u
++#define HFI_PROP_IMAGE_VERSION  0x03000001u
++#define HFI_PROP_CODEC          0x03000100u
++#define IFACEQ_NUMQ             3u            /* cmd / msg / debug */
++#define IFACEQ_CORE_PKT_SIZE    (1024u * 4u)  /* 4096 */
++#define IRQ_Q_SIZE              (16u * 1024u) /* per-queue ring; UNKNOWN exact */
++
++/* Generic packet header: u32 size, u32 pkt_type (little endian).
++ * Source: mainline hfi_packet header layout (facts only). */
++struct vidc_pkt_hdr {
++    uint32_t size;
++    uint32_t pkt_type;
++};
++
++/* Queue header, byte-exact layout from struct iris_hfi_queue_header. */
++struct vidc_queue_header {
++    uint32_t status;        /* bit0 = active */
++    uint32_t start_addr;
++    uint16_t queue_type;
++    uint16_t header_type;
++    uint32_t q_size;
++    uint32_t pkt_size;      /* 0 = variable */
++    uint32_t pkt_drop_cnt;
++    uint32_t rx_wm;
++    uint32_t tx_wm;
++    uint32_t rx_req;
++    uint32_t tx_req;
++    uint32_t rx_irq_status;
++    uint32_t tx_irq_status;
++    uint32_t read_idx;
++    uint32_t write_idx;
++};
++
++/* Queue table header, byte-exact layout from struct iris_hfi_queue_table_header.
++ * The name[256] field and the 64-bit device_addr slot set qhdr0_offset to
++ * sizeof(header) - NUMQ*sizeof(queue_header) in the mainline setup. */
++struct vidc_queue_table {
++    uint32_t version;
++    uint32_t size;
++    uint32_t qhdr0_offset;
++    uint32_t qhdr_size;
++    uint32_t num_q;
++    uint32_t num_active_q;
++    uint64_t device_addr;
++    char name[256];
++    struct vidc_queue_header qhdr[IFACEQ_NUMQ];
++};
++
++/* ------------------------------------------------------------------ */
++/* State */
++/* ------------------------------------------------------------------ */
++static int      vidc_level;                    /* pandora_vidc boot-arg */
++static char     vidc_fw_name[64] = "vpu40_2v_v1.mbn";
++static vm_offset_t vidc_mmio;                  /* mapped VIDC registers */
++static bool     vidc_mmio_on;
++
++/* qtable + SFR: host-allocated coherent buffers (mainline mechanism, fact). */
++static void    *vidc_qtable_va;
++static uint64_t vidc_qtable_pa;
++static void    *vidc_sfr_va;
++static uint64_t vidc_sfr_pa;
++
++/* qtable/SFR sizes.  The qtable size 0x300000 is what msm_video.ko writes to
++ * CPU+0x68 on this variant (disassembly, 2026-11-19).  SFR size is a mainline
++ * default and still [U] on canoe. */
++#define VIDC_QTABLE_BYTES       0x00300000u
++#define VIDC_SFR_BYTES          0x00004000u
++
++/* Physically contiguous, zeroed, wired (same pattern as pandora_gpu.c
++ * gpu_contig).  The VPU reads these tables non-cacheably, so clean the D-cache
++ * before publishing the physical addresses. */
++static vm_offset_t
++vidc_contig(uint64_t bytes, uint64_t *pa)
++{
++    vm_offset_t va = 0;
++    if (kmem_alloc_contig(kernel_map, &va, (vm_size_t)bytes, PAGE_MASK, 0, 0,
++        KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++        return 0;
++    }
++    *pa = (uint64_t)ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va));
++    clean_dcache64((addr64_t)*pa, (unsigned)bytes, TRUE);
++    return va;
++}
++
++/* Allocate and fill the HFI queue table + SFR.  Layout mirrors mainline
++ * iris_hfi_queue.c: header, 3 queue headers, then the three rings. */
++static int
++vidc_alloc_queues(void)
++{
++    if (vidc_qtable_va && vidc_sfr_va) return 0;
++
++    vidc_qtable_va = vidc_contig(VIDC_QTABLE_BYTES, &vidc_qtable_pa);
++    if (!vidc_qtable_va) {
++        printf("PANDORA VIDC: no %#x contiguous bytes for qtable\n", VIDC_QTABLE_BYTES);
++        return -1;
++    }
++    vidc_sfr_va = vidc_contig(VIDC_SFR_BYTES, &vidc_sfr_pa);
++    if (!vidc_sfr_va) {
++        printf("PANDORA VIDC: no %#x contiguous bytes for SFR\n", VIDC_SFR_BYTES);
++        return -1;
++    }
++
++    struct vidc_queue_table *t = (struct vidc_queue_table *)vidc_qtable_va;
++    t->version = 0;
++    t->size = VIDC_QTABLE_BYTES;
++    t->qhdr_size = (uint32_t)sizeof(struct vidc_queue_header);
++    t->qhdr0_offset = (uint32_t)((char *)&t->qhdr[0] - (char *)t);
++    t->num_q = IFACEQ_NUMQ;
++    t->num_active_q = IFACEQ_NUMQ;
++    t->device_addr = vidc_qtable_pa;
++    const char *nm = "iris-hfi-queues";
++    for (unsigned i = 0; i < (unsigned)sizeof(t->name) - 1 && nm[i]; i++) t->name[i] = nm[i];
++
++    uint64_t ring = vidc_qtable_pa + t->qhdr0_offset +
++        IFACEQ_NUMQ * sizeof(struct vidc_queue_header);
++    for (unsigned i = 0; i < IFACEQ_NUMQ; i++) {
++        struct vidc_queue_header *q = &t->qhdr[i];
++        q->status = 1;                       /* active */
++        q->queue_type = (uint16_t)i;
++        q->header_type = 0;
++        q->q_size = IRQ_Q_SIZE;
++        q->pkt_size = 0;
++        q->start_addr = (uint32_t)(ring + (uint64_t)i * IRQ_Q_SIZE);
++        q->rx_irq_status = 1;
++        q->tx_irq_status = 1;
++    }
++    *(volatile uint32_t *)vidc_sfr_va = VIDC_SFR_BYTES;   /* first word: SFR size */
++
++    clean_dcache64((addr64_t)vidc_qtable_pa, VIDC_QTABLE_BYTES, TRUE);
++    clean_dcache64((addr64_t)vidc_sfr_pa, VIDC_SFR_BYTES, TRUE);
++    printf("PANDORA VIDC: qtable PA=%08llx size=%#x SFR PA=%08llx (header filled)\n",
++        (unsigned long long)vidc_qtable_pa, VIDC_QTABLE_BYTES,
++        (unsigned long long)vidc_sfr_pa);
++    return 0;
++}
++
++/* (qtable/SFR state declared above, before vidc_alloc_queues). */
++
++static inline uint32_t
++vidc_rd(uint32_t off)
++{
++    uint32_t v = *(volatile uint32_t *)(vidc_mmio + off);
++    __asm__ volatile ("dmb oshld" ::: "memory");
++    return v;
++}
++
++static inline void
++vidc_wr(uint32_t off, uint32_t v)
++{
++    *(volatile uint32_t *)(vidc_mmio + off) = v;
++    __asm__ volatile ("dmb oshst" ::: "memory");
++}
++
++/* ------------------------------------------------------------------ */
++/* Level 1: read-only identity probe.  Maps MMIO and prints the registers
++ * whose values establish the vpu4 variant.  No power or clock changes. */
++/* ------------------------------------------------------------------ */
++static int
++vidc_probe(void)
++{
++    if (!vidc_mmio_on) {
++        vidc_mmio = ml_io_map(VIDC_PA, VIDC_SIZE);
++        if (!vidc_mmio) {
++            printf("PANDORA VIDC: ml_io_map(%08x) failed\n", VIDC_PA);
++            return -1;
++        }
++        vidc_mmio_on = true;
++    }
++
++    printf("PANDORA VIDC: MMIO %08x -> %p\n", VIDC_PA, (void *)vidc_mmio);
++    printf("PANDORA VIDC: EFUSE=%08x CORE_PWR=%08x CORE_CLK=%08x IDLE=%08x\n",
++        vidc_rd(R_WRAPPER_EFUSE), vidc_rd(R_WRAPPER_CORE_PWR),
++        vidc_rd(R_WRAPPER_CORE_CLK), vidc_rd(R_VCODEC_SS_IDLE));
++    printf("PANDORA VIDC: INTR_STATUS=%08x INTR_MASK=%08x X2RPMH=%08x\n",
++        vidc_rd(R_WRAPPER_INTR_STATUS), vidc_rd(R_WRAPPER_INTR_MASK),
++        vidc_rd(R_CPU_X2RPMH));
++    printf("PANDORA VIDC: AON_LPI_CTRL=%08x AON_LPI_STATUS=%08x NOC_REQ=%08x NOC_ACK=%08x\n",
++        vidc_rd(R_AON_NOC_LPI_CTRL), vidc_rd(R_AON_NOC_LPI_STATUS),
++        vidc_rd(R_AON_NOC_RESET_REQ), vidc_rd(R_AON_NOC_RESET_ACK));
++    return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* UNKNOWN steps.  Each is a named, honest stub: it logs that the value must
++ * come from device/vendor reverse engineering and stops the sequence.  They
++ * are kept as separate functions so a later agent can replace one at a time
++ * without disturbing the protocol-correct code around them. */
++
++/* videocc power-up.  Offsets and the parent order were verified on the device:
++ * pm_genpd shows video_cc_mvs0c_gdsc as the parent of video_cc_mvs0_gdsc, and
++ * clk_summary shows mvs0/mvs0a/mvs0b at 240 MHz, mvs0c at 360 MHz while idle.
++ * GDSC flags 0x02A0 (mvs0c 0x00A0) mean POLL_CFG_GDSCR|RETAIN_FF_ENABLE
++ * (|HW_CTRL_TRIGGER).  We deliberately leave the domain in SW mode (do not set
++ * bit1) because the HW-control write sequence is not verified. */
++#define VIDEOCC_PA             0x020F0000u
++#define VIDEOCC_SIZE           0x00010000u
++
++struct vidc_gdsc_desc {
++    const char *name;
++    uint32_t    off;        /* relative to VIDEOCC_PA */
++    uint32_t    flags;
++};
++
++static const struct vidc_gdsc_desc vidc_gdscs[] = {
++    { "iris-ctl", 0x814Cu, 0x00A0u },   /* mvs0c, parent */
++    { "vcodec",   0x80A8u, 0x02A0u },   /* mvs0  */
++    { "vpp0",     0x8120u, 0x02A0u },
++    { "vpp1",     0x80F4u, 0x02A0u },
++    { "apv",      0x807Cu, 0x02A0u },   /* mvs0a */
++};
++
++static vm_offset_t vidc_cc;
++
++static int
++vidc_gdsc_on(const struct vidc_gdsc_desc *g)
++{
++    volatile uint32_t *gdscr = (volatile uint32_t *)(vidc_cc + g->off);
++    uint32_t v = *gdscr;
++
++    if (v & 0x80000000u) {
++        printf("PANDORA VIDC: gdsc %s already on\n", g->name);
++        return 0;
++    }
++    *gdscr = v & ~1u;                  /* SW_COLLAPSE = 0 */
++    __asm__ volatile ("dmb oshst" ::: "memory");
++    for (unsigned i = 0; i < 4000; i++) {
++        uint32_t s = *(volatile uint32_t *)(vidc_cc + g->off + 4);  /* CFG_GDSCR */
++        if (s & (1u << 16)) {          /* POWER_UP_COMPLETE */
++            if (g->flags & 0x80u) {    /* RETAIN_FF_ENABLE */
++                *(volatile uint32_t *)(vidc_cc + g->off + 4) = s | (1u << 11);
++            }
++            printf("PANDORA VIDC: gdsc %s on (cfg=%08x)\n", g->name, s);
++            return 0;
++        }
++    }
++    printf("PANDORA VIDC: gdsc %s power-up TIMEOUT\n", g->name);
++    return -1;
++}
++
++static void
++vidc_branch_on(uint32_t off)
++{
++    volatile uint32_t *cbcr = (volatile uint32_t *)(vidc_cc + off);
++    uint32_t v = *cbcr;
++
++    if (!(v & 1u)) {
++        *cbcr = v | 1u;                /* CLK_ENABLE */
++        __asm__ volatile ("dmb oshst" ::: "memory");
++    }
++    for (unsigned i = 0; i < 2000; i++) {
++        if (!(*cbcr & 0x80000000u)) return;   /* CLK_OFF cleared */
++    }
++    printf("PANDORA VIDC: branch %#x halt timeout\n", off);
++}
++
++static int
++vidc_power_up(void)
++{
++    if (!vidc_cc) {
++        vidc_cc = ml_io_map(VIDEOCC_PA, VIDEOCC_SIZE);
++        if (!vidc_cc) {
++            printf("PANDORA VIDC: ml_io_map(videocc) failed\n");
++            return -1;
++        }
++    }
++    for (unsigned i = 0; i < sizeof(vidc_gdscs) / sizeof(vidc_gdscs[0]); i++) {
++        if (vidc_gdsc_on(&vidc_gdscs[i]) != 0) return -1;
++    }
++    vidc_branch_on(0x8164u);           /* mvs0c */
++    vidc_branch_on(0x80D0u);           /* mvs0  */
++    vidc_branch_on(0x8134u);           /* vpp0  */
++    vidc_branch_on(0x8108u);           /* vpp1  */
++    vidc_branch_on(0x8090u);           /* mvs0a */
++
++    /* Bridge sync reset, mainline iris_vpu4x_set_hwmode order: BIT0|BIT1 ->
++     * BIT1 -> 0.  APV bridge exists on this variant (APV encoder advertised). */
++    vidc_wr(R_CPU_APV_BRIDGE_RESET, 0x3u); delay(1);
++    vidc_wr(R_CPU_APV_BRIDGE_RESET, 0x2u); delay(1);
++    vidc_wr(R_CPU_APV_BRIDGE_RESET, 0x0u); delay(1);
++    vidc_wr(R_CPU_AHB_BRIDGE_RESET, 0x3u); delay(1);
++    vidc_wr(R_CPU_AHB_BRIDGE_RESET, 0x2u); delay(1);
++    vidc_wr(R_CPU_AHB_BRIDGE_RESET, 0x0u); delay(1);
++
++    printf("PANDORA VIDC: videocc powered (5 GDSC + 5 branches + bridge reset)\n");
++    return 0;
++}
++
++/* Publish qtable/SFR physical addresses to firmware.  Offsets from
++ * msm_video.ko __boot_firmware_iris4 (2026-11-19): DA -> CPU+0x64, size
++ * 0x300000 -> CPU+0x68, second DA -> CPU+0x54, enable -> CPU+0x50, second
++ * address (SFR) -> CPU+0x60; poll CPU+0x4C bit0 (ready) with bits1-3 errors.
++ */
++static int
++vidc_publish_queues(void)
++{
++    if (!vidc_qtable_va || !vidc_sfr_va) {
++        printf("PANDORA VIDC: publish before alloc\n");
++        return -1;
++    }
++    vidc_wr(R_CPU_QUEUE_TABLE_DA, (uint32_t)vidc_qtable_pa);
++    vidc_wr(R_CPU_QUEUE_TABLE_SIZE, VIDC_QTABLE_BYTES);
++    vidc_wr(R_CPU_QUEUE_TABLE_DA2, (uint32_t)vidc_qtable_pa);
++    vidc_wr(R_CPU_QUEUE_TABLE_EN, 1);
++    vidc_wr(R_CPU_QUEUE_TABLE_ADDR2, (uint32_t)vidc_sfr_pa);
++
++    for (unsigned i = 0; i < 4000; i++) {
++        uint32_t s = vidc_rd(R_CPU_QUEUE_TABLE_STAT);
++        if (s & 0xEu) {
++            printf("PANDORA VIDC: queue table rejected, status %08x\n", s);
++            return -1;
++        }
++        if (s & 1u) {
++            printf("PANDORA VIDC: queue table accepted (status %08x, qtable %08llx)\n",
++                s, (unsigned long long)vidc_qtable_pa);
++            return 0;
++        }
++    }
++    printf("PANDORA VIDC: queue table publish TIMEOUT\n");
++    return -1;
++}
++
++/* Firmware load + auth + reset.  pandora_adsp.c already exposes
++ * pandora_pas_load_auth() (PAS init/mem_setup/segment copy/auth_and_reset over
++ * SMC); it works on this platform without a TrustZone driver of our own.
++ * Mainline uses IRIS_PAS_ID = 9 for video. */
++extern int pandora_pas_load_auth(const char *file, unsigned pas,
++    uint64_t mem_pa, uint64_t mem_size);
++
++#define VIDC_PAS_ID 9u
++
++static int
++vidc_auth_reset(void)
++{
++    int err = pandora_pas_load_auth(vidc_fw_name, VIDC_PAS_ID,
++        VIDEO_REGION_PA, VIDEO_REGION_SIZE);
++    if (err != 0) {
++        printf("PANDORA VIDC: PAS load/auth failed for %s (err %d)\n", vidc_fw_name, err);
++        return -1;
++    }
++    printf("PANDORA VIDC: firmware %s authenticated and released from reset\n", vidc_fw_name);
++    return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* Firmware load into the carveout via the existing firmware reader.  This
++ * part is implementable now: it parses the MBN ELF program headers and copies
++ * loadable segments into video_region, mirroring pandora_adsp.c's mdt loader.
++ * It writes into the reserved carveout only, no global power changes. */
++/* ------------------------------------------------------------------ */
++struct vidc_elf32_phdr {
++    uint32_t p_type;
++    uint32_t p_offset;
++    uint32_t p_vaddr;
++    uint32_t p_paddr;
++    uint32_t p_filesz;
++    uint32_t p_memsz;
++    uint32_t p_flags;
++    uint32_t p_align;
++};
++
++static int
++vidc_load_firmware(void)
++{
++    uint64_t mdt_size = 0;
++    uint8_t hdr[52];
++    int err;
++
++    err = pandora_firmware_pread(vidc_fw_name, 0, hdr, sizeof(hdr), &mdt_size);
++    if (err || mdt_size < sizeof(hdr) || hdr[0] != 0x7f || hdr[1] != 'E' ||
++        hdr[2] != 'L' || hdr[3] != 'F') {
++        printf("PANDORA VIDC: firmware %s not readable/ELF (err %d size %llu)\n",
++            vidc_fw_name, err, (unsigned long long)mdt_size);
++        return -1;
++    }
++
++    uint32_t phoff = *(uint32_t *)(hdr + 28);
++    uint16_t phentsize = *(uint16_t *)(hdr + 42);
++    uint16_t phnum = *(uint16_t *)(hdr + 44);
++    printf("PANDORA VIDC: firmware %s ELF32 phoff=%u phnum=%u size=%llu\n",
++        vidc_fw_name, phoff, phnum, (unsigned long long)mdt_size);
++
++    if (phnum == 0 || phnum > 64 || phentsize < sizeof(struct vidc_elf32_phdr)) {
++        printf("PANDORA VIDC: invalid ELF program header table\n");
++        return -1;
++    }
++    if (!vidc_mmio_on) {           /* ensure the carveout mapping is available */
++        if (vidc_probe() != 0) return -1;
++    }
++
++    /* Each loadable PT_LOAD segment goes to its p_paddr, which for these MBNs
++     * lies inside video_region.  Use ml_io_map_unmappable (not wcomb): the
++     * GPU lane found that unmapping a wcomb window panics (pandora_gpu.c p0180),
++     * while unmappable windows can be taken back with ml_io_unmap. */
++    vm_offset_t carveout = ml_io_map_unmappable(VIDEO_REGION_PA, VIDEO_REGION_SIZE, 0);
++    if (!carveout) {
++        printf("PANDORA VIDC: cannot map video_region carveout\n");
++        return -1;
++    }
++
++    uint8_t phbuf[64];
++    unsigned loaded = 0;
++    for (unsigned i = 0; i < phnum; i++) {
++        err = pandora_firmware_pread(vidc_fw_name, phoff + i * phentsize,
++                                     phbuf, sizeof(struct vidc_elf32_phdr), NULL);
++        if (err) { printf("PANDORA VIDC: phdr %u read failed %d\n", i, err); break; }
++        struct vidc_elf32_phdr *p = (struct vidc_elf32_phdr *)phbuf;
++        if (p->p_type != 1 || p->p_filesz == 0) continue;   /* PT_LOAD only */
++        if (p->p_paddr < VIDEO_REGION_PA ||
++            (uint64_t)p->p_paddr + p->p_filesz > VIDEO_REGION_PA + VIDEO_REGION_SIZE) {
++            printf("PANDORA VIDC: segment %u paddr %08x outside carveout, skip\n", i, p->p_paddr);
++            continue;
++        }
++        uint64_t dst_off = (uint64_t)p->p_paddr - VIDEO_REGION_PA;
++        err = pandora_firmware_pread(vidc_fw_name, p->p_offset,
++                                     (void *)(carveout + dst_off), p->p_filesz, NULL);
++        if (err) { printf("PANDORA VIDC: segment %u copy failed %d\n", i, err); break; }
++        loaded++;
++    }
++    printf("PANDORA VIDC: loaded %u firmware segments into carveout\n", loaded);
++    ml_io_unmap(carveout, VIDEO_REGION_SIZE);
++    return loaded ? 0 : -1;
++}
++
++/* Drain one response packet from the message queue (cmd=0, msg=1, dbg=2).
++ * Only the generic header is decoded for now; IMAGE_VERSION is carried in a
++ * property packet whose payload layout is the next parsing step. */
++static int
++vidc_hfi_poll(void)
++{
++    struct vidc_queue_table *t = (struct vidc_queue_table *)vidc_qtable_va;
++    struct vidc_queue_header *m = &t->qhdr[1];
++    uint32_t w = m->write_idx;
++
++    if (w == m->read_idx) return 0;
++    uint32_t off = (uint32_t)(m->start_addr - (uint32_t)vidc_qtable_pa) + m->read_idx;
++    struct vidc_pkt_hdr *p = (struct vidc_pkt_hdr *)((uint8_t *)vidc_qtable_va + off);
++    printf("PANDORA VIDC: response size=%u type=%08x read_idx=%u\n",
++        p->size, p->pkt_type, m->read_idx);
++
++    /* Property response layout (mainline iris_hfi response): header (8) +
++     * property_id (4) + flags (4) + payload_size (4) + payload.  The first
++     * field of a version payload is the NUL-terminated string. */
++    if (p->size >= 20 && p->size <= 4096) {
++        uint32_t *props = (uint32_t *)((uint8_t *)p + 8);
++        uint32_t pid = props[0], flags = props[1], psize = props[2];
++        printf("PANDORA VIDC: prop=%08x flags=%u payload=%u\n", pid, flags, psize);
++        if (pid == HFI_PROP_IMAGE_VERSION && psize && psize < 256) {
++            char ver[129];
++            unsigned n = psize < 128 ? psize : 128;
++            for (unsigned i = 0; i < n; i++) ver[i] = *(char *)((uint8_t *)p + 20 + i);
++            ver[n] = 0;
++            printf("PANDORA VIDC: IMAGE_VERSION=%s\n", ver);
++        }
++    }
++    m->read_idx = w;
++    return 1;
++}
++
++/* Queue HFI_CMD_INIT into the command ring and wait (bounded) for the firmware
++ * to advance the message queue.  The ring/idx semantics follow the mainline
++ * iris_hfi_queue header; the exact response parsing is left to the next step. */
++static int
++vidc_hfi_init(void)
++{
++    struct vidc_queue_table *t = (struct vidc_queue_table *)vidc_qtable_va;
++    struct vidc_queue_header *cmd = &t->qhdr[0];
++    uint32_t ring_off = (uint32_t)(cmd->start_addr - (uint32_t)vidc_qtable_pa);
++    uint64_t ring_pa = vidc_qtable_pa + ring_off;
++    struct vidc_pkt_hdr *pkt = (struct vidc_pkt_hdr *)((uint8_t *)vidc_qtable_va + ring_off);
++
++    pkt->size = (uint32_t)sizeof(*pkt);
++    pkt->pkt_type = HFI_CMD_INIT;
++    cmd->write_idx = (uint32_t)sizeof(*pkt);
++    cmd->tx_irq_status = 1;
++    clean_dcache64((addr64_t)ring_pa, (unsigned)sizeof(*pkt), TRUE);
++
++    vidc_wr(R_CPU_SOFTINT, 1);   /* CPU_IC_SOFTINT bit0: host -> Xtensa */
++    printf("PANDORA VIDC: HFI_CMD_INIT queued at %08llx, waiting for response\n",
++        (unsigned long long)ring_pa);
++
++    for (unsigned i = 0; i < 4000; i++) {
++        if (vidc_hfi_poll()) {
++            printf("PANDORA VIDC: HFI handshake response received\n");
++            return 0;
++        }
++    }
++    printf("PANDORA VIDC: HFI response TIMEOUT\n");
++    return -1;
++}
++
++/* ------------------------------------------------------------------ */
++/* Full bring-up sequence (level 2).  Order follows the mainline iris boot
++ * flow; UNKNOWN steps stop the sequence rather than proceeding on guesses. */
++/* ------------------------------------------------------------------ */
++static void
++vidc_bringup(void)
++{
++    if (vidc_probe() != 0) return;
++
++    /* Power the domain first (PAS writes the carveout over AXI), then let SCM
++     * load + authenticate + release the VPU core in one call.  vidc_load_firmware()
++     * is kept below as a manual fallback if SCM PAS is unavailable. */
++    if (vidc_power_up() != 0) return;   /* GDSC + clocks */
++    if (vidc_auth_reset() != 0) return;
++
++    if (vidc_alloc_queues() != 0) return;
++    if (vidc_publish_queues() != 0) return;
++
++    /* Send HFI_CMD_INIT and wait for the firmware to answer on the message
++     * queue (the response parser is the next step). */
++    vidc_hfi_init();
++}
++
++/* ------------------------------------------------------------------ */
++/* Worker thread and entry point */
++/* ------------------------------------------------------------------ */
++static void
++vidc_thread(void *arg, wait_result_t wresult)
++{
++    (void)arg; (void)wresult;
++    if (vidc_level >= 1) {
++        if (vidc_level >= 2) vidc_bringup();
++        else vidc_probe();
++    }
++    thread_terminate(current_thread());
++}
++
++void
++pandora_vidc_init(void)
++{
++    (void)PE_parse_boot_argn("pandora_vidc", &vidc_level, sizeof(vidc_level));
++    if (!vidc_level) return;
++    if (vidc_level < 1 || vidc_level > 2) {
++        printf("PANDORA VIDC: unsupported pandora_vidc=%d (expected 0..2)\n", vidc_level);
++        return;
++    }
++
++    char fw[64];
++    if (PE_parse_boot_arg_str("pandora_vidc_fw", fw, sizeof(fw)) && fw[0])
++        strlcpy(vidc_fw_name, fw, sizeof(vidc_fw_name));
++
++    printf("PANDORA VIDC: level %d, firmware %s (clean-room transport, "
++           "hardware UNKNOWN steps stop safely)\n", vidc_level, vidc_fw_name);
++
++    thread_t th;
++    if (kernel_thread_start(vidc_thread, NULL, &th) == KERN_SUCCESS)
++        thread_deallocate(th);
++}
++
++#endif /* PANDORA */
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -70,6 +70,7 @@
+ extern void pandora_therm_init(void);
+ extern void pandora_usb_init(void);
+ extern void pandora_camera_init(void);
++extern void pandora_vidc_init(void);
+ #endif
+ extern void fuxi_wlan_init(void);
+ extern void sweet_usb_probe(void);
+@@ -1582,6 +1583,8 @@
+ 	pandora_files_init();
+ 	/* Adreno 840 bring-up, boot-arg pandora_gpu (bsd/dev/pandora_gpu.c). */
+ 	pandora_gpu_init();
++	/* Video codec transport, boot-arg pandora_vidc (bsd/dev/pandora_vidc.c). */
++	pandora_vidc_init();
+ 	/* CPU performance probe, boot-arg pandora_cpu (bsd/dev/pandora_cpu.c). */
+ 	pandora_cpu_init();
+ 	/* Board thermistors, read only, boot-arg pandora_therm (bsd/dev/pandora_therm.c). */
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -125,6 +125,7 @@
+ bsd/dev/qcomusb/soc/QcomUsbPrepare.c		standard
+ bsd/dev/pandora_selftest.c		standard
+ bsd/dev/pandora_adsp.c			standard
++bsd/dev/pandora_vidc.c			standard
+ bsd/dev/qcom/QcomSmem.c			standard
+ bsd/dev/qcom/QcomSmp2p.c		standard
+ bsd/dev/qcom/QcomGlink.c		standard
