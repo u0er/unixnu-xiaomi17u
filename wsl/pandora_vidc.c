@@ -976,6 +976,15 @@ vidc_publish_queues(void)
 
     vc_smmu_faults = 0;
     vc_smmu_faults_done = false;
+    /* Drop any fault latched during table build/attach so the capture below
+     * only ever shows faults this boot produced. */
+    if (vidc_smmu_on) {
+        const uint32_t stale = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
+        if (stale) vidc_smmu_wr((uint32_t)(vidc_smmu_cb + 0x58), stale);
+        printf("PANDORA VIDC: what the firmware will read: hdr %08x %08x %08x "
+               "q0 %08x %08x %08x\n", vidc_qt_rd(0), vidc_qt_rd(4), vidc_qt_rd(8),
+            vidc_qt_rd(0x120), vidc_qt_rd(0x124), vidc_qt_rd(0x128));
+    }
     vidc_wr(R_WRAPPER_SPARE_0, 1);
     vidc_wr(R_CPU_BOOT_CTRL, 1);
     printf("PANDORA VIDC: boot released (spare0=%08x boot=%08x stat=%08x)\n",
@@ -987,18 +996,22 @@ vidc_publish_queues(void)
         /* While the core boots it starts touching memory through the SMMU.
          * A single latched FSR only tells us the FIRST address; the pattern is
          * what identifies the window the firmware expects.  So sample often,
-         * and clear FSR (write-1-to-clear) to catch the next one. */
+         * and clear FSR (write-1-to-clear) to catch the next one.
+         *
+         * Note `fsr != 0`, not `fsr & 0xF`: a translation fault reads back as
+         * 0x400 here, whose low nibble is zero, and the first version of this
+         * capture silently printed nothing for exactly that reason. */
         if (vidc_smmu_on && !vc_smmu_faults_done && (i & 1u) == 0) {
             const uint32_t fsr = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
-            if (fsr & 0xFu) {
+            if (fsr != 0) {
                 const uint32_t far = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x60));
-                if (vc_smmu_faults < 8) {
+                if (vc_smmu_faults < 16) {
                     printf("PANDORA VIDC: fault[%u] t=%u fsr=%08x far=%08x\n",
                         vc_smmu_faults, i, fsr, far);
                     vc_smmu_faults++;
                 }
                 vidc_smmu_wr((uint32_t)(vidc_smmu_cb + 0x58), fsr);
-                if (vc_smmu_faults >= 8) {
+                if (vc_smmu_faults >= 16) {
                     vc_smmu_faults_done = true;
                 }
             }
