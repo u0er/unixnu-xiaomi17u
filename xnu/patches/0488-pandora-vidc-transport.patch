@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..eeb24ce
+index 0000000..2b9591c
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,1415 @@
+@@ -0,0 +1,1436 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -216,14 +216,23 @@ index 0000000..eeb24ce
 +};
 +
 +/* Queue header, byte-exact layout from struct iris_hfi_queue_header. */
++/* Byte-exact layout of struct iris_hfi_queue_header [M iris_hfi_queue.h]: every
++ * field is a u32 and header_type is at offset 8, BEFORE queue_type.
++ *
++ * Getting this wrong is not cosmetic: the boot snapshot printed
++ * `q0 00000001 ff001000 01010000`, i.e. the firmware read word 8 as 0x01010000
++ * instead of the required 0x0101, because an earlier revision had uint16_t
++ * queue_type at 8 and uint16_t header_type at 10 (plus a pkt_drop_cnt field the
++ * upstream header does not have).  The core then re-tried a single bogus
++ * address every poll (SMMU FAR 0xfdffdd7e, 16 times identical) instead of
++ * reporting ready. */
 +struct vidc_queue_header {
 +    uint32_t status;        /* bit0 = active */
 +    uint32_t start_addr;
-+    uint16_t queue_type;
-+    uint16_t header_type;
++    uint32_t header_type;   /* [M] IFACEQ_DFLT_QHDR = 0x0101, offset 8 */
++    uint32_t queue_type;    /* [M] offset 12 */
 +    uint32_t q_size;        /* in u32 WORDS [M] */
 +    uint32_t pkt_size;      /* 0 = variable */
-+    uint32_t pkt_drop_cnt;
 +    uint32_t rx_wm;
 +    uint32_t tx_wm;
 +    uint32_t rx_req;
@@ -233,6 +242,19 @@ index 0000000..eeb24ce
 +    uint32_t read_idx;      /* in u32 WORDS [M] */
 +    uint32_t write_idx;     /* in u32 WORDS [M] */
 +};
++
++_Static_assert(sizeof(struct vidc_queue_header) == 56,
++    "iris_hfi_queue_header is 14 u32 = 56 bytes");
++_Static_assert(offsetof(struct vidc_queue_header, header_type) == 8,
++    "header_type must be word 2 of the queue header");
++_Static_assert(offsetof(struct vidc_queue_header, queue_type) == 12,
++    "queue_type must be word 3 of the queue header");
++_Static_assert(offsetof(struct vidc_queue_header, q_size) == 16,
++    "q_size must be word 4 of the queue header");
++_Static_assert(offsetof(struct vidc_queue_header, read_idx) == 48,
++    "read_idx must be word 12 of the queue header");
++_Static_assert(offsetof(struct vidc_queue_header, write_idx) == 52,
++    "write_idx must be word 13 of the queue header");
 +
 +/* Queue table header, byte-exact layout from struct iris_hfi_queue_table_header. */
 +struct vidc_queue_table {
@@ -733,11 +755,10 @@ index 0000000..eeb24ce
 +        struct vidc_queue_header *q = &t->qhdr[i];
 +        q->status = 1;                         /* [M] active */
 +        q->start_addr = vidc_ring_da(i);        /* device address of the ring */
-+        q->queue_type = (uint16_t)i;
-+        q->header_type = IFACEQ_DFLT_QHDR;     /* [M] 0x0101 */
++        q->header_type = IFACEQ_DFLT_QHDR;     /* [M] 0x0101, word 2 */
++        q->queue_type = i;                      /* [M] word 3 */
 +        q->q_size = IFACEQ_QUEUE_WORDS;        /* [M] words, not bytes */
 +        q->pkt_size = 0;
-+        q->pkt_drop_cnt = 0;
 +        q->rx_wm = 1;
 +        q->tx_wm = 1;
 +        q->rx_req = (i == 2) ? 0 : 1;          /* [M] debug queue differs */
