@@ -955,3 +955,12 @@ edit('NativeBridgeMetalFrontend.mm',
 edit('NativeAdrenoMetalPlugin.mm',
      '    if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) != 0) return false;',
      '    int baRc = sysctlbyname("kern.bootargs", args, &size, nullptr, 0);\n    {static uint32_t baN=0;uint32_t k=baN++;if(k<10)NSLog(@"pandora-metal BA key=%s rc=%d errno=%d size=%zu arglen=%zu tail=%.50s",key,baRc,errno,size,strlen(args),args+(strlen(args)>50?strlen(args)-50:0));}\n    if (baRc != 0) return false;')
+
+# Stage-8 (2026-11-20): FIX the frame-trace writer root cause. Stage-6/7 proved SHENG_DIAG null in
+# backboardd because publish::requested() is false there, so device init bypasses publish::deviceForPort
+# (the only SHENG_DIAG setter) and returns via publish::clientDevice (which sets no diag env). bootArgSet
+# was never called (no BA log). Set the diag env in the common device-init path before clientDevice return,
+# so the render server gets SHENG_DIAG/SHENG_GPU_TRACE. Diagnostic-enabling; no rendering change.
+edit('NativeAdrenoMetalPlugin.mm',
+     '    if (port) return publish::clientDevice(port);',
+     '    if (publish::bootArgSet("diag=1") || publish::bootArgSet("gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);\n    if (publish::bootArgSet("gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);\n    if (port) return publish::clientDevice(port);')
