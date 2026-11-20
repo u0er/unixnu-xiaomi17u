@@ -1,0 +1,586 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index e4400fe..6d83623 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -172,15 +172,34 @@ sweet_usb_probe(void)
+ #define UD_SETUP        0x1040          /* 8-byte setup packet */
+ #define UD_DATA         0x1100          /* ep0 data stage, 512 bytes */
+ #define UD_NOTIFY       0x1300          /* 16-byte notification */
+-#define UD_RX           0x2000          /* one received frame */
+-#define UD_TX           0x2800          /* one frame to send */
++#define UD_RX           0x2000          /* one received frame (mux / ECM / NCM) */
++#define UD_TX           0x2800          /* one frame to send (mux / ECM / NCM) */
+ #define UD_FRAME_MAX    0x800
+-#define UD_SIZE         0x4000
++/*
++ * UD_CARPLAY needs a second, independent set of TRBs and buffers: the mux
++ * function owns EP_RX/EP_TX and UD_RX/UD_TX, the NCM function owns
++ * EP_NCM_RX/EP_NCM_TX and UD_NCM_RX/UD_NCM_TX.  Sharing one buffer would let
++ * an NCM NTB overwrite a mux frame (or the reverse) as soon as both functions
++ * have a transfer in flight, so the two functions never touch the same byte.
++ *
++ * Every new region starts on a 4 KiB boundary and UD_SIZE is a whole number
++ * of pages, so no page is shared between two regions.
++ */
++#define UD_TRB_NCM_RX   0x3000          /* ep4 OUT (NCM bulk OUT) TRB */
++#define UD_TRB_NCM_TX   0x4000          /* ep9 IN (NCM bulk IN) TRB */
++#define UD_TRB_NCM_INT  0x5000          /* ep7 IN (NCM notification) TRB */
++#define UD_NCM_NOTIFY   0x6000          /* 16-byte NCM notification */
++#define UD_NCM_RX       0x7000          /* one received NTB, 2 KiB */
++#define UD_NCM_TX       0x8000          /* one NTB to send, 2 KiB */
++#define UD_SIZE         0x9000          /* 9 pages: one 4 KiB page per region */
+ 
+ /* Physical endpoints: 2n = OUT, 2n+1 = IN */
+ #define EP_RX           2               /* 0x01 bulk OUT */
+ #define EP_TX           3               /* 0x81 bulk IN */
+ #define EP_INT          5               /* 0x82 interrupt IN */
++#define EP_NCM_RX       4               /* 0x02 bulk OUT (UD_CARPLAY) */
++#define EP_NCM_INT      7               /* 0x83 interrupt IN (UD_CARPLAY) */
++#define EP_NCM_TX       9               /* 0x84 bulk IN (UD_CARPLAY) */
+ #define TRBCTL_NORMAL   (1u << 4)
+ 
+ #define UD_TXQ          32
+@@ -196,7 +215,8 @@ static struct {
+ 	uint32_t    events;
+ 	bool        configured;
+ 	uint8_t     data_alt;       /* data interface alternate setting */
+-	int         personality;    /* UD_ECM (CDC-ECM), UD_APPLE (usbmux) or UD_NCM */
++	int         personality;    /* UD_ECM, UD_APPLE, UD_NCM or UD_CARPLAY (composite) */
++	bool        ncm_tx_busy;    /* NCM bulk IN in flight (composite keeps it separate) */
+ 	/*
+ 	 * NCM 1.1 section 9.1 wants CONNECTION_SPEED_CHANGE then NETWORK_CONNECTION.
+ 	 * The interrupt endpoint carries one transfer at a time, so the second
+@@ -407,6 +427,112 @@ static const char *const ud_ncm_strings[] = {
+ 	NULL, "UniXNU", "UniXNU iPhone (NCM)", "F2LXUNIXNU01", "02005E77EE02",
+ };
+ 
++/*
++ * Composite personality (sweetusb>=5): ONE configuration that carries BOTH the
++ * usbmux/iAP2 function and the CDC-NCM function.  That is what gate C0 asks
++ * for, and it is the one thing the two existing personalities cannot do:
++ * UD_APPLE advertises only 05ac:12a8 FF/FE/02 and UD_NCM only 1209:0001
++ * 02/0D/00, so a host sees either iAP2 or NCM, never both.
++ *
++ * Interface 0 is descriptor-identical to the UD_APPLE function (FF/FE/02, the
++ * bulk pair 0x81/0x01) and the device keeps Apple's 05ac:12a8 with a product
++ * id inside usbmuxd's 0x1290..0x12af window, so usbmuxd still binds the mux
++ * function.  Interfaces 1 and 2 are the CDC-NCM function: control interface 1
++ * (02/0D/00) with the 16-byte interrupt endpoint 0x83, data interface 2
++ * (0A/00/01) with alt 0/alt 1 and the bulk pair 0x84/0x02.  The functional
++ * descriptors are the same bytes as the UD_NCM set; only the interface numbers,
++ * the endpoint addresses and the notification wIndex differ.
++ *
++ * Endpoint addresses follow the DWC3 2n = OUT / 2n+1 = IN rule, so the physical
++ * endpoints are 0x81 -> ep3 and 0x01 -> ep2 (mux, reused from UD_APPLE) plus
++ * 0x83 -> ep7, 0x84 -> ep9 and 0x02 -> ep4 (NCM, new).  The NCM function gets
++ * its own TRBs and DMA buffers (UD_TRB_NCM_*, UD_NCM_*) so mux frames and NCM
++ * NTBs can be in flight at the same time without sharing a buffer.
++ */
++#define UD_CARPLAY      3
++
++static const uint8_t ud_carplay_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
++	0xac, 0x05, 0xa8, 0x12, 0x00, 0x01, 1, 2, 3, 1,
++};
++/*
++ * wTotalLength must equal sizeof(this array).  Sum of the bLength bytes:
++ *   9                        configuration
++ *   9 + 7 + 7                interface 0 (mux, 2 EPs) and its two bulk EPs
++ *   9                        interface 1 (NCM control, 1 EP)
++ *   5 + 5 + 13 + 6           CDC header, union, ethernet, NCM
++ *   7                        interrupt EP 0x83
++ *   9 + 9 + 7 + 7            interface 2 alt 0, alt 1, and their bulk EPs
++ * = 109 bytes.  The array is declared without a bound so sizeof() is the exact
++ * element count; the typedefs below turn a wrong count into a compile error
++ * instead of a configuration a host silently rejects.
++ */
++static const uint8_t ud_carplay_cfg_desc[] = {
++	9, 2, 109, 0, 3, 1, 0, 0x80, 125,            /* config: 3 interfaces, bMaxPower 125 (2 mA units) */
++	9, 4, 0, 0, 2, 0xff, 0xfe, 0x02, 0,          /* if0: Apple mux / iAP2, 2 endpoints */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,             /* EP 0x81 bulk IN 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,             /* EP 0x01 bulk OUT 512 */
++	9, 4, 1, 0, 1, 0x02, 0x0d, 0x00, 0,          /* if1 alt0: CDC-NCM control, 1 endpoint */
++	5, 0x24, 0x00, 0x10, 0x01,                   /* CDC header, bcdCDC 0x0110 */
++	5, 0x24, 0x06, 1, 2,                         /* union: master if1, slave if2 */
++	13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0,  /* ethernet: iMAC string 4, max segment 1514 */
++	6, 0x24, 0x1a, 0x00, 0x01, 0x00,             /* NCM: bcdNcmVersion 0x0100, capabilities 0x00 */
++	7, 5, 0x83, 0x03, 16, 0, 1,                  /* EP 0x83 interrupt IN, 16 bytes, 1 uframe */
++	9, 4, 2, 0, 0, 0x0a, 0x00, 0x01, 0,          /* if2 alt0: CDC data, protocol 01h, no endpoints */
++	9, 4, 2, 1, 2, 0x0a, 0x00, 0x01, 0,          /* if2 alt1: same, two bulk endpoints */
++	7, 5, 0x84, 0x02, 0x00, 0x02, 0,             /* EP 0x84 bulk IN 512 */
++	7, 5, 0x02, 0x02, 0x00, 0x02, 0,             /* EP 0x02 bulk OUT 512 */
++};
++/*
++ * Index 4 is the MAC the host adopts for its own end of the NCM link (the
++ * iMACAddress of the ethernet functional descriptor), exactly as in the UD_NCM
++ * table.  Indices 1..3 are the ones usbmuxd reads.
++ */
++static const char *const ud_carplay_strings[] = {
++	NULL, "UniXNU", "UniXNU iPhone", "F2LXUNIXNU01", "02005E77EE02",
++};
++
++typedef char ud_carplay_dev_desc_must_be_18_bytes[(sizeof(ud_carplay_dev_desc) == 18) ? 1 : -1];
++typedef char ud_carplay_cfg_desc_must_be_109_bytes[(sizeof(ud_carplay_cfg_desc) == 109) ? 1 : -1];
++
++/*
++ * Personality predicates.  UD_CARPLAY runs both functions, so every place that
++ * used to ask "is this the Apple personality" / "is this the NCM personality"
++ * asks whether that function exists instead.  For UD_ECM / UD_APPLE / UD_NCM the
++ * answer is identical to the old test, which is what keeps sweetusb=0..4
++ * byte-for-byte unchanged.
++ */
++static inline bool
++ud_has_mux(void)
++{
++	return ud.personality == UD_APPLE || ud.personality == UD_CARPLAY;
++}
++
++static inline bool
++ud_has_ncm(void)
++{
++	return ud.personality == UD_NCM || ud.personality == UD_CARPLAY;
++}
++
++/*
++ * Interface numbers of the NCM function.  The plain UD_NCM/UD_ECM sets put the
++ * control interface at 0 and the data interface at 1; the composite set puts
++ * them at 1 and 2 because interface 0 is the mux there.  The notification
++ * wIndex and the SET_INTERFACE/GET_INTERFACE target are derived from these, so
++ * there is one place to get them wrong instead of three.
++ */
++static unsigned
++ud_ncm_ctrl_ifnum(void)
++{
++	return ud.personality == UD_CARPLAY ? 1 : 0;
++}
++
++static unsigned
++ud_ncm_data_ifnum(void)
++{
++	return ud_ncm_ctrl_ifnum() + 1;
++}
++
+ /*
+  * GET_NTB_PARAMETERS reply (NCM 1.1 section 6.2.1, 28 bytes).
+  *
+@@ -466,10 +592,15 @@ ud_string(unsigned idx, uint8_t *out)
+ 		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;   /* en-US */
+ 		return 4;
+ 	}
+-	if (ud.personality == UD_APPLE) {
++	if (ud.personality == UD_CARPLAY) {
++		/* Tested first: this set must expose both the three Apple indices
++		 * usbmuxd reads and index 4, the NCM iMACAddress. */
++		tab = ud_carplay_strings;
++		n = sizeof(ud_carplay_strings) / sizeof(ud_carplay_strings[0]);
++	} else if (ud_has_mux()) {
+ 		tab = ud_apple_strings;
+ 		n = sizeof(ud_apple_strings) / sizeof(ud_apple_strings[0]);
+-	} else if (ud.personality == UD_NCM) {
++	} else if (ud_has_ncm()) {
+ 		tab = ud_ncm_strings;
+ 		n = sizeof(ud_ncm_strings) / sizeof(ud_ncm_strings[0]);
+ 	} else {
+@@ -491,6 +622,7 @@ ud_string(unsigned idx, uint8_t *out)
+ }
+ 
+ static void ud_rx_arm(void);
++static void ud_ncm_rx_arm(void);
+ static void ud_tx_kick_locked(void);
+ static void ud_apple_tx_kick(void);
+ static void ud_link_event(bool up);
+@@ -711,12 +843,16 @@ ud_ncm_ntb_parse(const uint8_t *ntb, uint32_t len)
+ static void
+ ud_notify_connected(void)
+ {
+-	uint8_t *n = (uint8_t *)(ud.dma + UD_NOTIFY);
++	bool      composite = (ud.personality == UD_CARPLAY);
++	uint32_t  buf = composite ? UD_NCM_NOTIFY : UD_NOTIFY;
++	uint8_t  *n = (uint8_t *)(ud.dma + buf);
++
+ 	n[0] = 0xa1; n[1] = 0x00;       /* NETWORK_CONNECTION */
+ 	n[2] = 1; n[3] = 0;             /* wValue: connected */
+-	n[4] = 0; n[5] = 0;             /* wIndex: communication interface 0 */
++	n[4] = (uint8_t)ud_ncm_ctrl_ifnum(); n[5] = 0; /* wIndex: control if */
+ 	n[6] = 0; n[7] = 0;             /* wLength: no payload */
+-	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 8, TRBCTL_NORMAL);
++	ud_start_trb(composite ? EP_NCM_INT : EP_INT,
++	    composite ? UD_TRB_NCM_INT : UD_TRB_INT, buf, 8, TRBCTL_NORMAL);
+ }
+ 
+ /*
+@@ -731,14 +867,18 @@ ud_notify_connected(void)
+ static void
+ ud_notify_speed(uint32_t downlink, uint32_t uplink)
+ {
+-	uint8_t *n = (uint8_t *)(ud.dma + UD_NOTIFY);
++	bool      composite = (ud.personality == UD_CARPLAY);
++	uint32_t  buf = composite ? UD_NCM_NOTIFY : UD_NOTIFY;
++	uint8_t  *n = (uint8_t *)(ud.dma + buf);
++
+ 	n[0] = 0xa1; n[1] = 0x2a;       /* CONNECTION_SPEED_CHANGE */
+ 	n[2] = 0; n[3] = 0;             /* wValue */
+-	n[4] = 0; n[5] = 0;             /* wIndex: communication interface 0 */
++	n[4] = (uint8_t)ud_ncm_ctrl_ifnum(); n[5] = 0; /* wIndex: control if */
+ 	n[6] = 8; n[7] = 0;             /* wLength: 8 */
+ 	ud_put32(n + 8, downlink);
+ 	ud_put32(n + 12, uplink);
+-	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 16, TRBCTL_NORMAL);
++	ud_start_trb(composite ? EP_NCM_INT : EP_INT,
++	    composite ? UD_TRB_NCM_INT : UD_TRB_INT, buf, 16, TRBCTL_NORMAL);
+ }
+ 
+ /* SET_CONFIGURATION(1): bulk IN/OUT and the interrupt endpoint. */
+@@ -748,7 +888,46 @@ ud_configure(void)
+ 	if (ud.configured) {
+ 		return;
+ 	}
+-	if (ud.personality == UD_APPLE) {
++	if (ud.personality == UD_CARPLAY) {
++		/*
++		 * Composite: five endpoints in one configuration.  mux keeps
++		 * EP_RX/EP_TX (0x01/0x81) configured exactly as the UD_APPLE path
++		 * configures them; NCM adds its own bulk pair (0x02 -> ep4,
++		 * 0x84 -> ep9) and the notification endpoint (0x83 -> ep7, 16-byte
++		 * packets as the descriptor advertises).
++		 *
++		 * DEPSTARTCFG/DEPCFG use the same parameters as the UD_APPLE path:
++		 * ep0 was configured when the controller started, so this is a
++		 * reconfiguration of an existing configuration.
++		 */
++		if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
++		    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
++		    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++		    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
++		    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++		    ud_epcmd(EP_NCM_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_NCM_RX << 25), 0) ||
++		    ud_epcmd(EP_NCM_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++		    ud_epcmd(EP_NCM_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_NCM_TX << 25), 0) ||
++		    ud_epcmd(EP_NCM_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++		    ud_epcmd(EP_NCM_INT, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17),
++		    (1u << 8) | (8u << 16) | ((uint32_t)EP_NCM_INT << 25), 0) ||
++		    ud_epcmd(EP_NCM_INT, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++			printf("SWEET USB: composite endpoints setup failed\n");
++			return;
++		}
++		dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) |
++		    (1u << EP_NCM_RX) | (1u << EP_NCM_TX) | (1u << EP_NCM_INT));
++		ud.configured = true;
++		/* NCM reset state (NCM 1.1 section 6.3.4), as in the UD_NCM path. */
++		ud_ncm_sequence = 0;
++		ud_ncm_in_max = NCM_NTB_MAX;
++		ud_rx_arm();            /* mux bulk OUT on EP_RX */
++		ud_ncm_rx_arm();        /* NCM bulk OUT on EP_NCM_RX */
++		apple_usbmux_link_up();
++		printf("SWEET USB: carplay composite endpoints configured\n");
++		return;
++	}
++	if (ud_has_mux()) {
+ 		if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
+ 		    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
+ 		    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+@@ -778,7 +957,7 @@ ud_configure(void)
+ 	 * because ep0 was already configured at SET_CONFIGURATION time and this
+ 	 * is a reconfiguration, not a first configuration.
+ 	 */
+-	unsigned int_mps = (ud.personality == UD_NCM) ? 64 : 16;
++	unsigned int_mps = ud_has_ncm() ? 64 : 16;
+ 
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
+ 	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
+@@ -793,7 +972,7 @@ ud_configure(void)
+ 	}
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
+-	if (ud.personality == UD_NCM) {
++	if (ud_has_ncm()) {
+ 		/* NCM reset state (NCM 1.1 section 6.3.4): sequence to 0 and the IN NTB
+ 		 * size back to dwNtbInMaxSize.  Entering alt 0 is defined as a
+ 		 * reset, so a host that re-selects the configuration starts clean. */
+@@ -802,7 +981,7 @@ ud_configure(void)
+ 	}
+ 	ud_rx_arm();
+ 	printf("SWEET USB: %s endpoints configured\n",
+-	    ud.personality == UD_NCM ? "NCM" : "ECM");
++	    ud_has_ncm() ? "NCM" : "ECM");
+ }
+ 
+ static void
+@@ -820,7 +999,7 @@ ud_setup(void)
+ 	printf("SWEET USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
+ 	ud.data_in = (type & 0x80) != 0;
+ 	if ((type & 0x60) == 0x20) {    /* class request */
+-		if (ud.personality == UD_NCM) {
++		if (ud_has_ncm()) {
+ 			/*
+ 			 * NCM class requests.  Only three are mandatory for
+ 			 * Linux cdc_ncm and Windows UsbNcm to bind, and only
+@@ -912,10 +1091,13 @@ ud_setup(void)
+ 		const uint8_t *dd = ud_dev_desc;
+ 		const uint8_t *cd = ud_cfg_desc;
+ 
+-		if (ud.personality == UD_APPLE) {
++		if (ud.personality == UD_CARPLAY) {
++			dd = ud_carplay_dev_desc;
++			cd = ud_carplay_cfg_desc;
++		} else if (ud_has_mux()) {
+ 			dd = ud_apple_dev_desc;
+ 			cd = ud_apple_cfg_desc;
+-		} else if (ud.personality == UD_NCM) {
++		} else if (ud_has_ncm()) {
+ 			dd = ud_ncm_dev_desc;
+ 			cd = ud_ncm_cfg_desc;
+ 		}
+@@ -939,10 +1121,12 @@ ud_setup(void)
+ 	} else if (req == 0) {          /* GET_STATUS */
+ 		data[0] = 0; data[1] = 0; n = 2;
+ 	} else if (req == 11) {         /* SET_INTERFACE */
+-		if (index == 1) {
++		/* Data interface number: 1 in the UD_ECM/UD_NCM sets, 2 in the
++		 * composite set (interface 1 is the NCM control interface there). */
++		if (index == ud_ncm_data_ifnum()) {
+ 			ud.data_alt = (uint8_t)value;
+ 			if (value == 1 && ud.configured) {
+-				if (ud.personality == UD_NCM) {
++				if (ud_has_ncm()) {
+ 					/*
+ 					 * NCM 1.1 section 9.1: the speed notification
+ 					 * comes FIRST, then the connection
+@@ -959,7 +1143,7 @@ ud_setup(void)
+ 					ud_notify_connected();
+ 				}
+ 				ud_link_event(true);
+-			} else if (value == 0 && ud.configured && ud.personality == UD_NCM) {
++			} else if (value == 0 && ud.configured && ud_has_ncm()) {
+ 				/* Back to alt 0 = NCM reset (section 6.3.4). */
+ 				ud_ncm_sequence = 0;
+ 				ud_ncm_in_max = NCM_NTB_MAX;
+@@ -967,7 +1151,7 @@ ud_setup(void)
+ 			}
+ 		}
+ 	} else if (req == 10) {         /* GET_INTERFACE */
+-		data[0] = index == 1 ? ud.data_alt : 0; n = 1;
++		data[0] = index == ud_ncm_data_ifnum() ? ud.data_alt : 0; n = 1;
+ 	} else if (req == 1 || req == 3) { /* CLEAR/SET_FEATURE (halt, remote wakeup) */
+ 	} else {
+ 		ok = false;
+@@ -996,10 +1180,11 @@ ud_setup(void)
+ static void
+ ud_rx_arm(void)
+ {
+-	/* The Apple function runs at packet granularity so that a bulk transfer
++	/* The mux function runs at packet granularity so that a bulk transfer
+ 	 * never depends on the host appending a zero-length packet. The mux
+-	 * layer does the reassembly. */
+-	if (ud.personality == UD_APPLE) {
++	 * layer does the reassembly.  The composite personality follows the same
++	 * rule for EP_RX; its NCM function is armed separately by ud_ncm_rx_arm. */
++	if (ud_has_mux()) {
+ 		ud.rx_req = 512;
+ 	} else {
+ 		/* ECM: one frame per transfer.  NCM: one OR MORE frames per
+@@ -1019,7 +1204,7 @@ ud_rx_done(void)
+ 	ud_sync(UD_TRB_RX, 16);
+ 	uint32_t len = ud.rx_req - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, ud.rx_req);
+-	if (ud.personality == UD_APPLE) {
++	if (ud_has_mux()) {
+ 		if (ud.rx_frames < 12) {
+ 			const uint8_t *p = (const uint8_t *)(ud.dma + UD_RX);
+ 			printf("SWEET USB: bulk rx len %u/%u %02x %02x %02x %02x "
+@@ -1034,7 +1219,13 @@ ud_rx_done(void)
+ 		ud_rx_arm();
+ 		return;
+ 	}
+-	if (ud.personality == UD_NCM) {
++	/*
++	 * A composite personality has already returned above: there EP_RX carries
++	 * mux frames and the NCM NTB arrives on EP_NCM_RX instead.  So reaching
++	 * here means the plain UD_NCM personality, whose NCM function owns EP_RX
++	 * and UD_RX.
++	 */
++	if (ud_has_ncm()) {
+ 		/*
+ 		 * NCM: the bulk-OUT transfer carries one NTB holding zero or more
+ 		 * Ethernet frames.  One transfer always maps to at least one
+@@ -1057,34 +1248,77 @@ ud_rx_done(void)
+ 	ud_rx_arm();
+ }
+ 
++/*
++ * NCM bulk-OUT of the composite personality: its own endpoint, TRB and
++ * buffer, so a mux frame arriving on EP_RX at the same time is untouched.
++ * One NTB is at most dwNtbOutMaxSize == NCM_NTB_MAX == UD_FRAME_MAX (2048),
++ * which is why the transfer is always armed with UD_FRAME_MAX.
++ */
++static void
++ud_ncm_rx_arm(void)
++{
++	ud_start_trb(EP_NCM_RX, UD_TRB_NCM_RX, UD_NCM_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
++}
++
++/* EP_NCM_RX completion: one NTB holding zero or more Ethernet frames. */
++static void
++ud_ncm_rx_done(void)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_NCM_RX);
++	uint32_t len;
++
++	ud_sync(UD_TRB_NCM_RX, 16);
++	len = UD_FRAME_MAX - (t[2] & 0xffffff);
++	ud_sync(UD_NCM_RX, UD_FRAME_MAX);
++	if (len != 0) {
++		unsigned got = ud_ncm_ntb_parse((const uint8_t *)(ud.dma + UD_NCM_RX), len);
++		if (ud.rx_frames < 12) {
++			printf("SWEET USB: NCM rx ntb %u bytes -> %u frames\n", len, got);
++		}
++	}
++	ud.rx_frames++;
++	ud_ncm_rx_arm();
++}
++
+ /* Start the next queued frame if the IN endpoint is idle. ud.lock held. */
+ static void
+ ud_tx_kick_locked(void)
+ {
+-	if (ud.personality == UD_NCM) {
++	if (ud_has_ncm()) {
+ 		/*
+ 		 * NCM batches: drain as many queued frames as fit into one NTB.
+ 		 * The zero-length-packet rule changes shape here -- the NTB block
+ 		 * length is what must not be a multiple of 512, not each frame,
+ 		 * because the host reads the NTB in bulk transfers whose end it
+ 		 * detects from wBlockLength.
++		 *
++		 * In the composite personality NCM has its own endpoint and buffer,
++		 * and it must also keep its own busy flag: ud.tx_busy belongs to the
++		 * mux there, and sharing it would let one transfer of the mux make
++		 * NCM believe an NTB is still in flight (and the reverse), stalling
++		 * one function behind the other.
+ 		 */
++		bool      composite = (ud.personality == UD_CARPLAY);
++		bool     *busy = composite ? &ud.ncm_tx_busy : &ud.tx_busy;
++		uint32_t  buf = composite ? UD_NCM_TX : UD_TX;
++		uint32_t  trb = composite ? UD_TRB_NCM_TX : UD_TRB_TX;
++		unsigned  ep = composite ? EP_NCM_TX : EP_TX;
+ 		uint32_t n;
+ 
+-		if (ud.tx_busy || !ud.configured) {
++		if (*busy || !ud.configured) {
+ 			return;
+ 		}
+-		n = ud_ncm_ntb_build((uint8_t *)(ud.dma + UD_TX), NCM_NTB_MAX);
++		n = ud_ncm_ntb_build((uint8_t *)(ud.dma + buf), NCM_NTB_MAX);
+ 		if (n == 0) {
+ 			return;
+ 		}
+ 		/* Force a short packet when the NTB is a multiple of 512. */
+ 		if ((n % 512) == 0 && n < NCM_NTB_MAX) {
+-			((uint8_t *)(ud.dma + UD_TX))[n++] = 0;
++			((uint8_t *)(ud.dma + buf))[n++] = 0;
+ 		}
+-		ud.tx_busy = true;
++		*busy = true;
+ 		ud.tx_frames++;
+-		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, n, TRBCTL_NORMAL);
++		ud_start_trb(ep, trb, buf, n, TRBCTL_NORMAL);
+ 		return;
+ 	}
+ 	while (!ud.tx_busy && ud.txq_count > 0 && ud.configured) {
+@@ -1115,7 +1349,7 @@ ud_apple_tx_kick(void)
+ {
+ 	uint32_t n;
+ 
+-	if (ud.personality != UD_APPLE || !ud.configured || ud.tx_busy) {
++	if (!ud_has_mux() || !ud.configured || ud.tx_busy) {
+ 		return;
+ 	}
+ 	n = apple_usbmux_next_tx((uint8_t *)(ud.dma + UD_TX), 512);
+@@ -1134,7 +1368,10 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+ 	lck_mtx_lock(ud.lock);
+ 	if (ud.personality == UD_APPLE) {
+ 		/* Apple personality owns the TX buffer for mux frames;
+-		 * drop Ethernet output from ue0 so the two don't collide. */
++		 * drop Ethernet output from ue0 so the two don't collide.
++		 * Deliberately NOT ud_has_mux(): in the composite personality the
++		 * NCM function has its own buffer, so Ethernet output from ue0 is
++		 * queued for the NCM bulk-IN endpoint by the code below. */
+ 		lck_mtx_unlock(ud.lock);
+ 		mbuf_freem(m);
+ 		ifnet_stat_increment_out(ifp, 0, 0, 1);
+@@ -1300,12 +1537,13 @@ ud_event(uint32_t ev)
+ 			 */
+ 			ud.configured = false;
+ 			ud.tx_busy = false;
++			ud.ncm_tx_busy = false;
+ 			ud.rx_req = 0;
+ 			ud.state = EP0_SETUP;
+ 			ud.ncm_notify_pending = false;
+ 			ud_ncm_sequence = 0;
+ 			ud_ncm_in_max = NCM_NTB_MAX;
+-			if (ud.personality == UD_APPLE) {
++			if (ud_has_mux()) {
+ 				apple_usbmux_link_down();
+ 			}
+ 			printf("SWEET USB: bus reset (endpoints rebuilt on next SET_CONFIGURATION)\n");
+@@ -1337,7 +1575,7 @@ ud_event(uint32_t ev)
+ 		return;
+ 	}
+ 	if (ep == EP_TX && type == 1) {
+-		if (ud.personality == UD_APPLE) {
++		if (ud_has_mux()) {
+ 			ud.tx_busy = false;
+ 			ud_apple_tx_kick();
+ 			return;
+@@ -1348,6 +1586,30 @@ ud_event(uint32_t ev)
+ 		lck_mtx_unlock(ud.lock);
+ 		return;
+ 	}
++	/*
++	 * Composite personality: the NCM function owns a second endpoint
++	 * triplet, so its completions are dispatched apart from the mux ones.
++	 * The mux never generates these endpoint numbers, so the branches are
++	 * dead for the other personalities.
++	 */
++	if (ep == EP_NCM_RX && type == 1) {
++		ud_ncm_rx_done();
++		return;
++	}
++	if (ep == EP_NCM_TX && type == 1) {
++		lck_mtx_lock(ud.lock);
++		ud.ncm_tx_busy = false;
++		ud_tx_kick_locked();
++		lck_mtx_unlock(ud.lock);
++		return;
++	}
++	if (ep == EP_NCM_INT && type == 1) {
++		if (ud.ncm_notify_pending) {
++			ud.ncm_notify_pending = false;
++			ud_notify_connected();
++		}
++		return;
++	}
+ 	/*
+ 	 * Interrupt endpoint completion.  Used only by NCM, which owes the host a
+ 	 * NETWORK_CONNECTION after the CONNECTION_SPEED_CHANGE that SET_INTERFACE
+@@ -1413,7 +1675,7 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
+-		if (ud.personality == UD_APPLE) {
++		if (ud_has_mux()) {
+ 			ud_apple_tx_kick();
+ 		}
+ 		if ((++ticks % 30000) == 0) {
+@@ -1491,8 +1753,10 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		int mode = 1;
+ 
+ 		PE_parse_boot_argn("sweetusb", &mode, sizeof(mode));
+-		ud.personality = (mode >= 4) ? UD_NCM : (mode >= 3) ? UD_APPLE : UD_ECM;
++		ud.personality = (mode >= 5) ? UD_CARPLAY :
++		    (mode >= 4) ? UD_NCM : (mode >= 3) ? UD_APPLE : UD_ECM;
+ 		printf("SWEET USB: personality %s (sweetusb=%d)\n",
++		    ud.personality == UD_CARPLAY ? "carplay-composite" :
+ 		    ud.personality == UD_NCM ? "cdc-ncm" :
+ 		    ud.personality == UD_APPLE ? "apple-usbmux" : "cdc-ecm", mode);
+ 	}
