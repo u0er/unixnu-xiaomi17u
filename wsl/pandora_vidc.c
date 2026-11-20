@@ -289,6 +289,9 @@ static uint32_t vidc_sfr_iova;
 static bool     vidc_smmu_on;
 static uint32_t vidc_smmu_cb;      /* CB base offset inside apps-smmu */
 static uint32_t vidc_smmu_bank;
+/* Fault-capture state for the post-boot-release window. */
+static bool     vc_smmu_faults_done;
+static unsigned vc_smmu_faults;
 
 /* Verdict accumulator: one line per stage so a single boot returns the ladder. */
 static uint32_t vidc_pass_mask;
@@ -971,6 +974,8 @@ vidc_publish_queues(void)
     printf("PANDORA VIDC: CP span 0xA0024/0xA0028 and 0xA005C skipped "
            "(no TZ CP table, vendor-equivalent path)\n");
 
+    vc_smmu_faults = 0;
+    vc_smmu_faults_done = false;
     vidc_wr(R_WRAPPER_SPARE_0, 1);
     vidc_wr(R_CPU_BOOT_CTRL, 1);
     printf("PANDORA VIDC: boot released (spare0=%08x boot=%08x stat=%08x)\n",
@@ -979,6 +984,25 @@ vidc_publish_queues(void)
 
     for (unsigned i = 0; i < 1000; i++) {
         uint32_t s = vidc_rd(R_CPU_QUEUE_TABLE_STAT);
+        /* While the core boots it starts touching memory through the SMMU.
+         * A single latched FSR only tells us the FIRST address; the pattern is
+         * what identifies the window the firmware expects.  So sample often,
+         * and clear FSR (write-1-to-clear) to catch the next one. */
+        if (vidc_smmu_on && !vc_smmu_faults_done && (i & 1u) == 0) {
+            const uint32_t fsr = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
+            if (fsr & 0xFu) {
+                const uint32_t far = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x60));
+                if (vc_smmu_faults < 8) {
+                    printf("PANDORA VIDC: fault[%u] t=%u fsr=%08x far=%08x\n",
+                        vc_smmu_faults, i, fsr, far);
+                    vc_smmu_faults++;
+                }
+                vidc_smmu_wr((uint32_t)(vidc_smmu_cb + 0x58), fsr);
+                if (vc_smmu_faults >= 8) {
+                    vc_smmu_faults_done = true;
+                }
+            }
+        }
         if (s & 0xEu) {
             printf("PANDORA VIDC: queue table rejected, status %08x (iter %u)\n", s, i);
             return -1;
