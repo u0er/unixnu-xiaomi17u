@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..b653dc3
+index 0000000..acd8df7
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,1454 @@
+@@ -0,0 +1,1468 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -154,19 +154,21 @@ index 0000000..b653dc3
 +/* Host->firmware qtable publish.  Every offset below is what
 + * __boot_firmware_iris4 writes [K .text+0x15a44, 776 bytes; base register
 + * w21 = 0xA0024 and the +N offsets are literal immediates in the disassembly]. */
-+/* Publish registers, re-decoded from __boot_firmware_iris4 with w21 = 0xA0000.
-+ * The earlier revision used 0x64/0x68/0x54/0x50/0x60, which is what a double
-+ * add on top of the already-absolute `movk w1,#0xa` produces: every one of the
-+ * five was wrong, so the firmware was never told where its queues are and could
-+ * never report ready.  Vendor order and values:
-+ *   0xA0040 <- qtable DA      0xA0044 <- 0x300000 (window size)
-+ *   0xA0030 <- qtable DA      0xA002C <- 1        (commit)
-+ *   0xA003C <- SFR DA                                     [K 0x15a70-0x15b0c] */
-+#define R_CPU_QUEUE_TABLE_DA    (CPU_BASE_OFFS + 0x040u)  /* qtable device addr */
-+#define R_CPU_QUEUE_TABLE_SIZE  (CPU_BASE_OFFS + 0x044u)  /* write 0x300000 */
-+#define R_CPU_QUEUE_TABLE_DA2   (CPU_BASE_OFFS + 0x030u)  /* qtable device addr */
-+#define R_CPU_QUEUE_TABLE_EN    (CPU_BASE_OFFS + 0x02Cu)  /* write 1 */
-+#define R_CPU_QUEUE_TABLE_ADDR2 (CPU_BASE_OFFS + 0x03Cu)  /* SFR device addr */
++/* Publish registers, decoded from __boot_firmware_iris4 where the function
++ * prologue sets the base to **w21 = 0xA0024** (`mov w21,#0x24` +
++ * `movk w21,#0xa,lsl#16`), so every `add w1,w21,#imm` below is 0xA0024+imm:
++ *   0xA0064 <- qtable DA   (orr w21,#0x40)   0xA0068 <- 0x300000 (add #0x44)
++ *   0xA0054 <- qtable DA   (add #0x30)       0xA0050 <- 1        (add #0x2c)
++ *   0xA0060 <- SFR DA      (add #0x3c)                       [K 0x15a60-0x15b0c]
++ * `0xA0048` (boot) and `0xA004C` (status) are likewise w21+0x24 and w21+0x28.
++ * A round where these were "corrected" to 0x40/0x44/0x30/0x2c/0x3c read back
++ * self-consistent but changed nothing, which is what a wrong-but-writable
++ * register set looks like: the fix was reverted. */
++#define R_CPU_QUEUE_TABLE_DA    (CPU_BASE_OFFS + 0x064u)  /* qtable device addr */
++#define R_CPU_QUEUE_TABLE_SIZE  (CPU_BASE_OFFS + 0x068u)  /* write 0x300000 */
++#define R_CPU_QUEUE_TABLE_DA2   (CPU_BASE_OFFS + 0x054u)  /* qtable device addr */
++#define R_CPU_QUEUE_TABLE_EN    (CPU_BASE_OFFS + 0x050u)  /* write 1 */
++#define R_CPU_QUEUE_TABLE_ADDR2 (CPU_BASE_OFFS + 0x060u)  /* SFR device addr */
 +#define R_CPU_QUEUE_TABLE_STAT  (CPU_BASE_OFFS + 0x04Cu)  /* bit0 ready, bits1-3 err */
 +#define R_CPU_CP_SPAN_A         (CPU_BASE_OFFS + 0x024u)  /* CP span size */
 +#define R_CPU_CP_SPAN_B         (CPU_BASE_OFFS + 0x028u)  /* CP span size */
@@ -962,11 +964,23 @@ index 0000000..b653dc3
 +    for (unsigned i = 0; i < sizeof(vidc_gdscs) / sizeof(vidc_gdscs[0]); i++) {
 +        if (vidc_gdsc_on(&vidc_gdscs[i]) != 0) failed++;
 +    }
-+    vidc_branch_on(0x8164u);           /* mvs0c */
-+    vidc_branch_on(0x80D0u);           /* mvs0  */
-+    vidc_branch_on(0x8134u);           /* vpp0  */
-+    vidc_branch_on(0x8108u);           /* vpp1  */
-+    vidc_branch_on(0x8090u);           /* mvs0a */
++    /* All seven hardware clocks upstream asks for.  The freerun and BSE branches
++     * were missing and that is the "core never executes" candidate worth
++     * testing: with HW_FREERUN gated the Xtensa cannot fetch its firmware, which
++     * shows up as no ready bit and no SMMU transactions at all -- precisely the
++     * observed state, as opposed to a translation fault.
++     * Base offsets are the captured videocc-canoe.ko clock objects:
++     *   video_cc_mvs0_clk 0x80d0, mvs0b_clk 0x80bc, mvs0c_clk 0x8164,
++     *   mvs0a_clk 0x8090, mvs0_vpp0_clk 0x8134, mvs0_vpp1_clk 0x8108,
++     *   mvs0_freerun_clk 0x80e4                            [V clock_regs.txt:559-574]
++     * Upstream order is AXI, HW_FREERUN, HW, BSE_HW, VPP0, VPP1, APV. */
++    vidc_branch_on(0x8164u);           /* mvs0c (AXI)   */
++    vidc_branch_on(0x80E4u);           /* mvs0 freerun  */
++    vidc_branch_on(0x80D0u);           /* mvs0 (HW)     */
++    vidc_branch_on(0x80BCu);           /* mvs0b (BSE)   */
++    vidc_branch_on(0x8134u);           /* vpp0          */
++    vidc_branch_on(0x8108u);           /* vpp1          */
++    vidc_branch_on(0x8090u);           /* mvs0a (APV)   */
 +    vidc_bridge_reset();
 +
 +    printf("PANDORA VIDC: videocc powered (%d/5 GDSC failed), CORE_PWR=%08x CORE_CLK=%08x\n",
@@ -1014,7 +1028,7 @@ index 0000000..b653dc3
 +        vidc_wr(R_CPU_QUEUE_TABLE_ADDR2, vidc_sfr_da());
 +    }
 +    printf("PANDORA VIDC: published DA=%08x SFR=%08x (smmu %s) "
-+           "regs A0040/A0044/A0030/A002C/A003C\n", da, vidc_sfr_da(),
++           "regs A0064/A0068/A0054/A0050/A0060\n", da, vidc_sfr_da(),
 +        vidc_smmu_on ? "on" : "OFF, truncated physical address");
 +    printf("PANDORA VIDC: readback DA=%08x size=%08x DA2=%08x en=%08x sfr=%08x\n",
 +        vidc_rd(R_CPU_QUEUE_TABLE_DA), vidc_rd(R_CPU_QUEUE_TABLE_SIZE),
