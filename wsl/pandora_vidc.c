@@ -957,7 +957,10 @@ vidc_power_up(void)
      *   mvs0_freerun_clk 0x80e4                            [V clock_regs.txt:559-574]
      * Upstream order is AXI, HW_FREERUN, HW, BSE_HW, VPP0, VPP1, APV. */
     vidc_branch_on(0x8164u);           /* mvs0c (AXI)   */
-    vidc_branch_on(0x80E4u);           /* mvs0 freerun  */
+    /* 0x80e4 is NOT a plain branch: its captured clock object has no +0x30/+0x34
+     * fields and a write there does not stick (`20010c00 -> 20010c00`), so the
+     * freerun clock cannot be enabled through it.  Left out deliberately
+     * instead of pretending it was turned on. */
     vidc_branch_on(0x80D0u);           /* mvs0 (HW)     */
     vidc_branch_on(0x80BCu);           /* mvs0b (BSE)   */
     vidc_branch_on(0x8134u);           /* vpp0          */
@@ -965,8 +968,21 @@ vidc_power_up(void)
     vidc_branch_on(0x8090u);           /* mvs0a (APV)   */
     vidc_bridge_reset();
 
+    /* WRAPPER_CORE_CLOCK_CONFIG semantics are inverted from the name:
+     * CORE_CLK_RUN == 0x0 [M iris_vpu_register_defines.h], and bit1 is
+     * APV_CLK_HALT, which upstream clears by writing 0x0 [M iris_vpu4x.c:98-101].
+     * A halted wrapper clock would leave the Xtensa unable to fetch, which is
+     * exactly "no ready bit, no interrupts, no SMMU traffic". */
+    uint32_t clk_cfg = vidc_rd(R_WRAPPER_CORE_CLK);
+    if (clk_cfg != 0) {
+        vidc_wr(R_WRAPPER_CORE_CLK, 0);
+        __asm__ volatile ("dsb sy" ::: "memory");
+        printf("PANDORA VIDC: core clock config %08x -> %08x (CORE_CLK_RUN=0)\n",
+            clk_cfg, vidc_rd(R_WRAPPER_CORE_CLK));
+        clk_cfg = vidc_rd(R_WRAPPER_CORE_CLK);
+    }
     printf("PANDORA VIDC: videocc powered (%d/5 GDSC failed), CORE_PWR=%08x CORE_CLK=%08x\n",
-        failed, vidc_rd(R_WRAPPER_CORE_PWR), vidc_rd(R_WRAPPER_CORE_CLK));
+        failed, vidc_rd(R_WRAPPER_CORE_PWR), clk_cfg);
     return failed ? -1 : 0;
 }
 
