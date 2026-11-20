@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..3135ba9c716e75fca62237c1e3ac9c40aafe1830
+index 0000000..86e1744abc4bd8eda0067274e965aad141ed3e71
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4110 @@
+@@ -0,0 +1,4151 @@
 +﻿/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2964,6 +2964,43 @@ index 0000000..3135ba9c716e75fca62237c1e3ac9c40aafe1830
 + * This device has no cnss_softsku_peach.pfm on /vendor/bt_firmware/image/
 + * (checked 2026-11-18), so like the HAL on this unit we SKIP the license
 + * phase and record the fact; TME-L is the level-20 gate. */
++/* Level 20.15: the Android trace sends the f1-family ActivateSS frame
++ * 31 00 f1 ff 02 02 0f at 9.773776, between Peri GetVer (9.766328) and
++ * arbitrate (9.801908). Every 20.x build so far started at PeriReset and
++ * never activated the PERI/TME-L subsystem, so the map was accepted on the
++ * wire but never treated as a completed patch. This is the one f1 frame the
++ * trace contains that the driver does not. Observation only: a missing
++ * answer is logged and the level continues. */
++static int
++bt_peri_activate_ss(void)
++{
++	static const uint8_t request[] = { 0x31, 0x00, 0xf1, 0xff, 0x02, 0x02, 0x0f };
++	uint8_t rx[BT_PERI_EVT_MAX] = {0};
++	unsigned got = 0;
++	uint64_t deadline;
++	int err;
++
++	err = bt_uart_tx(request, sizeof(request), "PERI ActivateSS");
++	if (err) {
++		return err;
++	}
++	clock_interval_to_deadline(500, NSEC_PER_MSEC, &deadline);
++	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x02,
++	    "PERI ActivateSS");
++	if (err) {
++		printf("PANDORA BT: ActivateSS: no reply (error %d, %u bytes); continuing\n",
++		    err, got);
++		bt_dump("PERI ActivateSS raw", rx, got);
++		pandora_log_sync();
++		return 0;
++	}
++	printf("PANDORA BT: ActivateSS reply (subcmd %u, %u bytes)\n",
++	    got >= 11u ? rx[10] : 0xffu, got);
++	bt_dump("PERI ActivateSS reply", rx, got);
++	pandora_log_sync();
++	return 0;
++}
++
 +static int
 +bt_peri_reset(void)
 +{
@@ -3862,9 +3899,13 @@ index 0000000..3135ba9c716e75fca62237c1e3ac9c40aafe1830
 +{
 +	int err;
 +
-+	printf("PANDORA BT: level 20: TME-L %u B, PeriReset + arbitrate v3 + peri map + map-only raw stream (20.14)\n",
++	printf("PANDORA BT: level 20: TME-L %u B, ActivateSS + PeriReset + arbitrate v3 + peri map + map-only raw stream (20.15)\n",
 +	    (unsigned)sizeof(pandora_peri_tmel_elf));
 +	pandora_log_sync();
++	/* Level 20.15: the trace ActivateSS frame is the only f1 frame the
++	 * driver has never sent; run it before the PeriReset that opens the
++	 * TME-L session. */
++	(void)bt_peri_activate_ss();
 +	err = bt_peri_reset();
 +	if (err) {
 +		return err;
