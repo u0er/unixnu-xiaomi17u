@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
+index 0000000..f95a79d2f0eb58a40bd199dbd168622c202155e9
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4442 @@
+@@ -0,0 +1,4481 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -1997,6 +1997,15 @@ index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
 +	}
 +}
 +
++/* Level 20.23: the map stages send 1,715 frames back to back. Logging one line
++ * per frame is not free - every printf goes through the kernel log path, and
++ * the ROM is waiting on the wire while it happens. Android's HAL logs nothing
++ * per frame, so the map stages switch this counter on and report a summary
++ * instead; every error path still prints unconditionally. */
++static bool bt_tx_long_quiet;
++static unsigned bt_tx_long_frames;
++static uint64_t bt_tx_long_bytes;
++
 +/* Watermark-chunked TX for frames larger than the SE FIFO. The proven
 + * one-shot bt_uart_tx fits levels 2..18 (frames <= 8 bytes); a 251-byte
 + * segment frame cannot, so feed at most (depth - tx_wm) words per
@@ -2071,8 +2080,12 @@ index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
 +		return ETIMEDOUT;
 +	}
 +	bt_wr(BT_W_SE, SE_M_IRQ_CLR, M_CMD_DONE);
-+	printf("PANDORA BT: %s sent (%u bytes, fifo depth %u, %u bursts)\n", what,
-+	    len, depth, bursts);
++	if (bt_tx_long_quiet) {
++		bt_tx_long_frames++;
++		bt_tx_long_bytes += len;
++	} else
++		printf("PANDORA BT: %s sent (%u bytes, fifo depth %u, %u bursts)\n",
++		    what, len, depth, bursts);
 +	return 0;
 +}
 +
@@ -3409,10 +3422,17 @@ index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
 +			printf("PANDORA BT: %s: HCI event %02x len %u\n", what, eh[0], plen);
 +			bt_dump_wide("TME probe HCI event", rx, plen);
 +			if (eh[0] == 0x0eu && plen >= 3u) {
-+				printf("PANDORA BT: %s: Command Complete status %u opcode %02x %02x trailing %02x %02x %02x %02x\n",
-+				    what, rx[0], rx[2], rx[1],
-+				    plen > 3u ? rx[3] : 0xffu, plen > 4u ? rx[4] : 0xffu,
-+				    plen > 5u ? rx[5] : 0xffu, plen > 6u ? rx[6] : 0xffu);
++				/* rx starts after the 4-byte 04 0e len ncmds
++				 * header, so with the trace's 04 0e 05 01 00 fc
++				 * 00 1e this is rx = 01 00 fc 00 1e: rx[0] is the
++				 * command count, rx[1..2] the little-endian
++				 * opcode, rx[3] the status and rx[4] the
++				 * subcommand echo. */
++				printf("PANDORA BT: %s: Command Complete status %u opcode %02x %02x ncmds %u trailing %02x %02x %02x %02x\n",
++				    what, plen > 3u ? rx[3] : 0xffu, rx[2], rx[1], rx[0],
++				    plen > 4u ? rx[4] : 0xffu, plen > 5u ? rx[5] : 0xffu,
++				    plen > 6u ? rx[6] : 0xffu,
++				    plen > 7u ? rx[7] : 0xffu);
 +			}
 +			pandora_log_sync();
 +			continue;
@@ -3699,17 +3719,20 @@ index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
 +			params += got;
 +		}
 +		bt_dump_wide("PERI HCI event", body, params);
++		/* body[0] is the command count, body[1..2] the little-endian
++		 * opcode, body[3] the status and body[4] the subcommand echo
++		 * (the trace's 04 0e 05 01 00 fc 00 1e -> body = 01 00 fc 00 1e). */
 +		if (hdr[1] == 0x0eu && params >= 3u && body[1] == 0xfcu &&
 +		    body[2] == 0x00u) {
 +			hci_ccs++;
 +			printf("PANDORA BT: %s: 0xfc00 Command Complete status %u, %u trailing byte(s): %02x %02x %02x %02x %02x %02x\n",
-+			    what, body[0], params - 3u,
-+			    params > 3u ? body[3] : 0xffu, params > 4u ? body[4] : 0xffu,
-+			    params > 5u ? body[5] : 0xffu, params > 6u ? body[6] : 0xffu,
-+			    params > 7u ? body[7] : 0xffu, params > 8u ? body[8] : 0xffu);
++			    what, params > 3u ? body[3] : 0xffu, params - 3u,
++			    params > 4u ? body[4] : 0xffu, params > 5u ? body[5] : 0xffu,
++			    params > 6u ? body[6] : 0xffu, params > 7u ? body[7] : 0xffu,
++			    params > 8u ? body[8] : 0xffu, params > 9u ? body[9] : 0xffu);
 +		} else if (hdr[1] == 0x0eu && params >= 3u) {
 +			printf("PANDORA BT: %s: Command Complete status %u opcode %02x %02x\n",
-+			    what, body[0], body[2], body[1]);
++			    what, params > 3u ? body[3] : 0xffu, body[2], body[1]);
 +		}
 +		pandora_log_sync();
 +		continue;
@@ -3895,6 +3918,9 @@ index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
 +	printf("PANDORA BT: %s: TLV 06 %02x stage, %u bytes -> %u frames (last %u), wire speed\n",
 +	    what, sub06, size, nseg, last);
 +	pandora_log_sync();
++	bt_tx_long_quiet = true;
++	bt_tx_long_frames = 0;
++	bt_tx_long_bytes = 0;
 +	while (sent < size) {
 +		unsigned len = size - sent;
 +
@@ -3914,6 +3940,7 @@ index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
 +		}
 +		err = bt_uart_tx_long(frame, len + 8u, what);
 +		if (err) {
++			bt_tx_long_quiet = false;
 +			printf("PANDORA BT: %s: frame %u/%u failed (error %d) after %u bytes\n",
 +			    what, seg + 1u, nseg, err, sent);
 +			pandora_log_sync();
@@ -3926,8 +3953,11 @@ index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
 +			pandora_log_sync();
 +		}
 +	}
++	bt_tx_long_quiet = false;
 +	printf("PANDORA BT: %s: %u frames sent (%u bytes), %u wake(s), %u byte(s) flushed\n",
 +	    what, seg, sent, wakes, flushed);
++	printf("PANDORA BT: %s: %u TX command(s), %llu byte(s) on the wire, no per-frame log\n",
++	    what, bt_tx_long_frames, (unsigned long long)bt_tx_long_bytes);
 +	pandora_log_sync();
 +	return 0;
 +}
@@ -3962,6 +3992,9 @@ index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
 +	    what, size, nseg, last,
 +	    per_frame_cc ? "one Command Complete per frame" : "wire speed, bulk answer");
 +	pandora_log_sync();
++	bt_tx_long_quiet = true;
++	bt_tx_long_frames = 0;
++	bt_tx_long_bytes = 0;
 +	while (sent < size) {
 +		unsigned len = size - sent;
 +		unsigned got = 0;
@@ -3980,6 +4013,7 @@ index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
 +		}
 +		err = bt_uart_tx_long(frame, len + 6u, what);
 +		if (err) {
++			bt_tx_long_quiet = false;
 +			printf("PANDORA BT: %s: frame %u/%u failed (error %d) after %u bytes\n",
 +			    what, seg + 1u, nseg, err, sent);
 +			pandora_log_sync();
@@ -4003,6 +4037,7 @@ index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
 +				err = bt_peri_cc_read(200u, ev, sizeof(ev), &got,
 +				    &wakes, what);
 +				if (err) {
++					bt_tx_long_quiet = false;
 +					printf("PANDORA BT: %s: frame %u/%u got no Command Complete (error %d, %u byte(s))\n",
 +					    what, seg, nseg, err, got);
 +					pandora_log_sync();
@@ -4029,6 +4064,7 @@ index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
 +				pandora_log_sync();
 +			}
 +			if (!acked) {
++				bt_tx_long_quiet = false;
 +				printf("PANDORA BT: %s: frame %u/%u never acked after %u event(s)\n",
 +				    what, seg, nseg, tries);
 +				pandora_log_sync();
@@ -4040,8 +4076,11 @@ index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
 +			pandora_log_sync();
 +		}
 +	}
++	bt_tx_long_quiet = false;
 +	printf("PANDORA BT: %s: %u frames sent (%u bytes), %u Command Complete(s), last sub %02x, %u wake(s), %u byte(s) flushed\n",
 +	    what, seg, sent, ccs, last_sub, wakes, flushed);
++	printf("PANDORA BT: %s: %u TX command(s), %llu byte(s) on the wire, no per-frame log\n",
++	    what, bt_tx_long_frames, (unsigned long long)bt_tx_long_bytes);
 +	pandora_log_sync();
 +	return 0;
 +}
@@ -4118,7 +4157,7 @@ index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
 +{
 +	int err;
 +
-+	printf("PANDORA BT: level 20: TME-L map A %u B (TLV) + B %u B + C %u B (HCI 0xfc00) (20.22)\n",
++	printf("PANDORA BT: level 20: TME-L map A %u B (TLV) + B %u B + C %u B (HCI 0xfc00) (20.23)\n",
 +	    (unsigned)sizeof(pandora_peri_tmel_elf),
 +	    (unsigned)sizeof(pandora_peri_tmel_mbn),
 +	    (unsigned)sizeof(pandora_peri_tmel_nvm));
