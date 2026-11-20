@@ -1,5 +1,18 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index d70963c..44db1dd 100755
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -152,6 +152,7 @@ bsd/dev/pandora_cpu.c			standard
+ bsd/dev/pandora_autoswipe.c		standard
+ bsd/dev/pandora_dpu.c			standard
+ bsd/dev/pandora_camera.c			standard
++bsd/dev/pandora_vidc.c		standard
+ bsd/dev/adreno/ArmSmmu4K.c		standard
+ bsd/dev/adreno/ArmSmmu4KContext.c		standard
+ bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
+index 0000000..94231de
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
 @@ -0,0 +1,679 @@
@@ -682,35 +695,24 @@ new file mode 100644
 +}
 +
 +#endif /* PANDORA */
-
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 5fe98eb..2ddbf2e 100755
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -70,6 +70,7 @@
- extern void pandora_therm_init(void);
+@@ -72,6 +72,7 @@ extern void pandora_therm_init(void);
  extern void pandora_usb_init(void);
+ extern void pandora_bt_init(void);
  extern void pandora_camera_init(void);
 +extern void pandora_vidc_init(void);
  #endif
  extern void fuxi_wlan_init(void);
  extern void sweet_usb_probe(void);
-@@ -1582,6 +1583,8 @@
- 	pandora_files_init();
- 	/* Adreno 840 bring-up, boot-arg pandora_gpu (bsd/dev/pandora_gpu.c). */
- 	pandora_gpu_init();
+@@ -1594,6 +1595,8 @@ sweet_ufs_init(void)
+ 	pandora_bt_init();
+ 	/* Camera Stage C-1 read-only CCI diag, boot-arg pandora_camera (bsd/dev/pandora_camera.c). */
+ 	pandora_camera_init();
 +	/* Video codec transport, boot-arg pandora_vidc (bsd/dev/pandora_vidc.c). */
 +	pandora_vidc_init();
- 	/* CPU performance probe, boot-arg pandora_cpu (bsd/dev/pandora_cpu.c). */
- 	pandora_cpu_init();
- 	/* Board thermistors, read only, boot-arg pandora_therm (bsd/dev/pandora_therm.c). */
-diff --git a/bsd/conf/files b/bsd/conf/files
---- a/bsd/conf/files
-+++ b/bsd/conf/files
-@@ -125,6 +125,7 @@
- bsd/dev/qcomusb/soc/QcomUsbPrepare.c		standard
- bsd/dev/pandora_selftest.c		standard
- bsd/dev/pandora_adsp.c			standard
-+bsd/dev/pandora_vidc.c			standard
- bsd/dev/qcom/QcomSmem.c			standard
- bsd/dev/qcom/QcomSmp2p.c		standard
- bsd/dev/qcom/QcomGlink.c		standard
+ 	/* USB gadget probe / start, boot-arg sweetusb (bsd/dev/sweet_usb.c).
+ 	 * Previously only called on non-FUXI boards; Nezha needs it too for device-mode USB. */
+ 	sweet_usb_probe();
