@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..55e882db7bb957829493989265c3101e88f55a1f
+index 0000000..4b6b428c9f63ffc54829a06e861203103266266f
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4245 @@
+@@ -0,0 +1,4246 @@
 +﻿/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2735,7 +2735,7 @@ index 0000000..55e882db7bb957829493989265c3101e88f55a1f
 + * the PERI patch and NVM and before build info; every earlier build skipped
 + * it, then went straight to PeriReset + the TME-L map. Observation only:
 + * a missing reply is logged and the level continues. */
-+static int
++static int __unused
 +bt_peri_tlv_end(void)
 +{
 +	static const uint8_t request[] = { 0x31, 0x00, 0xf0, 0xff, 0x0f, 0x06,
@@ -3971,7 +3971,7 @@ index 0000000..55e882db7bb957829493989265c3101e88f55a1f
 +{
 +	int err;
 +
-+	printf("PANDORA BT: level 20: TME-L %u B, ActivateSS in level 19 + reset + arbitrate v3 + paced peri map + map-only raw stream (20.19)\n",
++	printf("PANDORA BT: level 20: TME-L %u B, ActivateSS in level 19 + reset + arbitrate v3 + paced peri map + map-only raw stream (20.20)\n",
 +	    (unsigned)sizeof(pandora_peri_tmel_elf));
 +	pandora_log_sync();
 +	/* Level 20.19: GetVer(00) and ActivateSS now happen in the level-19 chain
@@ -4074,11 +4074,12 @@ index 0000000..55e882db7bb957829493989265c3101e88f55a1f
 +	if (err) {
 +		return err;
 +	}
-+	/* Level 20.18: the trace's TLV end frame, between NVM and build info. */
-+	err = bt_peri_tlv_end();
-+	if (err) {
-+		return err;
-+	}
++	/* Level 20.20: do NOT send the TLV end here. Both device runs that sent it
++	 * (20.18 and 20.19) got the ROM's diagnostic dump instead of the 12-byte
++	 * ACK + sub-09 build info push, even with ActivateSS already sent before
++	 * the patch; build info then read 0 bytes and level 19 failed. Keep the
++	 * function for the deferred (b) route, but leave the proven 20.17b chain:
++	 * NVM -> build info VSC. */
 +	err = bt_peri_build_info();
 +	if (err) {
 +		printf("PANDORA BT: level 19 download %s (error %d)\n",
