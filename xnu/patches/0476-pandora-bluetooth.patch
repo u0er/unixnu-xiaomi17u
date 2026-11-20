@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..8338c069799c8c27cb683740ce05349cb6062249
+index 0000000..5fd48bf53049328d654ee38f008b7dab864b3940
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4409 @@
+@@ -0,0 +1,4442 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3950,6 +3950,7 @@ index 0000000..8338c069799c8c27cb683740ce05349cb6062249
 +	unsigned ccs = 0;
 +	unsigned wakes = 0;
 +	unsigned flushed = 0;
++	uint8_t last_sub = 0;
 +	unsigned nseg = (size + BT_FW_SEG_MAX - 1u) / BT_FW_SEG_MAX;
 +	unsigned last = size % BT_FW_SEG_MAX;
 +	int err;
@@ -3987,36 +3988,60 @@ index 0000000..8338c069799c8c27cb683740ce05349cb6062249
 +		sent += len;
 +		seg++;
 +		if (per_frame_cc) {
-+			err = bt_peri_cc_read(200u, ev, sizeof(ev), &got, &wakes, what);
-+			if (err) {
-+				printf("PANDORA BT: %s: frame %u/%u got no Command Complete (error %d, %u byte(s))\n",
-+				    what, seg, nseg, err, got);
++			/* The trace's per-frame ack is 04 0e 05 01 00 fc 00 1e:
++			 * plen 5, one command, opcode 0xfc00, status 0, and the
++			 * subcommand echo last. Late acks from the previous bulk
++			 * stage look like 04 0e 08 01 00 fc 00 23 ... (plen 8),
++			 * so they are logged and skipped instead of being taken
++			 * for this frame's ack or aborting the stage. */
++			unsigned tries = 0;
++			bool acked = false;
++
++			while (!acked && tries < 8u) {
++				tries++;
++				got = 0;
++				err = bt_peri_cc_read(200u, ev, sizeof(ev), &got,
++				    &wakes, what);
++				if (err) {
++					printf("PANDORA BT: %s: frame %u/%u got no Command Complete (error %d, %u byte(s))\n",
++					    what, seg, nseg, err, got);
++					pandora_log_sync();
++					return err;
++				}
++				if (ev[0] == 0x04u && ev[1] == 0x0eu && got >= 8u &&
++				    ev[2] == 0x05u && ev[3] == 0x01u &&
++				    ev[4] == 0x00u && ev[5] == 0xfcu &&
++				    ev[6] == 0x00u) {
++					acked = true;
++					last_sub = ev[7];
++					ccs++;
++					continue;
++				}
++				if (ev[0] == 0x04u && ev[1] == 0x0eu && got >= 7u) {
++					printf("PANDORA BT: %s: frame %u/%u late event %02x %02x len %u status %u sub %02x (skipped)\n",
++					    what, seg, nseg, ev[0], ev[1], ev[2],
++					    ev[6], got >= 8u ? ev[7] : 0x00u);
++				} else {
++					printf("PANDORA BT: %s: frame %u/%u unexpected event %02x %02x (%u byte(s), skipped)\n",
++					    what, seg, nseg, ev[0], ev[1], got);
++					bt_dump("PERI HCI unexpected event", ev, got);
++				}
 +				pandora_log_sync();
-+				return err;
 +			}
-+			if (ev[0] != 0x04u || ev[1] != 0x0eu || got < 8u ||
-+			    ev[4] != 0x00u || ev[6] != 0x1eu) {
-+				printf("PANDORA BT: %s: frame %u/%u answered a non-0x1e event (%u byte(s))\n",
-+				    what, seg, nseg, got);
-+				bt_dump("PERI HCI unexpected event", ev, got);
++			if (!acked) {
++				printf("PANDORA BT: %s: frame %u/%u never acked after %u event(s)\n",
++				    what, seg, nseg, tries);
 +				pandora_log_sync();
 +				return EPROTO;
 +			}
-+			if (ev[2] != 0x05u || ev[3] != 0x01u || ev[5] != 0xfcu || ev[7] != 0x00u) {
-+				printf("PANDORA BT: %s: frame %u/%u Command Complete status %u (opcode %02x %02x)\n",
-+				    what, seg, nseg, ev[7], ev[5], ev[4]);
-+				pandora_log_sync();
-+				return EPROTO;
-+			}
-+			ccs++;
 +		}
 +		if (!per_frame_cc && (seg & 63u) == 0u) {
 +			bt_peri_flush(4096u, &flushed, &wakes);
 +			pandora_log_sync();
 +		}
 +	}
-+	printf("PANDORA BT: %s: %u frames sent (%u bytes), %u Command Complete(s), %u wake(s), %u byte(s) flushed\n",
-+	    what, seg, sent, ccs, wakes, flushed);
++	printf("PANDORA BT: %s: %u frames sent (%u bytes), %u Command Complete(s), last sub %02x, %u wake(s), %u byte(s) flushed\n",
++	    what, seg, sent, ccs, last_sub, wakes, flushed);
 +	pandora_log_sync();
 +	return 0;
 +}
@@ -4051,9 +4076,14 @@ index 0000000..8338c069799c8c27cb683740ce05349cb6062249
 +		pandora_log_sync();
 +		return err;
 +	}
-+	printf("PANDORA BT: %s: VS command answered event %02x %02x len %u status %u\n",
++	/* Status is ev[6] and the subcommand echo is ev[7]: the trace's
++	 * 04 0e 08 01 00 fc 00 23 02 00 00 (the 0x23 answer) and
++	 * 04 0e 75 01 00 fc 00 20 6f 42 54 46 ... (the 0x20 answer, whose
++	 * payload is the ASCII "oBTFW...") both put status first. */
++	printf("PANDORA BT: %s: VS command answered event %02x %02x len %u status %u sub %02x\n",
 +	    what, ev[0], got > 1u ? ev[1] : 0u, got > 2u ? ev[2] : 0u,
-+	    (ev[0] == 0x04u && got >= 8u) ? ev[7] : 0xffu);
++	    (ev[0] == 0x04u && got >= 7u) ? ev[6] : 0xffu,
++	    (ev[0] == 0x04u && got >= 8u) ? ev[7] : 0x00u);
 +	bt_dump_wide("PERI VS answer", ev, got < sizeof(ev) ? got : sizeof(ev));
 +	pandora_log_sync();
 +	return 0;
@@ -4088,7 +4118,7 @@ index 0000000..8338c069799c8c27cb683740ce05349cb6062249
 +{
 +	int err;
 +
-+	printf("PANDORA BT: level 20: TME-L map A %u B (TLV) + B %u B + C %u B (HCI 0xfc00) (20.21)\n",
++	printf("PANDORA BT: level 20: TME-L map A %u B (TLV) + B %u B + C %u B (HCI 0xfc00) (20.22)\n",
 +	    (unsigned)sizeof(pandora_peri_tmel_elf),
 +	    (unsigned)sizeof(pandora_peri_tmel_mbn),
 +	    (unsigned)sizeof(pandora_peri_tmel_nvm));
@@ -4121,7 +4151,10 @@ index 0000000..8338c069799c8c27cb683740ce05349cb6062249
 +		bt_peri_raw_dump(2000u, "PERI TME-L map A failure raw");
 +		return err;
 +	}
-+	bt_peri_bulk_drain(500u, "PERI TME-L map A");
++	/* The trace puts the 0x19 that opens phase B 54 ms after phase A's last
++	 * frame, and phase A itself produces no ROM traffic at all, so this drain
++	 * is only long enough to answer a wake request if one shows up. */
++	bt_peri_bulk_drain(150u, "PERI TME-L map A");
 +	/* Phase B (trace 10.199460 start command, then 1374 frames to 11.189057):
 +	 * the 333,868-byte gngbtfw20.mbn as HCI 0xfc00/subcmd 0x1e frames of 243
 +	 * bytes (last 229). Wire speed: Android's stage spans 0.99 s for 342 KB,
