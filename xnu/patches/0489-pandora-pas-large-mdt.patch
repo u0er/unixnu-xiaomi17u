@@ -1,0 +1,69 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 56132ef..fa99123 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -753,20 +753,32 @@ pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t me
+ 		snprintf(name, sizeof(name), "%s.mdt", base);
+ 	}
+ 	struct fw_file mdt;
+-	if (fw_open(name, part, &mdt) || mdt.size < 52 || mdt.size > 0x10000) {
++	if (fw_open(name, part, &mdt) || mdt.size < 52) {
+ 		printf("PANDORA ADSP: %s missing in the %s\n", name, part ? "firmware partition" : "pack");
+ 		return ENOENT;
+ 	}
++	/*
++	 * Only the ELF header and the program header table are needed up front; the segments and
++	 * the hash table are read straight from the image.  The 64 KiB staging buffer used to cap
++	 * the whole image, which rejected every real MDT (the VPU's vpu40_2v_v1.mbn is 2.35 MiB
++	 * and its hash segment sits at 0x258000), so this is now bounded by the header instead.
++	 */
+ 	static uint8_t hdr[0x10000];
+-	int err = fw_pread(&mdt, 0, hdr, mdt.size);
++	unsigned hdr_bytes = mdt.size < sizeof(hdr) ? (unsigned)mdt.size : (unsigned)sizeof(hdr);
++	int err = fw_pread(&mdt, 0, hdr, hdr_bytes);
+ 	if (err) {
+ 		return err;
+ 	}
++	if (hdr_bytes < 52) {
++		printf("PANDORA ADSP: %s is %u bytes, shorter than an ELF header\n", name, hdr_bytes);
++		return EINVAL;
++	}
+ 	uint32_t phoff, phnum;
+ 	memcpy(&phoff, hdr + 28, 4);
+ 	phnum = hdr[44] | (hdr[45] << 8);
+ 	if (memcmp(hdr, "\177ELF", 4) || hdr[4] != 1 || phnum < 2 || phnum > 128 ||
+-	    phoff + phnum * sizeof(struct elf32_phdr) > mdt.size) {
++	    (uint64_t)phoff + phnum * sizeof(struct elf32_phdr) > mdt.size ||
++	    (uint64_t)phoff + phnum * sizeof(struct elf32_phdr) > hdr_bytes) {
+ 		printf("PANDORA ADSP: %s is not a 32-bit ELF header\n", name);
+ 		return EINVAL;
+ 	}
+@@ -803,11 +815,25 @@ pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t me
+ 		return ENOMEM;
+ 	}
+ 	uint64_t md_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)md));
++	if (ehdr_size > hdr_bytes) {
++		printf("PANDORA ADSP: %s: ELF header is %u bytes, staging holds %u\n", name, ehdr_size,
++		    hdr_bytes);
++		return EINVAL;
++	}
+ 	memcpy((void *)md, hdr, ehdr_size);
+-	if (ehdr_size + hash_size == mdt.size) {
+-		memcpy((void *)(md + ehdr_size), hdr + ehdr_size, hash_size);
+-	} else if ((uint64_t)ph[hash].p_offset + hash_size <= mdt.size) {
++	/*
++	 * The hash table normally sits at the end of the image (VPU: offset 0x258000 of 2.35 MiB),
++	 * well past the header staging area, so it has to come from the file.  Only an image whose
++	 * hash happens to be inside the staging window may be copied from memory.
++	 */
++	if ((uint64_t)ph[hash].p_offset + hash_size <= mdt.size &&
++	    (uint64_t)ph[hash].p_offset + hash_size <= hdr_bytes) {
+ 		memcpy((void *)(md + ehdr_size), hdr + ph[hash].p_offset, hash_size);
++	} else if ((uint64_t)ph[hash].p_offset + hash_size <= mdt.size) {
++		if ((err = fw_pread(&mdt, ph[hash].p_offset, (void *)(md + ehdr_size), hash_size))) {
++			printf("PANDORA ADSP: %s: hash segment read failed %d\n", name, err);
++			return err;
++		}
+ 	} else if ((err = mdt_segment(base, part, &mdt, &ph[hash], hash, (void *)(md + ehdr_size)))) {
+ 		return err;
+ 	}
