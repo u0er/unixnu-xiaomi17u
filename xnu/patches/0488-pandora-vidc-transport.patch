@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..2b9591c
+index 0000000..b653dc3
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,1436 @@
+@@ -0,0 +1,1454 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -154,11 +154,19 @@ index 0000000..2b9591c
 +/* Host->firmware qtable publish.  Every offset below is what
 + * __boot_firmware_iris4 writes [K .text+0x15a44, 776 bytes; base register
 + * w21 = 0xA0024 and the +N offsets are literal immediates in the disassembly]. */
-+#define R_CPU_QUEUE_TABLE_DA    (CPU_BASE_OFFS + 0x064u)  /* qtable physical addr */
-+#define R_CPU_QUEUE_TABLE_SIZE  (CPU_BASE_OFFS + 0x068u)  /* write 0x300000 */
-+#define R_CPU_QUEUE_TABLE_DA2   (CPU_BASE_OFFS + 0x054u)  /* second publish */
-+#define R_CPU_QUEUE_TABLE_EN    (CPU_BASE_OFFS + 0x050u)  /* write 1 */
-+#define R_CPU_QUEUE_TABLE_ADDR2 (CPU_BASE_OFFS + 0x060u)  /* core+0x13E8 -> SFR */
++/* Publish registers, re-decoded from __boot_firmware_iris4 with w21 = 0xA0000.
++ * The earlier revision used 0x64/0x68/0x54/0x50/0x60, which is what a double
++ * add on top of the already-absolute `movk w1,#0xa` produces: every one of the
++ * five was wrong, so the firmware was never told where its queues are and could
++ * never report ready.  Vendor order and values:
++ *   0xA0040 <- qtable DA      0xA0044 <- 0x300000 (window size)
++ *   0xA0030 <- qtable DA      0xA002C <- 1        (commit)
++ *   0xA003C <- SFR DA                                     [K 0x15a70-0x15b0c] */
++#define R_CPU_QUEUE_TABLE_DA    (CPU_BASE_OFFS + 0x040u)  /* qtable device addr */
++#define R_CPU_QUEUE_TABLE_SIZE  (CPU_BASE_OFFS + 0x044u)  /* write 0x300000 */
++#define R_CPU_QUEUE_TABLE_DA2   (CPU_BASE_OFFS + 0x030u)  /* qtable device addr */
++#define R_CPU_QUEUE_TABLE_EN    (CPU_BASE_OFFS + 0x02Cu)  /* write 1 */
++#define R_CPU_QUEUE_TABLE_ADDR2 (CPU_BASE_OFFS + 0x03Cu)  /* SFR device addr */
 +#define R_CPU_QUEUE_TABLE_STAT  (CPU_BASE_OFFS + 0x04Cu)  /* bit0 ready, bits1-3 err */
 +#define R_CPU_CP_SPAN_A         (CPU_BASE_OFFS + 0x024u)  /* CP span size */
 +#define R_CPU_CP_SPAN_B         (CPU_BASE_OFFS + 0x028u)  /* CP span size */
@@ -995,13 +1003,23 @@ index 0000000..2b9591c
 +    }
 +    uint32_t da = vidc_qtable_da();
 +
++    /* Vendor order, kept exactly: DA, window size, second DA, commit, SFR.
++     * The commit (0xA002C <- 1) is what latches the addresses, so writing it
++     * before the DAs would publish stale values. */
 +    vidc_wr(R_CPU_QUEUE_TABLE_DA, da);
 +    vidc_wr(R_CPU_QUEUE_TABLE_SIZE, VIDC_QTABLE_BYTES);
 +    vidc_wr(R_CPU_QUEUE_TABLE_DA2, da);
 +    vidc_wr(R_CPU_QUEUE_TABLE_EN, 1);
-+    vidc_wr(R_CPU_QUEUE_TABLE_ADDR2, vidc_sfr_da());
-+    printf("PANDORA VIDC: published DA=%08x SFR=%08x (smmu %s)\n", da, vidc_sfr_da(),
++    if (vidc_sfr_da()) {
++        vidc_wr(R_CPU_QUEUE_TABLE_ADDR2, vidc_sfr_da());
++    }
++    printf("PANDORA VIDC: published DA=%08x SFR=%08x (smmu %s) "
++           "regs A0040/A0044/A0030/A002C/A003C\n", da, vidc_sfr_da(),
 +        vidc_smmu_on ? "on" : "OFF, truncated physical address");
++    printf("PANDORA VIDC: readback DA=%08x size=%08x DA2=%08x en=%08x sfr=%08x\n",
++        vidc_rd(R_CPU_QUEUE_TABLE_DA), vidc_rd(R_CPU_QUEUE_TABLE_SIZE),
++        vidc_rd(R_CPU_QUEUE_TABLE_DA2), vidc_rd(R_CPU_QUEUE_TABLE_EN),
++        vidc_rd(R_CPU_QUEUE_TABLE_ADDR2));
 +
 +    /* 0xA0024/0xA0028 carry the TrustZone content-protection span: the vendor
 +     * derives it from its CP resource table and only writes it when that table
@@ -1097,12 +1115,12 @@ index 0000000..2b9591c
 +        const uint32_t fsr = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
 +        const uint32_t far = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x60));
 +        const uint32_t sctlr = vidc_smmu_rd(vidc_smmu_cb);
-+        printf("PANDORA VIDC: smmu gfsr=%08x fsr=%08x far=%08x sctlr=%08x\n",
-+            gfsr, fsr, far, sctlr);
-+        if (fsr) {
-+            printf("PANDORA VIDC: smmu FAULTED - the VPU did run and was "
-+                "mistranslated, not gated\n");
-+        }
++        /* ArmSmmu4KProgram.c defines FSR_FAULT as 0xc00001fe.  0x400 has none
++         * of those bits, so it is NOT a context fault -- an earlier revision of
++         * this diagnostic printed "the VPU did run and was mistranslated" for
++         * it, which was a false positive worth remembering. */
++        printf("PANDORA VIDC: smmu gfsr=%08x fsr=%08x far=%08x sctlr=%08x fault=%s\n",
++            gfsr, fsr, far, sctlr, (fsr & 0xc00001feu) ? "YES" : "no(0x400 is not a fault)");
 +    }
 +    return -1;
 +}
