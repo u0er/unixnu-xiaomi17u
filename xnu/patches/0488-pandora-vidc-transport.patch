@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..156f3d1
+index 0000000..a79ed4a
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,1339 @@
+@@ -0,0 +1,1378 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -287,7 +287,12 @@ index 0000000..156f3d1
 +#define VIDC_SMMU_SIZE          0x00100000u
 +#define VIDC_IOVA_BASE          0xFF000000ull /* < 0xffc00000 DMA limit */
 +#define VIDC_IOVA_SFR           0xFF400000ull /* its own 4 KiB page */
-+#define VIDC_SMMU_TABLE_PAGES   64u           /* 3 ranges -> ~12 pages needed */
++/* ArmSmmu4KBuild reported `pages 10` for our three ranges on the real
++ * hardware, so 16 pages leaves 60% headroom while keeping the permanent
++ * wired footprint small: at 64 pages the extra 192 KiB of wired memory
++ * contributed to a kernel-map exhaustion (kmem_alloc 128 KiB failing with
++ * KERN_NO_SPACE at 5.17 s on the first level-4 run). */
++#define VIDC_SMMU_TABLE_PAGES   16u
 +/* Leaves actually mapped: carveout 8 MiB (2048) + qtable 0x310000 (784) +
 + * SFR 4 KiB (1) = 2836, so the budget must exceed that or ArmSmmu4KBuild
 + * refuses with ArmSmmu4KBudget. */
@@ -300,6 +305,8 @@ index 0000000..156f3d1
 +static uint32_t vidc_qtable_iova;
 +static uint32_t vidc_sfr_iova;
 +static bool     vidc_smmu_on;
++static uint32_t vidc_smmu_cb;      /* CB base offset inside apps-smmu */
++static uint32_t vidc_smmu_bank;
 +
 +/* Verdict accumulator: one line per stage so a single boot returns the ladder. */
 +static uint32_t vidc_pass_mask;
@@ -678,6 +685,8 @@ index 0000000..156f3d1
 +
 +    vidc_qtable_iova = (uint32_t)VIDC_IOVA_BASE;
 +    vidc_sfr_iova = (uint32_t)VIDC_IOVA_SFR;
++    vidc_smmu_cb = cb_off;
++    vidc_smmu_bank = bank;
 +    vidc_smmu_on = true;
 +    printf("PANDORA VIDC: apps-smmu bank %u asid %u cb %#x sctlr %08x/%08x "
 +           "tcr %08x ttbr0 %#llx pages %zu\n", bank, asid, cb_off, sctlr,
@@ -1007,6 +1016,36 @@ index 0000000..156f3d1
 +    printf("PANDORA VIDC: queue table publish TIMEOUT (stat=%08x boot=%08x spare0=%08x)\n",
 +        vidc_rd(R_CPU_QUEUE_TABLE_STAT), vidc_rd(R_CPU_BOOT_CTRL),
 +        vidc_rd(R_WRAPPER_SPARE_0));
++    /* Why the Xtensa never reports ready, measured rather than guessed.
++     *
++     * Vendor fact (msm_video.ko): __power_on_iris4 / _controller / _hardware
++     * contain NO __write_register at all -- power-on is genpd+clk only -- and
++     * __power_off_iris4_hardware does write WRAPPER_CORE_CLK (0xB0088)=0.  So if
++     * the wrapper core clock is left gated, the core never fetches its firmware
++     * and 0xA004C stays 0 forever, which is exactly what we see.  The same
++     * snapshot also tells us whether the VPU actually touched memory at all:
++     * an SMMU context fault (CB_FSR != 0) would mean the firmware started but
++     * its accesses were mistranslated, a completely different fix. */
++    printf("PANDORA VIDC: core clk=%08x pwr=%08x boot=%08x a2h=%08x x2rpmh=%08x\n",
++        vidc_rd(R_WRAPPER_CORE_CLK), vidc_rd(R_WRAPPER_CORE_PWR),
++        vidc_rd(R_CPU_BOOT_CTRL), vidc_rd(R_CPU_A2HSOFTINTCLR),
++        vidc_rd(R_CPU_X2RPMH));
++    printf("PANDORA VIDC: bridge ahb=%08x apv=%08x lpi=%08x/%08x noc=%08x/%08x\n",
++        vidc_rd(R_CPU_AHB_BRIDGE_RESET), vidc_rd(R_CPU_APV_BRIDGE_RESET),
++        vidc_rd(R_AON_NOC_LPI_CTRL), vidc_rd(R_AON_NOC_LPI_STATUS),
++        vidc_rd(R_AON_NOC_RESET_REQ), vidc_rd(R_AON_NOC_RESET_ACK));
++    if (vidc_smmu_on) {
++        const uint32_t gfsr = vidc_smmu_rd(0x48);
++        const uint32_t fsr = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
++        const uint32_t far = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x60));
++        const uint32_t sctlr = vidc_smmu_rd(vidc_smmu_cb);
++        printf("PANDORA VIDC: smmu gfsr=%08x fsr=%08x far=%08x sctlr=%08x\n",
++            gfsr, fsr, far, sctlr);
++        if (fsr) {
++            printf("PANDORA VIDC: smmu FAULTED - the VPU did run and was "
++                "mistranslated, not gated\n");
++        }
++    }
 +    return -1;
 +}
 +
