@@ -674,7 +674,7 @@
  	case AFC_OP_READ_DIR:
  		afc_read_dir(conn, c, (const char *)pl);
  		break;
-@@ -1074,17 +1467,34 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+@@ -1074,17 +1467,40 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
  		afc_file_info(conn, c, (const char *)pl);
  		break;
  	case AFC_OP_FILE_OPEN: {
@@ -700,7 +700,13 @@
 +			mode = apple_le64(pl);
 +			rel = (const char *)(const void *)(pl + 8);
 +		} else {
-+			nlen = strlen((const char *)pl) + 1;
++			const uint8_t *nul = memchr(pl, '\0', len);
++
++			if (nul == NULL) {
++				afc_status(conn, c, AFC_E_INVALID);
++				break;
++			}
++			nlen = (size_t)(nul - pl) + 1;
 +			if (len < nlen + 4) {
 +				afc_status(conn, c, AFC_E_INVALID);
 +				break;
@@ -718,7 +724,7 @@
  		break;
  	}
  	case AFC_OP_FILE_READ:
-@@ -1094,15 +1504,54 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+@@ -1094,15 +1510,54 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
  		}
  		afc_file_read(conn, c, apple_le64(pl), apple_le64(pl + 8));
  		break;
@@ -775,7 +781,7 @@
  
  		if (len < 8) {
  			afc_status(conn, c, AFC_E_INVALID);
-@@ -1113,16 +1562,32 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+@@ -1113,16 +1568,32 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
  			afc_status(conn, c, AFC_E_INVALID);
  			break;
  		}
@@ -810,7 +816,7 @@
  			afc_status(conn, c, AFC_E_INVALID);
  			break;
  		}
-@@ -1131,7 +1596,32 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+@@ -1131,7 +1602,32 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
  			afc_status(conn, c, AFC_E_INVALID);
  			break;
  		}
@@ -844,7 +850,7 @@
  		afc_status(conn, c, AFC_E_SUCCESS);
  		break;
  	}
-@@ -1152,6 +1642,39 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+@@ -1152,6 +1648,39 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
  		afc_reply(conn, c, AFC_OP_FILE_TELL_RES, out, sizeof(out));
  		break;
  	}
@@ -884,7 +890,7 @@
  	case AFC_OP_MAKE_DIR: {
  		char path[512];
  
-@@ -1180,6 +1703,9 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+@@ -1180,10 +1709,22 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
  		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
  		break;
  	}
@@ -893,8 +899,22 @@
 +		break;
  	case AFC_OP_RENAME: {
  		char from[512], to[512];
- 		size_t n = strlen((const char *)pl) + 1;
-@@ -1193,8 +1719,14 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+-		size_t n = strlen((const char *)pl) + 1;
++		const uint8_t *nul = memchr(pl, '\0', len);
++		size_t n;
+ 
++		/* RENAME is [from\0][to\0]; find the split inside the declared
++		 * payload instead of trusting strlen() on a buffer the host
++		 * controls. */
++		if (nul == NULL || pl[0] == '\0') {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		n = (size_t)(nul - pl) + 1;
+ 		if (afc_path((const char *)pl, from, sizeof(from)) != 0 ||
+ 		    afc_path((const char *)pl + n, to, sizeof(to)) != 0) {
+ 			afc_status(conn, c, AFC_E_PERM);
+@@ -1193,8 +1734,14 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
  		break;
  	}
  	default:
@@ -910,7 +930,7 @@
  		break;
  	}
  }
-@@ -1207,6 +1739,13 @@ afc_input(void *conn, void *ctx, const uint8_t *buf, uint32_t len)
+@@ -1207,6 +1754,13 @@ afc_input(void *conn, void *ctx, const uint8_t *buf, uint32_t len)
  	if (c == NULL) {
  		return;
  	}
@@ -924,7 +944,7 @@
  	if (len > AFC_BUF - c->len) {
  		printf("APPLE AFC: packet too large, dropping\n");
  		c->len = 0;
-@@ -1216,8 +1755,9 @@ afc_input(void *conn, void *ctx, const uint8_t *buf, uint32_t len)
+@@ -1216,8 +1770,9 @@ afc_input(void *conn, void *ctx, const uint8_t *buf, uint32_t len)
  	c->len += len;
  
  	for (;;) {
@@ -936,7 +956,7 @@
  
  		if (c->len < AFC_HDR) {
  			break;
-@@ -1229,7 +1769,18 @@ afc_input(void *conn, void *ctx, const uint8_t *buf, uint32_t len)
+@@ -1229,7 +1784,18 @@ afc_input(void *conn, void *ctx, const uint8_t *buf, uint32_t len)
  		}
  		total = apple_le64((const uint8_t *)c->buf + 8);
  		this_len = apple_le64((const uint8_t *)c->buf + 16);
@@ -955,22 +975,40 @@
  		if (total < AFC_HDR || total > AFC_BUF || this_len < AFC_HDR ||
  		    this_len > total) {
  			printf("APPLE AFC: bad lengths %llu/%llu\n",
-@@ -1241,12 +1792,18 @@ afc_input(void *conn, void *ctx, const uint8_t *buf, uint32_t len)
+@@ -1241,12 +1807,35 @@ afc_input(void *conn, void *ctx, const uint8_t *buf, uint32_t len)
  			break;
  		}
  		plen = (uint32_t)(this_len - AFC_HDR);
-+		extralen = (uint32_t)(total - this_len);
-+		extra = (const uint8_t *)c->buf + this_len;
- 		/* keep the request readable for the handler: it is NUL terminated
+-		/* keep the request readable for the handler: it is NUL terminated
 -		 * only when the host says so, so make sure of it */
 -		if (plen != 0) {
-+		 * only when the host says so, so make sure of it.  The byte after
-+		 * this_length's payload is the first byte of the trailing payload,
-+		 * so NUL-terminate in place only when there is no tail. */
-+		if (plen != 0 && extralen == 0) {
++		extralen = (uint32_t)(total - this_len);
++		extra = (const uint8_t *)c->buf + this_len;
++		/* Keep the request readable for the handler: it is NUL terminated
++		 * only when the host says so, so make sure of it.  The byte at
++		 * this_length is the first byte of the trailing payload when there
++		 * is one, so NUL-terminate in place only when there is no tail.
++		 * Terminate even for an empty payload: a path-carrying opcode with
++		 * plen == 0 would otherwise strlen() stale bytes from an earlier
++		 * request. */
++		if (extralen == 0) {
  			c->buf[AFC_HDR + plen] = '\0';
  		}
 -		afc_dispatch(conn, c, op, (const uint8_t *)c->buf + AFC_HDR, plen);
++		/*
++		 * Only the two write opcodes carry a trailing payload.  For
++		 * anything else extra bytes mean the header is malformed, and
++		 * since a trailing payload also suppresses the NUL terminator
++		 * (see above) a path-carrying request would then run strlen()
++		 * off the end of the buffer.  Refuse it instead of guessing.
++		 */
++		if (extralen != 0 && op != AFC_OP_FILE_WRITE &&
++		    op != AFC_OP_FILE_WRITE_OFFSET) {
++			printf("APPLE AFC: trailing payload on op 0x%llx\n",
++			    (unsigned long long)op);
++			c->len = 0;
++			break;
++		}
 +		c->reqno = pktno;
 +		afc_dispatch(conn, c, op, (const uint8_t *)c->buf + AFC_HDR, plen,
 +		    extra, extralen);
