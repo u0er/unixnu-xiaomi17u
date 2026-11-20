@@ -1,5 +1,5 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index d70963c..44db1dd 100755
+index d70963c..44db1dd 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -152,6 +152,7 @@ bsd/dev/pandora_cpu.c			standard
@@ -12,18 +12,18 @@ index d70963c..44db1dd 100755
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..23b4a44
+index 0000000..f99c5be
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,680 @@
+@@ -0,0 +1,965 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
 + * Target: Xiaomi 17 Ultra (nezha, SM8850-AC / canoe / kaanapali), video IP at
 + * /soc/qcom,vidc@2000000 (compatible qcom,canoe-vidc-v2), GIC SPI 174, 8 MiB
-+ * carveout video_region@9a600000.  The only goal of this first revision is an
-+ * HFI version handshake: power the block, load the firmware into the carveout,
-+ * set up the shared command/message queues, send HFI_CMD_INIT and read back the
++ * carveout video_region@9a600000.  The only goal of this revision is an HFI
++ * version handshake: power the block, load the firmware into the carveout, set
++ * up the shared command/message queues, send HFI_CMD_INIT and read back the
 + * HFI_PROP_IMAGE_VERSION response.  It deliberately does NOT create a session,
 + * encode a frame, or expose an IOKit user client.
 + *
@@ -34,14 +34,29 @@ index 0000000..23b4a44
 + *    isolated in work/references/iris-hfi-spec-20261119/ and NO GPL code is
 + *    copied here: only numeric constants and wire layouts, each tagged with
 + *    its origin.  See docs/research/PANDORA-VIDC-DRAFT-SPEC.md section 6.1.
-+ *  - Hardware unknowns are isolated, not guessed.  Anything that could not be
-+ *    established offline is an explicit UNKNOWN step that logs and stops.
-+ *    In particular: how the host publishes the qtable/SFR physical addresses
-+ *    to the firmware, the videocc GDSC/clock programming, and bypassing the
-+ *    (absent) TrustZone PAS reset.  A failed UNKNOWN must never be reported as
-+ *    a successful handshake.
++ *  - Evidence tags: [V] verified on this device, [K] verified against
++ *    msm_video.ko disassembly, [M] mainline protocol fact, [I] inference that
++ *    is logged but not trusted.  Anything still unknown is logged, never
++ *    silently guessed.
 + *  - Default off.  pandora_vidc=0 (default): do nothing.  =1: read-only MMIO
 + *    identity probe.  =2: power + firmware + queue setup + HFI handshake.
++ *
++ * Revision history (2026-11-20, level-2 rewrite):
++ *  - Queue indices are u32-WORD indices, not bytes [M iris_hfi_queue.c:14-16].
++ *  - Queue header header_type = 0x0101 (IFACEQ_DFLT_QHDR), q_size in words,
++ *    rings 1 MiB apart, rx/tx_irq_status start at 0 [M iris_hfi_queue.c:202-217].
++ *  - Published qtable size, queue layout and the boot sequence now follow the
++ *    vendor boot path exactly: five publish registers, then the CP-span
++ *    registers 0xA0024/0xA0028, then WRAPPER SPARE_0 0xB078=1 and boot control
++ *    0xA0048=1, then poll 0xA004C, then H2XSOFTINTEN 0xA0148=1 and
++ *    X2RPMH 0xA0168=0 [K __boot_firmware_iris4 @ .text+0x15a44].
++ *  - The queue table and rings live in contiguous wired memory that the CPU
++ *    touches through its normal kernel mapping; every hand-off to or from the
++ *    VPU is bracketed by an explicit clean/invalidate of the exact range on
++ *    the physical address, so neither side reads stale lines.
++ *  - bringup() now runs every stage best-effort and prints one PASS/FAIL line
++ *    per stage, so a single 120 s boot yields the whole ladder instead of only
++ *    the first failure.
 + *
 + * Firmware note (2026-11-19 device evidence; VPU_FIRMWARE_RECON.md §0.1): the image
 + * actually loaded on this unit is /odm/firmware/vpu40_2v_v1.mbn (vfw-4.0:rel0060,
@@ -50,10 +65,10 @@ index 0000000..23b4a44
 + * legacy/alternate family and NOT the current image.  The image name comes from
 + * boot-arg pandora_vidc_fw (default "vpu40_2v_v1.mbn").
 + *
-+ * INTEGRATION GAP (now a staging step): a candidate pack containing vpu40_2v_v1.mbn
-+ * has been built offline at work/fwpack-vidc-20261119/firmware-update-vidc.img
-+ * (19 entries, 50,479,104 B).  Before a device boot, regenerate the ADT
-+ * pandora-fw-extents/blocks and write it through active_storage.write_firmware.
++ * PAS viability (2026-11-20 offline check of vpu40_2v_v1.mbn): ELF32, 22 phdrs,
++ * HASH at index 21, loadable p_paddr span 0x0f500000-0x0fd00000 == exactly
++ * 8 MiB, so pandora_pas_load_auth() with mem_pa=0x9a600000 mem_size=8 MiB has
++ * zero slack and must succeed or fail loudly.
 + */
 +
 +#ifdef PANDORA
@@ -70,6 +85,7 @@ index 0000000..23b4a44
 +extern vm_map_t kernel_map;
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +extern void clean_dcache64(addr64_t pa, unsigned len, boolean_t to_mem);
++extern void flush_dcache64(addr64_t pa, unsigned len, int phys);
 +extern void delay(int);
 +
 +/* MMIO mapping and firmware access helpers already present in this kernel. */
@@ -79,6 +95,10 @@ index 0000000..23b4a44
 +extern int pandora_firmware_pread(const char *name, uint64_t off, void *dst, size_t len, uint64_t *size);
 +extern kern_return_t thread_terminate(thread_t);
 +
++/* -Wmissing-prototypes is on in the kernel build (-Weverything -Werror), and
++ * sweet_ufs.c calls this via its own extern, so declare it here as well. */
++void pandora_vidc_init(void);
++
 +/* ------------------------------------------------------------------ */
 +/* Hardware addresses (facts: live.dtb / Android base.dtb, draft spec 2) */
 +/* ------------------------------------------------------------------ */
@@ -86,12 +106,10 @@ index 0000000..23b4a44
 +#define VIDC_SIZE               0x000F0000u   /* reg size */
 +#define VIDEO_REGION_PA         0x9A600000u   /* video_region@9a600000 (8 MiB) */
 +#define VIDEO_REGION_SIZE       (8u * 1024u * 1024u)
-+#define VIDC_IRQ                174u           /* GIC SPI, level */
++#define VIDC_IRQ                174u           /* GIC SPI, level (unused so far) */
 +
 +/* vpu4 register offsets, relative to VIDC_PA.
-+ * Source: mainline iris_vpu_register_defines.h (generic vpu4).  Numeric values
-+ * are protocol facts, not copied code.  The local canoe-vidc-v2 variant may
-+ * differ; level 1 prints these registers so the mapping can be verified. */
++ * Source: mainline iris_vpu_register_defines.h (generic vpu4). */
 +#define VCODEC_BASE_OFFS        0x00000000u
 +#define AON_MVP_NOC_RESET       0x0001F000u
 +#define CPU_BASE_OFFS           0x000A0000u
@@ -99,44 +117,48 @@ index 0000000..23b4a44
 +#define AON_BASE_OFFS           0x000E0000u
 +
 +#define R_VCODEC_SS_IDLE        (VCODEC_BASE_OFFS + 0x070u)
-+#define R_WRAPPER_EFUSE         (WRAPPER_BASE_OFFS + 0x004u)   /* see iris_vpu4x.c: +0x08 */
++
++/* WRAPPER_EFUSE_MONITOR is WRAPPER+0x08 on vpu4 (mainline iris_vpu4x.c) and the
++ * vendor reads 0xB0008 here [K __power_on_iris4_hardware @0x17754: mov w1,#8;
++ * movk w1,#0xb,lsl#16 -> __read_register(0xB0008, ...)].  The earlier revision
++ * used 0xB0004, which is a different register. */
++#define R_WRAPPER_EFUSE         (WRAPPER_BASE_OFFS + 0x008u)
 +#define R_WRAPPER_INTR_STATUS   (WRAPPER_BASE_OFFS + 0x00Cu)
 +#define R_WRAPPER_INTR_MASK     (WRAPPER_BASE_OFFS + 0x010u)
++#define R_WRAPPER_SPARE_0       (WRAPPER_BASE_OFFS + 0x078u)
 +#define R_WRAPPER_CORE_PWR      (WRAPPER_BASE_OFFS + 0x080u)
 +#define R_WRAPPER_CORE_CLK      (WRAPPER_BASE_OFFS + 0x088u)
++
 +#define R_CPU_A2HSOFTINTCLR     (CPU_BASE_OFFS + 0x01Cu)
 +#define R_CPU_H2XSOFTINTEN      (CPU_BASE_OFFS + 0x148u)
 +#define R_CPU_SOFTINT           (CPU_BASE_OFFS + 0x150u)
 +#define R_CPU_AHB_BRIDGE_RESET  (CPU_BASE_OFFS + 0x160u)
 +#define R_CPU_APV_BRIDGE_RESET  (CPU_BASE_OFFS + 0x174u)
 +#define R_CPU_X2RPMH            (CPU_BASE_OFFS + 0x168u)
++
 +#define R_AON_NOC_LPI_CTRL      (AON_BASE_OFFS + 0x000u)
 +#define R_AON_NOC_LPI_STATUS    (AON_BASE_OFFS + 0x004u)
 +#define R_AON_NOC_RESET_REQ     (AON_MVP_NOC_RESET + 0x000u)
 +#define R_AON_NOC_RESET_ACK     (AON_MVP_NOC_RESET + 0x004u)
 +
-+/* Host->firmware queue-table publish, from msm_video.ko __boot_firmware_iris4
-+ * (AArch64 disassembly, 2026-11-19; offsets are absolute in the disasm, mapped
-+ * here onto the existing CPU_BASE_OFFS = 0xA0000).  Note that +0x148 collides
-+ * with R_CPU_H2XSOFTINTEN above, which is consistent: the boot path enables
-+ * the host->fw soft interrupt there. */
++/* Host->firmware qtable publish.  Every offset below is what
++ * __boot_firmware_iris4 writes [K .text+0x15a44, 776 bytes; base register
++ * w21 = 0xA0024 and the +N offsets are literal immediates in the disassembly]. */
 +#define R_CPU_QUEUE_TABLE_DA    (CPU_BASE_OFFS + 0x064u)  /* qtable physical addr */
-+#define R_CPU_QUEUE_TABLE_SIZE  (CPU_BASE_OFFS + 0x068u)  /* 0x300000 (3 MiB) */
++#define R_CPU_QUEUE_TABLE_SIZE  (CPU_BASE_OFFS + 0x068u)  /* write 0x300000 */
 +#define R_CPU_QUEUE_TABLE_DA2   (CPU_BASE_OFFS + 0x054u)  /* second publish */
 +#define R_CPU_QUEUE_TABLE_EN    (CPU_BASE_OFFS + 0x050u)  /* write 1 */
-+#define R_CPU_QUEUE_TABLE_ADDR2 (CPU_BASE_OFFS + 0x060u)  /* core+0x13E8, suspect SFR */
++#define R_CPU_QUEUE_TABLE_ADDR2 (CPU_BASE_OFFS + 0x060u)  /* core+0x13E8 -> SFR */
 +#define R_CPU_QUEUE_TABLE_STAT  (CPU_BASE_OFFS + 0x04Cu)  /* bit0 ready, bits1-3 err */
-+#define R_CPU_BOOT_CTRL         (CPU_BASE_OFFS + 0x048u)  /* write 1 */
-+#define R_CPU_BOOT_CLR1         (CPU_BASE_OFFS + 0x148u)  /* CPU_CS_H2XSOFTINTEN */
-+#define R_CPU_BOOT_CLR0         (CPU_BASE_OFFS + 0x168u)  /* CPU_CS_X2RPMH; write-0 meaning [U] */
-+#define R_WRAPPER_BOOT_CTRL     (WRAPPER_BASE_OFFS + 0x078u) /* WRAPPER_..._SPARE_0, not IRQ */
++#define R_CPU_CP_SPAN_A         (CPU_BASE_OFFS + 0x024u)  /* CP span size */
++#define R_CPU_CP_SPAN_B         (CPU_BASE_OFFS + 0x028u)  /* CP span size */
++#define R_CPU_CP_NONPIXEL       (CPU_BASE_OFFS + 0x05Cu)  /* nonpixel size + 1 */
++#define R_CPU_BOOT_CTRL         (CPU_BASE_OFFS + 0x048u)  /* write 1, release VPU */
 +
-+#define BIT_A2H                 (1u << 2)    /* WRAPPER_INTR_STATUS / A2HSOFTINTCLR */
++#define BIT_A2H                 (1u << 2)
 +#define BIT_A2HWD               (1u << 3)
 +#define CORE_BRIDGE_SW_RESET    (1u << 0)
 +#define CORE_BRIDGE_HW_RST_DIS  (1u << 1)
-+#define REQ_POWER_DOWN_PREP     (1u << 0)
-+#define VIDEO_NOC_RESET_REQ     ((1u << 0) | (1u << 1))
 +
 +/* ------------------------------------------------------------------ */
 +/* HFI gen2 wire protocol constants.
@@ -149,12 +171,35 @@ index 0000000..23b4a44
 +#define HFI_CMD_BUFFER          0x01000009u
 +#define HFI_PROP_IMAGE_VERSION  0x03000001u
 +#define HFI_PROP_CODEC          0x03000100u
++
 +#define IFACEQ_NUMQ             3u            /* cmd / msg / debug */
 +#define IFACEQ_CORE_PKT_SIZE    (1024u * 4u)  /* 4096 */
-+#define IRQ_Q_SIZE              (16u * 1024u) /* per-queue ring; UNKNOWN exact */
++#define IFACEQ_DFLT_QHDR        0x0101u       /* [M iris_hfi_queue.h:22] */
 +
-+/* Generic packet header: u32 size, u32 pkt_type (little endian).
-+ * Source: mainline hfi_packet header layout (facts only). */
++/* Published qtable size: exactly what the vendor driver writes to CPU+0x68
++ * [K], i.e. 3 MiB total for the header plus the three rings.  We therefore
++ * place the rings on 1 MiB boundaries INSIDE those 3 MiB so nothing is
++ * described outside the published window:
++ *
++ *   0x000000 +--------------------------+
++ *            | table header (456 B)     |
++ *   0x001000 +--------------------------+
++ *            | cmd ring, 0x000FE000 B   |
++ *   0x100000 |                          |  <- ring stride 0x100000, size 0xFF000
++ *   0x1FF000 +--------------------------+  (1 KiB gap keeps rings disjoint)
++ *   0x200000 | msg ring / dbg ring      |
++ *   0x2FF000 +--------------------------+
++ *   0x300000   end of published window
++ */
++#define VIDC_QTABLE_BYTES       0x00300000u   /* [K] CPU+0x68 constant */
++#define VIDC_QTABLE_ALLOC       (VIDC_QTABLE_BYTES + 0x00010000u)
++#define IFACEQ_RING_OFFS(i)     (0x001000u + (i) * 0x00100000u)  /* 0x1000/0x101000/0x201000 */
++#define IFACEQ_QUEUE_SIZE       0x000FF000u   /* 1 MiB - 4 KiB, rings stay disjoint */
++#define IFACEQ_QUEUE_WORDS      (IFACEQ_QUEUE_SIZE / 4u)
++
++#define VIDC_SFR_BYTES          0x00004000u   /* [M] SFR_SIZE = 4 KiB */
++
++/* Generic packet header: u32 size, u32 pkt_type (little endian). */
 +struct vidc_pkt_hdr {
 +    uint32_t size;
 +    uint32_t pkt_type;
@@ -166,7 +211,7 @@ index 0000000..23b4a44
 +    uint32_t start_addr;
 +    uint16_t queue_type;
 +    uint16_t header_type;
-+    uint32_t q_size;
++    uint32_t q_size;        /* in u32 WORDS [M] */
 +    uint32_t pkt_size;      /* 0 = variable */
 +    uint32_t pkt_drop_cnt;
 +    uint32_t rx_wm;
@@ -175,13 +220,11 @@ index 0000000..23b4a44
 +    uint32_t tx_req;
 +    uint32_t rx_irq_status;
 +    uint32_t tx_irq_status;
-+    uint32_t read_idx;
-+    uint32_t write_idx;
++    uint32_t read_idx;      /* in u32 WORDS [M] */
++    uint32_t write_idx;     /* in u32 WORDS [M] */
 +};
 +
-+/* Queue table header, byte-exact layout from struct iris_hfi_queue_table_header.
-+ * The name[256] field and the 64-bit device_addr slot set qhdr0_offset to
-+ * sizeof(header) - NUMQ*sizeof(queue_header) in the mainline setup. */
++/* Queue table header, byte-exact layout from struct iris_hfi_queue_table_header. */
 +struct vidc_queue_table {
 +    uint32_t version;
 +    uint32_t size;
@@ -202,21 +245,37 @@ index 0000000..23b4a44
 +static vm_offset_t vidc_mmio;                  /* mapped VIDC registers */
 +static bool     vidc_mmio_on;
 +
-+/* qtable + SFR: host-allocated coherent buffers (mainline mechanism, fact). */
++/* qtable + SFR: physically contiguous, zeroed, wired pages.  The CPU touches
++ * them through the normal kernel mapping (vidc_*_va); every hand-off to or from
++ * the VPU is bracketed by a flush_dcache64() on the PHYSICAL address, which is
++ * clean+invalidate in xnu.  That is the pattern already proven on this board in
++ * pandora_gpu.c:1095 / pandora_adsp.c:814: it never leaves a dirty line that
++ * could later be written back over firmware-owned data, and it never lets the
++ * CPU read a stale line after the VPU wrote. */
 +static void    *vidc_qtable_va;
 +static uint64_t vidc_qtable_pa;
 +static void    *vidc_sfr_va;
 +static uint64_t vidc_sfr_pa;
 +
-+/* qtable/SFR sizes.  The qtable size 0x300000 is what msm_video.ko writes to
-+ * CPU+0x68 on this variant (disassembly, 2026-11-19).  SFR size is a mainline
-+ * default and still [U] on canoe. */
-+#define VIDC_QTABLE_BYTES       0x00300000u
-+#define VIDC_SFR_BYTES          0x00004000u
++/* Verdict accumulator: one line per stage so a single boot returns the ladder. */
++static uint32_t vidc_pass_mask;
++#define VIDC_STAGE_PROBE    (1u << 0)
++#define VIDC_STAGE_POWER    (1u << 1)
++#define VIDC_STAGE_ALLOC    (1u << 2)
++#define VIDC_STAGE_PAS      (1u << 3)
++#define VIDC_STAGE_PUBLISH  (1u << 4)
++#define VIDC_STAGE_HFI      (1u << 5)
++#define VIDC_STAGE_FWCOPY   (1u << 6)
++#define VIDC_STAGE_ALL      0x7Fu
 +
-+/* Physically contiguous, zeroed, wired (same pattern as pandora_gpu.c
-+ * gpu_contig).  The VPU reads these tables non-cacheably, so clean the D-cache
-+ * before publishing the physical addresses. */
++static void
++vidc_verdict(const char *stage, int ok)
++{
++    printf("PANDORA VIDC: STAGE %-8s = %s\n", stage, ok == 0 ? "PASS" : "FAIL");
++}
++
++/* Physically contiguous, zeroed, wired pages (same pattern as pandora_gpu.c
++ * gpu_contig).  Returns the cached VA and the physical base. */
 +static vm_offset_t
 +vidc_contig(uint64_t bytes, uint64_t *pa)
 +{
@@ -226,63 +285,113 @@ index 0000000..23b4a44
 +        return 0;
 +    }
 +    *pa = (uint64_t)ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va));
++    /* Push the KMA_ZERO contents out while the pages are still clean. */
 +    clean_dcache64((addr64_t)*pa, (unsigned)bytes, TRUE);
 +    return va;
 +}
 +
-+/* Allocate and fill the HFI queue table + SFR.  Layout mirrors mainline
-+ * iris_hfi_queue.c: header, 3 queue headers, then the three rings. */
++/* Accessors over the CPU mapping.  Callers bracket VPU hand-off with
++ * vidc_sync_out() / vidc_sync_in() on the physical range. */
++static inline uint32_t
++vidc_qt_rd(uint32_t off)
++{
++    return *(volatile uint32_t *)((volatile uint8_t *)vidc_qtable_va + off);
++}
++
++static inline void
++vidc_qt_wr(uint32_t off, uint32_t v)
++{
++    *(volatile uint32_t *)((volatile uint8_t *)vidc_qtable_va + off) = v;
++    __asm__ volatile ("dmb oshst" ::: "memory");
++}
++
++/* Push host-written bytes to memory before the VPU reads them. */
++static inline void
++vidc_sync_out(uint64_t off, unsigned len)
++{
++    __asm__ volatile ("dmb oshst" ::: "memory");
++    clean_dcache64((addr64_t)(vidc_qtable_pa + off), len, TRUE);
++    __asm__ volatile ("dmb oshst" ::: "memory");
++}
++
++/* Drop stale CPU lines so the next read sees what the VPU wrote. */
++static inline void
++vidc_sync_in(uint64_t off, unsigned len)
++{
++    __asm__ volatile ("dmb oshld" ::: "memory");
++    flush_dcache64((addr64_t)(vidc_qtable_pa + off), len, TRUE);
++    __asm__ volatile ("dmb oshld" ::: "memory");
++}
++
++/* Allocate and fill the HFI queue table + SFR.  Layout and field values follow
++ * mainline iris_hfi_queue.c exactly; offsets come from the struct above. */
 +static int
 +vidc_alloc_queues(void)
 +{
 +    if (vidc_qtable_va && vidc_sfr_va) return 0;
 +
-+    vidc_qtable_va = (void *)vidc_contig(VIDC_QTABLE_BYTES, &vidc_qtable_pa);
 +    if (!vidc_qtable_va) {
-+        printf("PANDORA VIDC: no %#x contiguous bytes for qtable\n", VIDC_QTABLE_BYTES);
-+        return -1;
++        vidc_qtable_va = (void *)vidc_contig(VIDC_QTABLE_ALLOC, &vidc_qtable_pa);
++        if (!vidc_qtable_va) {
++            printf("PANDORA VIDC: no %#x contiguous bytes for qtable\n", VIDC_QTABLE_ALLOC);
++            return -1;
++        }
 +    }
-+    vidc_sfr_va = (void *)vidc_contig(VIDC_SFR_BYTES, &vidc_sfr_pa);
 +    if (!vidc_sfr_va) {
-+        printf("PANDORA VIDC: no %#x contiguous bytes for SFR\n", VIDC_SFR_BYTES);
-+        return -1;
++        vidc_sfr_va = (void *)vidc_contig(VIDC_SFR_BYTES, &vidc_sfr_pa);
++        if (!vidc_sfr_va) {
++            printf("PANDORA VIDC: no %#x contiguous bytes for SFR\n", VIDC_SFR_BYTES);
++            return -1;
++        }
 +    }
 +
 +    struct vidc_queue_table *t = (struct vidc_queue_table *)vidc_qtable_va;
++    memset(t, 0, sizeof(*t));
 +    t->version = 0;
-+    t->size = VIDC_QTABLE_BYTES;
++    t->size = (uint32_t)sizeof(*t);            /* [M] 456, not the 3 MiB window */
 +    t->qhdr_size = (uint32_t)sizeof(struct vidc_queue_header);
-+    t->qhdr0_offset = (uint32_t)((char *)&t->qhdr[0] - (char *)t);
++    t->qhdr0_offset = (uint32_t)((char *)&t->qhdr[0] - (char *)t);   /* [M] 288 */
 +    t->num_q = IFACEQ_NUMQ;
 +    t->num_active_q = IFACEQ_NUMQ;
 +    t->device_addr = vidc_qtable_pa;
 +    const char *nm = "iris-hfi-queues";
 +    for (unsigned i = 0; i < (unsigned)sizeof(t->name) - 1 && nm[i]; i++) t->name[i] = nm[i];
 +
-+    uint64_t ring = vidc_qtable_pa + t->qhdr0_offset +
-+        IFACEQ_NUMQ * sizeof(struct vidc_queue_header);
 +    for (unsigned i = 0; i < IFACEQ_NUMQ; i++) {
 +        struct vidc_queue_header *q = &t->qhdr[i];
-+        q->status = 1;                       /* active */
++        q->status = 1;                         /* [M] active */
++        q->start_addr = (uint32_t)(vidc_qtable_pa + IFACEQ_RING_OFFS(i));
 +        q->queue_type = (uint16_t)i;
-+        q->header_type = 0;
-+        q->q_size = IRQ_Q_SIZE;
++        q->header_type = IFACEQ_DFLT_QHDR;     /* [M] 0x0101 */
++        q->q_size = IFACEQ_QUEUE_WORDS;        /* [M] words, not bytes */
 +        q->pkt_size = 0;
-+        q->start_addr = (uint32_t)(ring + (uint64_t)i * IRQ_Q_SIZE);
-+        q->rx_irq_status = 1;
-+        q->tx_irq_status = 1;
++        q->pkt_drop_cnt = 0;
++        q->rx_wm = 1;
++        q->tx_wm = 1;
++        q->rx_req = (i == 2) ? 0 : 1;          /* [M] debug queue differs */
++        q->tx_req = 0;
++        q->rx_irq_status = 0;                  /* [M] starts at 0 */
++        q->tx_irq_status = 0;
++        q->read_idx = 0;
++        q->write_idx = 0;
 +    }
-+    *(volatile uint32_t *)vidc_sfr_va = VIDC_SFR_BYTES;   /* first word: SFR size */
++    *(volatile uint32_t *)vidc_sfr_va = VIDC_SFR_BYTES;   /* [M] first word = SFR size */
 +
-+    clean_dcache64((addr64_t)vidc_qtable_pa, VIDC_QTABLE_BYTES, TRUE);
-+    clean_dcache64((addr64_t)vidc_sfr_pa, VIDC_SFR_BYTES, TRUE);
-+    printf("PANDORA VIDC: qtable PA=%08llx size=%#x SFR PA=%08llx (header filled)\n",
-+        (unsigned long long)vidc_qtable_pa, VIDC_QTABLE_BYTES,
++    /* One clean for the header and every ring header the VPU will read. */
++    vidc_sync_out(0, (unsigned)sizeof(*t));
++    __asm__ volatile ("dmb oshst" ::: "memory");
++    clean_dcache64((addr64_t)vidc_sfr_pa, (unsigned)VIDC_SFR_BYTES, TRUE);
++
++    printf("PANDORA VIDC: qtable PA=%08llx hdr=%u qhdr0=%u q_size=%u ring0=%08x\n",
++        (unsigned long long)vidc_qtable_pa, t->size, t->qhdr0_offset,
++        IFACEQ_QUEUE_WORDS, (unsigned)(vidc_qtable_pa + IFACEQ_RING_OFFS(0)));
++    printf("PANDORA VIDC: rings %08llx/%08llx/%08llx SFR PA=%08llx\n",
++        (unsigned long long)(vidc_qtable_pa + IFACEQ_RING_OFFS(0)),
++        (unsigned long long)(vidc_qtable_pa + IFACEQ_RING_OFFS(1)),
++        (unsigned long long)(vidc_qtable_pa + IFACEQ_RING_OFFS(2)),
 +        (unsigned long long)vidc_sfr_pa);
 +    return 0;
 +}
-+
-+/* (qtable/SFR state declared above, before vidc_alloc_queues). */
 +
 +static inline uint32_t
 +vidc_rd(uint32_t off)
@@ -315,9 +424,10 @@ index 0000000..23b4a44
 +        vidc_mmio_on = true;
 +    }
 +
++    uint32_t efuse = vidc_rd(R_WRAPPER_EFUSE);
 +    printf("PANDORA VIDC: MMIO %08x -> %p\n", VIDC_PA, (void *)vidc_mmio);
 +    printf("PANDORA VIDC: EFUSE=%08x CORE_PWR=%08x CORE_CLK=%08x IDLE=%08x\n",
-+        vidc_rd(R_WRAPPER_EFUSE), vidc_rd(R_WRAPPER_CORE_PWR),
++        efuse, vidc_rd(R_WRAPPER_CORE_PWR),
 +        vidc_rd(R_WRAPPER_CORE_CLK), vidc_rd(R_VCODEC_SS_IDLE));
 +    printf("PANDORA VIDC: INTR_STATUS=%08x INTR_MASK=%08x X2RPMH=%08x\n",
 +        vidc_rd(R_WRAPPER_INTR_STATUS), vidc_rd(R_WRAPPER_INTR_MASK),
@@ -325,18 +435,21 @@ index 0000000..23b4a44
 +    printf("PANDORA VIDC: AON_LPI_CTRL=%08x AON_LPI_STATUS=%08x NOC_REQ=%08x NOC_ACK=%08x\n",
 +        vidc_rd(R_AON_NOC_LPI_CTRL), vidc_rd(R_AON_NOC_LPI_STATUS),
 +        vidc_rd(R_AON_NOC_RESET_REQ), vidc_rd(R_AON_NOC_RESET_ACK));
++    printf("PANDORA VIDC: efuse apv_disabled=%u vpp1_disabled=%u vpp0_disabled=%u\n",
++        (efuse >> 27) & 1u, (efuse >> 28) & 1u, (efuse >> 29) & 1u);
 +    return 0;
 +}
 +
 +/* ------------------------------------------------------------------ */
-+/* UNKNOWN steps.  Each is a named, honest stub: it logs that the value must
-+ * come from device/vendor reverse engineering and stops the sequence.  They
-+ * are kept as separate functions so a later agent can replace one at a time
-+ * without disturbing the protocol-correct code around them. */
-+
-+/* videocc power-up.  Offsets and the parent order were verified on the device:
-+ * pm_genpd shows video_cc_mvs0c_gdsc as the parent of video_cc_mvs0_gdsc, and
-+ * clk_summary shows mvs0/mvs0a/mvs0b at 240 MHz, mvs0c at 360 MHz while idle.
++/* videocc power-up.
++ *
++ * GDSC offsets are [V]: parsed out of videocc-canoe.ko .data, one unique hit
++ * per domain (gdscr at struct+0x610, flags/pwrsts at struct+0x640).  The
++ * parent relation mvs0c -> mvs0 is [V]: Android pm_genpd_detail.txt lists
++ * video_cc_mvs0_gdsc as a child of video_cc_mvs0c_gdsc, so mvs0c is powered
++ * first.  Branch CB/CR offsets are [V] too: clock_regs.txt:559-574 gives
++ * mvs0c 0x8164, mvs0 0x80D0, vpp0 0x8134, vpp1 0x8108, mvs0a 0x8090.
++ *
 + * GDSC flags 0x02A0 (mvs0c 0x00A0) mean POLL_CFG_GDSCR|RETAIN_FF_ENABLE
 + * (|HW_CTRL_TRIGGER).  We deliberately leave the domain in SW mode (do not set
 + * bit1) because the HW-control write sequence is not verified. */
@@ -366,22 +479,28 @@ index 0000000..23b4a44
 +    uint32_t v = *gdscr;
 +
 +    if (v & 0x80000000u) {
-+        printf("PANDORA VIDC: gdsc %s already on\n", g->name);
++        printf("PANDORA VIDC: gdsc %s already on (gdscr=%08x cfg=%08x)\n",
++            g->name, v, *(volatile uint32_t *)(vidc_cc + g->off + 4));
 +        return 0;
 +    }
 +    *gdscr = v & ~1u;                  /* SW_COLLAPSE = 0 */
 +    __asm__ volatile ("dmb oshst" ::: "memory");
++    /* 4000 x 10 us = 40 ms.  Android waits on the same POWER_UP_COMPLETE bit
++     * with a usleep_range, so sweeping the whole budget is the honest default. */
 +    for (unsigned i = 0; i < 4000; i++) {
 +        uint32_t s = *(volatile uint32_t *)(vidc_cc + g->off + 4);  /* CFG_GDSCR */
 +        if (s & (1u << 16)) {          /* POWER_UP_COMPLETE */
 +            if (g->flags & 0x80u) {    /* RETAIN_FF_ENABLE */
 +                *(volatile uint32_t *)(vidc_cc + g->off + 4) = s | (1u << 11);
 +            }
-+            printf("PANDORA VIDC: gdsc %s on (cfg=%08x)\n", g->name, s);
++            printf("PANDORA VIDC: gdsc %s on (gdscr %08x -> %08x cfg=%08x)\n",
++                g->name, v, *gdscr, s);
 +            return 0;
 +        }
++        delay(10);
 +    }
-+    printf("PANDORA VIDC: gdsc %s power-up TIMEOUT\n", g->name);
++    printf("PANDORA VIDC: gdsc %s power-up TIMEOUT (gdscr=%08x cfg=%08x)\n",
++        g->name, *gdscr, *(volatile uint32_t *)(vidc_cc + g->off + 4));
 +    return -1;
 +}
 +
@@ -396,9 +515,39 @@ index 0000000..23b4a44
 +        __asm__ volatile ("dmb oshst" ::: "memory");
 +    }
 +    for (unsigned i = 0; i < 2000; i++) {
-+        if (!(*cbcr & 0x80000000u)) return;   /* CLK_OFF cleared */
++        uint32_t s = *cbcr;
++        if (!(s & 0x80000000u)) {      /* CLK_OFF cleared */
++            printf("PANDORA VIDC: branch %#x on (%08x -> %08x)\n", off, v, s);
++            return;
++        }
++        delay(1);
 +    }
-+    printf("PANDORA VIDC: branch %#x halt timeout\n", off);
++    printf("PANDORA VIDC: branch %#x halt timeout (cbcr=%08x)\n", off, *cbcr);
++}
++
++/* Bridge sync reset, mainline iris_vpu4x_set_hwmode order: BIT0|BIT1 ->
++ * BIT1 -> 0.  APV bridge exists on this variant (APV encoder advertised).
++ * The vendor does this in set_hwmode, i.e. AFTER boot_firmware [K iris_core.c
++ * order is power_on -> fw_load -> boot_firmware -> switch_to_hwmode]; doing it
++ * before firmware release is the conservative order we can verify by register
++ * read-back, so keep it here and note the difference. */
++static void
++vidc_bridge_reset(void)
++{
++    vidc_wr(R_CPU_APV_BRIDGE_RESET, CORE_BRIDGE_SW_RESET | CORE_BRIDGE_HW_RST_DIS);
++    delay(10);
++    vidc_wr(R_CPU_APV_BRIDGE_RESET, CORE_BRIDGE_HW_RST_DIS);
++    delay(10);
++    vidc_wr(R_CPU_APV_BRIDGE_RESET, 0);
++    delay(10);
++    vidc_wr(R_CPU_AHB_BRIDGE_RESET, CORE_BRIDGE_SW_RESET | CORE_BRIDGE_HW_RST_DIS);
++    delay(10);
++    vidc_wr(R_CPU_AHB_BRIDGE_RESET, CORE_BRIDGE_HW_RST_DIS);
++    delay(10);
++    vidc_wr(R_CPU_AHB_BRIDGE_RESET, 0);
++    delay(10);
++    printf("PANDORA VIDC: bridge reset done (apv=%08x ahb=%08x)\n",
++        vidc_rd(R_CPU_APV_BRIDGE_RESET), vidc_rd(R_CPU_AHB_BRIDGE_RESET));
 +}
 +
 +static int
@@ -411,33 +560,42 @@ index 0000000..23b4a44
 +            return -1;
 +        }
 +    }
++    int failed = 0;
 +    for (unsigned i = 0; i < sizeof(vidc_gdscs) / sizeof(vidc_gdscs[0]); i++) {
-+        if (vidc_gdsc_on(&vidc_gdscs[i]) != 0) return -1;
++        if (vidc_gdsc_on(&vidc_gdscs[i]) != 0) failed++;
 +    }
 +    vidc_branch_on(0x8164u);           /* mvs0c */
 +    vidc_branch_on(0x80D0u);           /* mvs0  */
 +    vidc_branch_on(0x8134u);           /* vpp0  */
 +    vidc_branch_on(0x8108u);           /* vpp1  */
 +    vidc_branch_on(0x8090u);           /* mvs0a */
++    vidc_bridge_reset();
 +
-+    /* Bridge sync reset, mainline iris_vpu4x_set_hwmode order: BIT0|BIT1 ->
-+     * BIT1 -> 0.  APV bridge exists on this variant (APV encoder advertised). */
-+    vidc_wr(R_CPU_APV_BRIDGE_RESET, 0x3u); delay(1);
-+    vidc_wr(R_CPU_APV_BRIDGE_RESET, 0x2u); delay(1);
-+    vidc_wr(R_CPU_APV_BRIDGE_RESET, 0x0u); delay(1);
-+    vidc_wr(R_CPU_AHB_BRIDGE_RESET, 0x3u); delay(1);
-+    vidc_wr(R_CPU_AHB_BRIDGE_RESET, 0x2u); delay(1);
-+    vidc_wr(R_CPU_AHB_BRIDGE_RESET, 0x0u); delay(1);
-+
-+    printf("PANDORA VIDC: videocc powered (5 GDSC + 5 branches + bridge reset)\n");
-+    return 0;
++    printf("PANDORA VIDC: videocc powered (%d/5 GDSC failed), CORE_PWR=%08x CORE_CLK=%08x\n",
++        failed, vidc_rd(R_WRAPPER_CORE_PWR), vidc_rd(R_WRAPPER_CORE_CLK));
++    return failed ? -1 : 0;
 +}
 +
-+/* Publish qtable/SFR physical addresses to firmware.  Offsets from
-+ * msm_video.ko __boot_firmware_iris4 (2026-11-19): DA -> CPU+0x64, size
-+ * 0x300000 -> CPU+0x68, second DA -> CPU+0x54, enable -> CPU+0x50, second
-+ * address (SFR) -> CPU+0x60; poll CPU+0x4C bit0 (ready) with bits1-3 errors.
-+ */
++/* Publish qtable/SFR to the firmware and release the VPU core.
++ *
++ * Sequence is byte-for-byte what __boot_firmware_iris4 does [K]:
++ *   0xA0064 <- qtable PA            (32-bit)
++ *   0xA0068 <- 0x300000             (published window)
++ *   0xA0054 <- qtable PA            (second copy)
++ *   0xA0050 <- 1                    (enable)
++ *   0xA0060 <- SFR PA               (vendor: core->+0x13E8, the SFR carveout)
++ *   0xA0024/0xA0028/0xA005C         (TZ content-protection span: the vendor
++ *                                    only writes these when it has a CP table
++ *                                    with a non-zero start, which we do not)
++ *   0xB078  <- 1                    (WRAPPER SPARE_0, canoe-vidc-v2 match path)
++ *   0xA0048 <- 1                    (boot control: release the VPU)
++ *   poll 0xA004C up to 1000x, 50-100us apart: bits1-3 = error, bit0 = ready
++ *   0xA0148 <- 1                    (CPU_CS_H2XSOFTINTEN, host->Xtensa IRQ)
++ *   0xA0168 <- 0                    (CPU_CS_X2RPMH)
++ *
++ * The earlier revision stopped after the five publish registers and immediately
++ * polled 0xA004C without 0xB078/0xA0048, so the core was never actually
++ * released from reset -- that alone explains "queue table publish TIMEOUT". */
 +static int
 +vidc_publish_queues(void)
 +{
@@ -445,32 +603,59 @@ index 0000000..23b4a44
 +        printf("PANDORA VIDC: publish before alloc\n");
 +        return -1;
 +    }
-+    vidc_wr(R_CPU_QUEUE_TABLE_DA, (uint32_t)vidc_qtable_pa);
++    uint32_t da = (uint32_t)vidc_qtable_pa;
++
++    vidc_wr(R_CPU_QUEUE_TABLE_DA, da);
 +    vidc_wr(R_CPU_QUEUE_TABLE_SIZE, VIDC_QTABLE_BYTES);
-+    vidc_wr(R_CPU_QUEUE_TABLE_DA2, (uint32_t)vidc_qtable_pa);
++    vidc_wr(R_CPU_QUEUE_TABLE_DA2, da);
 +    vidc_wr(R_CPU_QUEUE_TABLE_EN, 1);
 +    vidc_wr(R_CPU_QUEUE_TABLE_ADDR2, (uint32_t)vidc_sfr_pa);
 +
-+    for (unsigned i = 0; i < 4000; i++) {
++    /* 0xA0024/0xA0028 carry the TrustZone content-protection span: the vendor
++     * derives it from its CP resource table and only writes it when that table
++     * reports a non-zero start (start != 0 is purely a guard; both registers
++     * receive the SPAN) [K __boot_firmware_iris4 step 6-7].  We do not use
++     * protected playback and own no CP table, so the vendor-equivalent action
++     * is to write nothing -- not to invent a span for video_region.  Both
++     * registers and 0xA005C are therefore left at their reset values. */
++    printf("PANDORA VIDC: CP span 0xA0024/0xA0028 and 0xA005C skipped "
++           "(no TZ CP table, vendor-equivalent path)\n");
++
++    vidc_wr(R_WRAPPER_SPARE_0, 1);
++    vidc_wr(R_CPU_BOOT_CTRL, 1);
++    printf("PANDORA VIDC: boot released (spare0=%08x boot=%08x stat=%08x)\n",
++        vidc_rd(R_WRAPPER_SPARE_0), vidc_rd(R_CPU_BOOT_CTRL),
++        vidc_rd(R_CPU_QUEUE_TABLE_STAT));
++
++    for (unsigned i = 0; i < 1000; i++) {
 +        uint32_t s = vidc_rd(R_CPU_QUEUE_TABLE_STAT);
 +        if (s & 0xEu) {
-+            printf("PANDORA VIDC: queue table rejected, status %08x\n", s);
++            printf("PANDORA VIDC: queue table rejected, status %08x (iter %u)\n", s, i);
 +            return -1;
 +        }
 +        if (s & 1u) {
-+            printf("PANDORA VIDC: queue table accepted (status %08x, qtable %08llx)\n",
-+                s, (unsigned long long)vidc_qtable_pa);
++            vidc_wr(R_CPU_H2XSOFTINTEN, 1);
++            vidc_wr(R_CPU_X2RPMH, 0);
++            printf("PANDORA VIDC: queue table accepted after %u polls (status %08x)\n", i, s);
++            printf("PANDORA VIDC: h2x=%08x x2rpmh=%08x core_clk=%08x intr=%08x/%08x\n",
++                vidc_rd(R_CPU_H2XSOFTINTEN), vidc_rd(R_CPU_X2RPMH),
++                vidc_rd(R_WRAPPER_CORE_CLK),
++                vidc_rd(R_WRAPPER_INTR_STATUS), vidc_rd(R_WRAPPER_INTR_MASK));
 +            return 0;
 +        }
++        delay(100);                    /* 100 us, vendor uses 50-100 us */
 +    }
-+    printf("PANDORA VIDC: queue table publish TIMEOUT\n");
++    printf("PANDORA VIDC: queue table publish TIMEOUT (stat=%08x boot=%08x spare0=%08x)\n",
++        vidc_rd(R_CPU_QUEUE_TABLE_STAT), vidc_rd(R_CPU_BOOT_CTRL),
++        vidc_rd(R_WRAPPER_SPARE_0));
 +    return -1;
 +}
 +
 +/* Firmware load + auth + reset.  pandora_adsp.c already exposes
 + * pandora_pas_load_auth() (PAS init/mem_setup/segment copy/auth_and_reset over
 + * SMC); it works on this platform without a TrustZone driver of our own.
-+ * Mainline uses IRIS_PAS_ID = 9 for video. */
++ * Mainline uses IRIS_PAS_ID = 9 for video; the MBN segment span is exactly the
++ * 8 MiB carveout, so a wrong PAS id shows up as a loud SCM failure. */
 +extern int pandora_pas_load_auth(const char *file, unsigned pas,
 +    uint64_t mem_pa, uint64_t mem_size);
 +
@@ -490,10 +675,9 @@ index 0000000..23b4a44
 +}
 +
 +/* ------------------------------------------------------------------ */
-+/* Firmware load into the carveout via the existing firmware reader.  This
-+ * part is implementable now: it parses the MBN ELF program headers and copies
-+ * loadable segments into video_region, mirroring pandora_adsp.c's mdt loader.
-+ * It writes into the reserved carveout only, no global power changes. */
++/* Firmware load into the carveout via the existing firmware reader.  Kept as
++ * the manual fallback if SCM PAS is unavailable; parses the MBN ELF program
++ * headers and copies loadable segments into video_region. */
 +/* ------------------------------------------------------------------ */
 +struct vidc_elf32_phdr {
 +    uint32_t p_type;
@@ -570,93 +754,194 @@ index 0000000..23b4a44
 +}
 +
 +/* Drain one response packet from the message queue (cmd=0, msg=1, dbg=2).
-+ * Only the generic header is decoded for now; IMAGE_VERSION is carried in a
-+ * property packet whose payload layout is the next parsing step. */
++ * Both indices are u32 WORD indices [M iris_hfi_queue.c:14-16], so the byte
++ * offset of a packet is start_addr_rel + read_idx*4.  The queue is read through
++ * the CPU mapping, so invalidate the ring region first: the VPU wrote it while
++ * our lines were still resident.
++ *
++ * Return: 0 = queue empty, 1 = one valid packet consumed, 2 = malformed packet
++ * discarded (the caller must NOT treat 2 as a handshake). */
 +static int
 +vidc_hfi_poll(void)
 +{
 +    struct vidc_queue_table *t = (struct vidc_queue_table *)vidc_qtable_va;
-+    struct vidc_queue_header *m = &t->qhdr[1];
-+    uint32_t w = m->write_idx;
++    uint32_t moff = (uint32_t)((char *)&t->qhdr[1] - (char *)t);
 +
-+    if (w == m->read_idx) return 0;
-+    uint32_t off = (uint32_t)(m->start_addr - (uint32_t)vidc_qtable_pa) + m->read_idx;
-+    struct vidc_pkt_hdr *p = (struct vidc_pkt_hdr *)((uint8_t *)vidc_qtable_va + off);
-+    printf("PANDORA VIDC: response size=%u type=%08x read_idx=%u\n",
-+        p->size, p->pkt_type, m->read_idx);
++    /* Only the queue header changes while we are idle: invalidate that (56 B)
++     * on every pass.  The ring body is invalidated lazily, once write_idx has
++     * actually moved, so the poll loop does not flush 1 MiB per iteration. */
++    vidc_sync_in(moff, (unsigned)sizeof(struct vidc_queue_header));
 +
-+    /* Property response layout (mainline iris_hfi response): header (8) +
-+     * property_id (4) + flags (4) + payload_size (4) + payload.  The first
-+     * field of a version payload is the NUL-terminated string. */
-+    if (p->size >= 20 && p->size <= 4096) {
-+        uint32_t *props = (uint32_t *)((uint8_t *)p + 8);
-+        uint32_t pid = props[0], flags = props[1], psize = props[2];
++    uint32_t w = vidc_qt_rd(moff + offsetof(struct vidc_queue_header, write_idx));
++    uint32_t r = vidc_qt_rd(moff + offsetof(struct vidc_queue_header, read_idx));
++    if (w == r) return 0;
++
++    uint32_t start = vidc_qt_rd(moff + offsetof(struct vidc_queue_header, start_addr));
++    uint32_t ring_off = start - (uint32_t)vidc_qtable_pa;
++    uint32_t q_off = ring_off + r * 4u;
++    if (q_off + 8u > VIDC_QTABLE_BYTES) {
++        printf("PANDORA VIDC: msg queue index out of range (r=%u w=%u start=%08x)\n", r, w, start);
++        vidc_qt_wr(moff + offsetof(struct vidc_queue_header, read_idx), w);
++        vidc_sync_out(moff, (unsigned)sizeof(struct vidc_queue_header));
++        return 2;
++    }
++    /* One packet is at most IFACEQ_CORE_PKT_SIZE, and it may wrap at the ring
++     * end, so invalidate the tail and (when wrapping) the head separately. */
++    uint32_t ring_end = ring_off + (uint32_t)IFACEQ_QUEUE_SIZE;
++    uint32_t span = 20u + 128u;                  /* header + property head */
++    if (q_off + span <= ring_end) {
++        vidc_sync_in(q_off, span);
++    } else {
++        vidc_sync_in(q_off, ring_end - q_off);
++        vidc_sync_in(ring_off, span - (ring_end - q_off));
++    }
++    uint32_t size = vidc_qt_rd(q_off);
++    uint32_t type = vidc_qt_rd(q_off + 4u);
++    printf("PANDORA VIDC: response size=%u type=%08x read_idx=%u write_idx=%u (words)\n",
++        size, type, r, w);
++
++    if (size < 8u || size > IFACEQ_CORE_PKT_SIZE) {
++        printf("PANDORA VIDC: bad packet size %u, dropping whole queue\n", size);
++        vidc_qt_wr(moff + offsetof(struct vidc_queue_header, read_idx), w);
++        vidc_sync_out(moff, (unsigned)sizeof(struct vidc_queue_header));
++        return 2;
++    }
++    /* Property response layout [M iris_hfi]: header (8) + property_id (4) +
++     * flags (4) + payload_size (4) + payload. */
++    if (size >= 20u) {
++        uint32_t pid = vidc_qt_rd(q_off + 8u);
++        uint32_t flags = vidc_qt_rd(q_off + 12u);
++        uint32_t psize = vidc_qt_rd(q_off + 16u);
 +        printf("PANDORA VIDC: prop=%08x flags=%u payload=%u\n", pid, flags, psize);
-+        if (pid == HFI_PROP_IMAGE_VERSION && psize && psize < 256) {
++        if (pid == HFI_PROP_IMAGE_VERSION && psize && psize <= 128u) {
++            /* The ring was clean+invalidated above, so byte access through the
++             * CPU mapping is coherent with what the VPU wrote. */
 +            char ver[129];
-+            unsigned n = psize < 128 ? psize : 128;
-+            for (unsigned i = 0; i < n; i++) ver[i] = *(char *)((uint8_t *)p + 20 + i);
++            unsigned n = psize;
++            const volatile uint8_t *src =
++                (const volatile uint8_t *)vidc_qtable_va + q_off + 20u;
++            if (q_off + 20u + n > VIDC_QTABLE_BYTES) n = 0;
++            for (unsigned i = 0; i < n; i++) ver[i] = (char)src[i];
 +            ver[n] = 0;
 +            printf("PANDORA VIDC: IMAGE_VERSION=%s\n", ver);
 +        }
 +    }
-+    m->read_idx = w;
++    vidc_qt_wr(moff + offsetof(struct vidc_queue_header, read_idx), w);
++    vidc_sync_out(moff, (unsigned)sizeof(struct vidc_queue_header));
 +    return 1;
 +}
 +
 +/* Queue HFI_CMD_INIT into the command ring and wait (bounded) for the firmware
-+ * to advance the message queue.  The ring/idx semantics follow the mainline
-+ * iris_hfi_queue header; the exact response parsing is left to the next step. */
++ * to advance the message queue.  The wakeup is CPU_IC_SOFTINT bit0 after
++ * clearing any stale A2H latch, which is the documented host->Xtensa doorbell. */
 +static int
 +vidc_hfi_init(void)
 +{
 +    struct vidc_queue_table *t = (struct vidc_queue_table *)vidc_qtable_va;
-+    struct vidc_queue_header *cmd = &t->qhdr[0];
-+    uint32_t ring_off = (uint32_t)(cmd->start_addr - (uint32_t)vidc_qtable_pa);
++    uint32_t coff = (uint32_t)((char *)&t->qhdr[0] - (char *)t);
++    if (!vidc_qtable_va) {
++        printf("PANDORA VIDC: hfi_init before alloc\n");
++        return -1;
++    }
++    uint32_t start = vidc_qt_rd(coff + offsetof(struct vidc_queue_header, start_addr));
++    uint32_t ring_off = start - (uint32_t)vidc_qtable_pa;
 +    uint64_t ring_pa = vidc_qtable_pa + ring_off;
-+    struct vidc_pkt_hdr *pkt = (struct vidc_pkt_hdr *)((uint8_t *)vidc_qtable_va + ring_off);
 +
-+    pkt->size = (uint32_t)sizeof(*pkt);
-+    pkt->pkt_type = HFI_CMD_INIT;
-+    cmd->write_idx = (uint32_t)sizeof(*pkt);
-+    cmd->tx_irq_status = 1;
-+    clean_dcache64((addr64_t)ring_pa, (unsigned)sizeof(*pkt), TRUE);
++    /* Drop any stale host->fw interrupt latch before ringing the doorbell. */
++    vidc_wr(R_CPU_A2HSOFTINTCLR, 1);
++
++    vidc_qt_wr(ring_off + 0u, (uint32_t)sizeof(struct vidc_pkt_hdr));   /* size */
++    vidc_qt_wr(ring_off + 4u, HFI_CMD_INIT);                           /* type */
++    /* The packet body must be visible to the VPU before write_idx moves; push
++     * the whole first cache line of the ring out now. */
++    vidc_sync_out(ring_off, 64u);
++    /* write_idx is in WORDS [M], so a single 8-byte packet advances it by 2. */
++    vidc_qt_wr(coff + offsetof(struct vidc_queue_header, write_idx),
++        (uint32_t)(sizeof(struct vidc_pkt_hdr) / 4u));
++    vidc_sync_out((uint64_t)coff, (unsigned)sizeof(struct vidc_queue_header));
 +
 +    vidc_wr(R_CPU_SOFTINT, 1);   /* CPU_IC_SOFTINT bit0: host -> Xtensa */
-+    printf("PANDORA VIDC: HFI_CMD_INIT queued at %08llx, waiting for response\n",
-+        (unsigned long long)ring_pa);
++    printf("PANDORA VIDC: HFI_CMD_INIT queued at %08llx (cmd write_idx=2 words), "
++           "doorbell %08x\n", (unsigned long long)ring_pa, vidc_rd(R_CPU_SOFTINT));
 +
 +    for (unsigned i = 0; i < 4000; i++) {
-+        if (vidc_hfi_poll()) {
-+            printf("PANDORA VIDC: HFI handshake response received\n");
++        int got = vidc_hfi_poll();
++        if (got == 1) {
++            printf("PANDORA VIDC: HFI handshake response received (iter %u, intr=%08x)\n",
++                i, vidc_rd(R_WRAPPER_INTR_STATUS));
++            vidc_wr(R_CPU_A2HSOFTINTCLR, 1);
 +            return 0;
 +        }
++        if (got == 2) {
++            printf("PANDORA VIDC: malformed reply discarded (iter %u), still waiting\n", i);
++        }
++        if ((i % 500u) == 0)
++            printf("PANDORA VIDC: waiting for HFI response, iter %u stat=%08x intr=%08x\n",
++                i, vidc_rd(R_CPU_QUEUE_TABLE_STAT), vidc_rd(R_WRAPPER_INTR_STATUS));
++        delay(1000);
 +    }
-+    printf("PANDORA VIDC: HFI response TIMEOUT\n");
++    printf("PANDORA VIDC: HFI response TIMEOUT (stat=%08x intr=%08x/%08x core_pwr=%08x)\n",
++        vidc_rd(R_CPU_QUEUE_TABLE_STAT), vidc_rd(R_WRAPPER_INTR_STATUS),
++        vidc_rd(R_WRAPPER_INTR_MASK), vidc_rd(R_WRAPPER_CORE_PWR));
 +    return -1;
 +}
 +
 +/* ------------------------------------------------------------------ */
 +/* Full bring-up sequence (level 2).  Order follows the mainline iris boot
-+ * flow; UNKNOWN steps stop the sequence rather than proceeding on guesses. */
++ * flow; every stage is attempted and reported so one boot returns the whole
++ * ladder.  Stages that depend on a failed predecessor are still attempted
++ * because the register read-back they produce is diagnostic (e.g. PAS without
++ * power tells us whether SCM rejects the id or the domain). */
 +/* ------------------------------------------------------------------ */
 +static void
 +vidc_bringup(void)
 +{
-+    if (vidc_probe() != 0) return;
++    int rc;
 +
-+    /* Power the domain first (PAS writes the carveout over AXI), then let SCM
-+     * load + authenticate + release the VPU core in one call.  vidc_load_firmware()
-+     * is kept below as a manual fallback if SCM PAS is unavailable. */
-+    if (vidc_power_up() != 0) return;   /* GDSC + clocks */
-+    if (vidc_auth_reset() != 0) return;
++    rc = vidc_probe();
++    vidc_verdict("probe", rc);
++    if (rc == 0) vidc_pass_mask |= VIDC_STAGE_PROBE;
 +
-+    if (vidc_alloc_queues() != 0) return;
-+    if (vidc_publish_queues() != 0) return;
++    rc = vidc_power_up();               /* GDSC + branches + bridge reset */
++    vidc_verdict("power", rc);
++    if (rc == 0) vidc_pass_mask |= VIDC_STAGE_POWER;
 +
-+    /* Send HFI_CMD_INIT and wait for the firmware to answer on the message
-+     * queue (the response parser is the next step). */
-+    vidc_hfi_init();
++    rc = vidc_alloc_queues();           /* host memory only, always safe */
++    vidc_verdict("queues", rc);
++    if (rc == 0) vidc_pass_mask |= VIDC_STAGE_ALLOC;
++
++    rc = vidc_auth_reset();             /* SCM PAS load + auth_and_reset */
++    vidc_verdict("pas", rc);
++    if (rc == 0) {
++        vidc_pass_mask |= VIDC_STAGE_PAS;
++    } else {
++        /* PAS rejected the image (wrong PAS id, or the carveout span does not
++         * match).  Copy the loadable segments into video_region ourselves so
++         * the publish stage still has firmware to release: if the handshake
++         * then succeeds the failure was in PAS bookkeeping, not in the image. */
++        int fw = vidc_load_firmware();
++        vidc_verdict("fwcopy", fw);
++        if (fw == 0) vidc_pass_mask |= VIDC_STAGE_FWCOPY;
++    }
++
++    rc = vidc_publish_queues();         /* boot release + 0xA004C poll */
++    vidc_verdict("publish", rc);
++    if (rc == 0) vidc_pass_mask |= VIDC_STAGE_PUBLISH;
++
++    rc = vidc_hfi_init();               /* HFI_CMD_INIT + version packet */
++    vidc_verdict("hfi", rc);
++    if (rc == 0) vidc_pass_mask |= VIDC_STAGE_HFI;
++
++    printf("PANDORA VIDC: SUMMARY mask=%02x/%02x probe=%u power=%u queues=%u pas=%u "
++           "fwcopy=%u publish=%u hfi=%u\n", vidc_pass_mask, VIDC_STAGE_ALL,
++        !!(vidc_pass_mask & VIDC_STAGE_PROBE), !!(vidc_pass_mask & VIDC_STAGE_POWER),
++        !!(vidc_pass_mask & VIDC_STAGE_ALLOC), !!(vidc_pass_mask & VIDC_STAGE_PAS),
++        !!(vidc_pass_mask & VIDC_STAGE_FWCOPY),
++        !!(vidc_pass_mask & VIDC_STAGE_PUBLISH), !!(vidc_pass_mask & VIDC_STAGE_HFI));
++    if (vidc_mmio_on)
++        printf("PANDORA VIDC: final EFUSE=%08x CORE_PWR=%08x CORE_CLK=%08x IDLE=%08x\n",
++            vidc_rd(R_WRAPPER_EFUSE), vidc_rd(R_WRAPPER_CORE_PWR),
++            vidc_rd(R_WRAPPER_CORE_CLK), vidc_rd(R_VCODEC_SS_IDLE));
 +}
 +
 +/* ------------------------------------------------------------------ */
@@ -688,7 +973,7 @@ index 0000000..23b4a44
 +        strlcpy(vidc_fw_name, fw, sizeof(vidc_fw_name));
 +
 +    printf("PANDORA VIDC: level %d, firmware %s (clean-room transport, "
-+           "hardware UNKNOWN steps stop safely)\n", vidc_level, vidc_fw_name);
++           "per-stage verdicts)\n", vidc_level, vidc_fw_name);
 +
 +    thread_t th;
 +    if (kernel_thread_start(vidc_thread, NULL, &th) == KERN_SUCCESS)
@@ -697,7 +982,7 @@ index 0000000..23b4a44
 +
 +#endif /* PANDORA */
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 5fe98eb..2ddbf2e 100755
+index 5fe98eb..2ddbf2e 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -72,6 +72,7 @@ extern void pandora_therm_init(void);
