@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..caedae0cff768d2bf05512d9f894a82ce2eafc4a
+index 0000000..9781a1611db19dfa3bba3bbb6774d4150ef4701a
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4187 @@
+@@ -0,0 +1,4230 @@
 +﻿/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2730,6 +2730,43 @@ index 0000000..caedae0cff768d2bf05512d9f894a82ce2eafc4a
 +	return 0;
 +}
 +
++/* Level 20.18: TlvDnldEnd / DownloadAndCmdExeStatus at trace 9.921517:
++ * 31 00 f0 ff 0f 06 00 0c 01 01 00 x10 (20 bytes). Android sends it after
++ * the PERI patch and NVM and before build info; every earlier build skipped
++ * it, then went straight to PeriReset + the TME-L map. Observation only:
++ * a missing reply is logged and the level continues. */
++static int
++bt_peri_tlv_end(void)
++{
++	static const uint8_t request[] = { 0x31, 0x00, 0xf0, 0xff, 0x0f, 0x06,
++	    0x00, 0x0c, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	    0x00, 0x00, 0x00, 0x00 };
++	uint8_t rx[BT_PERI_EVT_MAX] = {0};
++	unsigned got = 0;
++	uint64_t deadline;
++	int err;
++
++	err = bt_uart_tx(request, sizeof(request), "PERI TLV end");
++	if (err) {
++		return err;
++	}
++	clock_interval_to_deadline(500, NSEC_PER_MSEC, &deadline);
++	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x06,
++	    "PERI TLV end");
++	if (err) {
++		printf("PANDORA BT: TLV end: no reply (error %d, %u bytes); continuing\n",
++		    err, got);
++		bt_dump("PERI TLV end raw", rx, got);
++		pandora_log_sync();
++		return 0;
++	}
++	printf("PANDORA BT: TLV end reply subcmd %u status %u, %u bytes\n",
++	    got >= 11u ? rx[10] : 0xffu, got >= 10u ? rx[9] : 0xffu, got);
++	bt_dump("PERI TLV end reply", rx, got);
++	pandora_log_sync();
++	return 0;
++}
++
 +/* GetBuildInfoReq: Android's own post-download gate (failure = init
 + * reason 63). Level 19.6 sends the REAL request the HAL sends
 + * (PatchDLManager::GetBuildInfoReq, disasm dd8a8): the HCI vendor
@@ -3934,7 +3971,7 @@ index 0000000..caedae0cff768d2bf05512d9f894a82ce2eafc4a
 +{
 +	int err;
 +
-+	printf("PANDORA BT: level 20: TME-L %u B, ActivateSS + PeriReset + arbitrate v3 + peri map + map-only raw stream (20.17)\n",
++	printf("PANDORA BT: level 20: TME-L %u B, ActivateSS + PeriReset + arbitrate v3 + peri map + map-only raw stream (20.18)\n",
 +	    (unsigned)sizeof(pandora_peri_tmel_elf));
 +	pandora_log_sync();
 +	/* Level 20.17: replay the PERI preamble in trace order - GetVer(00), then
@@ -4019,6 +4056,11 @@ index 0000000..caedae0cff768d2bf05512d9f894a82ce2eafc4a
 +	}
 +	err = bt_peri_tlv_download(pandora_peri_nvm_bin, sizeof(pandora_peri_nvm_bin),
 +	    "PERI NVM", BT_PERI_NVM_PACE_US, BT_PERI_NVM_LAST_ACK_MS);
++	if (err) {
++		return err;
++	}
++	/* Level 20.18: the trace's TLV end frame, between NVM and build info. */
++	err = bt_peri_tlv_end();
 +	if (err) {
 +		return err;
 +	}
@@ -4199,6 +4241,7 @@ index 0000000..caedae0cff768d2bf05512d9f894a82ce2eafc4a
 +	}
 +}
 +#endif /* PANDORA */
++
 +
 +
 +
