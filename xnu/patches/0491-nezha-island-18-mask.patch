@@ -1,0 +1,25 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -292,8 +292,9 @@
+ 	return on != 0;
+ }
+ 
+-/* Static Pro Max style mask, after the GPU fence and before either display path.
+- * Coordinates scale with the composed frame; no UI process or input handler. */
++/* Static iPhone 18 Pro small Dynamic Island mask, after the GPU fence and before
++ * either display path. Coordinates scale with the composed frame; no UI process
++ * or input handler. */
+ static void
+ nezha_draw_capsule(SweetSurface *s)
+ {
+@@ -303,8 +304,8 @@
+ 	    (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
+ 		return;
+ 	}
+-	const uint32_t w = s->width * 110 / 375, h = s->width * 32 / 375;
+-	const uint32_t x0 = (s->width - w) / 2, y0 = s->width * 14 / 375 - (s->width * 2 + 600) / 1200;
++	const uint32_t w = s->width * 70 / 375, h = s->width * 26 / 375;
++	const uint32_t x0 = (s->width - w) / 2, y0 = s->width * 59 / 750 - h / 2;
+ 	uintptr_t pixels = s->kernelAddress();
+ 	if (!pixels || y0 + h > s->height) {
+ 		return;
