@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..f99c5be
+index 0000000..9f5e2ad
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,965 @@
+@@ -0,0 +1,1323 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -81,6 +81,16 @@ index 0000000..f99c5be
 +#include <vm/pmap.h>
 +#include <vm/vm_kern.h>
 +#include <arm/caches_internal.h>
++#include "adreno/ArmSmmu4K.h"
++#include "adreno/ArmSmmu4KContext.h"
++#include "adreno/ArmSmmu4KProgram.h"
++#include "adreno/ArmSmmu4KMmio.h"
++#include "adreno/ArmSmmu4KStreams.h"
++
++/* The apps-SMMU is shared with the display, the camera TPG and WiFi, so the
++ * context is claimed under the same lock they use (pandora_adsp.c). */
++extern void pandora_apps_smmu_lock(void);
++extern void pandora_apps_smmu_unlock(void);
 +
 +extern vm_map_t kernel_map;
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
@@ -252,21 +262,54 @@ index 0000000..f99c5be
 + * pandora_gpu.c:1095 / pandora_adsp.c:814: it never leaves a dirty line that
 + * could later be written back over firmware-owned data, and it never lets the
 + * CPU read a stale line after the VPU wrote. */
-+static void    *vidc_qtable_va;
++static vm_offset_t vidc_qtable_va;
 +static uint64_t vidc_qtable_pa;
-+static void    *vidc_sfr_va;
++static vm_offset_t vidc_sfr_va;
 +static uint64_t vidc_sfr_pa;
++
++/* The VPU is an Xtensa core whose queue-table and start-address registers are
++ * 32-bit, but every wired page xnu hands out sits above 4 GiB (level-2b run:
++ * qtable PA 0x8cc482000).  Writing (uint32_t)pa published 0xcc482000, an
++ * address outside the carveout, so the firmware could never find its queues.
++ * Mainline does the same thing differently: iris_hfi_queue.c allocates with
++ * dma_alloc_attrs() and publishes iface_q_table_daddr, an IOVA, never a PA
++ * [M iris_hfi_queue.c:231,254 / iris_core.h:106].  We therefore put the queue
++ * table and the SFR behind the apps-SMMU (non_secure_cb, SIDs 0x1940/0x1a20/
++ * 0x1944) and give them 32-bit IOVAs below the 0xffc00000 DMA limit that the
++ * DT's iommu_region_partition enforces [V live.dts iommu-addresses].
++ *
++ * Layout: the table header plus its three 1 MiB rings are one contiguous
++ * allocation; the SFR is a separate 4 KiB allocation.  Both get a fixed 32-bit
++ * IOVA from the same window, and the arm-smmu 4K tables map range by range, so
++ * the IOVA offset of every ring inside the table pool equals its PA offset --
++ * which is exactly the arithmetic vidc_fill_queues() relies on. */
++#define VIDC_SMMU_PA            0x15000000u   /* apps-smmu@15000000 */
++#define VIDC_SMMU_SIZE          0x00100000u
++#define VIDC_IOVA_BASE          0xFF000000ull /* < 0xffc00000 DMA limit */
++#define VIDC_IOVA_SFR           0xFF400000ull /* its own 4 KiB page */
++#define VIDC_SMMU_TABLE_PAGES   64u           /* 2 ranges -> 6 pages needed */
++#define VIDC_SMMU_LEAF_BUDGET   2048u
++#define VIDC_SMMU_ACTLR         0x103u        /* DT qcom,actlr for these SIDs */
++#define VIDC_SID_NONSEC         0x1940u
++#define VIDC_SID_NONSEC_ALT     0x1A20u
++#define VIDC_SID_NONSEC_ALT2    0x1944u
++
++static uint32_t vidc_qtable_iova;
++static uint32_t vidc_sfr_iova;
++static bool     vidc_smmu_on;
 +
 +/* Verdict accumulator: one line per stage so a single boot returns the ladder. */
 +static uint32_t vidc_pass_mask;
 +#define VIDC_STAGE_PROBE    (1u << 0)
 +#define VIDC_STAGE_POWER    (1u << 1)
 +#define VIDC_STAGE_ALLOC    (1u << 2)
-+#define VIDC_STAGE_PAS      (1u << 3)
-+#define VIDC_STAGE_PUBLISH  (1u << 4)
-+#define VIDC_STAGE_HFI      (1u << 5)
-+#define VIDC_STAGE_FWCOPY   (1u << 6)
-+#define VIDC_STAGE_ALL      0x7Fu
++#define VIDC_STAGE_SMMU     (1u << 3)
++#define VIDC_STAGE_QUEUES   (1u << 4)
++#define VIDC_STAGE_PAS      (1u << 5)
++#define VIDC_STAGE_PUBLISH  (1u << 6)
++#define VIDC_STAGE_HFI      (1u << 7)
++#define VIDC_STAGE_FWCOPY   (1u << 8)
++#define VIDC_STAGE_ALL      0x1FFu
 +
 +static void
 +vidc_verdict(const char *stage, int ok)
@@ -291,17 +334,56 @@ index 0000000..f99c5be
 +}
 +
 +/* Accessors over the CPU mapping.  Callers bracket VPU hand-off with
-+ * vidc_sync_out() / vidc_sync_in() on the physical range. */
++ * vidc_sync_out() / vidc_sync_in() on the physical range.
++ *
++ * The bases are vm_offset_t (an integer) rather than byte pointers, so
++ * `base + off` is integer arithmetic and the pointer cast below cannot trip
++ * -Wcast-align.  This is the same shape as pandora_gpu.c's gpu_rd()/gpu_wr(),
++ * which CI accepts under -Weverything -Werror. */
++static inline uint32_t
++vidc_ld32(vm_offset_t base, uint32_t off)
++{
++    return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++vidc_st32(vm_offset_t base, uint32_t off, uint32_t v)
++{
++    *(volatile uint32_t *)(base + off) = v;
++}
++
++static inline uint64_t
++vidc_ld64(vm_offset_t base, uint32_t off)
++{
++    return *(volatile uint64_t *)(base + off);
++}
++
++/* Little-endian field reads out of an unaligned byte buffer.  The firmware
++ * blob is only byte-aligned, so an ELF header field must not be read through
++ * a wider pointer. */
++static inline uint16_t
++vidc_le16(const uint8_t *p)
++{
++    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
++}
++
++static inline uint32_t
++vidc_le32(const uint8_t *p)
++{
++    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
 +static inline uint32_t
 +vidc_qt_rd(uint32_t off)
 +{
-+    return *(volatile uint32_t *)((volatile uint8_t *)vidc_qtable_va + off);
++    return vidc_ld32(vidc_qtable_va, off);
 +}
 +
 +static inline void
 +vidc_qt_wr(uint32_t off, uint32_t v)
 +{
-+    *(volatile uint32_t *)((volatile uint8_t *)vidc_qtable_va + off) = v;
++    vidc_st32(vidc_qtable_va, off, v);
 +    __asm__ volatile ("dmb oshst" ::: "memory");
 +}
 +
@@ -323,26 +405,288 @@ index 0000000..f99c5be
 +    __asm__ volatile ("dmb oshld" ::: "memory");
 +}
 +
-+/* Allocate and fill the HFI queue table + SFR.  Layout and field values follow
-+ * mainline iris_hfi_queue.c exactly; offsets come from the struct above. */
++/* Allocate the HFI queue table and the SFR as physically contiguous wired
++ * memory.  Filling them in needs their 32-bit device addresses, which come
++ * from vidc_smmu_up(), so allocation and publication are separate stages. */
 +static int
-+vidc_alloc_queues(void)
++vidc_alloc_buffers(void)
 +{
-+    if (vidc_qtable_va && vidc_sfr_va) return 0;
-+
 +    if (!vidc_qtable_va) {
-+        vidc_qtable_va = (void *)vidc_contig(VIDC_QTABLE_ALLOC, &vidc_qtable_pa);
++        vidc_qtable_va = vidc_contig(VIDC_QTABLE_ALLOC, &vidc_qtable_pa);
 +        if (!vidc_qtable_va) {
 +            printf("PANDORA VIDC: no %#x contiguous bytes for qtable\n", VIDC_QTABLE_ALLOC);
 +            return -1;
 +        }
 +    }
 +    if (!vidc_sfr_va) {
-+        vidc_sfr_va = (void *)vidc_contig(VIDC_SFR_BYTES, &vidc_sfr_pa);
++        vidc_sfr_va = vidc_contig(VIDC_SFR_BYTES, &vidc_sfr_pa);
 +        if (!vidc_sfr_va) {
 +            printf("PANDORA VIDC: no %#x contiguous bytes for SFR\n", VIDC_SFR_BYTES);
 +            return -1;
 +        }
++    }
++    printf("PANDORA VIDC: buffers qtable PA=%08llx (%#x) SFR PA=%08llx (%#x)\n",
++        (unsigned long long)vidc_qtable_pa, VIDC_QTABLE_ALLOC,
++        (unsigned long long)vidc_sfr_pa, VIDC_SFR_BYTES);
++    if (vidc_qtable_pa >> 32)
++        printf("PANDORA VIDC: qtable is above 4 GiB (%#llx); a 32-bit VPU cannot "
++               "reach it, the apps-SMMU IOVA below is mandatory\n",
++            (unsigned long long)vidc_qtable_pa);
++    return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* apps-SMMU: 32-bit IOVAs for the queue table and the SFR             */
++/* ------------------------------------------------------------------ */
++
++static vm_offset_t vidc_smmu_va;
++
++static inline uint32_t
++vidc_smmu_rd(uint32_t off)
++{
++    return vidc_ld32(vidc_smmu_va, off);
++}
++
++static inline void
++vidc_smmu_wr(uint32_t off, uint32_t v)
++{
++    vidc_st32(vidc_smmu_va, off, v);
++    __asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Device address the VPU must publish for the queue table / SFR.  With the
++ * SMMU up this is the IOVA; without it the PA, which only works when the
++ * allocation happens to land below 4 GiB (it does not on this board). */
++static inline uint32_t
++vidc_qtable_da(void)
++{
++    return vidc_smmu_on ? vidc_qtable_iova : (uint32_t)vidc_qtable_pa;
++}
++
++static inline uint32_t
++vidc_sfr_da(void)
++{
++    return vidc_smmu_on ? vidc_sfr_iova : (uint32_t)vidc_sfr_pa;
++}
++
++static inline uint32_t
++vidc_ring_da(unsigned i)
++{
++    return vidc_qtable_da() + IFACEQ_RING_OFFS(i);
++}
++
++/* Claim a free apps-SMMU bank, build 4K stage-1 tables that map the queue
++ * table and the SFR at fixed 32-bit IOVAs, program the context and route the
++ * three non-secure video SIDs to it.  The bank/ASID/stream lease follows the
++ * same discipline as pandora_wifi.c: only a disabled, unreferenced bank is
++ * taken, and nothing is touched while another endpoint can still reach it. */
++static int
++vidc_smmu_up(void)
++{
++    if (vidc_smmu_on) return 0;
++    if (!vidc_qtable_va || !vidc_sfr_va) {
++        printf("PANDORA VIDC: SMMU before buffers\n");
++        return -1;
++    }
++    if (!vidc_smmu_va) {
++        vidc_smmu_va = ml_io_map(VIDC_SMMU_PA, VIDC_SMMU_SIZE);
++        if (!vidc_smmu_va) {
++            printf("PANDORA VIDC: cannot map apps-smmu at %#x\n", VIDC_SMMU_PA);
++            return -1;
++        }
++    }
++
++    const uint32_t id0 = vidc_smmu_rd(0x20);
++    const uint32_t id1 = vidc_smmu_rd(0x24);
++    const uint32_t id2 = vidc_smmu_rd(0x28);
++    const unsigned slots = id0 & 0xffu, banks = id1 & 0xffu, s2banks = (id1 >> 16) & 0xffu;
++    const uint64_t page = (id1 & (1u << 31)) ? 0x10000 : 0x1000;
++    const uint64_t cbbase = page << (((id1 >> 28) & 7) + 1);
++    printf("PANDORA VIDC: apps-smmu id0=%08x id1=%08x id2=%08x slots=%u banks=%u "
++           "s2=%u page=%#llx cbbase=%#llx\n", id0, id1, id2, slots, banks, s2banks,
++        page, cbbase);
++    if (!(id0 & (1u << 27)) || !slots || !banks || banks > 128 || s2banks >= banks ||
++        cbbase + banks * page > VIDC_SMMU_SIZE) {
++        printf("PANDORA VIDC: apps-smmu layout unsupported\n");
++        return -1;
++    }
++
++    const uint16_t sids[3] = { VIDC_SID_NONSEC, VIDC_SID_NONSEC_ALT, VIDC_SID_NONSEC_ALT2 };
++    ArmSmmu4KStream route[3];
++    ArmSmmu4KStreamState sstate = { 0 };
++    ArmSmmu4KStreamResult sres;
++    unsigned nroute = 0;
++    bool used[128] = {false}, asid_used[256] = {false};
++    bool slot_taken[3] = {false, false, false};
++
++    pandora_apps_smmu_lock();
++    /* A stream slot is claimable when its S2CR still reports the "fault"
++     * encoding (2 << 16) that the bootloader leaves on unowned SIDs, or when
++     * its SMR already names one of our SIDs and S2CR is likewise idle.  That is
++     * exactly what ArmSmmu4KAttachStreams()'s scan() accepts, so do not rewrite
++     * S2CR here -- the kit installs the bank itself. [M ArmSmmu4KStreams.c:45] */
++    /* Mirror scan() exactly: it rejects an owned slot unless
++     * (s2cr & ~valid_s2cr) == FAULT, and when the stream already validates it
++     * also demands smr == (valid_smr | sid). valid_smr is 0 in EXIDS mode and
++     * 1<<31 otherwise; valid_s2cr is 1<<10 in EXIDS mode and 0 otherwise.
++     * [M ArmSmmu4KStreams.c:12-14,44-47] */
++    const bool exids = (id0 & (1u << 8)) != 0;
++    const uint32_t valid_smr = exids ? 0u : (1u << 31);
++    const uint32_t valid_s2cr = exids ? (1u << 10) : 0u;
++    const uint32_t smr_sid_mask = exids ? 0xffffu : ((1u << ((id0 >> 9) & 15)) - 1u);
++    for (unsigned s = 0; s < slots; s++) {
++        const uint32_t smr = vidc_smmu_rd(0x800 + s * 4);
++        const uint32_t s2cr = vidc_smmu_rd(0xc00 + s * 4);
++        const bool live = exids ? ((s2cr & valid_s2cr) != 0) : ((smr & valid_smr) != 0);
++        if ((s2cr & ~valid_s2cr) != (2u << 16)) {
++            if (live && ((s2cr >> 16) & 3) == 0 && (s2cr & 0xffu) < banks)
++                used[s2cr & 0xffu] = true;
++            continue;
++        }
++        for (unsigned k = 0; k < 3; k++) {
++            if (slot_taken[k]) continue;
++            if ((sids[k] & ~smr_sid_mask) != 0) continue;
++            if (live && smr != (valid_smr | sids[k])) continue;
++            route[nroute].slot = s;
++            route[nroute].sid = sids[k];
++            slot_taken[k] = true;
++            nroute++;
++            break;
++        }
++        if (nroute == 3) break;
++    }
++    if (nroute != 3) {
++        pandora_apps_smmu_unlock();
++        printf("PANDORA VIDC: only %u idle SMR slots for 3 video SIDs\n", nroute);
++        return -1;
++    }
++    printf("PANDORA VIDC: stream slots %u/%u/%u for SIDs %#x/%#x/%#x\n",
++        route[0].slot, route[1].slot, route[2].slot, sids[0], sids[1], sids[2]);
++
++    unsigned bank = banks;
++    for (unsigned b = s2banks; b < banks; b++) {
++        const uint32_t ctl = vidc_smmu_rd((uint32_t)(cbbase + b * page));
++        if (!(ctl & 1u) && !used[b]) { bank = b; break; }
++        if (ctl & 1u) {
++            const uint64_t ttbr = vidc_ld64(vidc_smmu_va,
++                (uint32_t)(cbbase + b * page + 0x20));
++            if ((ttbr >> 48) < 256) asid_used[ttbr >> 48] = true;
++        }
++    }
++    if (bank >= banks) {
++        pandora_apps_smmu_unlock();
++        printf("PANDORA VIDC: no free apps-smmu bank (%u banks, s2banks %u)\n",
++            banks, s2banks);
++        return -1;
++    }
++    unsigned asid = 1;
++    while (asid < 256 && asid_used[asid]) asid++;
++    if (asid == 256) {
++        pandora_apps_smmu_unlock();
++        printf("PANDORA VIDC: no free ASID\n");
++        return -1;
++    }
++
++    uint64_t tpa = 0;
++    vm_offset_t tva = vidc_contig((uint64_t)VIDC_SMMU_TABLE_PAGES * 0x1000, &tpa);
++    if (!tva) {
++        pandora_apps_smmu_unlock();
++        printf("PANDORA VIDC: no table pool\n");
++        return -1;
++    }
++    static const uint8_t widths[6] = { 32, 36, 40, 42, 44, 48 };
++    const unsigned encoding = (id2 >> 4) & 15;
++    if (encoding >= 6) {
++        pandora_apps_smmu_unlock();
++        printf("PANDORA VIDC: unencodable OAS field %u\n", encoding);
++        return -1;
++    }
++    const unsigned oas = widths[encoding] < 40 ? widths[encoding] : 40;
++    if ((vidc_qtable_pa + VIDC_QTABLE_ALLOC) >> oas ||
++        (vidc_sfr_pa + VIDC_SFR_BYTES) >> oas) {
++        pandora_apps_smmu_unlock();
++        printf("PANDORA VIDC: buffers exceed the %u-bit output address space\n", oas);
++        return -1;
++    }
++
++    ArmSmmu4KConfig tcfg = { 32, oas, tpa, VIDC_SMMU_LEAF_BUDGET };
++    ArmSmmu4KResult tres;
++    ArmSmmu4KRange ranges[2];
++    ranges[0] = (ArmSmmu4KRange){ VIDC_IOVA_BASE, vidc_qtable_pa, VIDC_QTABLE_ALLOC,
++        ArmSmmu4KRead | ArmSmmu4KWrite, 0, 2 };
++    ranges[1] = (ArmSmmu4KRange){ VIDC_IOVA_SFR, vidc_sfr_pa, VIDC_SFR_BYTES,
++        ArmSmmu4KRead | ArmSmmu4KWrite, 0, 2 };
++    ArmSmmu4KStatus st = ArmSmmu4KBuild(&tcfg, ranges, 2, (uint64_t *)tva,
++        VIDC_SMMU_TABLE_PAGES, &tres);
++    if (st != ArmSmmu4KSuccess) {
++        pandora_apps_smmu_unlock();
++        printf("PANDORA VIDC: SMMU tables status %d\n", (int)st);
++        return -1;
++    }
++    clean_dcache64((addr64_t)tpa, VIDC_SMMU_TABLE_PAGES * 0x1000, TRUE);
++
++    ArmSmmu4KMmio mmio = { (volatile unsigned char *)vidc_smmu_va, VIDC_SMMU_SIZE };
++    ArmSmmu4KIo io;
++    if (ArmSmmu4KBindMmio(&mmio, &io) != ArmSmmu4KSuccess) {
++        pandora_apps_smmu_unlock();
++        printf("PANDORA VIDC: SMMU mmio bind failed\n");
++        return -1;
++    }
++    if (ArmSmmu4KCheckFaultedStreams(&io, route, 3, bank, &sres) != ArmSmmu4KSuccess) {
++        pandora_apps_smmu_unlock();
++        printf("PANDORA VIDC: SMMU reports faulted streams before attach\n");
++        return -1;
++    }
++    const uint32_t cb_off = (uint32_t)(cbbase + bank * page);
++    vidc_smmu_wr(cb_off + 4, VIDC_SMMU_ACTLR);
++    ArmSmmu4KContextConfig ctx = { &tcfg, NULL, &tres, NULL, id0, id2, asid, 0, 0, 1 };
++    ArmSmmu4KProgramResult prog;
++    st = ArmSmmu4KProgramDisabledContext(&io, bank, &ctx, 1000, &prog);
++    if (st != ArmSmmu4KSuccess) {
++        pandora_apps_smmu_unlock();
++        printf("PANDORA VIDC: SMMU context status %d (sctlr %08x)\n", (int)st,
++            prog.readback.sctlr);
++        return -1;
++    }
++    if (ArmSmmu4KAttachStreams(&io, &sstate, route, 3, bank, &ctx, &sres) !=
++        ArmSmmu4KSuccess) {
++        pandora_apps_smmu_unlock();
++        printf("PANDORA VIDC: SMMU stream attach failed\n");
++        return -1;
++    }
++    /* No fault dispatcher exists for these streams; keep CFIE clear so a fault
++     * is observed through FSR polling instead of an unhandled IRQ. */
++    uint32_t sctlr = vidc_smmu_rd(cb_off);
++    vidc_smmu_wr(cb_off, sctlr & ~(1u << 6));
++    pandora_apps_smmu_unlock();
++
++    vidc_qtable_iova = (uint32_t)VIDC_IOVA_BASE;
++    vidc_sfr_iova = (uint32_t)VIDC_IOVA_SFR;
++    vidc_smmu_on = true;
++    printf("PANDORA VIDC: apps-smmu bank %u asid %u cb %#x sctlr %08x/%08x "
++           "tcr %08x ttbr0 %#llx pages %zu\n", bank, asid, cb_off, sctlr,
++        prog.readback.sctlr, prog.readback.tcr, prog.readback.ttbr0,
++        tres.table_pages);
++    printf("PANDORA VIDC: IOVA qtable %08x (PA %08llx) SFR %08x (PA %08llx) "
++           "sids %#x/%#x/%#x\n", vidc_qtable_iova,
++        (unsigned long long)vidc_qtable_pa, vidc_sfr_iova,
++        (unsigned long long)vidc_sfr_pa, sids[0], sids[1], sids[2]);
++    return 0;
++}
++
++/* Fill the queue table now that the device addresses are known. */
++static int
++vidc_fill_queues(void)
++{
++    if (!vidc_qtable_va || !vidc_sfr_va) {
++        printf("PANDORA VIDC: fill before alloc\n");
++        return -1;
++    }
++    if (!vidc_smmu_on && ((vidc_qtable_pa | vidc_sfr_pa) >> 32)) {
++        printf("PANDORA VIDC: refusing to publish truncated 32-bit addresses "
++               "(qtable %#llx SFR %#llx)\n",
++            (unsigned long long)vidc_qtable_pa, (unsigned long long)vidc_sfr_pa);
++        return -1;
 +    }
 +
 +    struct vidc_queue_table *t = (struct vidc_queue_table *)vidc_qtable_va;
@@ -353,14 +697,14 @@ index 0000000..f99c5be
 +    t->qhdr0_offset = (uint32_t)((char *)&t->qhdr[0] - (char *)t);   /* [M] 288 */
 +    t->num_q = IFACEQ_NUMQ;
 +    t->num_active_q = IFACEQ_NUMQ;
-+    t->device_addr = vidc_qtable_pa;
++    t->device_addr = vidc_qtable_da();          /* device address, not the PA */
 +    const char *nm = "iris-hfi-queues";
 +    for (unsigned i = 0; i < (unsigned)sizeof(t->name) - 1 && nm[i]; i++) t->name[i] = nm[i];
 +
 +    for (unsigned i = 0; i < IFACEQ_NUMQ; i++) {
 +        struct vidc_queue_header *q = &t->qhdr[i];
 +        q->status = 1;                         /* [M] active */
-+        q->start_addr = (uint32_t)(vidc_qtable_pa + IFACEQ_RING_OFFS(i));
++        q->start_addr = vidc_ring_da(i);        /* device address of the ring */
 +        q->queue_type = (uint16_t)i;
 +        q->header_type = IFACEQ_DFLT_QHDR;     /* [M] 0x0101 */
 +        q->q_size = IFACEQ_QUEUE_WORDS;        /* [M] words, not bytes */
@@ -382,14 +726,11 @@ index 0000000..f99c5be
 +    __asm__ volatile ("dmb oshst" ::: "memory");
 +    clean_dcache64((addr64_t)vidc_sfr_pa, (unsigned)VIDC_SFR_BYTES, TRUE);
 +
-+    printf("PANDORA VIDC: qtable PA=%08llx hdr=%u qhdr0=%u q_size=%u ring0=%08x\n",
-+        (unsigned long long)vidc_qtable_pa, t->size, t->qhdr0_offset,
-+        IFACEQ_QUEUE_WORDS, (unsigned)(vidc_qtable_pa + IFACEQ_RING_OFFS(0)));
-+    printf("PANDORA VIDC: rings %08llx/%08llx/%08llx SFR PA=%08llx\n",
-+        (unsigned long long)(vidc_qtable_pa + IFACEQ_RING_OFFS(0)),
-+        (unsigned long long)(vidc_qtable_pa + IFACEQ_RING_OFFS(1)),
-+        (unsigned long long)(vidc_qtable_pa + IFACEQ_RING_OFFS(2)),
-+        (unsigned long long)vidc_sfr_pa);
++    printf("PANDORA VIDC: qtable DA=%08x hdr=%u qhdr0=%u q_size=%u ring0=%08x\n",
++        vidc_qtable_da(), t->size, t->qhdr0_offset,
++        IFACEQ_QUEUE_WORDS, vidc_ring_da(0));
++    printf("PANDORA VIDC: rings %08x/%08x/%08x SFR DA=%08x\n",
++        vidc_ring_da(0), vidc_ring_da(1), vidc_ring_da(2), vidc_sfr_da());
 +    return 0;
 +}
 +
@@ -603,13 +944,15 @@ index 0000000..f99c5be
 +        printf("PANDORA VIDC: publish before alloc\n");
 +        return -1;
 +    }
-+    uint32_t da = (uint32_t)vidc_qtable_pa;
++    uint32_t da = vidc_qtable_da();
 +
 +    vidc_wr(R_CPU_QUEUE_TABLE_DA, da);
 +    vidc_wr(R_CPU_QUEUE_TABLE_SIZE, VIDC_QTABLE_BYTES);
 +    vidc_wr(R_CPU_QUEUE_TABLE_DA2, da);
 +    vidc_wr(R_CPU_QUEUE_TABLE_EN, 1);
-+    vidc_wr(R_CPU_QUEUE_TABLE_ADDR2, (uint32_t)vidc_sfr_pa);
++    vidc_wr(R_CPU_QUEUE_TABLE_ADDR2, vidc_sfr_da());
++    printf("PANDORA VIDC: published DA=%08x SFR=%08x (smmu %s)\n", da, vidc_sfr_da(),
++        vidc_smmu_on ? "on" : "OFF, truncated physical address");
 +
 +    /* 0xA0024/0xA0028 carry the TrustZone content-protection span: the vendor
 +     * derives it from its CP resource table and only writes it when that table
@@ -705,9 +1048,11 @@ index 0000000..f99c5be
 +        return -1;
 +    }
 +
-+    uint32_t phoff = *(uint32_t *)(hdr + 28);
-+    uint16_t phentsize = *(uint16_t *)(hdr + 42);
-+    uint16_t phnum = *(uint16_t *)(hdr + 44);
++    /* Byte-wise so the parse does not depend on the alignment of hdr/phbuf
++     * (and does not trip -Wcast-align). */
++    uint32_t phoff = vidc_le32(hdr + 28);
++    uint16_t phentsize = vidc_le16(hdr + 42);
++    uint16_t phnum = vidc_le16(hdr + 44);
 +    printf("PANDORA VIDC: firmware %s ELF32 phoff=%u phnum=%u size=%llu\n",
 +        vidc_fw_name, phoff, phnum, (unsigned long long)mdt_size);
 +
@@ -735,16 +1080,20 @@ index 0000000..f99c5be
 +        err = pandora_firmware_pread(vidc_fw_name, phoff + i * phentsize,
 +                                     phbuf, sizeof(struct vidc_elf32_phdr), NULL);
 +        if (err) { printf("PANDORA VIDC: phdr %u read failed %d\n", i, err); break; }
-+        struct vidc_elf32_phdr *p = (struct vidc_elf32_phdr *)phbuf;
-+        if (p->p_type != 1 || p->p_filesz == 0) continue;   /* PT_LOAD only */
-+        if (p->p_paddr < VIDEO_REGION_PA ||
-+            (uint64_t)p->p_paddr + p->p_filesz > VIDEO_REGION_PA + VIDEO_REGION_SIZE) {
-+            printf("PANDORA VIDC: segment %u paddr %08x outside carveout, skip\n", i, p->p_paddr);
++        /* Field-wise (byte-aligned buffer, no widening pointer cast). */
++        const uint32_t p_type = vidc_le32(phbuf + 0);
++        const uint32_t p_offset = vidc_le32(phbuf + 4);
++        const uint32_t p_paddr = vidc_le32(phbuf + 12);
++        const uint32_t p_filesz = vidc_le32(phbuf + 16);
++        if (p_type != 1 || p_filesz == 0) continue;         /* PT_LOAD only */
++        if (p_paddr < VIDEO_REGION_PA ||
++            (uint64_t)p_paddr + p_filesz > VIDEO_REGION_PA + VIDEO_REGION_SIZE) {
++            printf("PANDORA VIDC: segment %u paddr %08x outside carveout, skip\n", i, p_paddr);
 +            continue;
 +        }
-+        uint64_t dst_off = (uint64_t)p->p_paddr - VIDEO_REGION_PA;
-+        err = pandora_firmware_pread(vidc_fw_name, p->p_offset,
-+                                     (void *)(carveout + dst_off), p->p_filesz, NULL);
++        uint64_t dst_off = (uint64_t)p_paddr - VIDEO_REGION_PA;
++        err = pandora_firmware_pread(vidc_fw_name, p_offset,
++                                     (void *)(carveout + dst_off), p_filesz, NULL);
 +        if (err) { printf("PANDORA VIDC: segment %u copy failed %d\n", i, err); break; }
 +        loaded++;
 +    }
@@ -777,7 +1126,7 @@ index 0000000..f99c5be
 +    if (w == r) return 0;
 +
 +    uint32_t start = vidc_qt_rd(moff + offsetof(struct vidc_queue_header, start_addr));
-+    uint32_t ring_off = start - (uint32_t)vidc_qtable_pa;
++    uint32_t ring_off = start - vidc_qtable_da();
 +    uint32_t q_off = ring_off + r * 4u;
 +    if (q_off + 8u > VIDC_QTABLE_BYTES) {
 +        printf("PANDORA VIDC: msg queue index out of range (r=%u w=%u start=%08x)\n", r, w, start);
@@ -844,7 +1193,7 @@ index 0000000..f99c5be
 +        return -1;
 +    }
 +    uint32_t start = vidc_qt_rd(coff + offsetof(struct vidc_queue_header, start_addr));
-+    uint32_t ring_off = start - (uint32_t)vidc_qtable_pa;
++    uint32_t ring_off = start - vidc_qtable_da();
 +    uint64_t ring_pa = vidc_qtable_pa + ring_off;
 +
 +    /* Drop any stale host->fw interrupt latch before ringing the doorbell. */
@@ -906,9 +1255,17 @@ index 0000000..f99c5be
 +    vidc_verdict("power", rc);
 +    if (rc == 0) vidc_pass_mask |= VIDC_STAGE_POWER;
 +
-+    rc = vidc_alloc_queues();           /* host memory only, always safe */
-+    vidc_verdict("queues", rc);
++    rc = vidc_alloc_buffers();          /* host memory only, always safe */
++    vidc_verdict("alloc", rc);
 +    if (rc == 0) vidc_pass_mask |= VIDC_STAGE_ALLOC;
++
++    rc = vidc_smmu_up();                /* 32-bit IOVAs for table + SFR */
++    vidc_verdict("smmu", rc);
++    if (rc == 0) vidc_pass_mask |= VIDC_STAGE_SMMU;
++
++    rc = vidc_fill_queues();            /* needs the device addresses */
++    vidc_verdict("queues", rc);
++    if (rc == 0) vidc_pass_mask |= VIDC_STAGE_QUEUES;
 +
 +    rc = vidc_auth_reset();             /* SCM PAS load + auth_and_reset */
 +    vidc_verdict("pas", rc);
@@ -932,10 +1289,11 @@ index 0000000..f99c5be
 +    vidc_verdict("hfi", rc);
 +    if (rc == 0) vidc_pass_mask |= VIDC_STAGE_HFI;
 +
-+    printf("PANDORA VIDC: SUMMARY mask=%02x/%02x probe=%u power=%u queues=%u pas=%u "
-+           "fwcopy=%u publish=%u hfi=%u\n", vidc_pass_mask, VIDC_STAGE_ALL,
++    printf("PANDORA VIDC: SUMMARY mask=%03x/%03x probe=%u power=%u alloc=%u smmu=%u "
++           "queues=%u pas=%u fwcopy=%u publish=%u hfi=%u\n", vidc_pass_mask, VIDC_STAGE_ALL,
 +        !!(vidc_pass_mask & VIDC_STAGE_PROBE), !!(vidc_pass_mask & VIDC_STAGE_POWER),
-+        !!(vidc_pass_mask & VIDC_STAGE_ALLOC), !!(vidc_pass_mask & VIDC_STAGE_PAS),
++        !!(vidc_pass_mask & VIDC_STAGE_ALLOC), !!(vidc_pass_mask & VIDC_STAGE_SMMU),
++        !!(vidc_pass_mask & VIDC_STAGE_QUEUES), !!(vidc_pass_mask & VIDC_STAGE_PAS),
 +        !!(vidc_pass_mask & VIDC_STAGE_FWCOPY),
 +        !!(vidc_pass_mask & VIDC_STAGE_PUBLISH), !!(vidc_pass_mask & VIDC_STAGE_HFI));
 +    if (vidc_mmio_on)
