@@ -1,23 +1,19 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index fa1653a..e31bccd 100644
+index fa1653a..5338d26 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -152,6 +152,18 @@ bsd/dev/pandora_cpu.c			standard
+@@ -152,6 +152,14 @@ bsd/dev/pandora_cpu.c			standard
  bsd/dev/pandora_autoswipe.c		standard
  bsd/dev/pandora_dpu.c			standard
  bsd/dev/pandora_camera.c			standard
-+bsd/dev/pandora_part.h			standard
-+bsd/dev/pandora_modem.h			standard
 +bsd/dev/pandora_fw.c			standard
-+bsd/dev/pandora_fw.h			standard
 +bsd/dev/pandora_pas.c			standard
-+bsd/dev/pandora_pas.h			standard
 +bsd/dev/pandora_mpss.c			standard
 +bsd/dev/pandora_rmtfs.c			standard
 +bsd/dev/pandora_qrtr.c			standard
-+bsd/dev/pandora_qrtr.h			standard
 +bsd/dev/pandora_ipa.c			standard
-+bsd/dev/pandora_ipa.h			standard
++bsd/dev/pandora_qmi.c			standard
++bsd/dev/pandora_cell.c			standard
  bsd/dev/adreno/ArmSmmu4K.c		standard
  bsd/dev/adreno/ArmSmmu4KContext.c		standard
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
@@ -68,6 +64,2956 @@ index 56132ef..5a1b7be 100644
  static int
  scm_call_avail(unsigned svc, unsigned cmd)
  {
+diff --git a/bsd/dev/pandora_cell.c b/bsd/dev/pandora_cell.c
+new file mode 100644
+index 0000000..a294cfb
+--- /dev/null
++++ b/bsd/dev/pandora_cell.c
+@@ -0,0 +1,2730 @@
++/*
++ * PANDORA CELL: en1, the fake Ethernet interface the modem's IP packets ride on, the DHCP and ARP
++ * that make iOS use it, and the QMI sessions that keep it up.
++ *
++ * This is HakiOS's bsd/dev/hakios.cell.c, its bsd/dev/hakios.nas.c, and the WDS / WDA / DPM / UIM /
++ * DMS / NAS half of drivers/modem/hakios.mpss.c, ported to this tree (SM8850 "canoe", X85 modem,
++ * IPA 5.5, iOS 16). The wire format and the transaction table are in bsd/dev/pandora_qmi.c; this
++ * file is everything above them. The interface is HakiOS's hakios.net.c shim, which this tree
++ * already has an equivalent of in bsd/dev/qcom/PeachNet.c -- that file's comment at :285-287 says
++ * so in as many words ("See HackiOS redwood_net.c's BSD interface integration"), and its attach
++ * sequence, its BPF taps and its link event are what 10.2.1 below copies.
++ *
++ * Where every part came from (work/baseband-port/cell-nas-qmi-spec.md):
++ *
++ *   1.2   the MAC addresses, the forced /24, the made-up router, the MTU that is DHCP's only
++ *   1.3   the downlink: an IP packet from the IPA becomes a frame from the router to us
++ *   1.4   the uplink: ARP first, then DHCP, then everything else is an IP packet to the modem;
++ *         IPv6 and the rest are counted and not carried
++ *   1.6   the interface: ifnet_allocate_extended / ifnet_attach / bpfattach, the callback set
++ *   1.7   en1's unit number is given, not allocated (IFNET_INIT_LEGACY)
++ *   2     DHCP: this machine is the DHCP server; the modem only supplies static settings
++ *   3     WDS: bind mux, set IP family, start the network interface, get current settings
++ *   4     WDA: set data format (raw IP, QMAP both ways, the embedded endpoint)
++ *   5     DPM: open the hardware data port, with this IPA's endpoint pair
++ *   7     UIM: get card status, switch slot, change provisioning session
++ *   8     DMS (online) and NAS (register, serving system, signal)
++ *   9.1   why no baseband node may ever be added -- THE WARNING AT THE TOP OF pandora_cell.h
++ *   10.2  the function list, in that order, which is the order of the sections below
++ *   10.6  the boot arguments
++ *
++ * THE ONE RULE THAT MUST NOT BE BROKEN (spec 9.1): do NOT add a "baseband" (or "bbdev") node to
++ * the device tree, and do not publish or match an AppleBaseband / AppleIPAppender service for this
++ * port. mkadt_pandora.py has none today (its comments at :245 and :250 say so) and that must stay
++ * true: a baseband node makes CommCenter take its "this device has a baseband" path, fault in
++ * ApplePDPHelperInterface::callStructMethod on a NULL std::mutex, and take SIGSEGV/SIGABRT every
++ * five to ten seconds. The data path is this fake Ethernet interface and nothing else: en1 is not
++ * pdp_ip0, it is not in the Cellular Data switch, and it carries no signal bars.
++ *
++ * Two hazards the spec flags, both of which this file handles and neither of which HakiOS writes
++ * down:
++ *
++ *   1. ifnet_event() with KEV_DL_LINK_ON / KEV_DL_LINK_OFF is not optional (spec 9.2, risk 17).
++ *      configd's IPConfiguration only starts DHCP on an Ethernet interface whose link it has been
++ *      told came up. Without it en1 stays at 169.254.x.x forever. The initial one is sent with the
++ *      first data session, and a second one is sent when the link goes down.
++ *
++ *   2. The QMI TLVs carry the modem's IPv4 address as a little-endian u32 whose value is already
++ *      the host-order address (10.0.0.1 arrives as 0x0A000001, spec 3.2). It is stored as such and
++ *      put on the wire by put32(), which is big-endian, exactly as HakiOS does. There is no ntohl
++ *      or htonl in this file, and there must not be: that is the silent killer the spec names.
++ *
++ * PORTER'S NOTE on one thing this file does NOT do: it never waits inside a QMI transaction. The
++ * thread that runs the sessions also drives pandora_ipa_poll() (spec 1.5's poll model, HakiOS's
++ * arrangement), so a thread asleep in a QMI wait is a data path that has stopped, and the receive
++ * endpoints' aggregation window is 500 us (spec 4.1). Every phase below is therefore a state on a
++ * 100 ms tick instead of a sleep: HakiOS's `dms_set_mode(); sleep_ms(2000); dms_set_mode()` is two
++ * ticks and a timer here, and its 6-second WDS retry is the same number of milliseconds spent the
++ * same way. Where that changes a behaviour it is said so, at the state machine.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/sysctl.h>
++#include <sys/kern_event.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <net/ether_if_module.h>
++#include <net/if_ether.h>
++#include <net/bpf.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
++#include "pandora_modem.h"
++#include "pandora_ipa.h"
++#include "pandora_qrtr.h"
++#include "pandora_cell.h"
++
++/*
++ * thread_terminate(thread_t) has no public declaration in this tree's headers; pandora_adsp.c:58
++ * and pandora_amp.c:47 declare it the same way, so this file does too.
++ */
++extern kern_return_t thread_terminate(thread_t);
++
++#if defined(PANDORA)
++
++/* ---- the interface's numbers (spec 1.1, 1.2, 1.7) -------------------------------------------- */
++
++#define CELL_UNIT               1       /* en1: the modem's packets (HakiOS CELL_UNIT, hakios.cell.c:29) */
++#define CELL_MUX                1       /* the QMAP mux id the session is bound to (WDS Bind Mux Data Port) */
++#define CELL_ETHER_HEADER       14      /* an Ethernet header, no VLAN, no 802.3 length field */
++#define CELL_FRAME_MAX          1514    /* HakiOS HAKIOS_NET_FRAME_MAX, hakios.net.h:27 */
++#define CELL_MTU                1500    /* what en1 is told; the modem's MTU only reaches DHCP */
++#define CELL_TICK_MS            100     /* the state machine's tick */
++/*
++ * The largest frame this layer builds itself: an ARP reply (42 bytes) or a DHCP reply, which is
++ * Ethernet + IPv4 + UDP + the padded BOOTP body (spec 2.1: 300 bytes of it at least). 512 is
++ * comfortably more than both, and keeps cell_output()'s two buffers from crowding the kernel stack.
++ */
++#define CELL_REPLY_MAX          512
++
++/*
++ * Locally administered: "pand" and the unit, not HakiOS's 02:68:61:6b:69:01 ("haki"), so that a
++ * log or a packet capture of the two ports cannot be confused (spec 10.2's MAC section, and risk
++ * 16). The router's is the same prefix with 0xfe in the last byte, which is HakiOS's arrangement
++ * (hakios.cell.c:32-33) and keeps the two addresses visibly a pair.
++ */
++static const uint8_t cell_mac[6] = { 0x02, 0x70, 0x61, 0x6e, 0x64, 0x01 };
++static const uint8_t router_mac[6] = { 0x02, 0x70, 0x61, 0x6e, 0x64, 0xfe };
++
++/* ---- the QMI wire (spec 3.2, 4.2, 5.1, 7.1, 8) ----------------------------------------------- */
++
++#define QMI_WDS                         0x01
++#define WDS_START_NETWORK_INTERFACE     0x0020
++#define WDS_GET_CURRENT_SETTINGS        0x002d
++#define WDS_BIND_MUX_DATA_PORT          0x00a2
++#define WDS_SET_IP_FAMILY               0x004d
++
++#define QMI_DMS                         0x02
++#define DMS_SET_OPERATING_MODE          0x002e
++#define DMS_GET_OPERATING_MODE          0x002d
++#define DMS_ONLINE                      0
++#define DMS_LOW_POWER                   1
++
++#define QMI_NAS                         0x03
++#define NAS_SERVING_SYSTEM              0x0024
++#define NAS_GET_SIGNAL_INFO             0x004f
++#define NAS_SIGNAL_INFO                 0x0051
++#define NAS_INITIATE_NETWORK_REGISTER   0x0022
++#define NAS_GET_SYSTEM_SELECTION_PREFERENCE 0x0034
++#define NAS_GET_SYSTEM_INFO             0x004d
++
++#define QMI_UIM                         0x0b
++#define UIM_GET_CARD_STATUS             0x002f
++#define UIM_SWITCH_SLOT                 0x0046
++#define UIM_CHANGE_PROVISIONING_SESSION 0x0038
++
++#define QMI_WDA                         0x1a
++#define WDA_SET_DATA_FORMAT             0x0020
++
++#define QMI_DPM                         0x2f
++#define DPM_OPEN_PORT                   0x0020
++
++#define DATA_ENDPOINT_EMBEDDED          4       /* spec 5.1: the port type the modem maps */
++#define DATA_ENDPOINT_INTERFACE         1       /* ... and the interface number inside it */
++
++/* The QMI result's "the device is not ready yet": DMS's cold-boot refusal to go straight online. */
++#define QMI_ERR_DEVICE_NOT_READY        52
++
++/* ---- state ---------------------------------------------------------------------------------- */
++
++static LCK_GRP_DECLARE(cell_lock_group, "pandora-cell");
++static LCK_MTX_DECLARE(cell_lock, &cell_lock_group);
++
++static ifnet_t cell_interface;                  /* en1, retained until reboot */
++static thread_t cell_thread;
++static bool cell_attached;
++static bool cell_started;
++static bool cell_trace;
++
++/*
++ * The data session as DHCP and ARP see it (spec 1.2). Copied whole under the lock by the output
++ * path rather than read field by field, so that a DHCP answer cannot mix two sessions' settings.
++ */
++struct cell_session {
++	bool            up;
++	uint32_t        address;                /* host order, from WDS (spec 3.2) */
++	uint32_t        mask;                   /* the /24 this layer imposes, not the modem's */
++	uint32_t        router;                 /* the made-up peer in that /24 */
++	uint32_t        dns1, dns2;
++	uint32_t        mtu;
++	uint32_t        modem_mask, modem_gateway;      /* what the modem said, for the log */
++};
++static struct cell_session session;
++
++static struct cell_counts {
++	uint64_t        arp, dhcp, to_modem, from_modem, dropped_out, dropped_in, not_ip4, other_mux;
++} cell_count;
++
++/* BOOT ARGUMENTS (spec 10.6): read once, in pandora_cell_start(). */
++static bool cell_data_off;                      /* pandora_cell_data_off: NAS and the SIM only */
++static bool cell_dpm_off;                       /* pandora_cell_dpm_off */
++static bool cell_wda_off;                       /* pandora_cell_wda_off */
++static bool cell_nobind;                        /* pandora_cell_nobind */
++static bool cell_sim_switch_off;                /* pandora_cell_sim_switch_off */
++static uint8_t cell_apn[64];                    /* pandora_cell_apn */
++static size_t cell_apn_length;
++
++/* ---- forward declarations: one section per spec 10.2 entry ---------------------------------- */
++
++static errno_t  cell_output(ifnet_t interface, mbuf_t packet);
++static errno_t  cell_ioctl(ifnet_t interface, u_long command, void *data);
++static void     cell_link_event(bool up);
++static void     cell_inject(const uint8_t *frame, size_t length);
++static bool     cell_arp(const uint8_t *frame, size_t length,
++                    const struct cell_session *settings, uint8_t *reply, size_t *reply_length);
++static bool     cell_dhcp_request(const uint8_t *frame, size_t length, const uint8_t **udp);
++static bool     cell_dhcp_answer(const uint8_t *frame, size_t length, const uint8_t *udp,
++                    const struct cell_session *settings, uint8_t *reply, size_t *reply_length);
++static void     cell_tick(void);
++static void     cell_thread_main(void *context, wait_result_t result);
++static void     cell_data_tick(uint64_t now);
++static void     cell_dms_tick(uint64_t now);
++static void     cell_uim_tick(uint64_t now);
++static void     cell_uim_card_status(const uint8_t *value, uint16_t length);
++static void     cell_nas_tick(uint64_t now);
++static bool     cell_qmi_links_open(void);
++static void     cell_dms_receive(void *context, uint32_t node, uint32_t port, const void *data,
++                    size_t length);
++static void     cell_dms_server(void *context, bool arrived, uint32_t service, uint32_t version,
++                    uint32_t instance, uint32_t node, uint32_t port);
++static void     cell_uim_receive(void *context, uint32_t node, uint32_t port, const void *data,
++                    size_t length);
++static void     cell_uim_server(void *context, bool arrived, uint32_t service, uint32_t version,
++                    uint32_t instance, uint32_t node, uint32_t port);
++static void     cell_nas_receive(void *context, uint32_t node, uint32_t port, const void *data,
++                    size_t length);
++static void     cell_nas_server(void *context, bool arrived, uint32_t service, uint32_t version,
++                    uint32_t instance, uint32_t node, uint32_t port);
++static void     cell_wds_receive(void *context, uint32_t node, uint32_t port, const void *data,
++                    size_t length);
++static void     cell_wds_server(void *context, bool arrived, uint32_t service, uint32_t version,
++                    uint32_t instance, uint32_t node, uint32_t port);
++static void     cell_dpm_receive(void *context, uint32_t node, uint32_t port, const void *data,
++                    size_t length);
++static void     cell_dpm_server(void *context, bool arrived, uint32_t service, uint32_t version,
++                    uint32_t instance, uint32_t node, uint32_t port);
++static void     cell_wda_receive(void *context, uint32_t node, uint32_t port, const void *data,
++                    size_t length);
++static void     cell_wda_server(void *context, bool arrived, uint32_t service, uint32_t version,
++                    uint32_t instance, uint32_t node, uint32_t port);
++
++/* ---- small helpers -------------------------------------------------------------------------- */
++
++static inline uint16_t
++get16(const uint8_t *p)
++{
++	return (uint16_t)((uint16_t)p[0] << 8 | p[1]);
++}
++
++/* Big-endian, which is what the wire under en1 is: see the top of the file on byte order. */
++static inline uint32_t
++get32(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
++}
++
++static inline void
++put32(uint8_t *p, uint32_t value)
++{
++	p[0] = (uint8_t)(value >> 24);
++	p[1] = (uint8_t)(value >> 16);
++	p[2] = (uint8_t)(value >> 8);
++	p[3] = (uint8_t)value;
++}
++
++static inline void
++put16(uint8_t *p, uint32_t value)
++{
++	p[0] = (uint8_t)(value >> 8);
++	p[1] = (uint8_t)value;
++}
++
++/* The internet checksum of an IPv4 header or of a UDP pseudo-header payload (spec 2.1). */
++static uint16_t
++cell_checksum(const uint8_t *data, size_t length)
++{
++	uint32_t sum = 0;
++
++	for (size_t i = 0; i + 1 < length; i += 2) {
++		sum += (uint32_t)data[i] << 8 | data[i + 1];
++	}
++	if (length & 1) {
++		sum += (uint32_t)data[length - 1] << 8;
++	}
++	while (sum >> 16) {
++		sum = (sum & 0xffff) + (sum >> 16);
++	}
++	return (uint16_t)~sum;
++}
++
++/* Milliseconds since boot, for the state machine's timers. */
++static uint64_t
++cell_now_ms(void)
++{
++	uint64_t uptime, nanoseconds;
++
++	clock_get_uptime(&uptime);
++	absolutetime_to_nanoseconds(uptime, &nanoseconds);
++	return nanoseconds / 1000000ull;
++}
++
++/* A "pandora_cell*" boot argument that is on: present and not zero (HakiOS option()). */
++static bool
++cell_option(const char *name)
++{
++	char full[48];
++	unsigned on = 0;
++
++	snprintf(full, sizeof(full), "pandora_cell%s", name);
++	return PE_parse_boot_argn(full, &on, sizeof(on)) && on != 0;
++}
++
++/* A boot argument with a value. */
++static bool
++cell_argument(const char *name, void *value, size_t size)
++{
++	char full[48];
++
++	snprintf(full, sizeof(full), "pandora_cell%s", name);
++	return PE_parse_boot_argn(full, value, (uint32_t)size);
++}
++
++/* ---- 10.2.1 the interface (spec 1.6, 1.7, and PeachNet.c:261-295) --------------------------- */
++
++/*
++ * The uplink: one frame from the stack, which is a whole Ethernet frame because ether_frameout_
++ * extended put the header in it. Three answers in this order, and the order matters (spec 1.4):
++ * ARP is answered here, DHCP is answered here, and only then is anything an IP packet for the
++ * modem. IPv6 (0x86dd) and everything else is counted and not carried -- en1 is IPv4 only.
++ *
++ * PORTER'S NOTE: the session is copied once at the top and no lock is held for the rest. HakiOS
++ * holds its lock across the whole of cell_transmit() including the answer's injection back into
++ * the stack (hakios.cell.c:242-259), which is a non-recursive mutex held across a path that can
++ * reach this same output function again (an incoming DHCP answer that makes the stack send
++ * anything). Copying a 28-byte structure is cheaper than that deadlock.
++ *
++ * PORTER'S NOTE: this returns 0 for every frame it consumed, including the ones it deliberately
++ * does not carry (IPv6, and anything before the session is up). HakiOS's shim treats a false return
++ * as a drop; an errno from a Darwin output function is a packet the stack may retry, and retrying
++ * an IPv6 frame on an IPv4-only interface is worse than dropping it. The counters say what was
++ * dropped: `not_ip4` and `dropped_out`.
++ */
++static errno_t
++cell_output(ifnet_t interface, mbuf_t packet)
++{
++	uint8_t frame[CELL_FRAME_MAX];
++	uint8_t reply[CELL_REPLY_MAX];
++	size_t reply_length = sizeof(reply);    /* the answers below say how much of it they used */
++	struct cell_session settings;
++	uint32_t type;
++	size_t length;
++	const uint8_t *udp = NULL;
++	int error;
++
++	length = mbuf_pkthdr_len(packet);
++	if (length < CELL_ETHER_HEADER || length > sizeof(frame)) {
++		mbuf_freem(packet);
++		return EMSGSIZE;
++	}
++	if (mbuf_copydata(packet, 0, length, frame) != 0) {
++		mbuf_freem(packet);
++		return EIO;
++	}
++	/* BPF sees the frame before this layer decides what to do with it (PeachNet.c:206-212). */
++	bpf_tap_out(interface, DLT_EN10MB, packet, NULL, 0);
++	mbuf_freem(packet);
++	lck_mtx_lock(&cell_lock);
++	settings = session;
++	lck_mtx_unlock(&cell_lock);
++	type = get16(frame + 12);
++	if (type == 0x0806) {
++		if (cell_arp(frame, length, &settings, reply, &reply_length)) {
++			cell_count.arp++;
++			cell_inject(reply, reply_length);
++		}
++		return 0;
++	}
++	if (type == 0x0800 && cell_dhcp_request(frame, length, &udp)) {
++		/*
++		 * No answer while the session is down: that is what makes en1 "up with no address yet"
++		 * instead of handing out a stale one (spec 2.1, HakiOS hakios.cell.c:236).
++		 */
++		if (settings.up && cell_dhcp_answer(frame, length, udp, &settings, reply, &reply_length)) {
++			cell_count.dhcp++;
++			cell_inject(reply, reply_length);
++		}
++		return 0;
++	}
++	if (type == 0x0800) {
++		if (!settings.up) {
++			cell_count.dropped_out++;
++			return 0;
++		}
++		error = pandora_ipa_transmit(CELL_MUX, frame + CELL_ETHER_HEADER,
++		    length - CELL_ETHER_HEADER);
++		if (error == 0) {
++			cell_count.to_modem++;
++		} else {
++			cell_count.dropped_out++;
++			if (cell_trace) {
++				printf("PANDORA CELL: the IPA refused a %zu-byte uplink packet: %d\n",
++				    length - CELL_ETHER_HEADER, error);
++			}
++		}
++		return 0;
++	}
++	cell_count.not_ip4++;                   /* IPv6 and the rest: not carried (hakios.cell.c:253) */
++	return 0;
++}
++
++/*
++ * The ioctls an Ethernet interface needs and no more. PeachNet's interface_ioctl() does the same
++ * job with Wi-Fi media; this one has no media (it is a fake cable), so SIOCSIFADDR is what brings
++ * the interface up and SIOCSIFMTU is bounded like any Ethernet.
++ *
++ * PORTER'S NOTE: a driver here could call ether_attach_at() for IFT_ETHER's own ioctls, but the
++ * legacy path only needs the flags and the MTU. If a later iOS version asks for media or a
++ * capability this does not have, the answer is EOPNOTSUPP and not a fault.
++ */
++static errno_t
++cell_ioctl(ifnet_t interface, u_long command, void *data)
++{
++	struct ifreq *request = data;
++
++	switch (command) {
++	case SIOCSIFADDR:
++		return ifnet_set_flags(interface, IFF_UP, IFF_UP);
++	case SIOCSIFFLAGS:
++		return 0;                       /* the data session owns the link state */
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	case SIOCSIFMTU:
++		return request->ifr_mtu >= 576 && request->ifr_mtu <= CELL_MTU ?
++		    ifnet_set_mtu(interface, request->ifr_mtu) : EINVAL;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++/*
++ * The link event configd listens for (spec 9.2, risk 17). PeachNet.c:246-260 is the template and
++ * this is that code with the interface this file owns.
++ *
++ * This is the one thing HakiOS does inside its shim and does not write down; the spec calls it
++ * out as non-optional: no KEV_DL_LINK_ON, no DHCP, no address, ever.
++ */
++static void
++cell_link_event(bool up)
++{
++	_Alignas(struct kern_event_msg) unsigned char message[
++	    KEV_MSG_HEADER_SIZE + sizeof(struct net_event_data)] = { 0 };
++	struct kern_event_msg *header = (void *)message;
++	/* kern_event_msg includes a trailing event_data[1] placeholder. Its sizeof is four bytes
++	 * larger than the actual wire header, which is why the buffer is sized from
++	 * KEV_MSG_HEADER_SIZE and not sizeof(struct kern_event_msg). (PeachNet.c:248-250) */
++	struct net_event_data *data = (void *)(message + KEV_MSG_HEADER_SIZE);
++
++	if (cell_interface == NULL) {
++		return;
++	}
++	header->total_size = sizeof(message);
++	header->vendor_code = KEV_VENDOR_APPLE;
++	header->kev_class = KEV_NETWORK_CLASS;
++	header->kev_subclass = KEV_DL_SUBCLASS;
++	header->event_code = up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF;
++	data->if_family = ifnet_family(cell_interface);
++	data->if_unit = ifnet_unit(cell_interface);
++	strlcpy(data->if_name, ifnet_name(cell_interface), sizeof(data->if_name));
++	(void)ifnet_event(cell_interface, header);
++	pandora_say("en%u: link %s told to the network stack\n", ifnet_unit(cell_interface),
++	    up ? "up" : "down");
++}
++
++/* One Ethernet frame into the stack, the way PeachNet.c:381-395 does it: BPF first, then BSD. */
++static void
++cell_inject(const uint8_t *frame, size_t length)
++{
++	mbuf_t packet;
++	struct ifnet_stat_increment_param stats = { 0 };
++	void *header;
++
++	if (cell_interface == NULL) {
++		return;
++	}
++	if (mbuf_getpacket(MBUF_DONTWAIT, &packet) != 0) {
++		return;
++	}
++	if (mbuf_copyback(packet, 0, length, frame, MBUF_DONTWAIT) != 0) {
++		mbuf_freem(packet);
++		return;
++	}
++	mbuf_setlen(packet, length);
++	mbuf_pkthdr_setlen(packet, length);
++	mbuf_pkthdr_setrcvif(packet, cell_interface);
++	mbuf_pkthdr_setheader(packet, mbuf_data(packet));
++	header = mbuf_data(packet);
++	mbuf_adj(packet, CELL_ETHER_HEADER);
++	bpf_tap_in(cell_interface, DLT_EN10MB, packet, header, CELL_ETHER_HEADER);
++	stats.packets_in = 1;
++	stats.bytes_in = length;
++	(void)ifnet_input(cell_interface, packet, &stats);      /* the stack owns it, error or not */
++}
++
++/*
++ * 10.2.3 the downlink: one IP packet from the modem, made into a frame from the router to us.
++ * This is HakiOS's cell_receive (hakios.cell.c:261-280) and it is pandora_ipa.h's receive
++ * pointer, so it runs on the link thread inside pandora_ipa_poll().
++ */
++void
++pandora_cell_receive(uint32_t mux, const uint8_t *packet, size_t length)
++{
++	uint8_t frame[CELL_FRAME_MAX];
++	uint32_t version;
++
++	/*
++	 * PORTER'S NOTE: HakiOS ignores mux here ("this interface only carries mux 1, the IPA layer
++	 * drops the rest", spec 1.3). This one refuses anything that is not the bound mux, because a
++	 * second PDN's packets appearing on en1 with this session's address is worse than a drop.
++	 */
++	if (mux != CELL_MUX) {
++		cell_count.other_mux++;
++		return;
++	}
++	version = length > 0 ? packet[0] >> 4 : 0;
++	if (length < 20 || length + CELL_ETHER_HEADER > sizeof(frame) ||
++	    (version != 4 && version != 6)) {
++		cell_count.dropped_in++;
++		return;
++	}
++	if (cell_trace) {
++		printf("PANDORA CELL: %zu bytes from the modem on mux %u (IPv%u)\n", length, mux,
++		    version);
++	}
++	/* From the router to us: the source is the fake peer, the destination this interface. */
++	memcpy(frame, router_mac, 6);
++	memcpy(frame + 6, cell_mac, 6);
++	put16(frame + 12, version == 4 ? 0x0800 : 0x86dd);
++	memcpy(frame + CELL_ETHER_HEADER, packet, length);
++	cell_count.from_modem++;
++	cell_inject(frame, CELL_ETHER_HEADER + length);
++}
++
++/*
++ * 10.2.1 #1: make en1. Idempotent. The sequence is PeachNet.c:261-295's, which is the one this
++ * tree's own author wrote from HakiOS's shim: allocate extended with the legacy flag (so the unit
++ * number is ours and not allocated), attach, set the link address, attach BPF (IPConfiguration
++ * receives DHCP through BPF -- BSD input alone does not register an Ethernet BPF endpoint), and
++ * leave the interface up with the link down until a session gives it an address.
++ *
++ * IFNET_SUBFAMILY_*: PORTER'S NOTE. PeachNet uses IFNET_SUBFAMILY_WIFI for en0 because it is a
++ * Wi-Fi interface. This port plan says IFNET_SUBFAMILY_OTHER (spec 10.2 #1), which does not exist
++ * in this tree's kpi_interface.h; the list ends at IFNET_SUBFAMILY_MANAGEMENT (12). The two
++ * candidates were ANY (0) and DEFAULT (8); DEFAULT is what a plain Ethernet interface is, and the
++ * subfamily's only job here is to keep en1 from matching en0's family entry, which unit 1 already
++ * does. It is not a Wi-Fi interface and must not claim to be one.
++ */
++int
++pandora_cell_attach(void)
++{
++	struct ifnet_init_eparams init = { 0 };
++	ifnet_t interface = NULL;
++	errno_t error;
++
++	if (cell_attached) {
++		return 0;
++	}
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO;
++	init.name = "en";
++	init.unit = CELL_UNIT;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.subfamily = IFNET_SUBFAMILY_DEFAULT;
++	init.type = IFT_ETHER;
++	init.uniqueid = cell_mac;
++	init.uniqueid_len = 6;
++	init.output = cell_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = cell_ioctl;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = 6;
++	error = ifnet_allocate_extended(&init, &interface);
++	if (error != 0) {
++		pandora_say("en%u: ifnet_allocate_extended failed: %d\n", CELL_UNIT, error);
++		return error;
++	}
++	ifnet_set_addrlen(interface, 6);
++	ifnet_set_hdrlen(interface, CELL_ETHER_HEADER);
++	ifnet_set_mtu(interface, CELL_MTU);
++	/*
++	 * A made-up number: a cellular data path's rate is whatever the modem gets, and there is no
++	 * reason to advertise less than what these two endpoints can carry. PeachNet tells en0 its
++	 * legacy PHY's ceiling for the same reason (PeachNet.c:273).
++	 */
++	ifnet_set_baudrate(interface, 100000000);
++	ifnet_set_capabilities_enabled(interface, 0, -1);
++	ifnet_set_offload(interface, 0);
++	ifnet_set_flags(interface, IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX, 0xffff);
++	error = ifnet_attach(interface, NULL);
++	if (error != 0) {
++		pandora_say("en%u: ifnet_attach failed: %d\n", CELL_UNIT, error);
++		ifnet_release(interface);
++		return error;
++	}
++	cell_interface = interface;            /* retained until reboot, link failure included */
++	error = ifnet_set_lladdr(interface, cell_mac, 6);
++	if (error != 0) {
++		pandora_say("en%u: ifnet_set_lladdr failed: %d\n", CELL_UNIT, error);
++	} else {
++		bpfattach(interface, DLT_EN10MB, CELL_ETHER_HEADER);
++		(void)ifnet_set_flags(interface, IFF_UP, IFF_UP | IFF_RUNNING);
++		cell_attached = true;
++		pandora_say("en%u is up with %02x:%02x:%02x:%02x:%02x:%02x, no address yet "
++		    "(the link comes with the data session)\n", CELL_UNIT, cell_mac[0], cell_mac[1],
++		    cell_mac[2], cell_mac[3], cell_mac[4], cell_mac[5]);
++		/*
++		 * A session that came up before the interface existed (pandora_cell_session() skips the
++		 * link event when there is no interface) is told about it now, which is what HakiOS's
++		 * attach does at hakios.cell.c:355-357.
++		 */
++		{
++			bool up;
++
++			lck_mtx_lock(&cell_lock);
++			up = session.up;
++			lck_mtx_unlock(&cell_lock);
++			if (up) {
++				cell_link_event(true);
++			}
++		}
++	}
++	return error;
++}
++
++/* ---- 10.2.3 the session, and the sysctls it publishes (spec 1.2, 2.2) ----------------------- */
++
++/*
++ * The kern.pandora.cellular_* family (spec 2.2). HakiOS names them kern.hakios.cellular_*; the
++ * port plan renames them (§10.2 #7). They are read by nothing in this kernel -- they are for the
++ * log, for a user-space status tool, and for a future status-bar injection of the kind HakiOS's
++ * userland/src/inject_sb.c does -- so they are read-only.
++ */
++static int cell_sysctl_up;
++static int cell_sysctl_data;
++static int cell_sysctl_registered;
++static int cell_sysctl_bars;
++static int cell_sysctl_dbm;
++static int cell_sysctl_radio;
++static int cell_sysctl_ip;
++static int cell_sysctl_gateway;
++static int cell_sysctl_mask;
++static int cell_sysctl_mtu;
++static char cell_sysctl_operator[32];
++static char cell_sysctl_dns[40];
++
++SYSCTL_NODE(_kern, OID_AUTO, pandora, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
++    "the modem's data session (the fake Ethernet interface en1)");
++SYSCTL_INT(_kern_pandora, OID_AUTO, cellular_up, CTLFLAG_RD | CTLFLAG_LOCKED, &cell_sysctl_up, 0,
++    "the data session has an address");
++SYSCTL_INT(_kern_pandora, OID_AUTO, cellular_data, CTLFLAG_RD | CTLFLAG_LOCKED, &cell_sysctl_data, 0,
++    "WDS reported an address");
++SYSCTL_INT(_kern_pandora, OID_AUTO, cellular_registered, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &cell_sysctl_registered, 0, "NAS reports the modem registered");
++SYSCTL_INT(_kern_pandora, OID_AUTO, cellular_bars, CTLFLAG_RD | CTLFLAG_LOCKED, &cell_sysctl_bars, 0,
++    "signal bars, 0 to 4, only while registered");
++SYSCTL_INT(_kern_pandora, OID_AUTO, cellular_dbm, CTLFLAG_RD | CTLFLAG_LOCKED, &cell_sysctl_dbm, 0,
++    "the last signal reading in dBm");
++SYSCTL_INT(_kern_pandora, OID_AUTO, cellular_radio, CTLFLAG_RD | CTLFLAG_LOCKED, &cell_sysctl_radio,
++    0, "4 GSM, 5 UMTS, 8 LTE, 12 NR");
++SYSCTL_INT(_kern_pandora, OID_AUTO, cellular_ip, CTLFLAG_RD | CTLFLAG_LOCKED, &cell_sysctl_ip, 0,
++    "the session's IPv4 address, host order");
++SYSCTL_INT(_kern_pandora, OID_AUTO, cellular_gateway, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &cell_sysctl_gateway, 0, "the gateway the modem reported, host order");
++SYSCTL_INT(_kern_pandora, OID_AUTO, cellular_mask, CTLFLAG_RD | CTLFLAG_LOCKED, &cell_sysctl_mask, 0,
++    "the mask the modem reported, host order");
++SYSCTL_INT(_kern_pandora, OID_AUTO, cellular_mtu, CTLFLAG_RD | CTLFLAG_LOCKED, &cell_sysctl_mtu, 0,
++    "the MTU the modem reported, for DHCP's option 26");
++SYSCTL_STRING(_kern_pandora, OID_AUTO, cellular_operator, CTLFLAG_RD | CTLFLAG_LOCKED,
++    cell_sysctl_operator, sizeof(cell_sysctl_operator), "the operator's name from the PLMN");
++SYSCTL_STRING(_kern_pandora, OID_AUTO, cellular_dns, CTLFLAG_RD | CTLFLAG_LOCKED, cell_sysctl_dns,
++    sizeof(cell_sysctl_dns), "the session's DNS servers, in dotted quad, space separated");
++
++/* "a.b.c.d" for a log line. Host order in, dotted quad out (HakiOS ip4_string(), :5492-5495). */
++static void
++cell_ip_string(char *to, size_t size, uint32_t address)
++{
++	snprintf(to, size, "%u.%u.%u.%u", address >> 24, (address >> 16) & 0xff,
++	    (address >> 8) & 0xff, address & 0xff);
++}
++
++/*
++ * 10.2.3 #7: the data session changed. Called from WDS's Get Current Settings answer (spec 3.1
++ * step 5) and from wds_close's failure path (spec 2.2).
++ *
++ * The mask and the router are this layer's, not the modem's (spec 1.2): a cellular session is
++ * point to point and the gateway it reports need not be in any subnet with the address, which
++ * DHCP cannot express. So the interface is given a /24 around its address with the peer at its .1
++ * (or .2 if the address is the .1), and proxy ARP (cell_arp()) answers for the whole /24 so the
++ * stack never finds a hole in it. `up` with no address is still down: HakiOS's
++ * `session.up = up && address != 0`, and it is what stops configd from starting DHCP on an
++ * interface that has nothing behind it.
++ */
++void
++pandora_cell_session(bool up, uint32_t address, uint32_t mask, uint32_t gateway, uint32_t dns1,
++    uint32_t dns2, uint32_t mtu)
++{
++	struct cell_session next;
++	bool was_up;
++
++	next.modem_mask = mask;
++	next.modem_gateway = gateway;
++	mask = 0xffffff00;
++	next.address = address;
++	next.mask = mask;
++	next.router = (address & mask) | 1;
++	if (next.router == address) {
++		next.router = (address & mask) | 2;
++	}
++	next.dns1 = dns1;
++	next.dns2 = dns2;
++	next.mtu = mtu;
++	next.up = up && address != 0;
++
++	lck_mtx_lock(&cell_lock);
++	was_up = session.up;
++	session = next;
++	lck_mtx_unlock(&cell_lock);
++
++	cell_sysctl_up = next.up ? 1 : 0;
++	cell_sysctl_data = next.up ? 1 : 0;
++	cell_sysctl_ip = (int)address;
++	cell_sysctl_gateway = (int)gateway;
++	cell_sysctl_mask = (int)next.modem_mask;
++	cell_sysctl_mtu = (int)mtu;
++	if (dns1 != 0) {
++		cell_ip_string(cell_sysctl_dns, sizeof(cell_sysctl_dns), dns1);
++		if (dns2 != 0) {
++			char second[20];
++
++			cell_ip_string(second, sizeof(second), dns2);
++			strlcat(cell_sysctl_dns, " ", sizeof(cell_sysctl_dns));
++			strlcat(cell_sysctl_dns, second, sizeof(cell_sysctl_dns));
++		}
++	} else {
++		cell_sysctl_dns[0] = 0;
++	}
++	{
++		char address_string[20], mask_string[20], gateway_string[20];
++		char dns1_string[20], dns2_string[20], router_string[20];
++
++		cell_ip_string(address_string, sizeof(address_string), address);
++		cell_ip_string(mask_string, sizeof(mask_string), next.modem_mask);
++		cell_ip_string(gateway_string, sizeof(gateway_string), gateway);
++		cell_ip_string(dns1_string, sizeof(dns1_string), dns1);
++		cell_ip_string(dns2_string, sizeof(dns2_string), dns2);
++		cell_ip_string(router_string, sizeof(router_string), next.router);
++		pandora_say("the data session is %s: %s (the modem's mask %s and gateway %s; en1 is told "
++		    "/24 and router %s), DNS %s %s, MTU %u%s\n", next.up ? "UP" : "down", address_string,
++		    mask_string, gateway_string, router_string, dns1_string, dns2_string, mtu,
++		    cell_attached ? "" : " (no en1: the IPA's data path is not up)");
++	}
++	/*
++	 * Only a real transition is an event. Sending KEV_DL_LINK_ON again for every settings refresh
++	 * would make configd restart DHCP and drop the address it already has.
++	 */
++	if (cell_attached && was_up != next.up) {
++		cell_link_event(next.up);
++	}
++}
++
++/* ---- the thread and the entry (spec 10.2 #8, #9) -------------------------------------------- */
++
++/*
++ * 10.2.4 #8: the thread. HakiOS's step_nas() is a loop of sleeps whose union is these timers; here
++ * the same timers are fields, and the loop does two jobs at one period: pandora_ipa_poll() every
++ * couple of milliseconds (spec 1.5's model -- the rings are polled, no interrupt is taken from the
++ * GSI) and cell_tick() every CELL_TICK_MS.
++ */
++static void
++cell_thread_main(void *context __unused, wait_result_t result __unused)
++{
++	uint64_t last_tick = 0;
++
++	pandora_say("the cell thread is running (tick %u ms, trace %s)\n", CELL_TICK_MS,
++	    cell_trace ? "on" : "off");
++	while (cell_started) {
++		uint64_t now = cell_now_ms();
++
++		/*
++		 * The data path is polled every turn; the state machine's period is the tick, not the
++		 * turn, so that the IPA keeps draining its rings while a QMI phase waits (the top of
++		 * this file explains why no phase sleeps).
++		 */
++		pandora_ipa_poll();
++		if (now - last_tick >= CELL_TICK_MS) {
++			last_tick = now;
++			cell_tick();
++		}
++		/*
++		 * HakiOS polls "every 2 ms while frames are coming and every 10 ms when none has for a
++		 * while" (hakios.net.h:45-47). Before the data path is up there is nothing to poll, so
++		 * a longer sleep keeps this thread off the CPUs during the modem's boot.
++		 */
++		pandora_sleep_ms(pandora_ipa_data_ready() ? 2 : 20);
++	}
++	thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/*
++ * 10.2 #9: the entry. Refused by pandora_cell=0 (spec 10.6), and refused when the IPA's data path
++ * is not up, which is HakiOS's own gate at hakios.cell.c:346.
++ *
++ * PORTER'S NOTE: the order here is attach-then-thread rather than HakiOS's "attach only once the
++ * IPA is ready". This tree brings the IPA up in pandora_mpss.c's step_start() before the modem
++ * runs, and the cell layer has nothing to attach before that; but if this is called later than
++ * that (a boot argument, a second attempt after a failure) the attach must not be lost, and en1
++ * existing without a data path is harmless: it has no address and answers no DHCP.
++ */
++int
++pandora_cell_start(void)
++{
++	int error;
++	unsigned on = 1;
++
++	if (cell_started) {
++		return 0;
++	}
++	if (PE_parse_boot_argn("pandora_cell", &on, sizeof(on)) && on == 0) {
++		pandora_say("not started (pandora_cell=0)\n");
++		return 0;
++	}
++	/*
++	 * The boot arguments of spec 10.6. Every one of them is "pandora_cell_<name>"; the data path
++	 * ones are the same switches HakiOS has under different names (modem_data_off, modem_dpm_off,
++	 * modem_wda_off, modem_data_nobind, modem_apn, modem_sim_switch_off, modem_ipa_data_trace).
++	 */
++	cell_trace = cell_option("_trace");
++	cell_data_off = cell_option("_data_off");
++	cell_dpm_off = cell_option("_dpm_off");
++	cell_wda_off = cell_option("_wda_off");
++	cell_nobind = cell_option("_nobind");
++	cell_sim_switch_off = cell_option("_sim_switch_off");
++	cell_apn_length = 0;
++	if (cell_argument("_apn", cell_apn, sizeof(cell_apn) - 1)) {
++		cell_apn[sizeof(cell_apn) - 1] = 0;
++		cell_apn_length = strlen((const char *)cell_apn);
++	}
++	if (cell_apn_length != 0) {
++		pandora_say("APN from the boot argument: %s\n", (const char *)cell_apn);
++	}
++	if (cell_data_off) {
++		pandora_say("the data path is off (pandora_cell_data_off): the modem, the SIM and the "
++		    "registration only\n");
++	}
++	pandora_qmi_reset();
++	error = pandora_cell_attach();
++	if (error != 0) {
++		return error;
++	}
++	pandora_ipa_receive = pandora_cell_receive;
++	cell_started = true;
++	if (kernel_thread_start(cell_thread_main, NULL, &cell_thread) != KERN_SUCCESS) {
++		cell_started = false;
++		pandora_say("the cell thread could not be started\n");
++		return ENOMEM;
++	}
++	thread_deallocate(cell_thread);
++	pandora_announce("the cell layer's thread");
++	return 0;
++}
++
++/* One line of counters, for pandora_ipa_status()'s callers and for the log. */
++void
++pandora_cell_status(char *to, size_t size)
++{
++	char qmi[96];
++
++	if (to == NULL || size == 0) {
++		return;
++	}
++	pandora_qmi_status(qmi, sizeof(qmi));
++	snprintf(to, size,
++	    "en%u %s: %llu to the modem, %llu from it; dropped %llu out, %llu in; %llu not IPv4; "
++	    "%llu another mux; ARP %llu, DHCP %llu; %s",
++	    CELL_UNIT, cell_attached ? "attached" : "not attached", cell_count.to_modem,
++	    cell_count.from_modem, cell_count.dropped_out, cell_count.dropped_in, cell_count.not_ip4,
++	    cell_count.other_mux, cell_count.arp, cell_count.dhcp, qmi);
++}
++
++/* ---- 10.2.2 ARP: the router answers for everything (spec 1.2, 1.4) ------------------------- */
++
++/*
++ * Proxy ARP, HakiOS's arp_answer() (hakios.cell.c:84-109). Everything behind this interface is
++ * reached through the made-up router, so any address in the /24 that is asked about is answered
++ * with router_mac -- except the interface's own address, which is the one thing that is really
++ * here. That is what lets the stack believe the whole /24 is on the link while every packet
++ * actually goes to the modem.
++ *
++ * The reply is built into the caller's buffer and injected by the caller, outside the lock: see
++ * the PORTER'S NOTE on cell_output().
++ */
++static bool
++cell_arp(const uint8_t *frame, size_t length, const struct cell_session *settings, uint8_t *reply,
++    size_t *reply_length)
++{
++	const uint8_t *arp = frame + CELL_ETHER_HEADER;
++
++	/* Ethernet/IPv4, a request (operation 1), and not for our own address. */
++	if (length < CELL_ETHER_HEADER + 28 || get32(arp) != 0x00010800 || arp[4] != 6 || arp[5] != 4 ||
++	    arp[7] != 1 || get32(arp + 24) == settings->address) {
++		return false;
++	}
++	if (reply == NULL || reply_length == NULL || *reply_length < CELL_ETHER_HEADER + 28) {
++		return false;
++	}
++	memcpy(reply, frame + 6, 6);                    /* to the asker */
++	memcpy(reply + 6, router_mac, 6);
++	put16(reply + 12, 0x0806);
++	put32(reply + 14, 0x00010800);                  /* Ethernet, IPv4 */
++	reply[18] = 6;
++	reply[19] = 4;
++	put16(reply + 20, 2);                           /* a reply */
++	memcpy(reply + 22, router_mac, 6);              /* "that address is me" */
++	memcpy(reply + 28, arp + 24, 4);                /* the address that was asked for */
++	memcpy(reply + 32, arp + 8, 10);                /* the asker's hardware and protocol addresses */
++	*reply_length = CELL_ETHER_HEADER + 28;
++	if (cell_trace) {
++		printf("PANDORA CELL: ARP: %u.%u.%u.%u is the router\n", arp[24], arp[25], arp[26],
++		    arp[27]);
++	}
++	return true;
++}
++
++/* ---- 10.2.2 DHCP: the session's settings, answered here (spec 2.1) -------------------------- */
++
++#define DHCP_DISCOVER           1
++#define DHCP_OFFER              2
++#define DHCP_REQUEST            3
++#define DHCP_ACK                5
++#define DHCP_NAK                6
++
++#define DHCP_CLIENT_PORT        68
++#define DHCP_SERVER_PORT        67
++#define DHCP_BOOTP_FIXED        240     /* op..file..magic, before the options */
++#define DHCP_REPLY_MINIMUM      300     /* the traditional padded minimum (hakios.cell.c:215) */
++#define DHCP_LEASE_SECONDS      86400   /* a day, HakiOS's number */
++
++/* Is this frame a DHCP request (IPv4, UDP, to port 67)? `udp` is set to its UDP header. */
++static bool
++cell_dhcp_request(const uint8_t *frame, size_t length, const uint8_t **udp)
++{
++	const uint8_t *ip = frame + CELL_ETHER_HEADER;
++	size_t header_length;
++
++	/* Ethernet + IP + UDP + BOOTP is the least a request can be (hakios.cell.c:120-135). */
++	if (length < CELL_ETHER_HEADER + 20 + 8 + DHCP_BOOTP_FIXED || (ip[0] >> 4) != 4 ||
++	    ip[9] != 17) {
++		return false;
++	}
++	header_length = 4 * (size_t)(ip[0] & 0x0f);
++	if (header_length < 20 || CELL_ETHER_HEADER + header_length + 8 + DHCP_BOOTP_FIXED > length) {
++		return false;
++	}
++	*udp = ip + header_length;
++	return get16(*udp + 2) == DHCP_SERVER_PORT;
++}
++
++/*
++ * The answer to a DHCP request: an offer for a discover, an acknowledgement for a request, and a
++ * refusal when the address asked for is not ours (HakiOS's choice of kind, hakios.cell.c:166).
++ *
++ * Every option is the session's: the mask and router this layer made up (spec 1.2), the DNS
++ * servers and the MTU the modem reported. The MTU only reaches the interface through option 26
++ * (bounded 576 to 1500); the interface's own MTU stays 1500 (spec 1.2's last row).
++ */
++static bool
++cell_dhcp_answer(const uint8_t *frame, size_t length, const uint8_t *udp,
++    const struct cell_session *settings, uint8_t *reply, size_t *reply_length)
++{
++	const uint8_t *request = udp + 8;
++	const uint8_t *end = frame + length;
++	const uint8_t *option;
++	uint8_t *ip, *rudp, *bootp, *at;
++	uint32_t type = 0, wanted = 0, kind;
++	size_t size;
++
++	if (request[0] != 1 || request[1] != 1 || request[2] != 6 || get32(request + 236) != 0x63825363) {
++		return false;                   /* not a BOOTP request from a 6-byte Ethernet client */
++	}
++	/* The options that matter: the message type (53) and the address asked for (50). */
++	for (option = request + DHCP_BOOTP_FIXED; option + 2 <= end && *option != 255;
++	    option += option[0] == 0 ? 1 : 2 + option[1]) {
++		if (option[0] == 0) {
++			continue;
++		}
++		if (option + 2 + option[1] > end) {
++			break;
++		}
++		if (option[0] == 53 && option[1] == 1) {
++			type = option[2];
++		} else if (option[0] == 50 && option[1] == 4) {
++			wanted = get32(option + 2);
++		}
++	}
++	if (type != DHCP_DISCOVER && type != DHCP_REQUEST) {
++		return false;
++	}
++	if (reply == NULL || reply_length == NULL ||
++	    *reply_length < CELL_ETHER_HEADER + 20 + 8 + DHCP_REPLY_MINIMUM) {
++		return false;
++	}
++	kind = type == DHCP_DISCOVER ? DHCP_OFFER :
++	    wanted != 0 && wanted != settings->address ? DHCP_NAK : DHCP_ACK;
++	bzero(reply, CELL_ETHER_HEADER + 20 + 8 + DHCP_REPLY_MINIMUM);
++	ip = reply + CELL_ETHER_HEADER;
++	rudp = ip + 20;
++	bootp = rudp + 8;
++	/* BOOTP */
++	bootp[0] = 2;                           /* a reply */
++	bootp[1] = 1;                           /* Ethernet */
++	bootp[2] = 6;                           /* six bytes of hardware address */
++	memcpy(bootp + 4, request + 4, 4);      /* the transaction id */
++	memcpy(bootp + 10, request + 10, 2);    /* the flags (broadcast?) */
++	if (kind != DHCP_NAK) {
++		put32(bootp + 16, settings->address);   /* yiaddr */
++		put32(bootp + 20, settings->router);    /* siaddr: the server is the router */
++	}
++	memcpy(bootp + 28, request + 28, 16);   /* the client's hardware address */
++	put32(bootp + 236, 0x63825363);         /* the magic cookie */
++	at = bootp + DHCP_BOOTP_FIXED;
++	*at++ = 53; *at++ = 1; *at++ = (uint8_t)kind;
++	*at++ = 54; *at++ = 4; put32(at, settings->router); at += 4;    /* server identifier */
++	if (kind != DHCP_NAK) {
++		*at++ = 51; *at++ = 4; put32(at, DHCP_LEASE_SECONDS); at += 4;
++		*at++ = 1; *at++ = 4; put32(at, settings->mask); at += 4;
++		*at++ = 3; *at++ = 4; put32(at, settings->router); at += 4;
++		if (settings->dns1 != 0 || settings->dns2 != 0) {
++			*at++ = 6;
++			*at++ = (uint8_t)(4 * ((settings->dns1 != 0) + (settings->dns2 != 0)));
++			if (settings->dns1 != 0) {
++				put32(at, settings->dns1); at += 4;
++			}
++			if (settings->dns2 != 0) {
++				put32(at, settings->dns2); at += 4;
++			}
++		}
++		if (settings->mtu >= 576 && settings->mtu <= CELL_MTU) {
++			*at++ = 26; *at++ = 2; put16(at, settings->mtu); at += 2;
++		}
++	}
++	*at++ = 255;
++	size = (size_t)(at - bootp);
++	if (size < DHCP_REPLY_MINIMUM) {
++		size = DHCP_REPLY_MINIMUM;      /* padded with zeros */
++	}
++	/* UDP: 67 -> 68, no checksum (IPv4 allows it) */
++	put16(rudp, DHCP_SERVER_PORT);
++	put16(rudp + 2, DHCP_CLIENT_PORT);
++	put16(rudp + 4, (uint32_t)(8 + size));
++	put16(rudp + 6, 0);
++	/* IPv4: from the router to everyone, as HakiOS sends it (hakios.cell.c:207-212) */
++	ip[0] = 0x45;
++	ip[1] = 0;
++	put16(ip + 2, (uint32_t)(20 + 8 + size));
++	put16(ip + 4, 0);                       /* no fragmentation */
++	put16(ip + 6, 0);
++	ip[8] = 64;                             /* TTL */
++	ip[9] = 17;                             /* UDP */
++	put32(ip + 12, settings->router);
++	put32(ip + 16, 0xffffffff);              /* the broadcast address, before an address exists */
++	put16(ip + 10, cell_checksum(ip, 20));
++	/* Ethernet to the client */
++	memcpy(reply, request + 28, 6);
++	memcpy(reply + 6, router_mac, 6);
++	put16(reply + 12, 0x0800);
++	*reply_length = CELL_ETHER_HEADER + 20 + 8 + size;
++	{
++		char address[20], mask[20], router[20], dns1[20], dns2[20];
++
++		cell_ip_string(address, sizeof(address), settings->address);
++		cell_ip_string(mask, sizeof(mask), settings->mask);
++		cell_ip_string(router, sizeof(router), settings->router);
++		cell_ip_string(dns1, sizeof(dns1), settings->dns1);
++		cell_ip_string(dns2, sizeof(dns2), settings->dns2);
++		printf("PANDORA CELL: DHCP %s answered with %s: %s/%s, router %s, DNS %s %s, MTU %u\n",
++		    type == DHCP_DISCOVER ? "discover" : "request",
++		    kind == DHCP_OFFER ? "an offer" : kind == DHCP_ACK ? "an acknowledgement" : "a refusal",
++		    address, mask, router, dns1, dns2, settings->mtu);
++	}
++	return true;
++}
++
++/* ---- the six QMI clients (spec 3.2 (a), 7.1, 8) ---------------------------------------------- */
++
++/*
++ * One QRTR port per QMI service, and the same callback shape HakiOS uses (hakios.mpss.c:5605-5625:
++ * `qrtr_open(receive, server, NULL)` plus a lookup). The service event is the "the modem's service
++ * is here" signal: QRTR's server callback, not QMI's SYNC, is how a request is allowed to start.
++ *
++ * PORTER'S NOTE: every QMI request in this file is sent from cell_tick(), never from a receive or
++ * a server callback. HakiOS sends from inside them (dpm_server() opens the port, wda_receive()
++ * calls wds_advance(), the UIM answer sends the slot switch). Here the callbacks only record what
++ * happened and the tick decides, so every send happens on one thread and the transaction table has
++ * one writer. The fields the callback does write (node, port, connected) are read by the tick; a
++ * 32-bit store each, and a stale pair costs one request that goes nowhere.
++ */
++struct cell_link {
++	struct pandora_qrtr_port *port;
++	struct pandora_qmi_client qmi;
++	const char *name;
++	uint16_t service;
++	bool looked_up;                 /* the lookup of the service is in */
++};
++
++static struct cell_link dms_link = { .name = "DMS", .service = QMI_DMS };
++static struct cell_link uim_link = { .name = "UIM", .service = QMI_UIM };
++static struct cell_link nas_link = { .name = "NAS", .service = QMI_NAS };
++static struct cell_link wds_link = { .name = "WDS", .service = QMI_WDS };
++static struct cell_link dpm_link = { .name = "DPM", .service = QMI_DPM };
++static struct cell_link wda_link = { .name = "WDA", .service = QMI_WDA };
++
++static int
++cell_link_transmit(void *context, uint32_t node, uint32_t port, const void *data, size_t length)
++{
++	struct cell_link *link = context;
++
++	if (link->port == NULL) {
++		return ENXIO;
++	}
++	return pandora_mpss_qrtr_send(link->port, node, port, data, length);
++}
++
++/* The shared half of every server callback: note where the service is, or that it went. */
++static void
++cell_link_server(struct cell_link *link, bool arrived, uint32_t node, uint32_t port)
++{
++	if (arrived) {
++		if (link->qmi.connected && link->qmi.node == node && link->qmi.port == port) {
++			return;
++		}
++		link->qmi.node = node;
++		link->qmi.port = port;
++		link->qmi.connected = true;
++		pandora_say("QMI %s: the modem's service is at node %u port %u\n", link->name, node, port);
++	} else if (link->qmi.connected && link->qmi.node == node && link->qmi.port == port) {
++		link->qmi.connected = false;
++		link->qmi.node = 0;
++		link->qmi.port = 0;
++		pandora_say("QMI %s: the modem's service went away\n", link->name);
++	}
++}
++
++/* A request slot: at most one in flight per message, and its answer is read on a later tick. */
++struct cell_request {
++	struct pandora_qmi_txn *txn;
++	uint16_t message;
++};
++
++static bool
++request_send(struct cell_request *request, struct cell_link *link, uint16_t message,
++    const uint8_t *tlvs, size_t tlv_bytes, uint64_t timeout_ms)
++{
++	if (request->txn != NULL) {
++		return false;                   /* one at a time: the state machine waits for this one */
++	}
++	request->txn = pandora_qmi_send(&link->qmi, message, tlvs, tlv_bytes, timeout_ms);
++	if (request->txn == NULL) {
++		return false;
++	}
++	request->message = message;
++	return true;
++}
++
++/* 1 answered, 0 still in flight, -1 nothing in flight (or it timed out and was dropped). */
++static int
++request_state(struct cell_request *request, uint16_t *result, uint16_t *error)
++{
++	if (request->txn == NULL) {
++		return -1;
++	}
++	switch (pandora_qmi_txn_state(request->txn)) {
++	case PANDORA_QMI_TXN_DONE:
++		/*
++		 * A response that made it into the table; a malformed one never gets here and leaves the
++		 * transaction to time out, which is the right answer for a frame we cannot read.
++		 */
++		(void)pandora_qmi_txn_done(request->txn, result);
++		if (error != NULL) {
++			*error = 0;
++		}
++		return 1;
++	case PANDORA_QMI_TXN_PENDING:
++		return 0;
++	default:
++		pandora_qmi_txn_free(request->txn);
++		request->txn = NULL;
++		return -1;
++	}
++}
++
++static void
++request_clear(struct cell_request *request)
++{
++	pandora_qmi_txn_free(request->txn);
++	request->txn = NULL;
++}
++
++/* ---- TLV lookups: the idiom the rest of this file reads answers with -------------------------- */
++
++/*
++ * HakiOS has qmi_tlv(frame, length, type, &size) (hakios.mpss.c:5522's use) and every receive
++ * handler asks for the two or three TLVs it cares about. This is that, over pandora_qmi.c's
++ * walker, so the header's length is still checked before a TLV is believed.
++ */
++struct cell_lookup {
++	uint8_t         type;
++	const uint8_t   *value;
++	uint16_t        length;
++	bool            found;
++};
++
++static bool
++cell_lookup_tlv(void *context, uint8_t type, const uint8_t *value, uint16_t length)
++{
++	struct cell_lookup *lookup = context;
++
++	if (type != lookup->type) {
++		return true;
++	}
++	lookup->found = true;
++	lookup->value = value;
++	lookup->length = length;
++	return false;
++}
++
++static bool
++cell_find_tlv(const uint8_t *frame, size_t length, uint8_t type, const uint8_t **value,
++    uint16_t *size)
++{
++	struct cell_lookup lookup = { type, NULL, 0, false };
++
++	if (!pandora_qmi_walk(frame, length, cell_lookup_tlv, &lookup) || !lookup.found) {
++		return false;
++	}
++	if (value != NULL) {
++		*value = lookup.value;
++	}
++	if (size != NULL) {
++		*size = lookup.length;
++	}
++	return true;
++}
++
++/* A TLV that is a little-endian u32 (every address, mask, MTU and count in these messages). */
++static bool
++cell_find_u32(const uint8_t *frame, size_t length, uint8_t type, uint32_t *value)
++{
++	const uint8_t *at = NULL;
++	uint16_t size = 0;
++
++	if (!cell_find_tlv(frame, length, type, &at, &size) || size < 4) {
++		return false;
++	}
++	*value = pandora_qmi_le32(at);
++	return true;
++}
++
++/* The message id of a well-formed frame, and its type; false when the frame is not one. */
++static bool
++cell_message(const uint8_t *frame, size_t length, uint8_t *kind, uint16_t *message)
++{
++	uint16_t id = 0;
++
++	if (!pandora_qmi_walk_message(frame, length, &id, NULL, NULL, NULL)) {
++		return false;
++	}
++	if (kind != NULL) {
++		*kind = frame[0];
++	}
++	if (message != NULL) {
++		*message = id;
++	}
++	return true;
++}
++
++/* ---- the QMI state (spec 3, 4, 5, 7, 8) ------------------------------------------------------ */
++
++/* BOOT ARGUMENTS (spec 10.6) live with the other state at the top of the file: read once, in
++ * pandora_cell_start(). */
++
++/* DMS: the modem's operating mode (spec 8.1). */
++static struct {
++	struct cell_request     get, set;
++	unsigned                phase;          /* see cell_dms_tick() */
++	uint64_t                next_ms;
++	unsigned                low_power_tries;
++	uint8_t                 mode;
++	bool                    online;
++} dms;
++
++/*
++ * UIM: the card and its applications (spec 7). `slot_ready` is the physical slot whose card is
++ * PRESENT with a READY application, 1-based; `first_card` is what the modem says the primary
++ * subscription's slot holds (0 absent, 1 present, 2 error).
++ */
++static struct {
++	struct cell_request     card, sw, prov;
++	unsigned                phase;
++	uint64_t                next_ms;
++	uint8_t                 first_card;
++	uint8_t                 slot_ready;
++	uint8_t                 slot_count;
++	bool                    switched;
++	bool                    provisioned;
++	bool                    switch_wanted;
++	bool                    provision_wanted;
++	bool                    register_again;         /* NAS must be asked to register again */
++	uint8_t                 ready_aid[32];
++	uint8_t                 ready_aid_length;
++} uim;
++
++/* NAS: registration, the serving system and the signal (spec 8.2, 8.3). */
++static struct {
++	struct cell_request     selection, register_, system, serving, signal;
++	uint64_t                next_register_ms;
++	uint64_t                next_system_ms;
++	uint64_t                next_poll_ms;
++	bool                    register_sent;
++	bool                    selection_asked;
++	bool                    registered;             /* what Serving System says; gates WDS */
++	bool                    has_signal;
++	int16_t                 dbm;
++	uint8_t                 radio;
++	uint8_t                 bars;
++	uint16_t                mcc, mnc;
++	char                    operator_name[32];
++	uint8_t                 service_status[3];      /* GSM, WCDMA, LTE (spec 8.2, Get System Info) */
++} nas;
++
++/* WDS: the data session, step by step (spec 3). */
++static struct {
++	struct cell_request     bind, family, start, settings;
++	unsigned                phase;                  /* see cell_wds_tick() */
++	uint64_t                next_ms;
++	uint64_t                setup_began;            /* when the data path was first attempted */
++	uint32_t                handle;                 /* TLV 0x01 of Start Network Interface */
++	bool                    bound, family_set, up;
++	bool                    registered;             /* NAS says the modem is registered */
++	/* The settings Get Current Settings reported, applied on the tick and not in the callback. */
++	bool                    got_address;
++	uint32_t                address, mask, gateway, dns1, dns2, mtu;
++} wds;
++
++/* DPM and WDA: the port mapping and the data format (spec 4, 5). */
++static struct {
++	struct cell_request     open;
++	uint64_t                next_ms;
++	bool                    done, open_ok;
++} dpm;
++
++static struct {
++	struct cell_request     format;
++	uint64_t                next_ms;
++	bool                    done, set;
++} wda;
++
++/* ---- 10.2.4 (a) DMS: bring the modem online (spec 8.1) -------------------------------------- */
++
++static const char *
++cell_dms_mode_name(unsigned mode)
++{
++	static const char *const modes[] = {
++		"ONLINE", "LOW POWER", "factory test", "OFFLINE", "resetting", "shutting down",
++		"PERSISTENT LOW POWER", "mode-only low power", "network test"
++	};
++
++	return mode < sizeof(modes) / sizeof(modes[0]) ? modes[mode] : "?";
++}
++
++static void
++cell_dms_online(uint64_t now)
++{
++	dms.online = true;
++	dms.phase = 0;
++	dms.next_ms = 0;
++	(void)now;
++	pandora_say("DMS: THE MODEM IS ONLINE\n");
++}
++
++static void
++cell_dms_tick(uint64_t now)
++{
++	uint8_t tlvs[8];
++	uint16_t result = 0;
++	size_t length;
++	int state;
++
++	if (!dms_link.qmi.connected) {
++		request_clear(&dms.get);
++		request_clear(&dms.set);
++		dms.phase = 0;
++		dms.online = false;
++		dms.next_ms = 0;
++		dms.low_power_tries = 0;
++		return;
++	}
++	if (dms.online) {
++		return;
++	}
++	if (now < dms.next_ms) {
++		return;
++	}
++	switch (dms.phase) {
++	case 0:
++		/*
++		 * The operating mode is asked for first, as HakiOS does (hakios.mpss.c:5256-5303): a modem
++		 * that is already ONLINE needs no SET, and a modem that answers is awake.
++		 */
++		if (!request_send(&dms.get, &dms_link, DMS_GET_OPERATING_MODE, NULL, 0, 3000)) {
++			dms.next_ms = now + 1000;
++			return;
++		}
++		dms.phase = 1;
++		return;
++	case 1:
++		state = request_state(&dms.get, &result, NULL);
++		if (state == 0) {
++			return;
++		}
++		if (state == 1) {
++			pandora_say("DMS: the modem's operating mode is %s\n", cell_dms_mode_name(dms.mode));
++			if (dms.mode == DMS_ONLINE) {
++				request_clear(&dms.get);
++				cell_dms_online(now);
++				return;
++			}
++		}
++		request_clear(&dms.get);
++		length = pandora_qmi_tlv_u8(tlvs, 0x01, DMS_ONLINE);    /* TLV 1: the mode (spec 8.1) */
++		if (!request_send(&dms.set, &dms_link, DMS_SET_OPERATING_MODE, tlvs, length, 5000)) {
++			dms.phase = 0;
++			dms.next_ms = now + 1000;
++			return;
++		}
++		dms.phase = 2;
++		return;
++	case 2:
++		state = request_state(&dms.set, &result, NULL);
++		if (state == 0) {
++			return;
++		}
++		request_clear(&dms.set);
++		if (state == 1 && result == 0) {
++			cell_dms_online(now);
++			return;
++		}
++		/*
++		 * A cold modem refuses ONLINE with error 52 (device not ready) and wants the way HakiOS
++		 * found: offline -> LOW POWER -> (two seconds) -> ONLINE (hakios.mpss.c:5310-5321).
++		 * PORTER'S NOTE: HakiOS sleeps two seconds inside dms_online(); this is phase 4 and a
++		 * timer, because the thread has the IPA to poll (see the top of the file).
++		 */
++		if (state == 1 && result == QMI_ERR_DEVICE_NOT_READY && dms.low_power_tries < 2) {
++			dms.low_power_tries++;
++			length = pandora_qmi_tlv_u8(tlvs, 0x01, DMS_LOW_POWER);
++			if (request_send(&dms.set, &dms_link, DMS_SET_OPERATING_MODE, tlvs, length, 5000)) {
++				dms.phase = 3;
++				pandora_say("DMS: the modem is not ready for ONLINE; LOW POWER first, then ONLINE "
++				    "(error %u)\n", result);
++				return;
++			}
++		}
++		dms.phase = 0;
++		dms.next_ms = now + 5000;               /* HakiOS's five seconds between tries */
++		return;
++	case 3:
++		state = request_state(&dms.set, &result, NULL);
++		if (state == 0) {
++			return;
++		}
++		request_clear(&dms.set);
++		if (state == 1 && result == 0) {
++			dms.phase = 4;
++			dms.next_ms = now + 2000;       /* HakiOS's sleep_ms(2000) */
++		} else {
++			dms.phase = 0;
++			dms.next_ms = now + 5000;
++		}
++		return;
++	case 4:
++		length = pandora_qmi_tlv_u8(tlvs, 0x01, DMS_ONLINE);
++		if (request_send(&dms.set, &dms_link, DMS_SET_OPERATING_MODE, tlvs, length, 5000)) {
++			dms.phase = 2;
++		} else {
++			dms.phase = 4;
++			dms.next_ms = now + 1000;
++		}
++		return;
++	default:
++		dms.phase = 0;
++		return;
++	}
++}
++
++/* ---- 10.2.4 (b) UIM: the card, its slots and its applications (spec 7) --------------------- */
++
++/*
++ * The answer to Get Card Status (spec 7.2, hakios.mpss.c:5795-5826's layout):
++ *
++ *   [0..1] primary GW slot, [2..3] primary 1X, [4..5] secondary GW, [6..7] secondary 1X,
++ *   [8] number of slots; then per slot: card state, UPIN state, UPIN retries, PUK retries,
++ *   error code, application count; then per application: type, state, personalization (4),
++ *   AID length, AID, then seven bytes of PIN states.
++ */
++static void
++cell_uim_card_status(const uint8_t *value, uint16_t length)
++{
++	size_t at = 9;
++	unsigned slots, slot;
++
++	if (length < 9) {
++		return;
++	}
++	uim.first_card = 0xff;
++	uim.slot_count = value[8];
++	slots = value[8];
++	pandora_say("UIM: the primary GW application is slot %u application %u (0xff, 0xff: none); "
++	    "%u slots\n", value[1], value[0], slots);
++	for (slot = 0; slot < slots; slot++) {
++		unsigned card, applications, application;
++
++		if (length - at < 6) {
++			return;
++		}
++		card = value[at];
++		applications = value[at + 5];
++		if (slot == 0) {
++			uim.first_card = (uint8_t)card;
++		}
++		pandora_say("UIM: slot %u: the card is %s (%u), UPIN state %u, error %u, %u applications\n",
++		    slot + 1, card == 0 ? "ABSENT" : card == 1 ? "PRESENT" : card == 2 ? "ERROR" : "?",
++		    card, value[at + 1], value[at + 4], applications);
++		at += 6;
++		for (application = 0; application < applications; application++) {
++			unsigned type, state, aid;
++
++			if (length - at < 7) {
++				return;
++			}
++			type = value[at];
++			state = value[at + 1];
++			aid = value[at + 6];
++			if (length - at < (size_t)7 + aid + 7) {
++				return;
++			}
++			pandora_say("UIM:   application %u: type %u, state %u (%s)\n", application, type, state,
++			    state == 7 ? "READY" : state == 1 ? "detected" : state == 2 ? "PIN1 wanted" :
++			    state == 3 ? "PUK1 wanted" : state == 4 ? "personalization" :
++			    state == 5 ? "PIN1 blocked" : state == 6 ? "illegal" : "unknown");
++			if (card == 1 && state == 7 && uim.slot_ready == 0) {
++				uim.slot_ready = (uint8_t)(slot + 1);   /* 1-based physical slot */
++			}
++			/*
++			 * The application that the provisioning session is bound to: a USIM (or SIM) in logical
++			 * slot 1 that is READY, or only "detected" (HakiOS cycle 37: the card sits in slot 1
++			 * with its application detected and never initialized, because no provisioning session
++			 * names it). Either is worth naming.
++			 */
++			if (slot == 0 && card == 1 && (state == 7 || state == 1) && (type == 2 || type == 1) &&
++			    aid <= sizeof(uim.ready_aid)) {
++				uim.ready_aid_length = (uint8_t)aid;
++				memcpy(uim.ready_aid, value + at + 7, aid);
++			}
++			at += 7 + aid + 7;
++		}
++	}
++	/*
++	 * The two steps a dual-SIM phone needs (spec 7.3), only asked for, not sent: the tick sends.
++	 *
++	 * (b) primary_gw == 0xffff after a switch means the modem has no primary provisioning session
++	 *     and sits in power save with no service; the READY USIM of logical slot 1 is made the
++	 *     primary GW application with its AID.
++	 * (a) first_card != 1 with the SIM READY in a later physical slot means logical slot 1 has to
++	 *     be pointed at it.
++	 */
++	if (pandora_qmi_le16(value) == 0xffff && uim.ready_aid_length != 0 && !uim.provisioned) {
++		uim.provision_wanted = true;
++	}
++	if (uim.first_card != 1 && uim.slot_ready > 1 && !uim.switched && !cell_sim_switch_off) {
++		uim.switch_wanted = true;
++	}
++}
++
++static void
++cell_uim_tick(uint64_t now)
++{
++	uint8_t tlvs[8 + 2 + sizeof(uim.ready_aid)];
++	uint16_t result = 0;
++	int state;
++
++	if (!uim_link.qmi.connected) {
++		request_clear(&uim.card);
++		request_clear(&uim.sw);
++		request_clear(&uim.prov);
++		uim.phase = 0;
++		uim.next_ms = 0;
++		return;
++	}
++	if (now < uim.next_ms) {
++		return;
++	}
++	switch (uim.phase) {
++	case 0:
++		if (!dms.online) {
++			return;                         /* nothing to ask a modem that is not online */
++		}
++		if (!request_send(&uim.card, &uim_link, UIM_GET_CARD_STATUS, NULL, 0, 3000)) {
++			uim.next_ms = now + 1000;
++			return;
++		}
++		uim.phase = 1;
++		return;
++	case 1:
++		state = request_state(&uim.card, &result, NULL);
++		if (state == 0) {
++			return;
++		}
++		request_clear(&uim.card);
++		/*
++		 * The switch first: the card status the provisioning decision was made from is the one
++		 * before the switch, and the slot switch changes it (spec 7.4's ordering note says the
++		 * card status is asked again six seconds later).
++		 */
++		if (uim.switch_wanted) {
++			uint8_t *at = tlvs;
++
++			uim.switch_wanted = false;
++			at += pandora_qmi_tlv_u8(at, 0x01, 1);                  /* the logical slot */
++			at += pandora_qmi_tlv_u32(at, 0x02, uim.slot_ready);    /* the physical slot */
++			if (request_send(&uim.sw, &uim_link, UIM_SWITCH_SLOT, tlvs, (size_t)(at - tlvs),
++			    3000)) {
++				uim.switched = true;
++				pandora_say("UIM: LOGICAL SLOT 1 IS POINTED AT PHYSICAL SLOT %u, where the card "
++				    "is ready\n", uim.slot_ready);
++				uim.phase = 2;
++			} else {
++				uim.phase = 0;
++				uim.next_ms = now + 1000;
++			}
++			return;
++		}
++		if (uim.provision_wanted) {
++			uint8_t *at = tlvs;
++
++			uim.provision_wanted = false;
++			at += pandora_qmi_tlv(at, 0x01, (const uint8_t[]){ 0, 1 }, 2);   /* primary GW, activate */
++			*at++ = 0x10;
++			*at++ = (uint8_t)(2 + uim.ready_aid_length);
++			*at++ = 0;
++			*at++ = 1;                                              /* logical slot 1 */
++			*at++ = uim.ready_aid_length;
++			memcpy(at, uim.ready_aid, uim.ready_aid_length);
++			at += uim.ready_aid_length;
++			if (request_send(&uim.prov, &uim_link, UIM_CHANGE_PROVISIONING_SESSION, tlvs,
++			    (size_t)(at - tlvs), 3000)) {
++				uim.provisioned = true;
++				pandora_say("UIM: THE USIM OF SLOT 1 IS MADE THE PRIMARY GW APPLICATION "
++				    "(an AID of %u bytes); its state is looked at again\n", uim.ready_aid_length);
++				uim.phase = 3;
++			} else {
++				uim.phase = 0;
++				uim.next_ms = now + 1000;
++			}
++			return;
++		}
++		if (uim.slot_ready != 0 || uim.provisioned) {
++			uim.next_ms = now + 60000;      /* a keepalive, not a hunt */
++		} else {
++			uim.next_ms = now + 10000;      /* still hunting for a READY card */
++		}
++		uim.phase = 0;
++		return;
++	case 2:
++		state = request_state(&uim.sw, &result, NULL);
++		if (state == 0) {
++			return;
++		}
++		request_clear(&uim.sw);
++		uim.phase = 0;
++		uim.next_ms = now + 6000;               /* spec 7.4: ask again six seconds later */
++		return;
++	case 3:
++		state = request_state(&uim.prov, &result, NULL);
++		if (state == 0) {
++			return;
++		}
++		request_clear(&uim.prov);
++		uim.phase = 0;
++		uim.next_ms = now + 6000;
++		/*
++		 * The provisioning change answer means registration has to be asked for again
++		 * (hakios.mpss.c:5840, spec 7.3): three seconds later, which is HakiOS's sleep before
++		 * its NAS Initiate Network Register.
++		 */
++		uim.register_again = true;
++		nas.next_register_ms = now + 3000;
++		return;
++	default:
++		uim.phase = 0;
++		return;
++	}
++}
++
++/* ---- opening the six ports (spec 3.2 (a), 6.5's nameserver note) ----------------------------- */
++
++/*
++ * A port, then a lookup of the service on it. HakiOS's wds_open() does the same and ignores the
++ * lookup's answer (hakios.mpss.c:5605-5625); here a failed lookup is retried on the next tick,
++ * because without it the modem's service never announces itself and nothing can be sent at all.
++ */
++static bool
++cell_link_open(struct cell_link *link, pandora_qrtr_receive_t receive, pandora_qrtr_server_t server)
++{
++	if (link->port == NULL) {
++		link->port = pandora_qrtr_open(receive, server, link);
++		if (link->port == NULL) {
++			return false;
++		}
++		link->qmi.transmit = cell_link_transmit;
++		link->qmi.context = link;
++		pandora_say("QMI %s: port %u\n", link->name, pandora_qrtr_port_number(link->port));
++	}
++	if (!link->looked_up) {
++		int error = pandora_qrtr_lookup(link->port, link->service, 0, 0);
++
++		if (error != 0) {
++			return false;
++		}
++		link->looked_up = true;
++		pandora_say("QMI %s: looking up service %#x\n", link->name, link->service);
++	}
++	return true;
++}
++
++/* True once all the ports this boot wants are open and their lookups are in. */
++static bool
++cell_qmi_links_open(void)
++{
++	bool all = true;
++
++	if (!cell_link_open(&dms_link, cell_dms_receive, cell_dms_server)) {
++		all = false;
++	}
++	if (!cell_link_open(&uim_link, cell_uim_receive, cell_uim_server)) {
++		all = false;
++	}
++	if (!cell_link_open(&nas_link, cell_nas_receive, cell_nas_server)) {
++		all = false;
++	}
++	/*
++	 * The data path's three services are refused by the data arguments (spec 10.6): with
++	 * pandora_cell_data_off there is no IPA and no WDS at all, only the modem and its registration.
++	 */
++	if (!cell_data_off) {
++		if (!cell_dpm_off && !cell_link_open(&dpm_link, cell_dpm_receive, cell_dpm_server)) {
++			all = false;
++		}
++		if (!cell_wda_off && !cell_link_open(&wda_link, cell_wda_receive, cell_wda_server)) {
++			all = false;
++		}
++		if (!cell_link_open(&wds_link, cell_wds_receive, cell_wds_server)) {
++			all = false;
++		}
++	}
++	return all;
++}
++
++/* ---- 10.2.4 (c) DPM then WDA, and only then WDS (spec 4.3, 5.4) ----------------------------- */
++
++static inline void
++cell_put_le32(uint8_t *p, uint32_t value)
++{
++	p[0] = (uint8_t)value;
++	p[1] = (uint8_t)(value >> 8);
++	p[2] = (uint8_t)(value >> 16);
++	p[3] = (uint8_t)(value >> 24);
++}
++
++/* Drain one request slot: true once an answer has been read (the slot is then free again). */
++static bool
++request_answered(struct cell_request *request, uint16_t *result)
++{
++	if (request_state(request, result, NULL) == 1) {
++		request_clear(request);
++		return true;
++	}
++	return false;
++}
++
++/*
++ * DPM Open Port (spec 5.1), byte for byte: TLV 0x11 with a one-byte count and per port the
++ * endpoint type, the interface number, the endpoint the modem receives on (ours that sends) and
++ * the one it sends from (ours that receives).
++ *
++ * THE POINT OF THIS FILE'S HARDWARE SECTION: those last two come from
++ * pandora_ipa_modem_endpoints(), which on this IPA (5.5) answers 2 and 23. HakiOS's default of 16
++ * is IPA 4.11's receive endpoint (hakios.mpss.c:5469) and on canoe it addresses an endpoint the
++ * modem does not have, which shows up as a mux bind that answers InvalidOperation and a session
++ * that never starts (spec 5.3, risk 1 and 2).
++ */
++static void
++cell_dpm_tick(uint64_t now)
++{
++	uint8_t tlvs[PANDORA_QMI_TLV_HEADER + 17];
++	uint8_t value[17];
++	uint32_t to_modem = 0, from_modem = 0;
++	uint16_t result = 0;
++	size_t length;
++	unsigned at;
++
++	if (cell_dpm_off) {
++		return;
++	}
++	if (!dpm_link.qmi.connected) {
++		request_clear(&dpm.open);
++		dpm.done = false;
++		dpm.open_ok = false;
++		dpm.next_ms = 0;
++		return;
++	}
++	if (dpm.done) {
++		return;
++	}
++	if (request_answered(&dpm.open, &result)) {
++		dpm.done = true;
++		dpm.open_ok = result == 0;
++		pandora_say("DPM: THE EMBEDDED DATA PORT IS %s (result %u)\n",
++		    dpm.open_ok ? "OPEN" : "NOT OPENED", result);
++		return;
++	}
++	if (dpm.open.txn != NULL || now < dpm.next_ms) {
++		return;
++	}
++	(void)pandora_ipa_modem_endpoints(&to_modem, &from_modem);
++	value[0] = 1;                                       /* the count of ports */
++	cell_put_le32(value + 1, DATA_ENDPOINT_EMBEDDED);
++	cell_put_le32(value + 5, DATA_ENDPOINT_INTERFACE);
++	cell_put_le32(value + 9, to_modem);
++	cell_put_le32(value + 13, from_modem);
++	at = (unsigned)pandora_qmi_tlv(tlvs, 0x11, value, sizeof(value));
++	length = at;
++	/*
++	 * PORTER'S NOTE: DPM's answer is given two seconds before the next try, not HakiOS's
++	 * on-arrival send. The modem's DPM service can arrive long before its IPA is ready, and a
++	 * refusal here is retried rather than remembered (spec 5.4's "the port is opened when the
++	 * service arrives" is why HakiOS sends from the callback in the first place).
++	 */
++	if (!request_send(&dpm.open, &dpm_link, DPM_OPEN_PORT, tlvs, length, 2000)) {
++		dpm.next_ms = now + 2000;
++		return;
++	}
++	pandora_say("DPM: opening the embedded data port (interface %u; the modem receives on IPA "
++	    "endpoint %u and sends on %u)\n", DATA_ENDPOINT_INTERFACE, to_modem, from_modem);
++}
++
++/*
++ * WDA Set Data Format (spec 4.1), byte for byte: raw IP, QMAP both ways, 16 datagrams or 14 KB per
++ * downlink aggregate, and the embedded endpoint pair.
++ *
++ * The order is not free: DPM has to have opened the port first. HakiOS's comment at
++ * hakios.mpss.c:5357-5373 says what the reverse order produces ("Without this the modem knows no
++ * embedded port: WDA answers InvalidOperation, the mux bind Internal, the session InvalidOperation
++ * -- what cycles 38 to 41 got").
++ */
++static void
++cell_wda_tick(uint64_t now)
++{
++	uint8_t tlvs[6 * (PANDORA_QMI_TLV_HEADER + 8)];
++	uint8_t endpoint[8];
++	uint16_t result = 0;
++	size_t length;
++	unsigned at;
++
++	if (cell_wda_off) {
++		return;
++	}
++	if (!wda_link.qmi.connected) {
++		request_clear(&wda.format);
++		wda.done = false;
++		wda.set = false;
++		wda.next_ms = 0;
++		return;
++	}
++	if (wda.done) {
++		return;
++	}
++	if (request_answered(&wda.format, &result)) {
++		wda.done = true;
++		wda.set = result == 0;
++		pandora_say("WDA: THE DATA FORMAT IS %s (result %u): raw IP, QMAP both ways, 16 datagrams "
++		    "or 14 KB per aggregate\n", wda.set ? "SET" : "REFUSED", result);
++		return;
++	}
++	if (wda.format.txn != NULL || now < wda.next_ms) {
++		return;
++	}
++	if (!cell_dpm_off && !dpm.done) {
++		return;                                 /* spec 4.3's order */
++	}
++	at = 0;
++	at += (unsigned)pandora_qmi_tlv_u32(tlvs + at, 0x11, 2);        /* data link protocol: raw IP */
++	at += (unsigned)pandora_qmi_tlv_u32(tlvs + at, 0x12, 5);        /* uplink aggregation: QMAP */
++	at += (unsigned)pandora_qmi_tlv_u32(tlvs + at, 0x13, 5);        /* downlink aggregation: QMAP */
++	at += (unsigned)pandora_qmi_tlv_u32(tlvs + at, 0x15, 16);       /* at most 16 datagrams ... */
++	at += (unsigned)pandora_qmi_tlv_u32(tlvs + at, 0x16, 0x3800);   /* ... or 14 KB */
++	cell_put_le32(endpoint, DATA_ENDPOINT_EMBEDDED);
++	cell_put_le32(endpoint + 4, DATA_ENDPOINT_INTERFACE);
++	at += (unsigned)pandora_qmi_tlv(tlvs + at, 0x17, endpoint, sizeof(endpoint));
++	length = at;
++	if (!request_send(&wda.format, &wda_link, WDA_SET_DATA_FORMAT, tlvs, length, 3000)) {
++		wda.next_ms = now + 2000;
++		return;
++	}
++	pandora_say("WDA: setting the data format of the embedded port: raw IP in QMAP, no checksum "
++	    "offload\n");
++}
++
++/* ---- 10.2.4 (d) NAS: registration, the serving system, the signal (spec 8.2, 8.3) ----------- */
++
++/* HakiOS's bars_for() (hakios.nas.c:16-23): four bars out of a reading in dBm. */
++static uint8_t
++cell_bars_for(int16_t dbm)
++{
++	if (dbm < -120) {
++		return 1;
++	}
++	if (dbm < -110) {
++		return 2;
++	}
++	if (dbm < -100) {
++		return 3;
++	}
++	return 4;
++}
++
++/*
++ * Apply one NAS report to the state, and say whether anything changed (hakios.nas.c's
++ * hakios_nas_apply(), which returns 1 for a change and 0 for a report that says nothing new).
++ *
++ * The two rules that matter (spec 8.3):
++ *   - only a response whose TLV 2 result is success is believed; an indication has no result;
++ *   - bars are nonzero only while registered AND holding a valid reading, and the last reading is
++ *     kept across a "not registered" sample, because this modem alternates the two messages.
++ */
++static bool
++cell_nas_apply(const uint8_t *frame, size_t length)
++{
++	const uint8_t *value;
++	uint16_t message, size, result = 0, error = 0;
++	uint8_t kind;
++	bool serving = false, signal = false, changed = false;
++	bool was_registered = nas.registered, was_has_signal = nas.has_signal;
++	uint16_t was_mcc = nas.mcc, was_mnc = nas.mnc;
++	uint8_t was_radio = nas.radio, was_bars = nas.bars;
++	int16_t was_dbm = nas.dbm;
++	char was_operator[sizeof(nas.operator_name)];
++
++	if (!cell_message(frame, length, &kind, &message)) {
++		return false;
++	}
++	if (message != NAS_SERVING_SYSTEM && message != NAS_GET_SIGNAL_INFO &&
++	    message != NAS_SIGNAL_INFO) {
++		return false;
++	}
++	if (kind == PANDORA_QMI_RESPONSE && pandora_qmi_result(frame, length, &result, &error) != 0) {
++		return false;
++	}
++	was_operator[0] = 0;
++	strlcpy(was_operator, nas.operator_name, sizeof(was_operator));
++	if (message == NAS_SERVING_SYSTEM && cell_find_tlv(frame, length, 1, &value, &size) &&
++	    size >= 5 && (size_t)size >= (size_t)5 + value[4]) {
++		static unsigned shown;
++
++		if (shown++ < 4) {
++			pandora_say("NAS: serving system: registration %u (0 none, 1 registered, 2 searching, "
++			    "3 denied, 4 unknown), CS %u, PS %u, network %u, %u radios\n", value[0], value[1],
++			    value[2], value[3], value[4]);
++		}
++		nas.registered = value[0] == 1;
++		serving = true;
++		if (cell_find_tlv(frame, length, 0x10, &value, &size) && size >= 5 &&
++		    (size_t)size >= (size_t)5 + value[4]) {
++			/* the current PLMN: MCC and MNC (16 bits each, little-endian), then the name */
++			unsigned name = value[4] < sizeof(nas.operator_name) - 1 ?
++			    value[4] : sizeof(nas.operator_name) - 1;
++
++			nas.mcc = pandora_qmi_le16(value);
++			nas.mnc = pandora_qmi_le16(value + 2);
++			memcpy(nas.operator_name, value + 5, name);
++			nas.operator_name[name] = 0;
++		}
++	} else if (message != NAS_SERVING_SYSTEM) {
++		int16_t level = 0;
++		uint8_t radio = 0;
++
++		/*
++		 * PORTER'S NOTE: TLV 0x17 is LTE's signal information in libqmi and HakiOS reports it as
++		 * radio 12 (NR). The spec flags this as low confidence (spec 8.3's UNKNOWN, risk 20): on an
++		 * NR SA network it may label an LTE reading as 5G. It only reaches a diagnostic sysctl and
++		 * would only matter to a status-bar injection, so it is left as HakiOS has it and named
++		 * here rather than guessed at.
++		 */
++		if (cell_find_tlv(frame, length, 0x17, &value, &size) && size >= 4) {
++			level = (int16_t)pandora_qmi_le16(value);
++			radio = 12;
++			signal = true;
++		} else if (cell_find_tlv(frame, length, 0x14, &value, &size) && size >= 6) {
++			level = (int16_t)pandora_qmi_le16(value + 2);
++			radio = 8;
++			signal = true;
++		} else if (cell_find_tlv(frame, length, 0x13, &value, &size) && size >= 3) {
++			level = (int8_t)value[0];
++			radio = 5;
++			signal = true;
++		} else if (cell_find_tlv(frame, length, 0x12, &value, &size) && size >= 1) {
++			level = (int8_t)value[0];
++			radio = 4;
++			signal = true;
++		}
++		if (signal && level >= -150 && level <= -30) {
++			nas.has_signal = true;
++			nas.dbm = level;
++			nas.radio = radio;
++		}
++	}
++	nas.bars = nas.registered && nas.has_signal ? cell_bars_for(nas.dbm) : 0;
++	if (!serving && !signal) {
++		return false;
++	}
++	changed = nas.registered != was_registered || nas.has_signal != was_has_signal ||
++	    nas.mcc != was_mcc || nas.mnc != was_mnc || nas.radio != was_radio || nas.dbm != was_dbm ||
++	    nas.bars != was_bars || strcmp(nas.operator_name, was_operator) != 0;
++	return changed;
++}
++
++/* The sysctls and WDS's gate, from the NAS state (hakios.mpss.c:5174-5188's nas_changed()). */
++static void
++cell_nas_changed(void)
++{
++	cell_sysctl_registered = nas.registered ? 1 : 0;
++	cell_sysctl_bars = nas.bars;
++	cell_sysctl_dbm = nas.dbm;
++	cell_sysctl_radio = nas.radio;
++	strlcpy(cell_sysctl_operator, nas.operator_name, sizeof(cell_sysctl_operator));
++	/*
++	 * This is the whole point of NAS in this file: without a registration the packet domain is not
++	 * attached and WDS Start Network Interface answers error 70 forever (spec 3.1, 8.3).
++	 */
++	wds.registered = nas.registered;
++	if (nas.registered) {
++		pandora_say("NAS: THE MODEM IS REGISTERED%s%s (PLMN %u-%u, %d dBm, %u bars)\n",
++		    nas.operator_name[0] != 0 ? " on " : "", nas.operator_name, nas.mcc, nas.mnc,
++		    (int)nas.dbm, nas.bars);
++	} else {
++		pandora_say("NAS: the modem is not registered (bars %u)\n", nas.bars);
++	}
++}
++
++/* Get System Info 0x4d: the service status of each radio access technology (spec 8.2). */
++static void
++cell_nas_system_info(const uint8_t *frame, size_t length)
++{
++	const uint8_t *value;
++	uint16_t size;
++
++	if (cell_find_tlv(frame, length, 0x12, &value, &size) && size >= 1) {
++		nas.service_status[0] = value[0];
++	}
++	if (cell_find_tlv(frame, length, 0x13, &value, &size) && size >= 1) {
++		nas.service_status[1] = value[0];
++	}
++	if (cell_find_tlv(frame, length, 0x14, &value, &size) && size >= 1) {
++		nas.service_status[2] = value[0];
++	}
++	/* 0 none, 1 limited, 2 available, 3 limited regional, 4 power save */
++	pandora_say("NAS: system info: GSM %u, WCDMA %u, LTE %u (0 none, 1 limited, 2 available, "
++	    "3 limited regional, 4 power save)\n", nas.service_status[0], nas.service_status[1],
++	    nas.service_status[2]);
++}
++
++/* Get System Selection Preference 0x34's answer: logged, not acted on (spec 8.2's table). */
++static void
++cell_nas_selection(const uint8_t *frame, size_t length)
++{
++	const uint8_t *value;
++	uint16_t size;
++	uint32_t mode = 0, selection = 0, domain = 0;
++
++	if (cell_find_tlv(frame, length, 0x11, &value, &size) && size >= 2) {
++		mode = pandora_qmi_le16(value);
++	}
++	if (cell_find_tlv(frame, length, 0x16, &value, &size) && size >= 1) {
++		selection = value[0];
++	}
++	if (cell_find_tlv(frame, length, 0x1c, &value, &size) && size >= 1) {
++		domain = value[0];
++	}
++	pandora_say("NAS: system selection: mode preference %#x (bit4 GSM, bit8 UMTS, 0x10 LTE), "
++	    "%s, service domain %u (0 CS only, 1 PS only, 2 CS+PS)\n", mode,
++	    selection == 0 ? "automatic" : "manual", domain);
++}
++
++static void
++cell_nas_tick(uint64_t now)
++{
++	uint8_t tlvs[8];
++	uint16_t result = 0;
++	size_t length;
++
++	if (!nas_link.qmi.connected) {
++		request_clear(&nas.selection);
++		request_clear(&nas.register_);
++		request_clear(&nas.system);
++		request_clear(&nas.serving);
++		request_clear(&nas.signal);
++		nas.register_sent = false;
++		nas.selection_asked = false;
++		if (nas.registered || nas.bars != 0) {
++			nas.registered = false;
++			nas.bars = 0;
++			cell_nas_changed();
++		} else {
++			wds.registered = false;
++		}
++		return;
++	}
++	if (!dms.online) {
++		return;
++	}
++	if (request_answered(&nas.register_, &result)) {
++		pandora_say("NAS: the register request is %s (result %u)\n",
++		    result == 0 ? "accepted" : "refused", result);
++	}
++	if (request_answered(&nas.selection, &result)) {
++		/* the answer itself was parsed by cell_nas_receive(); nothing to do with the result */
++	}
++	if (request_answered(&nas.system, &result)) {
++		nas.next_system_ms = now + 10000;
++	}
++	/* The serving system's and the signal's answers are parsed as they arrive. */
++	(void)request_answered(&nas.serving, &result);
++	(void)request_answered(&nas.signal, &result);
++	/* Register once, and again when a provisioning change asked for it (spec 7.3). */
++	if (nas.register_.txn == NULL && (!nas.register_sent ||
++	    (uim.register_again && now >= nas.next_register_ms))) {
++		length = pandora_qmi_tlv_u8(tlvs, 0x01, 1);     /* action 1: automatic registration */
++		if (request_send(&nas.register_, &nas_link, NAS_INITIATE_NETWORK_REGISTER, tlvs, length,
++		    4000)) {
++			if (!nas.register_sent) {
++				pandora_say("NAS: asking the modem to register (automatic)\n");
++			} else {
++				pandora_say("NAS: asking the modem to register again after the "
++				    "provisioning change\n");
++				uim.register_again = false;
++			}
++			nas.register_sent = true;
++		}
++	}
++	/* The selection preference: once, for the log (spec 8.2). */
++	if (nas.register_sent && !nas.selection_asked && nas.selection.txn == NULL) {
++		if (request_send(&nas.selection, &nas_link, NAS_GET_SYSTEM_SELECTION_PREFERENCE, NULL, 0,
++		    3000)) {
++			nas.selection_asked = true;
++		}
++	}
++	/* The serving system and the signal, every two seconds (hakios.nas.c:150-160's two requests). */
++	if (now >= nas.next_poll_ms) {
++		nas.next_poll_ms = now + 2000;
++		if (nas.serving.txn == NULL) {
++			(void)request_send(&nas.serving, &nas_link, NAS_SERVING_SYSTEM, NULL, 0, 2000);
++		}
++		if (nas.signal.txn == NULL) {
++			(void)request_send(&nas.signal, &nas_link, NAS_GET_SIGNAL_INFO, NULL, 0, 2000);
++		}
++	}
++	/* The system information, every ten seconds (spec 8.2, hakios.mpss.c:6060's ten). */
++	if (now >= nas.next_system_ms) {
++		nas.next_system_ms = now + 10000;
++		if (nas.system.txn == NULL) {
++			(void)request_send(&nas.system, &nas_link, NAS_GET_SYSTEM_INFO, NULL, 0, 3000);
++		}
++	}
++}
++
++/* ---- 10.2.4 (e) WDS: bind, family, start, settings (spec 3.1) ------------------------------- */
++
++/*
++ * The address sanity check spec 11 risk 19 asks for: is this address byte-reversed?
++ *
++ * A coarse test and deliberately so: a first octet that cannot be a unicast IPv4 address (0, 224
++ * and up) while the reversed value's first octet can be is the signature of a TLV read the wrong
++ * way round. Both plausible (10.0.0.1 against 1.0.0.10) is not detectable without knowing the
++ * operator, which is why the spec calls this a check and not a fix.
++ */
++static bool
++cell_address_reversed(uint32_t address)
++{
++	uint32_t reversed = (address >> 24 & 0xff) | (address >> 8 & 0xff00) |
++	    (address << 8 & 0xff0000) | (address << 24 & 0xff000000);
++	uint32_t first = address >> 24, reversed_first = reversed >> 24;
++
++	return reversed != address && (first == 0 || first > 223) &&
++	    reversed_first >= 1 && reversed_first <= 223;
++}
++
++static void
++cell_wds_tick(uint64_t now)
++{
++	uint8_t tlvs[128];
++	uint16_t result = 0;
++	size_t length;
++	unsigned at;
++
++	if (cell_data_off) {
++		return;
++	}
++	if (!wds_link.qmi.connected) {
++		request_clear(&wds.bind);
++		request_clear(&wds.family);
++		request_clear(&wds.start);
++		request_clear(&wds.settings);
++		if (wds.up) {
++			wds.up = false;
++			pandora_cell_session(false, 0, 0, 0, 0, 0, 0);
++		}
++		wds.phase = 0;
++		wds.next_ms = 0;
++		wds.setup_began = 0;
++		wds.bound = false;
++		wds.family_set = false;
++		wds.got_address = false;
++		return;
++	}
++	/*
++	 * The data path is gone (the IPA's channels stopped or its shutdown ran): the session cannot
++	 * carry a packet, so the interface loses its address before the stack finds out the hard way.
++	 */
++	if (wds.up && !pandora_ipa_data_ready()) {
++		wds.up = false;
++		pandora_cell_session(false, 0, 0, 0, 0, 0, 0);
++		wds.phase = 0;
++		wds.next_ms = now + 5000;
++		return;
++	}
++	if (wds.phase == 8) {
++		return;
++	}
++	if (now < wds.next_ms) {
++		return;
++	}
++	switch (wds.phase) {
++	case 0:
++		/*
++		 * The port mapping and the data format first (hakios.mpss.c:5634-5655). Once DPM and WDA
++		 * have answered, the bind may go; if they never answer, the bind goes after twenty seconds
++		 * all the same, because a bind that fails is more informative than a session that never
++		 * started.
++		 */
++		if (wds.setup_began == 0) {
++			wds.setup_began = now;
++		}
++		if (!cell_dpm_off && !dpm.done && now - wds.setup_began < 20000) {
++			return;
++		}
++		if (!cell_wda_off && !wda.done && now - wds.setup_began < 20000) {
++			return;
++		}
++		if (cell_nobind) {
++			wds.phase = 2;
++			return;
++		}
++		{
++			uint8_t port[8];
++
++			cell_put_le32(port, DATA_ENDPOINT_EMBEDDED);
++			cell_put_le32(port + 4, DATA_ENDPOINT_INTERFACE);
++			at = 0;
++			at += (unsigned)pandora_qmi_tlv(tlvs + at, 0x10, port, sizeof(port));
++			at += (unsigned)pandora_qmi_tlv_u8(tlvs + at, 0x11, CELL_MUX);
++			length = at;
++		}
++		if (request_send(&wds.bind, &wds_link, WDS_BIND_MUX_DATA_PORT, tlvs, length, 3000)) {
++			wds.phase = 1;
++			pandora_say("WDS: about to bind the client to mux %u of the embedded port (the IPA)\n",
++			    CELL_MUX);
++		} else {
++			wds.next_ms = now + 1000;
++		}
++		return;
++	case 1:
++		if (request_answered(&wds.bind, &result)) {
++			wds.bound = result == 0;
++			pandora_say("WDS: the client %s to mux %u of the embedded port (result %u)\n",
++			    wds.bound ? "is bound" : "IS NOT BOUND", CELL_MUX, result);
++			wds.phase = 2;
++			return;
++		}
++		if (wds.bind.txn == NULL) {             /* timed out */
++			wds.phase = 0;
++			wds.next_ms = now + 6000;
++		}
++		return;
++	case 2:
++		length = pandora_qmi_tlv_u8(tlvs, 0x01, 4);     /* IPv4 (spec 3.2 (d)) */
++		if (request_send(&wds.family, &wds_link, WDS_SET_IP_FAMILY, tlvs, length, 3000)) {
++			wds.phase = 3;
++		} else {
++			wds.next_ms = now + 1000;
++		}
++		return;
++	case 3:
++		if (request_answered(&wds.family, &result)) {
++			wds.family_set = result == 0;
++			pandora_say("WDS: the IP family (IPv4) %s (result %u)\n",
++			    wds.family_set ? "is set" : "is not set", result);
++			wds.phase = 4;
++			wds.next_ms = now + 6000;           /* HakiOS gives the session a moment to attach */
++			return;
++		}
++		if (wds.family.txn == NULL) {
++			wds.phase = 2;
++			wds.next_ms = now + 6000;
++		}
++		return;
++	case 4:
++		/*
++		 * Only once NAS has registered: the packet domain is not attached before that and the
++		 * modem answers error 70 (spec 3.1, 3.2 (d), 8.3).
++		 */
++		if (!wds.registered) {
++			wds.next_ms = now + 1000;
++			return;
++		}
++		at = 0;
++		at += (unsigned)pandora_qmi_tlv_u8(tlvs + at, 0x19, 4);  /* IP family preference: IPv4 */
++		length = at;
++		if (cell_apn_length != 0 && length + PANDORA_QMI_TLV_HEADER + cell_apn_length <=
++		    sizeof(tlvs)) {
++			length += pandora_qmi_tlv(tlvs + length, 0x14, cell_apn, (uint16_t)cell_apn_length);
++		}
++		if (request_send(&wds.start, &wds_link, WDS_START_NETWORK_INTERFACE, tlvs, length, 5000)) {
++			wds.phase = 5;
++			pandora_say("WDS: about to start the data session (IPv4, %s%s%s)\n",
++			    cell_apn_length != 0 ? "APN " : "the default profile",
++			    cell_apn_length != 0 ? (const char *)cell_apn : "", "");
++		} else {
++			wds.next_ms = now + 1000;
++		}
++		return;
++	case 5:
++		if (request_answered(&wds.start, &result)) {
++			if (result == 0 && wds.handle != 0) {
++				pandora_say("WDS: THE DATA SESSION IS STARTED (handle %#x); its settings "
++				    "asked for\n", wds.handle);
++				wds.phase = 6;
++				return;
++			}
++			pandora_say("WDS: the data session is refused for now: result %u%s (will retry)\n",
++			    result, result == 70 ? " (invalid operation: the packet domain is not "
++			    "attached yet)" : "");
++			wds.phase = 4;
++			wds.next_ms = now + 6000;           /* the spec's WDS_RETRY_US of six seconds */
++			return;
++		}
++		if (wds.start.txn == NULL) {
++			wds.phase = 4;
++			wds.next_ms = now + 6000;
++		}
++		return;
++	case 6:
++		/* TLV 0x10: which settings to report (DNS, the address, the gateway, the MTU, family). */
++		length = pandora_qmi_tlv_u32(tlvs, 0x10, 0x0000a310);
++		if (request_send(&wds.settings, &wds_link, WDS_GET_CURRENT_SETTINGS, tlvs, length, 5000)) {
++			wds.phase = 7;
++		} else {
++			wds.next_ms = now + 1000;
++		}
++		return;
++	case 7:
++		if (request_answered(&wds.settings, &result)) {
++			if (wds.got_address) {
++				pandora_cell_session(true, wds.address, wds.mask, wds.gateway, wds.dns1,
++				    wds.dns2, wds.mtu);
++				wds.up = true;
++				wds.phase = 8;
++				pandora_say("WDS: en%u has the session's address\n", CELL_UNIT);
++				return;
++			}
++			pandora_say("WDS: the settings came back without an IPv4 address; the session is "
++			    "retried\n");
++		}
++		wds.phase = 4;
++		wds.next_ms = now + 6000;
++		return;
++	default:
++		wds.phase = 0;
++		return;
++	}
++}
++
++/* ---- the callbacks, one receive and one server per service ---------------------------------- */
++
++static void
++cell_dms_receive(void *context, uint32_t node, uint32_t port, const void *data, size_t length)
++{
++	struct cell_link *link = context;
++	const uint8_t *frame = data;
++	const uint8_t *value;
++	uint16_t message, size;
++	uint8_t kind;
++
++	(void)node;
++	(void)port;
++	if (!link->qmi.connected || pandora_qmi_input(frame, length) == NULL) {
++		return;
++	}
++	if (!cell_message(frame, length, &kind, &message) || kind != PANDORA_QMI_RESPONSE) {
++		return;
++	}
++	if (message == DMS_GET_OPERATING_MODE && cell_find_tlv(frame, length, 1, &value, &size) &&
++	    size >= 1) {
++		dms.mode = value[0];                    /* TLV 1: the operating mode */
++	}
++}
++
++static void
++cell_dms_server(void *context, bool arrived, uint32_t service, uint32_t version,
++    uint32_t instance, uint32_t node, uint32_t port)
++{
++	(void)version;
++	(void)instance;
++	if (service != QMI_DMS) {
++		return;
++	}
++	cell_link_server(context, arrived, node, port);
++}
++
++static void
++cell_uim_receive(void *context, uint32_t node, uint32_t port, const void *data, size_t length)
++{
++	struct cell_link *link = context;
++	const uint8_t *frame = data;
++	const uint8_t *value;
++	uint16_t message, size, result = 0, error = 0;
++	uint8_t kind;
++
++	(void)node;
++	(void)port;
++	if (!link->qmi.connected || pandora_qmi_input(frame, length) == NULL) {
++		return;
++	}
++	if (!cell_message(frame, length, &kind, &message) || kind != PANDORA_QMI_RESPONSE) {
++		return;
++	}
++	if (message == UIM_GET_CARD_STATUS) {
++		if (pandora_qmi_result(frame, length, &result, &error) == 0 &&
++		    cell_find_tlv(frame, length, 0x10, &value, &size) && size >= 9) {
++			cell_uim_card_status(value, size);
++		} else {
++			pandora_say("UIM: the card status could not be read (result %u, error %u)\n",
++			    result, error);
++		}
++	} else if (message == UIM_SWITCH_SLOT) {
++		pandora_say("UIM: the modem answers the slot switch\n");
++	} else if (message == UIM_CHANGE_PROVISIONING_SESSION) {
++		pandora_say("UIM: the modem answers the provisioning change; registration will be "
++		    "asked for again\n");
++	}
++}
++
++static void
++cell_uim_server(void *context, bool arrived, uint32_t service, uint32_t version,
++    uint32_t instance, uint32_t node, uint32_t port)
++{
++	(void)version;
++	(void)instance;
++	if (service != QMI_UIM) {
++		return;
++	}
++	cell_link_server(context, arrived, node, port);
++}
++
++static void
++cell_nas_receive(void *context, uint32_t node, uint32_t port, const void *data, size_t length)
++{
++	struct cell_link *link = context;
++	const uint8_t *frame = data;
++	uint16_t message;
++	uint8_t kind;
++
++	(void)node;
++	(void)port;
++	if (!link->qmi.connected) {
++		return;
++	}
++	if (!cell_message(frame, length, &kind, &message)) {
++		return;
++	}
++	if (message == NAS_GET_SYSTEM_SELECTION_PREFERENCE) {
++		if (pandora_qmi_input(frame, length) != NULL) {
++			cell_nas_selection(frame, length);
++		}
++		return;
++	}
++	if (message == NAS_GET_SYSTEM_INFO) {
++		if (pandora_qmi_input(frame, length) != NULL &&
++		    pandora_qmi_result(frame, length, NULL, NULL) == 0) {
++			cell_nas_system_info(frame, length);
++		}
++		return;
++	}
++	if (message == NAS_SERVING_SYSTEM || message == NAS_GET_SIGNAL_INFO ||
++	    message == NAS_SIGNAL_INFO) {
++		if (kind == PANDORA_QMI_RESPONSE && pandora_qmi_input(frame, length) == NULL) {
++			return;                         /* a response to nothing of ours */
++		}
++		if (cell_nas_apply(frame, length)) {
++			cell_nas_changed();
++		}
++	}
++}
++
++static void
++cell_nas_server(void *context, bool arrived, uint32_t service, uint32_t version,
++    uint32_t instance, uint32_t node, uint32_t port)
++{
++	(void)version;
++	(void)instance;
++	if (service != QMI_NAS) {
++		return;
++	}
++	cell_link_server(context, arrived, node, port);
++}
++
++static void
++cell_wds_receive(void *context, uint32_t node, uint32_t port, const void *data, size_t length)
++{
++	struct cell_link *link = context;
++	const uint8_t *frame = data;
++	const uint8_t *value;
++	uint16_t message, size, result = 0, error = 0, reason = 0;
++
++	(void)node;
++	(void)port;
++	if (!link->qmi.connected || pandora_qmi_input(frame, length) == NULL) {
++		return;
++	}
++	if (!cell_message(frame, length, NULL, &message)) {
++		return;
++	}
++	(void)pandora_qmi_result(frame, length, &result, &error);
++	if (message == WDS_START_NETWORK_INTERFACE) {
++		if (cell_find_tlv(frame, length, 0x10, &value, &size) && size >= 2) {
++			reason = pandora_qmi_le16(value);       /* the call end reason */
++		}
++		if (result == 0 && cell_find_tlv(frame, length, 0x01, &value, &size) && size >= 4) {
++			wds.handle = pandora_qmi_le32(value);
++		}
++		if (result != 0) {
++			pandora_say("WDS: the session was refused: result %u, error %u, call end "
++			    "reason %u\n", result, error, reason);
++		}
++	} else if (message == WDS_BIND_MUX_DATA_PORT || message == WDS_SET_IP_FAMILY) {
++		/* answered by the result alone; cell_wds_tick() reads it */
++	} else if (message == WDS_GET_CURRENT_SETTINGS) {
++		/*
++		 * The settings (spec 3.2 (d)): every one of them is a little-endian u32 whose value is
++		 * already host order -- the "silent killer" of spec 3.2's byte-order section. They are
++		 * stored here and applied by the tick, so that the session and the link event change on
++		 * one thread.
++		 *
++		 * PORTER'S NOTE / UNKNOWN: HakiOS reads the TLVs below, which are libqmi's current set.
++		 * A firmware that answers only the older set would report no address and the link would
++		 * never come up (spec 3.2's "pit", risk 19); the older ids are not known from the sources
++		 * this port has, so nothing is invented here. What is done instead is the sanity check
++		 * spec 11 #19 asks for: if the address looks byte-reversed, say so in the log, because
++		 * that is the other way this can go silently wrong.
++		 */
++		wds.address = 0;
++		(void)cell_find_u32(frame, length, 0x1e, &wds.address);
++		wds.gateway = 0;
++		wds.mask = 0;
++		wds.dns1 = 0;
++		wds.dns2 = 0;
++		wds.mtu = 0;
++		(void)cell_find_u32(frame, length, 0x20, &wds.gateway);
++		(void)cell_find_u32(frame, length, 0x21, &wds.mask);
++		(void)cell_find_u32(frame, length, 0x15, &wds.dns1);
++		(void)cell_find_u32(frame, length, 0x16, &wds.dns2);
++		(void)cell_find_u32(frame, length, 0x29, &wds.mtu);
++		wds.got_address = wds.address != 0;
++		if (wds.address != 0 && cell_address_reversed(wds.address)) {
++			pandora_say("WDS: WARNING: the address %#x looks byte-reversed; the modem may "
++			    "not be writing this TLV little-endian (spec 11 #19)\n", wds.address);
++		}
++		{
++			char a[20], g[20], mk[20];
++
++			cell_ip_string(a, sizeof(a), wds.address);
++			cell_ip_string(g, sizeof(g), wds.gateway);
++			cell_ip_string(mk, sizeof(mk), wds.mask);
++			pandora_say("WDS: THE DATA SESSION'S SETTINGS: address %s, gateway %s, netmask %s, "
++			    "DNS %#x %#x, MTU %u\n", a, g, mk, wds.dns1, wds.dns2, wds.mtu);
++		}
++	}
++}
++
++static void
++cell_wds_server(void *context, bool arrived, uint32_t service, uint32_t version,
++    uint32_t instance, uint32_t node, uint32_t port)
++{
++	(void)version;
++	(void)instance;
++	if (service != QMI_WDS) {
++		return;
++	}
++	cell_link_server(context, arrived, node, port);
++}
++
++static void
++cell_dpm_receive(void *context, uint32_t node, uint32_t port, const void *data, size_t length)
++{
++	struct cell_link *link = context;
++
++	(void)node;
++	(void)port;
++	/* Only the transaction's result matters; the tick reads it (spec 5.4). */
++	(void)pandora_qmi_input(data, length);
++	(void)link;
++}
++
++static void
++cell_dpm_server(void *context, bool arrived, uint32_t service, uint32_t version,
++    uint32_t instance, uint32_t node, uint32_t port)
++{
++	(void)version;
++	(void)instance;
++	if (service != QMI_DPM) {
++		return;
++	}
++	cell_link_server(context, arrived, node, port);
++}
++
++static void
++cell_wda_receive(void *context, uint32_t node, uint32_t port, const void *data, size_t length)
++{
++	const uint8_t *frame = data;
++	uint32_t link_layer = 0, uplink = 0, downlink = 0;
++
++	(void)context;
++	(void)node;
++	(void)port;
++	if (pandora_qmi_input(frame, length) == NULL) {
++		return;
++	}
++	/* The echoed format, for the log (hakios.mpss.c:5403-5406). */
++	(void)cell_find_u32(frame, length, 0x11, &link_layer);
++	(void)cell_find_u32(frame, length, 0x12, &uplink);
++	(void)cell_find_u32(frame, length, 0x13, &downlink);
++	if (link_layer != 0 || uplink != 0 || downlink != 0) {
++		pandora_say("WDA: the modem echoes link layer %u (2: raw IP), aggregation up %u down %u "
++		    "(5: QMAP)\n", link_layer, uplink, downlink);
++	}
++}
++
++static void
++cell_wda_server(void *context, bool arrived, uint32_t service, uint32_t version,
++    uint32_t instance, uint32_t node, uint32_t port)
++{
++	(void)version;
++	(void)instance;
++	if (service != QMI_WDA) {
++		return;
++	}
++	cell_link_server(context, arrived, node, port);
++}
++
++/* ---- 10.2.4 the tick, and the thread's other half -------------------------------------------- */
++
++static void
++cell_data_tick(uint64_t now)
++{
++	if (cell_data_off) {
++		return;
++	}
++	cell_dpm_tick(now);
++	cell_wda_tick(now);
++	cell_wds_tick(now);
++}
++
++/* ---- 10.2.4 #8: the tick -------------------------------------------------------------------- */
++
++/*
++ * One tick, in the order HakiOS's step_nas() takes its steps (hakios.mpss.c:6020-6130): the modem
++ * online, the card, the registration, then the data path. Each of them is idempotent and each has
++ * its own timers, so a tick that finds nothing to do costs a handful of comparisons.
++ */
++static void
++cell_tick(void)
++{
++	uint64_t now = cell_now_ms();
++
++	/*
++	 * The ports are opened from here and not from a constructor: the QRTR link does not exist until
++	 * pandora_mpss.c's step machine has brought the modem's GLINK channel up, and by then this
++	 * thread has been running for a while.
++	 */
++	(void)cell_qmi_links_open();
++	cell_dms_tick(now);
++	cell_uim_tick(now);
++	cell_nas_tick(now);
++	cell_data_tick(now);
++}
++
++/* ==================== END ==================== */
++
++#endif /* PANDORA */
+\ No newline at end of file
+diff --git a/bsd/dev/pandora_cell.h b/bsd/dev/pandora_cell.h
+new file mode 100644
+index 0000000..1fd2132
+--- /dev/null
++++ b/bsd/dev/pandora_cell.h
+@@ -0,0 +1,206 @@
++/*
++ * PANDORA CELL: en1, the fake Ethernet interface the modem's IP packets ride on, and the QMI
++ * sessions that keep it up. The counterpart of HakiOS's bsd/dev/hakios.cell.c, hakios.nas.c and
++ * the WDS/WDA/DPM/UIM/DMS/NAS parts of hakios.mpss.c.
++ *
++ * Every number and every message in the two files behind this header comes from
++ * work/baseband-port/cell-nas-qmi-spec.md; the section each part came from is named in the file
++ * that implements it (pandora_cell.c's and pandora_qmi.c's header comments), and each judgement
++ * call is marked PORTER'S NOTE at the place it happens.
++ *
++ * ---------------------------------------------------------------------------------------------
++ * THE ONE RULE THAT MUST NOT BE BROKEN
++ *
++ * Do NOT add a "baseband" node (or "bbdev") to the device tree, and do NOT publish or match an
++ * AppleBaseband / AppleIPAppender service anywhere, ever, for this port.
++ *
++ * mkadt_pandora.py has no baseband node today (see its comments at :245 and :250) and that has to
++ * stay true. A baseband node makes CommCenter take its "this device has a baseband" path, which
++ * faults in ApplePDPHelperInterface::callStructMethod on a NULL std::mutex -- SIGSEGV/SIGABRT
++ * every five to ten seconds (spec 9.1). The services that path wants do not exist in this tree.
++ *
++ * The data path here is a plain Ethernet interface (en1) and nothing else: the rest of iOS sees a
++ * network card, not a cellular radio. en1 is not pdp_ip0, it is not in the Cellular Data switch,
++ * and it carries no signal bars.
++ * ---------------------------------------------------------------------------------------------
++ *
++ * There is no pandora_qmi.h and there is no pandora_nas.h in this tree: HakiOS spread the same
++ * code over sys/hakios.qmi.h, sys/hakios.nas.h and the middle of hakios.mpss.c, and the port plan
++ * (spec 10.1/10.3) asks for it in two .c files. The QMI layer's interface is therefore declared
++ * at the bottom of this header, behind its own comment, and used only by pandora_cell.c.
++ * PORTER'S NOTE: three files instead of HakiOS's five, so one of them has to carry two
++ * interfaces. Nothing outside bsd/dev/pandora_*.c includes this header.
++ */
++#ifndef _BSD_DEV_PANDORA_CELL_H_
++#define _BSD_DEV_PANDORA_CELL_H_
++
++#if defined(PANDORA)
++
++#include <sys/types.h>
++
++/* ---- the interface (spec 10.2.1 and 10.2.3) ------------------------------------------------ */
++
++/*
++ * Bring en1 up, and start the thread that runs the sessions (spec 10.2 #9). Idempotent, and
++ * refused outright by boot arg pandora_cell=0. Also refused when the IPA's data path is not up
++ * (pandora_ipa_data_ready() == false), which is HakiOS's own gate (hakios.cell.c:346): without the
++ * IPA there is nothing to put a frame into.
++ *
++ * Not called by the step machine. pandora_mpss.c's step_start() brings the IPA up
++ * (pandora_ipa_bringup()); the cell layer is started by its own boot argument and its own thread.
++ */
++int pandora_cell_start(void);
++
++/*
++ * The interface half alone: make en1, attach it, attach BPF, and leave it down until a data
++ * session gives it an address. Returns 0 or an errno; EALREADY-and-quiet when en1 already exists.
++ * Safe to call from pandora_cell_start() and from a boot that wants the interface before the
++ * modem is up (it shows up in ifconfig with no address, which is what a first B0 test wants).
++ */
++int pandora_cell_attach(void);
++
++/*
++ * The data session changed: WDS's Get Current Settings, or its failure. `up` with a nonzero
++ * address is a link; anything else takes the link down. `mtu` is the modem's, reported to DHCP's
++ * option 26 only (the interface's own MTU stays 1500 -- spec 1.2).
++ *
++ * The mask and gateway are the modem's, and are kept for the log only: the interface is told a /24
++ * around the address with a made-up router (spec 1.2), because a point-to-point cellular link's
++ * gateway need not be in any subnet with the address and DHCP cannot express that.
++ *
++ * Sets kern.pandora.cellular_* (spec 2.2) and sends the link event configd listens for (spec 9.2).
++ */
++void pandora_cell_session(bool up, uint32_t address, uint32_t mask, uint32_t gateway, uint32_t dns1,
++    uint32_t dns2, uint32_t mtu);
++
++/*
++ * One line of counters for the log. Same shape and callers as pandora_ipa_status().
++ */
++void pandora_cell_status(char *to, size_t size);
++
++/*
++ * The receive side of pandora_ipa.h's function pointer: one IP packet (no Ethernet header) from
++ * the modem under QMAP mux `mux`. pandora_cell_start() points pandora_ipa_receive at it; the
++ * declaration is here so that the IPA side can name it too.
++ */
++void pandora_cell_receive(uint32_t mux, const uint8_t *packet, size_t length);
++
++/* ---- the QMI layer (spec 3.2 and 10.3) ------------------------------------------------------
++ *
++ * pandora_qmi.c is the wire format and the transaction table, and nothing else: it has no
++ * transport, no service, no port. The caller gives it a send callback and feeds every datagram it
++ * receives back in through pandora_qmi_input().
++ *
++ * The 7-byte header (spec 3.2, hakios.qmi.h:32-35) is
++ *
++ *	type (1) | transaction (2, LE) | message (2, LE) | length of the rest (2, LE)
++ *
++ * and every TLV is a type (1), a length (2, LE) and the value. Every number inside a TLV is
++ * little-endian on the wire; the helpers here do that conversion and nothing else, so a value read
++ * with pandora_qmi_le32() is a host-order integer already (10.0.0.1 -> 0x0A000001) and must not be
++ * passed through ntohl again (spec 3.2, the byte-order section).
++ */
++
++#define PANDORA_QMI_HEADER       7
++#define PANDORA_QMI_TLV_HEADER   3
++
++#define PANDORA_QMI_REQUEST      0
++#define PANDORA_QMI_RESPONSE     2
++#define PANDORA_QMI_INDICATION   4
++
++/* The transaction states pandora_qmi_txn_state() returns. */
++#define PANDORA_QMI_TXN_INVALID  0      /* not in the table */
++#define PANDORA_QMI_TXN_PENDING  1      /* sent, nothing back yet */
++#define PANDORA_QMI_TXN_DONE     2      /* a response arrived; the result is readable */
++#define PANDORA_QMI_TXN_EXPIRED  3      /* nothing arrived in time; still in the table */
++
++/* One send callback: one datagram, for a port that is already connected. */
++typedef int (*pandora_qmi_transmit_t)(void *context, uint32_t node, uint32_t port, const void *data,
++    size_t length);
++
++/* What one QMI service of ours is: the port, the peer, and how to send on it. */
++struct pandora_qmi_client {
++	pandora_qmi_transmit_t transmit;
++	void *context;
++	uint32_t node, port;                    /* the modem's, from the QRTR service event */
++	bool connected;
++};
++
++struct pandora_qmi_txn;
++
++/* Little-endian reads, for TLV values. Host order out; no ntohl/htonl anywhere near them. */
++uint16_t pandora_qmi_le16(const uint8_t *p);
++uint32_t pandora_qmi_le32(const uint8_t *p);
++
++/* Write the 7-byte header; returns PANDORA_QMI_HEADER, or 0 if tlv_bytes does not fit its field. */
++size_t pandora_qmi_header(uint8_t *buffer, uint8_t type, uint16_t transaction, uint16_t message,
++    size_t tlv_bytes);
++
++/* Write one TLV (3-byte header plus value); returns PANDORA_QMI_TLV_HEADER + length.
++ * PORTER'S NOTE: these four take the caller's word for the buffer's size, exactly as the port
++ * plan's signatures do (spec 10.3); pandora_cell.c checks its capacities before calling them.
++ * PORTER'S NOTE: bsd/dev/pandora_rmtfs.c:424 has a *static* helper also called pandora_qmi_tlv
++ * with a different shape (it searches a received message for a TLV). The two do not collide --
++ * that one has internal linkage and pandora_rmtfs.c does not include this header -- but a file
++ * that wants both must rename one of them. */
++size_t pandora_qmi_tlv(uint8_t *buffer, uint8_t type, const void *value, uint16_t length);
++size_t pandora_qmi_tlv_u8(uint8_t *buffer, uint8_t type, uint8_t value);
++size_t pandora_qmi_tlv_u16(uint8_t *buffer, uint8_t type, uint16_t value);
++size_t pandora_qmi_tlv_u32(uint8_t *buffer, uint8_t type, uint32_t value);
++size_t pandora_qmi_tlv_pair(uint8_t *buffer, uint8_t type, uint32_t first, uint32_t second);
++
++/* One TLV as pandora_qmi_walk() sees it. Return false to stop the walk. */
++typedef bool (*pandora_qmi_tlv_fn)(void *context, uint8_t type, const uint8_t *value, uint16_t length);
++
++/*
++ * Walk a whole message: check the 7-byte header's payload size against the length, then hand every
++ * TLV to `fn` in the order it came. False when the message is malformed (short, or a TLV that runs
++ * past the end). *message and *transaction are optional.
++ */
++bool pandora_qmi_walk(const uint8_t *frame, size_t length, pandora_qmi_tlv_fn fn, void *context);
++bool pandora_qmi_walk_message(const uint8_t *frame, size_t length, uint16_t *message,
++    uint16_t *transaction, pandora_qmi_tlv_fn fn, void *context);
++
++/*
++ * TLV 2, the result: 0 on success, -1 when the message has no result TLV, 1 when it has an error.
++ * *result and *error are filled in when there is a TLV to fill them from.
++ */
++int pandora_qmi_result(const uint8_t *frame, size_t length, uint16_t *result, uint16_t *error);
++
++/*
++ * Send one request and remember it: allocates a transaction, writes the header and the TLVs the
++ * caller built, and sends it on the client's port. NULL when there is no room in the table, the
++ * client is not connected, or the transport refused (its errno is lost; the caller's log says
++ * which message it was).
++ *
++ * The response is not waited for here (see the PORTER'S NOTE in pandora_qmi.c); the caller asks
++ * pandora_qmi_txn_state() on its own ticks.
++ */
++struct pandora_qmi_txn *pandora_qmi_send(struct pandora_qmi_client *client, uint16_t message,
++    const uint8_t *tlvs, size_t tlv_bytes, uint64_t timeout_ms);
++
++/* The state of a transaction from the table (PANDORA_QMI_TXN_*). */
++int pandora_qmi_txn_state(struct pandora_qmi_txn *txn);
++
++/* Done and successful: true, and *result gets TLV 2's result. False while pending or expired. */
++bool pandora_qmi_txn_done(struct pandora_qmi_txn *txn, uint16_t *result);
++
++/* Done with it: the transaction's id goes back to the table. NULL is accepted. */
++void pandora_qmi_txn_free(struct pandora_qmi_txn *txn);
++
++/*
++ * A datagram arrived on one of our ports: if it is a response whose transaction is in the table,
++ * complete that transaction and return it; otherwise NULL (an indication, or a response to
++ * something that has already timed out). The caller still parses indications itself.
++ */
++struct pandora_qmi_txn *pandora_qmi_input(const uint8_t *frame, size_t length);
++
++/* Empty the transaction table; called once, from pandora_cell_start(). */
++void pandora_qmi_reset(void);
++
++/* What the table holds: used, in flight, completed. For the log. */
++void pandora_qmi_status(char *to, size_t size);
++
++#endif /* PANDORA */
++
++#endif /* _BSD_DEV_PANDORA_CELL_H_ */
+\ No newline at end of file
 diff --git a/bsd/dev/pandora_fw.c b/bsd/dev/pandora_fw.c
 new file mode 100644
 index 0000000..e4ad7a7
@@ -5193,6 +8139,544 @@ index 0000000..743ff9a
 +}
 +#endif
 +#endif
+diff --git a/bsd/dev/pandora_qmi.c b/bsd/dev/pandora_qmi.c
+new file mode 100644
+index 0000000..5560cf3
+--- /dev/null
++++ b/bsd/dev/pandora_qmi.c
+@@ -0,0 +1,531 @@
++/*
++ * PANDORA QMI: the wire format of a QMI message and the table of transactions waiting for their
++ * answers. No transport, no service, no port: the caller supplies a send callback and feeds every
++ * datagram it receives back in.
++ *
++ * Where this came from (work/baseband-port/cell-nas-qmi-spec.md):
++ *
++ *   3.2   the 7-byte header and the 3-byte TLV header, the type codes, little-endian everywhere
++ *   10.3  the function list: header, TLV, walk, result, send, txn_done, txn_free
++ *   10.5  the dependency order: this file is step 1 and depends on nothing
++ *
++ * HakiOS's equivalent is drivers/modem/hakios.qmi.c (hakios_qmi_encode() at :388,
++ * hakios_qmi_decode() at :448, TLV_HEADER at :218) plus the transaction half of sys/hakios.qmi.h
++ * (qmi_txn_init at :850, qmi_send_request at :885, hakios_qmi_txn_wait_ms at :941).
++ *
++ * PORTER'S NOTE (the two places this file does not follow HakiOS):
++ *
++ *   1. HakiOS codes messages with Linux's qmi_helpers: a table of struct qmi_elem_info describes
++ *      each message and one generic encoder walks it (hakios.qmi.h:59-67). The port plan says not
++ *      to copy that (spec 10.3: "do not copy HakiOS's table-driven qmi_elem_info mechanism ...
++ *      twenty-odd messages of our own do not justify it; hand-written TLVs are clearer and easier
++ *      to compare against HakiOS's byte arrays"). So there is no table here: the caller writes its
++ *      TLVs with pandora_qmi_tlv_*(), which is what makes the byte arrays of spec 4/5/7/8
++ *      directly checkable against this code.
++ *
++ *   2. A transaction does not block (HakiOS's hakios_qmi_txn_wait_ms() sleeps until the answer or
++ *      the timeout). Here the answer completes the transaction from whatever thread the QRTR link
++ *      delivers it on, and the caller asks pandora_qmi_txn_state() on its own ticks. The reason is
++ *      that one thread has to keep pandora_ipa_poll() running while the QMI state machine waits,
++ *      and a thread asleep in a QMI wait is a data path that has stopped: the receive endpoints'
++ *      aggregation window is 500 us (spec 4.1). The state machine's phases are timers of their
++ *      own, so a wait of three seconds is three ticks rather than a sleep.
++ *
++ * Nothing in here knows a byte order but the wire's: every number in a TLV is little-endian and
++ * every helper converts it, so what pandora_qmi_le32() returns is a host-order integer already
++ * and must not be passed through ntohl (spec 3.2 -- this is the "silent killer" the spec warns
++ * about: WDS's IPv4 address arrives as 10.0.0.1 -> 0x0A000001, and pandora_cell.c's put32(), which
++ * is big-endian, is what turns it into a network-order frame field).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/sysctl.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <net/ether_if_module.h>
++#include <net/if_ether.h>
++#include <net/bpf.h>
++#include <net/if_types.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
++#include "pandora_modem.h"
++#include "pandora_ipa.h"
++#include "pandora_qrtr.h"
++#include "pandora_cell.h"
++
++#if defined(PANDORA)
++
++/* ---- the frame ------------------------------------------------------------------------------ */
++
++/*
++ * A request or a response: the 7-byte header and the TLVs. The largest TLV list any message here
++ * needs is the UIM provisioning session's (spec 7.3: eighteen bytes plus an AID of at most 32),
++ * so 1 KB is nine times the biggest frame and small enough for the kernel stack. PORTER'S NOTE:
++ * HakiOS keeps these on the stack too (hakios.mpss.c:5636, `uint8_t bind[7 + 11 + 4]`).
++ */
++#define PANDORA_QMI_FRAME_MAX   1024
++
++static inline uint16_t
++put_le16(uint8_t *p, uint16_t value)
++{
++	p[0] = (uint8_t)value;
++	p[1] = (uint8_t)(value >> 8);
++	return value;
++}
++
++uint16_t
++pandora_qmi_le16(const uint8_t *p)
++{
++	return (uint16_t)((uint16_t)p[0] | (uint16_t)p[1] << 8);
++}
++
++uint32_t
++pandora_qmi_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/* The header's "length of the rest" field. */
++static uint16_t
++frame_payload_length(const uint8_t *frame)
++{
++	return pandora_qmi_le16(frame + 5);
++}
++
++size_t
++pandora_qmi_header(uint8_t *buffer, uint8_t type, uint16_t transaction, uint16_t message,
++    size_t tlv_bytes)
++{
++	if (buffer == NULL || tlv_bytes > 0xffff) {
++		return 0;
++	}
++	buffer[0] = type;
++	put_le16(buffer + 1, transaction);
++	put_le16(buffer + 3, message);
++	put_le16(buffer + 5, (uint16_t)tlv_bytes);
++	return PANDORA_QMI_HEADER;
++}
++
++size_t
++pandora_qmi_tlv(uint8_t *buffer, uint8_t type, const void *value, uint16_t length)
++{
++	if (buffer == NULL) {
++		return 0;
++	}
++	buffer[0] = type;
++	put_le16(buffer + 1, length);
++	if (length != 0) {
++		if (value == NULL) {
++			return 0;
++		}
++		memcpy(buffer + PANDORA_QMI_TLV_HEADER, value, length);
++	}
++	return PANDORA_QMI_TLV_HEADER + (size_t)length;
++}
++
++size_t
++pandora_qmi_tlv_u8(uint8_t *buffer, uint8_t type, uint8_t value)
++{
++	return pandora_qmi_tlv(buffer, type, &value, 1);
++}
++
++size_t
++pandora_qmi_tlv_u16(uint8_t *buffer, uint8_t type, uint16_t value)
++{
++	uint8_t bytes[2];
++
++	put_le16(bytes, value);
++	return pandora_qmi_tlv(buffer, type, bytes, sizeof(bytes));
++}
++
++size_t
++pandora_qmi_tlv_u32(uint8_t *buffer, uint8_t type, uint32_t value)
++{
++	uint8_t bytes[4];
++
++	bytes[0] = (uint8_t)value;
++	bytes[1] = (uint8_t)(value >> 8);
++	bytes[2] = (uint8_t)(value >> 16);
++	bytes[3] = (uint8_t)(value >> 24);
++	return pandora_qmi_tlv(buffer, type, bytes, sizeof(bytes));
++}
++
++size_t
++pandora_qmi_tlv_pair(uint8_t *buffer, uint8_t type, uint32_t first, uint32_t second)
++{
++	uint8_t bytes[8];
++
++	bytes[0] = (uint8_t)first;
++	bytes[1] = (uint8_t)(first >> 8);
++	bytes[2] = (uint8_t)(first >> 16);
++	bytes[3] = (uint8_t)(first >> 24);
++	bytes[4] = (uint8_t)second;
++	bytes[5] = (uint8_t)(second >> 8);
++	bytes[6] = (uint8_t)(second >> 16);
++	bytes[7] = (uint8_t)(second >> 24);
++	return pandora_qmi_tlv(buffer, type, bytes, sizeof(bytes));
++}
++
++/* ---- walking one ---------------------------------------------------------------------------- */
++
++bool
++pandora_qmi_walk_message(const uint8_t *frame, size_t length, uint16_t *message,
++    uint16_t *transaction, pandora_qmi_tlv_fn fn, void *context)
++{
++	size_t at = PANDORA_QMI_HEADER;
++	uint16_t payload;
++
++	if (frame == NULL || length < PANDORA_QMI_HEADER) {
++		return false;
++	}
++	payload = frame_payload_length(frame);
++	/*
++	 * Spec 3.2: the header's length is "of the rest", so a message that does not agree with it is
++	 * not a message. HakiOS's NAS parser makes the same check (hakios.nas.c:22-23) and refuses
++	 * the frame; so does this.
++	 */
++	if ((size_t)payload != length - PANDORA_QMI_HEADER) {
++		return false;
++	}
++	if (message != NULL) {
++		*message = pandora_qmi_le16(frame + 3);
++	}
++	if (transaction != NULL) {
++		*transaction = pandora_qmi_le16(frame + 1);
++	}
++	while (at < length) {
++		uint8_t type;
++		uint16_t size;
++
++		if (length - at < PANDORA_QMI_TLV_HEADER) {
++			return false;
++		}
++		type = frame[at];
++		size = pandora_qmi_le16(frame + at + 1);
++		at += PANDORA_QMI_TLV_HEADER;
++		if ((size_t)size > length - at) {
++			return false;
++		}
++		if (fn != NULL && !fn(context, type, frame + at, size)) {
++			/* The walker's own stop, not a malformed message. */
++			return true;
++		}
++		at += size;
++	}
++	return true;
++}
++
++bool
++pandora_qmi_walk(const uint8_t *frame, size_t length, pandora_qmi_tlv_fn fn, void *context)
++{
++	return pandora_qmi_walk_message(frame, length, NULL, NULL, fn, context);
++}
++
++struct result_search {
++	uint16_t result;
++	uint16_t error;
++	bool found;
++};
++
++static bool
++result_walk(void *context, uint8_t type, const uint8_t *value, uint16_t length)
++{
++	struct result_search *search = context;
++
++	/*
++	 * TLV 2 is the result: a 16-bit result and a 16-bit error. Both are little-endian on the
++	 * wire like every other number here.
++	 */
++	if (type != 2 || length < 4) {
++		return true;
++	}
++	search->found = true;
++	search->result = pandora_qmi_le16(value);
++	search->error = pandora_qmi_le16(value + 2);
++	return false;
++}
++
++int
++pandora_qmi_result(const uint8_t *frame, size_t length, uint16_t *result, uint16_t *error)
++{
++	struct result_search search = { 0, 0, false };
++
++	if (!pandora_qmi_walk(frame, length, result_walk, &search) || !search.found) {
++		return -1;
++	}
++	if (result != NULL) {
++		*result = search.result;
++	}
++	if (error != NULL) {
++		*error = search.error;
++	}
++	return search.result == 0 && search.error == 0 ? 0 : 1;
++}
++
++/* ---- the transaction table ------------------------------------------------------------------ */
++
++/*
++ * Sixteen transactions. HakiOS's table is the qmi_handle's single `txn` pointer plus Linux's
++ * transaction ids; here every service has its own client, and the requests one service can have
++ * in flight at once is at most two (a WDS start and the settings that follow it), so sixteen
++ * across all six services is generous. PORTER'S NOTE: the table is static, not kalloc'd. The
++ * pointers pandora_qmi_send() hands out stay valid forever, which is what makes it safe for the
++ * link thread to complete a transaction while the cell thread is looking at it.
++ */
++#define PANDORA_QMI_TRANSACTIONS        16
++
++struct pandora_qmi_txn {
++	uint16_t transaction;                   /* the wire's, nonzero */
++	uint16_t message;                       /* what was asked; a response must agree */
++	uint16_t result;                        /* TLV 2, once done */
++	uint16_t error;                         /* TLV 2's second half */
++	bool used;                              /* in the table */
++	bool done;                              /* an answer arrived */
++	bool expired;                           /* timed out; a late answer no longer matches */
++	uint64_t deadline;                      /* absolute ns, 0: no timeout */
++};
++
++static LCK_GRP_DECLARE(qmi_lock_group, "pandora-qmi");
++static LCK_MTX_DECLARE(qmi_lock, &qmi_lock_group);
++
++static struct pandora_qmi_txn qmi_transactions[PANDORA_QMI_TRANSACTIONS];
++static uint16_t qmi_transaction_next;
++
++/* Absolute nanoseconds since boot: what a deadline is compared against. */
++static uint64_t
++qmi_now_ns(void)
++{
++	uint64_t uptime, nanoseconds;
++
++	clock_get_uptime(&uptime);
++	absolutetime_to_nanoseconds(uptime, &nanoseconds);
++	return nanoseconds;
++}
++
++void
++pandora_qmi_reset(void)
++{
++	lck_mtx_lock(&qmi_lock);
++	bzero(qmi_transactions, sizeof(qmi_transactions));
++	qmi_transaction_next = 0;
++	lck_mtx_unlock(&qmi_lock);
++}
++
++/* An unused transaction, with an id no other live transaction has. Called with the lock held. */
++static struct pandora_qmi_txn *
++transaction_take_locked(uint16_t message, uint64_t timeout_ms)
++{
++	struct pandora_qmi_txn *txn = NULL;
++	uint16_t id;
++	unsigned tries;
++
++	for (unsigned i = 0; i < PANDORA_QMI_TRANSACTIONS; i++) {
++		if (!qmi_transactions[i].used) {
++			txn = &qmi_transactions[i];
++			break;
++		}
++	}
++	if (txn == NULL) {
++		return NULL;
++	}
++	for (tries = 0; tries < 0x10000; tries++) {
++		bool taken = false;
++
++		if (++qmi_transaction_next == 0) {
++			qmi_transaction_next = 1;
++		}
++		id = qmi_transaction_next;
++		for (unsigned i = 0; i < PANDORA_QMI_TRANSACTIONS; i++) {
++			if (qmi_transactions[i].used && qmi_transactions[i].transaction == id) {
++				taken = true;
++				break;
++			}
++		}
++		if (!taken) {
++			break;
++		}
++	}
++	if (tries == 0x10000) {
++		return NULL;
++	}
++	bzero(txn, sizeof(*txn));
++	txn->used = true;
++	txn->transaction = id;
++	txn->message = message;
++	txn->deadline = timeout_ms == 0 ? 0 : qmi_now_ns() + timeout_ms * 1000000ull;
++	return txn;
++}
++
++struct pandora_qmi_txn *
++pandora_qmi_send(struct pandora_qmi_client *client, uint16_t message, const uint8_t *tlvs,
++    size_t tlv_bytes, uint64_t timeout_ms)
++{
++	uint8_t frame[PANDORA_QMI_FRAME_MAX];
++	struct pandora_qmi_txn *txn;
++	size_t length;
++	int error;
++
++	if (client == NULL || client->transmit == NULL || !client->connected) {
++		return NULL;
++	}
++	if (tlv_bytes > 0xffff || tlv_bytes + PANDORA_QMI_HEADER > sizeof(frame)) {
++		return NULL;
++	}
++	lck_mtx_lock(&qmi_lock);
++	txn = transaction_take_locked(message, timeout_ms);
++	lck_mtx_unlock(&qmi_lock);
++	if (txn == NULL) {
++		return NULL;
++	}
++	length = pandora_qmi_header(frame, PANDORA_QMI_REQUEST, txn->transaction, message, tlv_bytes);
++	if (length == 0) {
++		pandora_qmi_txn_free(txn);
++		return NULL;
++	}
++	if (tlv_bytes != 0) {
++		memcpy(frame + length, tlvs, tlv_bytes);
++	}
++	length += tlv_bytes;
++	/*
++	 * The send is outside the lock: the transport (pandora_mpss_qrtr_send()) takes the QRTR
++	 * layer's own lock, and this one must never be held across it.
++	 */
++	error = client->transmit(client->context, client->node, client->port, frame, length);
++	if (error != 0) {
++		pandora_qmi_txn_free(txn);
++		return NULL;
++	}
++	return txn;
++}
++
++int
++pandora_qmi_txn_state(struct pandora_qmi_txn *txn)
++{
++	int state;
++
++	if (txn == NULL) {
++		return PANDORA_QMI_TXN_INVALID;
++	}
++	lck_mtx_lock(&qmi_lock);
++	if (!txn->used) {
++		state = PANDORA_QMI_TXN_INVALID;
++	} else if (txn->done) {
++		state = PANDORA_QMI_TXN_DONE;
++	} else if (txn->expired) {
++		state = PANDORA_QMI_TXN_EXPIRED;
++	} else if (txn->deadline != 0 && qmi_now_ns() >= txn->deadline) {
++		/*
++		 * Marked here rather than by a timer: from now on a late answer will not match, which
++		 * is what lets the caller free the transaction without racing the link thread.
++		 */
++		txn->expired = true;
++		state = PANDORA_QMI_TXN_EXPIRED;
++	} else {
++		state = PANDORA_QMI_TXN_PENDING;
++	}
++	lck_mtx_unlock(&qmi_lock);
++	return state;
++}
++
++bool
++pandora_qmi_txn_done(struct pandora_qmi_txn *txn, uint16_t *result)
++{
++	bool done;
++
++	if (txn == NULL) {
++		return false;
++	}
++	lck_mtx_lock(&qmi_lock);
++	done = txn->used && txn->done;
++	if (done && result != NULL) {
++		*result = txn->result;
++	}
++	lck_mtx_unlock(&qmi_lock);
++	return done;
++}
++
++void
++pandora_qmi_txn_free(struct pandora_qmi_txn *txn)
++{
++	if (txn == NULL) {
++		return;
++	}
++	lck_mtx_lock(&qmi_lock);
++	txn->used = false;
++	txn->done = false;
++	txn->expired = false;
++	lck_mtx_unlock(&qmi_lock);
++}
++
++struct pandora_qmi_txn *
++pandora_qmi_input(const uint8_t *frame, size_t length)
++{
++	struct pandora_qmi_txn *found = NULL;
++	struct result_search search = { 0, 0, false };
++
++	if (frame == NULL || length < PANDORA_QMI_HEADER) {
++		return NULL;
++	}
++	/* Only a response completes a transaction; an indication is the caller's to parse. */
++	if (frame[0] != PANDORA_QMI_RESPONSE) {
++		return NULL;
++	}
++	if ((size_t)frame_payload_length(frame) != length - PANDORA_QMI_HEADER) {
++		return NULL;
++	}
++	/*
++	 * Everything below happens under the one lock, the TLV walk included, so that a transaction
++	 * cannot be freed and handed to someone else between the match and the write.
++	 */
++	lck_mtx_lock(&qmi_lock);
++	for (unsigned i = 0; i < PANDORA_QMI_TRANSACTIONS; i++) {
++		struct pandora_qmi_txn *txn = &qmi_transactions[i];
++
++		if (txn->used && !txn->done && !txn->expired &&
++		    txn->transaction == pandora_qmi_le16(frame + 1) &&
++		    txn->message == pandora_qmi_le16(frame + 3)) {
++			found = txn;
++			break;
++		}
++	}
++	if (found != NULL && pandora_qmi_walk(frame, length, result_walk, &search) && search.found) {
++		found->result = search.result;
++		found->error = search.error;
++		found->done = true;
++	}
++	lck_mtx_unlock(&qmi_lock);
++	return found;
++}
++
++void
++pandora_qmi_status(char *to, size_t size)
++{
++	unsigned used = 0, pending = 0;
++	char line[96];
++
++	if (to == NULL || size == 0) {
++		return;
++	}
++	lck_mtx_lock(&qmi_lock);
++	for (unsigned i = 0; i < PANDORA_QMI_TRANSACTIONS; i++) {
++		if (!qmi_transactions[i].used) {
++			continue;
++		}
++		used++;
++		if (!qmi_transactions[i].done) {
++			pending++;
++		}
++	}
++	lck_mtx_unlock(&qmi_lock);
++	snprintf(line, sizeof(line), "QMI %u/%u transactions in flight",
++	    pending, used == 0 ? 0 : used);
++	strlcpy(to, line, size);
++}
++
++#endif /* PANDORA */
+\ No newline at end of file
 diff --git a/bsd/dev/pandora_qrtr.c b/bsd/dev/pandora_qrtr.c
 new file mode 100644
 index 0000000..4120699
