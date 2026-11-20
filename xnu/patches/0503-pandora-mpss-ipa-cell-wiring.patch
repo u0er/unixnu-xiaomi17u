@@ -1,0 +1,96 @@
+diff --git a/bsd/dev/pandora_mpss.c b/bsd/dev/pandora_mpss.c
+index f39036d..e8f25f8 100644
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -51,6 +51,8 @@
+ #include "pandora_pas.h"
+ #include "pandora_modem.h"
+ #include "pandora_qrtr.h"
++#include "pandora_ipa.h"
++#include "pandora_cell.h"
+ 
+ extern kern_return_t thread_terminate(thread_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+@@ -145,6 +147,7 @@ static uint8_t *mp_gl_storage;                 /* 5 * 0x4400, the intents the DS
+ #define MP_GL_INTENT_SIZE  0x4400u
+ #define MP_GL_INTENT_COUNT 5u
+ static bool mp_link_running, mp_link_stop;
++static bool mp_cell_started;
+ static bool mp_mapped, mp_qmp_open, mp_p2p_on, mp_gl_on;
+ 
+ /*
+@@ -217,6 +220,26 @@ mp_option(const char *name)
+ 	return PE_parse_boot_argn(name, &on, sizeof(on)) && on != 0;
+ }
+ 
++/*
++ * Is the data path wanted?  The step machine decides whether the IPA step runs at all, so the
++ * two switches are read here: pandora_ipa_off=1 skips it, pandora_ipa=0 skips it, and with
++ * neither present it is brought up (spec 9.3's defaults).  mp_option() takes the whole name,
++ * unlike pandora_ipa.c's own ipa_option(), which supplies the pandora_ipa_ prefix itself.
++ */
++static bool
++mp_ipa_wanted(void)
++{
++	uint32_t on = 1;
++
++	if (mp_option("pandora_ipa_off")) {
++		return false;
++	}
++	if (PE_parse_boot_argn("pandora_ipa", &on, sizeof(on))) {
++		return on != 0;
++	}
++	return true;
++}
++
+ /*
+  * ---- what the rest of the modem stack calls (bsd/dev/pandora_modem.h) ------------------
+  *
+@@ -917,6 +940,23 @@ step_start(void)
+ 	 * rmtfs_sharedmem@0 reg is a bootloader placeholder, not memory -- so the modem starts anyway and
+ 	 * will offer little; pandora_rmtfs_buffer_make() has already printed why.
+ 	 */
++	/*
++	 * The IPA first, and here: spec 9.4 puts bring-up inside step_start(), after IPCC is enabled
++	 * (step 7) and before the buffer is made, because the modem reads the IPA's local memory,
++	 * its canaries and its default route the moment it runs.  A failure is not fatal -- the
++	 * modem still reaches READY and answers NAS and SMS with no data path, which is how HakiOS
++	 * treats it too -- so the result is reported and the step carries on.
++	 */
++	if (mp_ipa_wanted()) {
++		if (pandora_ipa_bringup()) {
++			printf("PANDORA MPSS: %u: the IPA is up, so the modem has a data path to join\n", pandora_step);
++		} else {
++			printf("PANDORA MPSS: %u: THE IPA DID NOT COME UP: the modem is started all the same, and will "
++			    "have no data path\n", pandora_step);
++		}
++	} else {
++		printf("PANDORA MPSS: %u: the IPA is not started (pandora_ipa=0 or pandora_ipa_off)\n", pandora_step);
++	}
+ 	if (pandora_option("modem_share_off")) {
+ 		printf("PANDORA MPSS: %u: the buffer is not shared with the modem (modem_share_off)\n", pandora_step);
+ 	} else if (!pandora_rmtfs_buffer_make() || !pandora_rmtfs_share(true)) {
+@@ -1086,6 +1126,23 @@ step_qrtr(void)
+ 	printf("PANDORA MPSS: GLINK after the watch: version %s, in %u out %u data %u, opens nobody serves %u (%s), "
+ 	    "doorbells SMP2P %u GLINK %u\n", mp_gl.version_agreed ? "agreed" : "NOT AGREED", mp_gl.rx_messages,
+ 	    mp_gl.tx_messages, mp_gl.rx_data, mp_gl.unknown_opens, mp_gl.unknown_names, mp_bells_smp2p, mp_bells_glink);
++	/*
++	 * The cell layer last, and only once the link has carried a datagram: it needs QRTR to reach
++	 * DMS/NAS/WDS, and there is nothing for it to do before HELLO.  pandora_cell_start() has its
++	 * own switches (pandora_cell=0 and the pandora_cell_* family, spec 10.6) and its own thread,
++	 * so it returns at once; it is called here rather than from the link thread because that
++	 * thread is what it will be polling through.
++	 */
++	if (!mp_cell_started && mp_gl.version_agreed) {
++		mp_cell_started = true;
++		if (pandora_cell_start() == 0) {
++			printf("PANDORA MPSS: %u: the cell layer is running; en1 and the modem's services are its "
++			    "business now\n", pandora_step);
++		} else {
++			printf("PANDORA MPSS: %u: THE CELL LAYER IS NOT RUNNING: the modem still answers, but there "
++			    "is no en1 and no data\n", pandora_step);
++		}
++	}
+ 	return mp_gl.version_agreed != 0;
+ }
+ 
