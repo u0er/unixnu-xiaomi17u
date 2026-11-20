@@ -1,0 +1,20 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14744,4 +14744,17 @@
+ 	return renameat_internal(vfs_context_kernel(), AT_FDCWD, CAST_USER_ADDR_T(from), AT_FDCWD,
+ 	           CAST_USER_ADDR_T(to), UIO_SYSSPACE, 0);
+ }
++
++/* For bsd/dev/apple_services.c: rmdir of a kernel-space path as the rmdir syscall makes it (patch 0490).
++ * rmdirat_internal() is static to this file, so a non-empty directory reports ENOTEMPTY before
++ * anything is removed -- which is exactly the signal the AFC recursive remove uses to recurse. */
++int pandora_rmdir(const char *path);
++
++int
++pandora_rmdir(const char *path)
++{
++	return rmdirat_internal(vfs_context_kernel(), AT_FDCWD, CAST_USER_ADDR_T(path),
++	           UIO_SYSSPACE, 0);
++}
++
+ #endif /* PANDORA */

@@ -1,0 +1,117 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -172,10 +172,21 @@ sweet_usb_probe(void)
+ #define UD_SETUP        0x1040          /* 8-byte setup packet */
+ #define UD_DATA         0x1100          /* ep0 data stage, 512 bytes */
+ #define UD_NOTIFY       0x1300          /* 16-byte notification */
++/*
++ * One bulk transfer may not exceed its window.  RX_MAX is the largest inbound
++ * transfer we ask the host for; a full 32 KiB AFC packet therefore arrives as
++ * a few back-to-back transfers and apple_usbmux_input() reassembles them.
++ * TX_MAX must hold a whole mux frame, i.e. AMUX_RXBUF plus the 36-byte
++ * mux/TCP header, so one AFC reply of any size leaves in a single transfer.
++ */
++#define UD_RX_MAX       0x4000          /* 16 KiB inbound per transfer */
++#define UD_TX_MAX       0x8000          /* 32 KiB outbound per transfer */
+ #define UD_RX           0x2000          /* one received frame */
+-#define UD_TX           0x2800          /* one frame to send */
++#define UD_RX_SIZE      UD_RX_MAX
++#define UD_TX           (UD_RX + UD_RX_SIZE)    /* one frame to send */
++#define UD_TX_SIZE      UD_TX_MAX
+ #define UD_FRAME_MAX    0x800
+-#define UD_SIZE         0x4000
++#define UD_SIZE         (UD_TX + UD_TX_SIZE)
+ 
+ /* Physical endpoints: 2n = OUT, 2n+1 = IN */
+ #define EP_RX           2               /* 0x01 bulk OUT */
+@@ -236,6 +247,27 @@ ud_sleep_ms(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * Poll interval for ud_thread.  The DWC event interrupt is masked
++ * (GEVNTSIZ bit 31), so a transfer completion is only ever noticed by
++ * looking at GEVNTCOUNT; there is no wakeup path and no second thread to
++ * post one.  Napping a fixed 1 ms therefore added ~1 ms of latency to every
++ * single 512-byte packet, which bounded bulk throughput at ~0.5 MB/s no
++ * matter how large the transfers were.  Poll tightly while a transfer is in
++ * flight or an event just fired, and fall back to the 1 ms nap when there is
++ * nothing to do so an idle device does not burn a core.
++ */
++static void
++ud_poll_wait(bool busy)
++{
++	uint64_t deadline;
++	uint32_t usec = busy ? 50 : 1000;
++
++	clock_interval_to_deadline(usec, NSEC_PER_USEC, &deadline);
++	(void)assert_wait_deadline(&ud.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static int
+ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ {
+@@ -533,11 +565,17 @@ ud_setup(void)
+ static void
+ ud_rx_arm(void)
+ {
+-	/* The Apple function runs at packet granularity so that a bulk transfer
+-	 * never depends on the host appending a zero-length packet. The mux
+-	 * layer does the reassembly. */
+-	ud.rx_req = ud.personality == UD_APPLE ? 512 : UD_FRAME_MAX;
+-	printf("SWEET USB: rx arm %u bytes\n", ud.rx_req);
++	/*
++	 * One bulk transfer per frame is what kept the pipe at 512 bytes per
++	 * poll round.  Asking for UD_RX_MAX instead lets the host push a whole
++	 * 16 KiB burst (many 512-byte packets, one TRB) before we look again;
++	 * the mux layer reassembles the pieces.  A host that stops mid-packet
++	 * still completes the transfer with a short length, so no ZLP is needed.
++	 */
++	ud.rx_req = ud.personality == UD_APPLE ? UD_RX_MAX : UD_FRAME_MAX;
++	if (ud.rx_frames < 12) {
++		printf("SWEET USB: rx arm %u bytes\n", ud.rx_req);
++	}
+ 	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, ud.rx_req, TRBCTL_NORMAL);
+ }
+ 
+@@ -619,7 +657,11 @@ ud_tx_kick_locked(void)
+ 	}
+ }
+ 
+-/* Apple function: one mux frame per bulk-IN transfer, packet sized. */
++/*
++ * Apple function: one mux frame per bulk-IN transfer.  UD_TX_MAX is large
++ * enough for a whole frame (AMUX_RXBUF + 36 bytes of mux/TCP header), so a
++ * 32 KiB AFC reply leaves in one transfer instead of 69.
++ */
+ static void
+ ud_apple_tx_kick(void)
+ {
+@@ -628,13 +670,15 @@ ud_apple_tx_kick(void)
+ 	if (ud.personality != UD_APPLE || !ud.configured || ud.tx_busy) {
+ 		return;
+ 	}
+-	n = apple_usbmux_next_tx((uint8_t *)(ud.dma + UD_TX), 512);
++	n = apple_usbmux_next_tx((uint8_t *)(ud.dma + UD_TX), UD_TX_MAX);
+ 	if (n == 0) {
+ 		return;
+ 	}
+ 	ud.tx_busy = true;
+ 	ud.tx_frames++;
+-	printf("SWEET USB: bulk tx submit %u bytes\n", n);
++	if (ud.tx_frames < 13) {
++		printf("SWEET USB: bulk tx submit %u bytes\n", n);
++	}
+ 	ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, n, TRBCTL_NORMAL);
+ }
+ 
+@@ -914,7 +958,7 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 		if ((++ticks % 30000) == 0) {
+ 			printf("SWEET USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
+ 		}
+-		ud_sleep_ms(1);
++		ud_poll_wait(count != 0 || ud.tx_busy);
+ 	}
+ }
+ 
