@@ -50,7 +50,6 @@
 #include <arm/caches_internal.h>
 
 extern vm_map_t kernel_map;
-extern pmap_t kernel_pmap;
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 extern void clean_dcache64(addr64_t pa, unsigned len, boolean_t to_mem);
 extern void delay(int);
@@ -220,12 +219,12 @@ vidc_alloc_queues(void)
 {
     if (vidc_qtable_va && vidc_sfr_va) return 0;
 
-    vidc_qtable_va = vidc_contig(VIDC_QTABLE_BYTES, &vidc_qtable_pa);
+    vidc_qtable_va = (void *)vidc_contig(VIDC_QTABLE_BYTES, &vidc_qtable_pa);
     if (!vidc_qtable_va) {
         printf("PANDORA VIDC: no %#x contiguous bytes for qtable\n", VIDC_QTABLE_BYTES);
         return -1;
     }
-    vidc_sfr_va = vidc_contig(VIDC_SFR_BYTES, &vidc_sfr_pa);
+    vidc_sfr_va = (void *)vidc_contig(VIDC_SFR_BYTES, &vidc_sfr_pa);
     if (!vidc_sfr_va) {
         printf("PANDORA VIDC: no %#x contiguous bytes for SFR\n", VIDC_SFR_BYTES);
         return -1;
