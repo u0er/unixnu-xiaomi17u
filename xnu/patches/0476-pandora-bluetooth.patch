@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..16f72c9fae6996decd5de0dd8c2e4f3a0a5b02d1
+index 0000000..8338c069799c8c27cb683740ce05349cb6062249
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4345 @@
+@@ -0,0 +1,4409 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3869,6 +3869,69 @@ index 0000000..16f72c9fae6996decd5de0dd8c2e4f3a0a5b02d1
 +	return ETIMEDOUT;
 +}
 +
++/* Level 20.21: phase A at the trace's own cadence.
++ *
++ * The 4 ms/segment pacing 20.13 introduced was a guess made before the Android
++ * capture was decoded. The trace settles it: phase A spans 9.949244-10.145364
++ * (196 ms) for 71,284 wire bytes, and 71,284 x 10 bits / 4 Mbaud = 178 ms - so
++ * the HAL runs the map at wire speed and the UART is the only limiter. This
++ * loop therefore sends every segment back to back and only polls the RX FIFO
++ * between frames, which keeps 0xfd answered without adding delay. */
++static int
++bt_peri_tlv_stage(const uint8_t *fw, unsigned size, const char *what, uint8_t sub06)
++{
++	uint8_t frame[BT_FW_SEG_MAX + 8u];
++	unsigned sent = 0;
++	unsigned seg = 0;
++	unsigned flushed = 0;
++	unsigned wakes = 0;
++	unsigned nseg = (size + BT_FW_SEG_MAX - 1u) / BT_FW_SEG_MAX;
++	unsigned last = size % BT_FW_SEG_MAX;
++	int err;
++
++	if (last == 0u) {
++		last = BT_FW_SEG_MAX;
++	}
++	printf("PANDORA BT: %s: TLV 06 %02x stage, %u bytes -> %u frames (last %u), wire speed\n",
++	    what, sub06, size, nseg, last);
++	pandora_log_sync();
++	while (sent < size) {
++		unsigned len = size - sent;
++
++		if (len > BT_FW_SEG_MAX) {
++			len = BT_FW_SEG_MAX;
++		}
++		frame[0] = 0x31;
++		frame[1] = 0x00;
++		frame[2] = 0xf0;
++		frame[3] = 0xff;
++		frame[4] = (uint8_t)(len + 3u);
++		frame[5] = 0x06;
++		frame[6] = sub06;
++		frame[7] = (uint8_t)len;
++		for (unsigned i = 0; i < len; i++) {
++			frame[8u + i] = fw[sent + i];
++		}
++		err = bt_uart_tx_long(frame, len + 8u, what);
++		if (err) {
++			printf("PANDORA BT: %s: frame %u/%u failed (error %d) after %u bytes\n",
++			    what, seg + 1u, nseg, err, sent);
++			pandora_log_sync();
++			return err;
++		}
++		sent += len;
++		seg++;
++		bt_peri_flush(64u, &flushed, &wakes);
++		if ((seg & 63u) == 0u) {
++			pandora_log_sync();
++		}
++	}
++	printf("PANDORA BT: %s: %u frames sent (%u bytes), %u wake(s), %u byte(s) flushed\n",
++	    what, seg, sent, wakes, flushed);
++	pandora_log_sync();
++	return 0;
++}
++
 +/* Level 20.21: one HCI 0xfc00 data stage. Frame layout is the one the trace
 + * and PatchDLManager::FrameHciPkt agree on:
 + *     01 00 fc <seglen+2> 1e <seglen> <seglen bytes>
@@ -4047,10 +4110,11 @@ index 0000000..16f72c9fae6996decd5de0dd8c2e4f3a0a5b02d1
 +		return err;
 +	}
 +	/* Phase A (trace 9.949244-10.145364): the 68,952-byte map ELF as 284
-+	 * sub-op 06 03 TLV frames at 4 ms/frame. The ROM is silent through the
-+	 * whole stage; it raises 0xfd only after the last frame. */
-+	err = bt_peri_tlv_download_sub(pandora_peri_tmel_elf,
-+	    sizeof(pandora_peri_tmel_elf), "PERI TME-L map A", 4000u, 0u, 0x03);
++	 * sub-op 06 03 TLV frames at wire speed - the trace's 196 ms for 71,284
++	 * bytes is exactly the 4 Mbaud wire time, so the old 4 ms/segment pacing
++	 * was a guess that cost 0.94 s of silence the ROM never asked for. */
++	err = bt_peri_tlv_stage(pandora_peri_tmel_elf,
++	    sizeof(pandora_peri_tmel_elf), "PERI TME-L map A", 0x03);
 +	if (err) {
 +		printf("PANDORA BT: level 20 phase A failed (error %d)\n", err);
 +		pandora_log_sync();
