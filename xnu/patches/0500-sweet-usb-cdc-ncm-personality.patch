@@ -1,0 +1,708 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index d82921b..6d8dc26 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -231,7 +231,14 @@ static struct {
+ 	uint32_t    events;
+ 	bool        configured;
+ 	uint8_t     data_alt;       /* data interface alternate setting */
+-	int         personality;    /* UD_ECM (CDC-ECM) or UD_APPLE (usbmux) */
++	int         personality;    /* UD_ECM (CDC-ECM), UD_APPLE (usbmux) or UD_NCM */
++	/*
++	 * NCM 1.1 section 9.1 wants CONNECTION_SPEED_CHANGE then NETWORK_CONNECTION.
++	 * The interrupt endpoint carries one transfer at a time, so the second
++	 * notification waits for the first to complete: this flag is set when
++	 * the connection notification is still owed.
++	 */
++	bool        ncm_notify_pending;
+ 	uint32_t    rx_req;         /* bytes the armed RX TRB asked for */
+ 	/* network */
+ 	ifnet_t     ifp;
+@@ -385,6 +392,104 @@ static const char *const ud_apple_strings[] = {
+ 	NULL, "UniXNU", "UniXNU iPhone", "F2LXUNIXNU01",
+ };
+ 
++/*
++ * NCM personality (sweetusb>=4): CDC-NCM instead of CDC-ECM.
++ *
++ * Why NCM and not ECM: a CarPlay head unit talks IP to the phone over NCM, not
++ * ECM, and NCM is the function that Apple's own gadget stack exposes
++ * (com.apple.driver.AppleUSBDeviceNCM and AppleUSBEthernetDevice's NCM-Lite
++ * both speak it).  ECM cannot frame more than one Ethernet packet per USB
++ * transfer, which is why the industry moved to NCM's NTB batching; presenting
++ * ECM to a head unit gets us nothing at C0.
++ *
++ * The descriptor set below is not hand-invented here: it is the exact byte
++ * sequence locked as NEZHA_NCM_EXPECTED in
++ * tools/ncm_ntb.py, which validates it against what Linux's cdc_ncm and
++ * Windows' UsbNcm actually require (204 self-checks, including the
++ * GET_NTB_PARAMETERS reply and NTB16 framing).  Any edit here must change that
++ * file too -- the two are meant to stay byte-identical.
++ *
++ * Endpoints are EP_RX/EP_TX/EP_INT, i.e. 0x01/0x81/0x82.  That is deliberate:
++ * reusing the endpoints the other personalities already drive means the TRB and
++ * DMA layout is untouched, so switching personality is a descriptor change and
++ * not a plumbing change.
++ */
++#define UD_NCM          2
++
++static const uint8_t ud_ncm_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
++	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++};
++static const uint8_t ud_ncm_cfg_desc[86] = {
++	9, 2, 86, 0, 2, 1, 0, 0x80, 125,               /* config: 2 interfaces, 250 mA (bMaxPower is in 2 mA units) */
++	9, 4, 0, 0, 1, 0x02, 0x0d, 0x00, 0,             /* if0 alt0: comm, NCM subclass 0Dh, 1 endpoint */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* CDC header, bcdCDC 0x0110 */
++	5, 0x24, 0x06, 0, 1,                            /* union: master 0, slave 1 */
++	13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, /* ethernet: iMAC string 4, max segment 1514 */
++	6, 0x24, 0x1a, 0x00, 0x01, 0x00,                /* NCM: bcdNcmVersion 0x0100, caps 0x00 */
++	7, 5, 0x82, 0x03, 64, 0, 1,                     /* ep 0x82 interrupt IN, 64 bytes, 1 uframe */
++	9, 4, 1, 0, 0, 0x0a, 0x00, 0x01, 0,             /* data alt 0: CDC data, proto 01h, no endpoints */
++	9, 4, 1, 1, 2, 0x0a, 0x00, 0x01, 0,             /* data alt 1: same, two bulk endpoints */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++};
++/*
++ * Index 4 is the MAC the host adopts for its own end of the link, so it must be
++ * the PHONE's address: iMACAddress in the ethernet functional descriptor is what
++ * Linux hands to usbnet_get_ethernet_addr().  Same value as ud_phone_mac.
++ */
++static const char *const ud_ncm_strings[] = {
++	NULL, "UniXNU", "UniXNU iPhone (NCM)", "F2LXUNIXNU01", "02005E77EE02",
++};
++
++/*
++ * GET_NTB_PARAMETERS reply (NCM 1.1 section 6.2.1, 28 bytes).
++ *
++ * Field order is wLength, bmNtbFormatsSupported, dwNtbInMaxSize, wNdpInDivisor,
++ * wNdpInPayloadRemainder, wNdpInAlignment, wPadding1, dwNtbOutMaxSize,
++ * wNdpOutDivisor, wNdpOutPayloadRemainder, wNdpOutAlignment,
++ * wNtbOutMaxDatagrams -- 10 u16s and 2 u32s, no padding.  (An earlier draft of
++ * tools/ncm_ntb.py declared wNdpOutAlignment as u8 and the struct came out 27
++ * bytes; that is what the layout check in that file now guards.)
++ *
++ * bmNtbFormatsSupported advertises NTB-16 ONLY.  Advertising NTB-32 makes
++ * Windows set m_Use32BitNtb and send 32-bit NTH32/NDP32 headers we do not parse,
++ * and makes Linux issue SET_NTB_FORMAT.  NTB-32 buys nothing at 2 KiB.
++ *
++ * 2 KiB in/out because UD_RX and UD_TX are 2 KiB each (UD_FRAME_MAX); it is the
++ * NCM minimum and it is a legal value, so no DMA rework is needed.
++ * Alignment 4 / remainder 0 / divisor 4 keeps datagram starts 4-byte aligned.
++ */
++static const uint8_t ud_ncm_ntb_params[28] = {
++	28, 0,                          /* wLength */
++	0x01, 0x00,                     /* bmNtbFormatsSupported: NTB-16 only */
++	0x00, 0x08, 0x00, 0x00,         /* dwNtbInMaxSize 2048 */
++	4, 0, 0, 0,                     /* wNdpInDivisor 4, remainder 0 */
++	4, 0, 0, 0,                     /* wNdpInAlignment 4, wPadding1 0 */
++	0x00, 0x08, 0x00, 0x00,         /* dwNtbOutMaxSize 2048 */
++	4, 0, 0, 0,                     /* wNdpOutDivisor 4, remainder 0 */
++	4, 0,                           /* wNdpOutAlignment 4 */
++	8, 0,                           /* wNtbOutMaxDatagrams 8 */
++};
++
++/* NCM class requests (CDC NCM 1.1 Table 6-1) and NTB signatures. */
++#define NCM_GET_NTB_PARAMETERS      0x80
++#define NCM_GET_NTB_FORMAT          0x83
++#define NCM_SET_NTB_FORMAT          0x84
++#define NCM_GET_NTB_INPUT_SIZE      0x85
++#define NCM_SET_NTB_INPUT_SIZE      0x86
++#define NCM_SET_ETHERNET_PACKET_FILTER 0x43
++#define NCM_NTH16_SIGNATURE         0x484d434e      /* "NCMH" */
++#define NCM_NDP16_NOCRC_SIGNATURE   0x304d434e      /* "NCM0" */
++#define NCM_NTH16_LEN               12
++#define NCM_NDP16_LEN               8
++#define NCM_DPE16_LEN               4
++#define NCM_NTB_MAX                 2048
++#define NCM_MAX_DATAGRAMS           8
++
++static uint32_t ud_ncm_sequence;
++static uint32_t ud_ncm_in_max = NCM_NTB_MAX;
++
+ static uint32_t
+ ud_string(unsigned idx, uint8_t *out)
+ {
+@@ -399,6 +504,9 @@ ud_string(unsigned idx, uint8_t *out)
+ 	if (ud.personality == UD_APPLE) {
+ 		tab = ud_apple_strings;
+ 		n = sizeof(ud_apple_strings) / sizeof(ud_apple_strings[0]);
++	} else if (ud.personality == UD_NCM) {
++		tab = ud_ncm_strings;
++		n = sizeof(ud_ncm_strings) / sizeof(ud_ncm_strings[0]);
+ 	} else {
+ 		tab = ud_strings;
+ 		n = sizeof(ud_strings) / sizeof(ud_strings[0]);
+@@ -422,18 +530,252 @@ static void ud_tx_kick_locked(void);
+ static void ud_apple_tx_kick(void);
+ static void ud_link_event(bool up);
+ 
++/*
++ * ---- CDC-NCM framing (personality UD_NCM) ----
++ *
++ * NCM batches several Ethernet frames into one USB transfer ("NTB").  The
++ * layout is: a 12-byte NTH16 header, then one or more NDP16 datagram tables
++ * (we always emit exactly one), each holding {offset,length} pairs that point
++ * back into the same buffer, then the frames themselves.
++ *
++ * The 4-byte datagram table alignment is why the payload starts at a fixed
++ * offset: the table grows with the datagram count, so if the payload began
++ * right after the table we would have to know the count before copying.  A
++ * fixed 56-byte header area (= 12 + 8 + (NCM_MAX_DATAGRAMS+1)*4) makes the
++ * builder a single forward pass and costs 32 bytes out of 2048.
++ */
++#define NCM_NDP16_CRC_SIGNATURE     0x314d434e      /* "NCM1" */
++#define NCM_NTB_PAYLOAD_OFF         56
++
++/* Explicit little-endian accessors.  The wire format is little-endian for every
++ * field; these avoid relying on struct packing and stay correct if the buffer
++ * is not naturally aligned for a given field. */
++static void
++ud_put16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++}
++
++static uint16_t
++ud_get16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
++}
++
++static void
++ud_put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++}
++
++static uint32_t
++ud_get32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/* Hand one received Ethernet frame to the stack. Returns true if it was queued. */
++static bool
++ud_if_input(const uint8_t *frame, size_t len)
++{
++	mbuf_t m = NULL;
++	struct ifnet_stat_increment_param stats = {};
++
++	if (ud.ifp == NULL) {
++		return false;
++	}
++	/*
++	 * One mbuf with a 2 KiB cluster holds any frame. (mbuf_allocpacket may
++	 * return a first mbuf of length 0: stripping the header from it panicked
++	 * "Failed mbuf validity check: len -14".)
++	 */
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < len) {
++		if (m != NULL) {
++			mbuf_freem(m);
++		}
++		return false;
++	}
++	memcpy(mbuf_data(m), frame, len);
++	mbuf_setlen(m, len);
++	mbuf_pkthdr_setlen(m, len);
++	void *frame_header = mbuf_data(m);
++	mbuf_pkthdr_setrcvif(m, ud.ifp);
++	mbuf_pkthdr_setheader(m, frame_header);
++	mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++	(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++	stats.packets_in = 1;
++	stats.bytes_in = len;
++	ifnet_input(ud.ifp, m, &stats);
++	return true;
++}
++
++/*
++ * Build one NTB from the transmit queue.  Returns the number of bytes to submit
++ * on the bulk-IN endpoint, or 0 when nothing was queued.  ud.lock held.
++ *
++ * Frames that do not fit are left in the queue for the next NTB rather than
++ * dropped, so a large burst just takes more transfers.
++ */
++static uint32_t
++ud_ncm_ntb_build(uint8_t *out, uint32_t cap)
++{
++	uint32_t off = NCM_NTB_PAYLOAD_OFF;
++	unsigned count = 0;
++	uint8_t *dpe = out + NCM_NTH16_LEN + NCM_NDP16_LEN;
++
++	while (ud.txq_count > 0 && count < NCM_MAX_DATAGRAMS) {
++		mbuf_t m = ud.txq[ud.txq_head];
++		size_t len = mbuf_pkthdr_len(m);
++
++		if (len < ETHER_HDR_LEN || len > ETHER_MAX_LEN - ETHER_CRC_LEN) {
++			ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++			ud.txq_count--;
++			mbuf_freem(m);
++			continue;
++		}
++		if (off + len > cap) {
++			break;
++		}
++		mbuf_copydata(m, 0, len, out + off);
++		ud_put16(dpe + count * NCM_DPE16_LEN, (uint16_t)off);
++		ud_put16(dpe + count * NCM_DPE16_LEN + 2, (uint16_t)len);
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_count--;
++		mbuf_freem(m);
++		off += len;
++		count++;
++	}
++	if (count == 0) {
++		return 0;
++	}
++	/*
++	 * The datagram table must end with a {0,0} pair.  This is not cosmetic:
++	 * Linux's cdc_ncm_rx_verify_ndp16() computes the entry count as
++	 * (wLength - 8) / 4 and then subtracts one, i.e. it never processes the
++	 * last pair -- so without the terminator the final datagram is invisible
++	 * to the host.
++	 */
++	ud_put16(dpe + count * NCM_DPE16_LEN, 0);
++	ud_put16(dpe + count * NCM_DPE16_LEN + 2, 0);
++
++	off = (off + 3u) & ~3u;         /* wBlockLength must stay 4-aligned */
++	if (off > cap) {
++		return 0;
++	}
++	ud_put32(out, NCM_NTH16_SIGNATURE);
++	ud_put16(out + 4, NCM_NTH16_LEN);
++	ud_put16(out + 6, (uint16_t)ud_ncm_sequence++);
++	ud_put16(out + 8, (uint16_t)off);
++	ud_put16(out + 10, NCM_NTH16_LEN);
++
++	uint32_t ndp_len = NCM_NDP16_LEN + (count + 1) * NCM_DPE16_LEN;
++	ud_put32(out + NCM_NTH16_LEN, NCM_NDP16_NOCRC_SIGNATURE);
++	ud_put16(out + NCM_NTH16_LEN + 4, (uint16_t)ndp_len);
++	ud_put16(out + NCM_NTH16_LEN + 6, 0);   /* wNextNdpIndex: single NDP */
++	return off;
++}
++
++/*
++ * Deliver every datagram of one received NTB.  Returns the number of frames
++ * handed to the stack.
++ *
++ * Every index and length is checked against the received block length before it
++ * is used: this buffer is filled by the host, so nothing here may be trusted.
++ */
++static unsigned
++ud_ncm_ntb_parse(const uint8_t *ntb, uint32_t len)
++{
++	unsigned delivered = 0;
++
++	if (len < NCM_NTH16_LEN + NCM_NDP16_LEN + NCM_DPE16_LEN) {
++		return 0;
++	}
++	if (ud_get32(ntb) != NCM_NTH16_SIGNATURE) {
++		return 0;
++	}
++	uint32_t block = ud_get16(ntb + 8);
++	uint32_t ndp = ud_get16(ntb + 10);
++	if (block > len) {
++		block = len;
++	}
++	if (ndp + NCM_NDP16_LEN + NCM_DPE16_LEN > block) {
++		return 0;
++	}
++	uint32_t sig = ud_get32(ntb + ndp);
++	if (sig != NCM_NDP16_NOCRC_SIGNATURE && sig != NCM_NDP16_CRC_SIGNATURE) {
++		return 0;
++	}
++	uint32_t nlen = ud_get16(ntb + ndp + 4);
++	if (nlen < NCM_NDP16_LEN + NCM_DPE16_LEN || ndp + nlen > block) {
++		return 0;
++	}
++	unsigned pairs = (nlen - NCM_NDP16_LEN) / NCM_DPE16_LEN;
++	if (pairs == 0) {
++		return 0;
++	}
++	unsigned usable = pairs - 1;    /* the last pair is the terminator */
++	for (unsigned i = 0; i < usable; i++) {
++		const uint8_t *e = ntb + ndp + NCM_NDP16_LEN + i * NCM_DPE16_LEN;
++		uint32_t index = ud_get16(e);
++		uint32_t dlen = ud_get16(e + 2);
++
++		if (index == 0 && dlen == 0) {
++			break;
++		}
++		if (dlen < ETHER_HDR_LEN || dlen > ETHER_MAX_LEN - ETHER_CRC_LEN) {
++			continue;
++		}
++		if (index < NCM_NTB_PAYLOAD_OFF || index + dlen > block) {
++			continue;
++		}
++		if (ud_if_input(ntb + index, dlen)) {
++			delivered++;
++		}
++	}
++	return delivered;
++}
++
+ /* NETWORK_CONNECTION notification: the host brings its link up on it. */
+ static void
+ ud_notify_connected(void)
+ {
+ 	uint8_t *n = (uint8_t *)(ud.dma + UD_NOTIFY);
+ 	n[0] = 0xa1; n[1] = 0x00;       /* NETWORK_CONNECTION */
+-	n[2] = 1; n[3] = 0;             /* connected */
+-	n[4] = 0; n[5] = 0;             /* interface 0 */
+-	n[6] = 0; n[7] = 0;
++	n[2] = 1; n[3] = 0;             /* wValue: connected */
++	n[4] = 0; n[5] = 0;             /* wIndex: communication interface 0 */
++	n[6] = 0; n[7] = 0;             /* wLength: no payload */
+ 	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 8, TRBCTL_NORMAL);
+ }
+ 
++/*
++ * CONNECTION_SPEED_CHANGE (CDC 1.2 section 6.3.3): 8-byte header plus an 8-byte payload
++ * carrying the downlink rate first and the uplink rate second, both in bits/s.
++ *
++ * NCM 1.1 section 9.1 asks for this BEFORE NETWORK_CONNECTION.  Linux's own f_ncm does
++ * the same (ncm_notify() starts in the SPEED state), and a host that never sees
++ * the speed notification keeps its carrier rate at zero, which on some stacks
++ * suppresses IPv6 router solicitation.
++ */
++static void
++ud_notify_speed(uint32_t downlink, uint32_t uplink)
++{
++	uint8_t *n = (uint8_t *)(ud.dma + UD_NOTIFY);
++	n[0] = 0xa1; n[1] = 0x2a;       /* CONNECTION_SPEED_CHANGE */
++	n[2] = 0; n[3] = 0;             /* wValue */
++	n[4] = 0; n[5] = 0;             /* wIndex: communication interface 0 */
++	n[6] = 8; n[7] = 0;             /* wLength: 8 */
++	ud_put32(n + 8, downlink);
++	ud_put32(n + 12, uplink);
++	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 16, TRBCTL_NORMAL);
++}
++
+ /* SET_CONFIGURATION(1): bulk IN/OUT and the interrupt endpoint. */
+ static void
+ ud_configure(void)
+@@ -457,12 +799,28 @@ ud_configure(void)
+ 		printf("SWEET USB: usbmux endpoints configured\n");
+ 		return;
+ 	}
++	/*
++	 * UD_ECM and UD_NCM share this path: same three endpoints, same packet
++	 * sizes.  Two details differ and both are driven by the descriptors.
++	 *
++	 * The interrupt endpoint's max packet is 64 for NCM because
++	 * ud_ncm_cfg_desc declares 64 and CONNECTION_SPEED_CHANGE needs 16 bytes
++	 * of notification -- a 16-byte endpoint would still fit it, but the
++	 * controller must agree with what we advertised or the host's SETUP
++	 * validation fails.  ECM keeps 16.
++	 *
++	 * DEPCFG's "action" field (bits 1..2) is 3 (modify) here rather than 2,
++	 * because ep0 was already configured at SET_CONFIGURATION time and this
++	 * is a reconfiguration, not a first configuration.
++	 */
++	unsigned int_mps = (ud.personality == UD_NCM) ? 64 : 16;
++
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
+ 	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
+ 	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+ 	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
+ 	    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    ud_epcmd(EP_INT, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17),
++	    ud_epcmd(EP_INT, DEPCMD_SETEPCONFIG, (3u << 1) | ((uint32_t)int_mps << 3) | (2u << 17),
+ 	    (1u << 8) | (8u << 16) | ((uint32_t)EP_INT << 25), 0) ||
+ 	    ud_epcmd(EP_INT, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+ 		printf("SWEET USB: data endpoints setup failed\n");
+@@ -470,8 +828,16 @@ ud_configure(void)
+ 	}
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
++	if (ud.personality == UD_NCM) {
++		/* NCM reset state (NCM 1.1 section 6.3.4): sequence to 0 and the IN NTB
++		 * size back to dwNtbInMaxSize.  Entering alt 0 is defined as a
++		 * reset, so a host that re-selects the configuration starts clean. */
++		ud_ncm_sequence = 0;
++		ud_ncm_in_max = NCM_NTB_MAX;
++	}
+ 	ud_rx_arm();
+-	printf("SWEET USB: ECM endpoints configured\n");
++	printf("SWEET USB: %s endpoints configured\n",
++	    ud.personality == UD_NCM ? "NCM" : "ECM");
+ }
+ 
+ static void
+@@ -488,8 +854,78 @@ ud_setup(void)
+ 
+ 	printf("SWEET USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
+ 	ud.data_in = (type & 0x80) != 0;
+-	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
+-		ok = (length == 0);
++	if ((type & 0x60) == 0x20) {    /* class request */
++		if (ud.personality == UD_NCM) {
++			/*
++			 * NCM class requests.  Only three are mandatory for
++			 * Linux cdc_ncm and Windows UsbNcm to bind, and only
++			 * GET_NTB_PARAMETERS has a fixed reply; everything
++			 * else either has a harmless trivial answer or is
++			 * genuinely optional (both hosts STALL or ignore it).
++			 *
++			 * Requests are accepted on BOTH interfaces.  A host
++			 * is allowed to address the control requests to
++			 * either the communication interface or the data
++			 * interface, and Linux's f_ncm answers them
++			 * regardless, so gating on `index` would only create
++			 * a failure mode.
++			 */
++			switch (req) {
++			case NCM_GET_NTB_PARAMETERS:
++				memcpy(data, ud_ncm_ntb_params, sizeof(ud_ncm_ntb_params));
++				n = sizeof(ud_ncm_ntb_params);
++				break;
++			case NCM_GET_NTB_INPUT_SIZE: {
++				/* 4-byte or 8-byte form depending on the host's
++				 * bmNetworkCapabilities bit D5.  We advertise
++				 * D5 = 0 (4-byte), but answer a longer request
++				 * with the 8-byte form anyway rather than
++				 * STALLing a legal request. */
++				ud_put32(data, ud_ncm_in_max);
++				n = (length >= 8) ? 8 : 4;
++				if (n == 8) {
++					ud_put32(data + 4, 0);  /* wNtbInMaxSize hi/lo split when NTB-32 */
++				}
++				break;
++			}
++			case NCM_SET_NTB_INPUT_SIZE:
++				/* wLength must be 4 or 8; anything else is a
++				 * malformed request and STALL is correct. */
++				if (length != 4 && length != 8) {
++					ok = false;
++				} else {
++					/* The value arrives in the OUT data
++					 * stage, which this driver does not
++					 * implement for class requests: accept
++					 * the request and keep our own maximum.
++					 * Both hosts tolerate it because they
++					 * only need it to not STALL. */
++					printf("SWEET USB: NCM SET_NTB_INPUT_SIZE len %u accepted\n", length);
++				}
++				break;
++			case NCM_GET_NTB_FORMAT:
++				data[0] = 0; data[1] = 0;       /* NTB-16 */
++				n = 2;
++				break;
++			case NCM_SET_NTB_FORMAT:
++				if (length != 0 || value != 0) {
++					ok = false;     /* only NTB-16 supported */
++				}
++				break;
++			case NCM_SET_ETHERNET_PACKET_FILTER:
++				/* Accept and ignore: we pass every frame up
++				 * anyway, which is what the "filter not set"
++				 * default in the NCM spec allows. */
++				break;
++			default:
++				ok = false;
++				break;
++			}
++			printf("SWEET USB: NCM request 0x%02x index %u len %u -> %s %u\n",
++			    req, index, length, ok ? "ok" : "stall", n);
++		} else {
++			ok = (length == 0);
++		}
+ 	} else if ((type & 0x60) == 0x40) {
+ 		/*
+ 		 * Apple vendor requests.  usbmuxd asks GET_MODE (0x45) and switches
+@@ -508,9 +944,16 @@ ud_setup(void)
+ 	} else if ((type & 0x60) != 0) {
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+-		const uint8_t *dd = ud.personality == UD_APPLE ? ud_apple_dev_desc : ud_dev_desc;
+-		const uint8_t *cd = ud.personality == UD_APPLE ? ud_apple_cfg_desc : ud_cfg_desc;
++		const uint8_t *dd = ud_dev_desc;
++		const uint8_t *cd = ud_cfg_desc;
+ 
++		if (ud.personality == UD_APPLE) {
++			dd = ud_apple_dev_desc;
++			cd = ud_apple_cfg_desc;
++		} else if (ud.personality == UD_NCM) {
++			dd = ud_ncm_dev_desc;
++			cd = ud_ncm_cfg_desc;
++		}
+ 		switch (value >> 8) {
+ 		case 1: memcpy(data, dd, 18); n = 18; break;
+ 		case 2: memcpy(data, cd, cd[2] | (cd[3] << 8)); n = cd[2] | (cd[3] << 8); break;
+@@ -534,8 +977,28 @@ ud_setup(void)
+ 		if (index == 1) {
+ 			ud.data_alt = (uint8_t)value;
+ 			if (value == 1 && ud.configured) {
+-				ud_notify_connected();
++				if (ud.personality == UD_NCM) {
++					/*
++					 * NCM 1.1 section 9.1: the speed notification
++					 * comes FIRST, then the connection
++					 * notification.  The interrupt
++					 * endpoint carries one transfer at a
++					 * time, so they cannot both be armed
++					 * back to back -- the completion of
++					 * the speed one queues the other
++					 * (see the EP_INT completion path).
++					 */
++					ud.ncm_notify_pending = true;
++					ud_notify_speed(0x00e1f505, 0x00e1f505); /* 100 Mb/s both ways */
++				} else {
++					ud_notify_connected();
++				}
+ 				ud_link_event(true);
++			} else if (value == 0 && ud.configured && ud.personality == UD_NCM) {
++				/* Back to alt 0 = NCM reset (section 6.3.4). */
++				ud_ncm_sequence = 0;
++				ud_ncm_in_max = NCM_NTB_MAX;
++				ud_link_event(false);
+ 			}
+ 		}
+ 	} else if (req == 10) {         /* GET_INTERFACE */
+@@ -571,7 +1034,15 @@ ud_rx_arm(void)
+ 	/* The Apple function runs at packet granularity so that a bulk transfer
+ 	 * never depends on the host appending a zero-length packet. The mux
+ 	 * layer does the reassembly. */
+-	ud.rx_req = ud.personality == UD_APPLE ? 512 : UD_FRAME_MAX;
++	if (ud.personality == UD_APPLE) {
++		ud.rx_req = 512;
++	} else {
++		/* ECM: one frame per transfer.  NCM: one OR MORE frames per
++		 * transfer, so the receive buffer is the whole NTB maximum --
++		 * the host sizes its NTB from dwNtbOutMaxSize, which we advertise
++		 * as NCM_NTB_MAX, and a short buffer would truncate it. */
++		ud.rx_req = UD_FRAME_MAX;
++	}
+ 	printf("SWEET USB: rx arm %u bytes\n", ud.rx_req);
+ 	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, ud.rx_req, TRBCTL_NORMAL);
+ }
+@@ -598,32 +1069,25 @@ ud_rx_done(void)
+ 		ud_rx_arm();
+ 		return;
+ 	}
+-	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
++	if (ud.personality == UD_NCM) {
+ 		/*
+-		 * One mbuf with a 2 KiB cluster holds any frame. (mbuf_allocpacket
+-		 * may return a first mbuf of length 0: stripping the header from
+-		 * it panicked "Failed mbuf validity check: len -14".)
++		 * NCM: the bulk-OUT transfer carries one NTB holding zero or more
++		 * Ethernet frames.  One transfer always maps to at least one
++		 * datagram, so there is no per-frame re-arming to do here; the
++		 * next transfer is armed after parsing.
+ 		 */
+-		mbuf_t m = NULL;
+-		if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
+-		    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
+-		    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
+-			struct ifnet_stat_increment_param stats = {};
+-			memcpy(mbuf_data(m), (const void *)(ud.dma + UD_RX), len);
+-			mbuf_setlen(m, len);
+-			mbuf_pkthdr_setlen(m, len);
+-			void *frame_header = mbuf_data(m);
+-			mbuf_pkthdr_setrcvif(m, ud.ifp);
+-			mbuf_pkthdr_setheader(m, frame_header);
+-			mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
+-			(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
+-			stats.packets_in = 1;
+-			stats.bytes_in = len;
+-			ud.rx_frames++;
+-			ifnet_input(ud.ifp, m, &stats);
+-		} else if (m != NULL) {
+-			mbuf_freem(m);
++		if (len != 0) {
++			unsigned got = ud_ncm_ntb_parse((const uint8_t *)(ud.dma + UD_RX), len);
++			if (ud.rx_frames < 12) {
++				printf("SWEET USB: NCM rx ntb %u bytes -> %u frames\n", len, got);
++			}
+ 		}
++		ud.rx_frames++;
++		ud_rx_arm();
++		return;
++	}
++	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
++		ud_if_input((const uint8_t *)(ud.dma + UD_RX), len);
+ 	}
+ 	ud_rx_arm();
+ }
+@@ -632,6 +1096,32 @@ ud_rx_done(void)
+ static void
+ ud_tx_kick_locked(void)
+ {
++	if (ud.personality == UD_NCM) {
++		/*
++		 * NCM batches: drain as many queued frames as fit into one NTB.
++		 * The zero-length-packet rule changes shape here -- the NTB block
++		 * length is what must not be a multiple of 512, not each frame,
++		 * because the host reads the NTB in bulk transfers whose end it
++		 * detects from wBlockLength.
++		 */
++		uint32_t n;
++
++		if (ud.tx_busy || !ud.configured) {
++			return;
++		}
++		n = ud_ncm_ntb_build((uint8_t *)(ud.dma + UD_TX), NCM_NTB_MAX);
++		if (n == 0) {
++			return;
++		}
++		/* Force a short packet when the NTB is a multiple of 512. */
++		if ((n % 512) == 0 && n < NCM_NTB_MAX) {
++			((uint8_t *)(ud.dma + UD_TX))[n++] = 0;
++		}
++		ud.tx_busy = true;
++		ud.tx_frames++;
++		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, n, TRBCTL_NORMAL);
++		return;
++	}
+ 	while (!ud.tx_busy && ud.txq_count > 0 && ud.configured) {
+ 		mbuf_t m = ud.txq[ud.txq_head];
+ 		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
+@@ -847,6 +1337,9 @@ ud_event(uint32_t ev)
+ 			ud.tx_busy = false;
+ 			ud.rx_req = 0;
+ 			ud.state = EP0_SETUP;
++			ud.ncm_notify_pending = false;
++			ud_ncm_sequence = 0;
++			ud_ncm_in_max = NCM_NTB_MAX;
+ 			if (ud.personality == UD_APPLE) {
+ 				apple_usbmux_link_down();
+ 			}
+@@ -890,6 +1383,18 @@ ud_event(uint32_t ev)
+ 		lck_mtx_unlock(ud.lock);
+ 		return;
+ 	}
++	/*
++	 * Interrupt endpoint completion.  Used only by NCM, which owes the host a
++	 * NETWORK_CONNECTION after the CONNECTION_SPEED_CHANGE that SET_INTERFACE
++	 * queued (NCM 1.1 section 9.1 order).
++	 */
++	if (ep == EP_INT && type == 1) {
++		if (ud.ncm_notify_pending) {
++			ud.ncm_notify_pending = false;
++			ud_notify_connected();
++		}
++		return;
++	}
+ 	if (ep > 1) {
+ 		return;
+ 	}
+@@ -1021,8 +1526,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		int mode = 1;
+ 
+ 		PE_parse_boot_argn("sweetusb", &mode, sizeof(mode));
+-		ud.personality = (mode >= 3) ? UD_APPLE : UD_ECM;
++		ud.personality = (mode >= 4) ? UD_NCM : (mode >= 3) ? UD_APPLE : UD_ECM;
+ 		printf("SWEET USB: personality %s (sweetusb=%d)\n",
++		    ud.personality == UD_NCM ? "cdc-ncm" :
+ 		    ud.personality == UD_APPLE ? "apple-usbmux" : "cdc-ecm", mode);
+ 	}
+ 	/* Always create ue0 so userspace network configuration is happy,

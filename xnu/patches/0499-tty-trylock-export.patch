@@ -1,0 +1,54 @@
+diff --git a/bsd/kern/tty.c b/bsd/kern/tty.c
+index e6f410a..79cd187 100644
+--- a/bsd/kern/tty.c
++++ b/bsd/kern/tty.c
+@@ -297,6 +297,25 @@ tty_unlock(struct tty *tp)
+ 	lck_mtx_unlock(&tp->t_lock);
+ }
+ 
++
++/*
++ * tty_trylock
++ *
++ * Attempt to lock the requested tty structure, without blocking.
++ *
++ * Parameters:	tp				The tty we want to lock
++ *
++ * Returns:	TRUE if the lock was acquired, FALSE if it is already held
++ *
++ * Locks:	On success, tp is locked
++ */
++boolean_t
++tty_trylock(struct tty *tp)
++{
++	TTY_LOCK_NOTOWNED(tp);  /* debug assert */
++	return lck_mtx_try_lock(&tp->t_lock);
++}
++
+ /*
+  * ttyopen (LDISC)
+  *
+diff --git a/bsd/sys/tty.h b/bsd/sys/tty.h
+index 70ad661..8a06266 100644
+--- a/bsd/sys/tty.h
++++ b/bsd/sys/tty.h
+@@ -304,6 +304,7 @@ int     ttcompat(struct tty *tp, u_long com, caddr_t data, int flag,
+ 
+ void tty_lock(struct tty *tp);
+ void tty_unlock(struct tty *tp);
++boolean_t tty_trylock(struct tty *tp);
+ 
+ void     termioschars(struct termios *t);
+ int      tputchar(int c, struct tty *tp);
+diff --git a/config/Private.exports b/config/Private.exports
+index 95550c9..7fc5aab 100644
+--- a/config/Private.exports
++++ b/config/Private.exports
+@@ -925,6 +925,7 @@ _ttspeedtab
+ _ttwakeup
+ _ttwwakeup
+ _tty_lock
++_tty_trylock
+ _tty_unlock
+ _ttyclose
+ _ttyflush
