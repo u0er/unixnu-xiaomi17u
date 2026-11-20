@@ -911,3 +911,23 @@ edit('NativeBridgeMetalFrontend.mm',
     }
    }
   }""")
+
+# Stage-5 (2026-11-20): fix the diagnostic gates' initialization-order hazard.
+# diagOn()/gpuTraceOn()/traceWanted() cache their getenv answer in a static const
+# on first call. When the first call lands before deviceForPort sets SHENG_DIAG /
+# SHENG_GPU_TRACE from the boot args, the cache stays false for the process's
+# life: tracePush drops every record and traceStartWriter never starts, so
+# gpu-trace=1 boots write no frames.trace (observed 2026-11-20: K rows prove
+# completed() runs, yet all three trace paths kept the previous boot's file).
+# Re-read the env until it answers yes; the env is set once at the first device
+# open and never unset afterwards, so the cached-true form is unchanged.
+# Diagnostic-only; no rendering change. Anchors verified unique in the export tree.
+edit('NativeBridgeMetalFrontend.mm',
+     'static bool gpuTraceOn(){static const bool on=getenv("SHENG_GPU_TRACE")!=nullptr;return on;}',
+     'static bool gpuTraceOn(){static bool on=false;if(!on)on=getenv("SHENG_GPU_TRACE")!=nullptr;return on;}')
+edit('NativeBridgeMetalFrontend.mm',
+     'static bool diagOn() {static const bool on=getenv("SHENG_DIAG")!=nullptr;return on;}',
+     'static bool diagOn() {static bool on=false;if(!on)on=getenv("SHENG_DIAG")!=nullptr;return on;}')
+edit('NativeBridgeMetalFrontend.mm',
+     'static bool traceWanted() {static const bool on=diagOn() && nativeIsRenderServer();return on;}',
+     'static bool traceWanted() {static bool on=false;if(!on)on=diagOn() && nativeIsRenderServer();return on;}')
