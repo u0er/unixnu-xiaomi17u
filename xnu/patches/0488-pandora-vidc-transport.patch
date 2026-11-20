@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..9f5e2ad
+index 0000000..156f3d1
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,1323 @@
+@@ -0,0 +1,1339 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -287,8 +287,11 @@ index 0000000..9f5e2ad
 +#define VIDC_SMMU_SIZE          0x00100000u
 +#define VIDC_IOVA_BASE          0xFF000000ull /* < 0xffc00000 DMA limit */
 +#define VIDC_IOVA_SFR           0xFF400000ull /* its own 4 KiB page */
-+#define VIDC_SMMU_TABLE_PAGES   64u           /* 2 ranges -> 6 pages needed */
-+#define VIDC_SMMU_LEAF_BUDGET   2048u
++#define VIDC_SMMU_TABLE_PAGES   64u           /* 3 ranges -> ~12 pages needed */
++/* Leaves actually mapped: carveout 8 MiB (2048) + qtable 0x310000 (784) +
++ * SFR 4 KiB (1) = 2836, so the budget must exceed that or ArmSmmu4KBuild
++ * refuses with ArmSmmu4KBudget. */
++#define VIDC_SMMU_LEAF_BUDGET   4096u
 +#define VIDC_SMMU_ACTLR         0x103u        /* DT qcom,actlr for these SIDs */
 +#define VIDC_SID_NONSEC         0x1940u
 +#define VIDC_SID_NONSEC_ALT     0x1A20u
@@ -611,12 +614,25 @@ index 0000000..9f5e2ad
 +
 +    ArmSmmu4KConfig tcfg = { 32, oas, tpa, VIDC_SMMU_LEAF_BUDGET };
 +    ArmSmmu4KResult tres;
-+    ArmSmmu4KRange ranges[2];
-+    ranges[0] = (ArmSmmu4KRange){ VIDC_IOVA_BASE, vidc_qtable_pa, VIDC_QTABLE_ALLOC,
++    /* ArmSmmu4KBuild requires IOVA-sorted, disjoint ranges, so the ascending
++     * order here is 0x9a600000 (identity-mapped carveout), 0xff000000 (queue
++     * table) and 0xff400000 (SFR).
++     *
++     * Why the carveout must be mapped: once these SIDs are routed into the
++     * bank, EVERY VPU access is translated, including the ones the firmware
++     * makes to its own image and data at video_region@9a600000.  An
++     * IOVA == PA identity mapping keeps whatever physical addresses the
++     * firmware computed (and PAS programmed) valid, the same way
++     * pandora_dpu.c identity-maps the ABL's panel memory.  The carveout is
++     * inside the non_secure_cb window and below the 0xffc00000 DMA limit. */
++    ArmSmmu4KRange ranges[3];
++    ranges[0] = (ArmSmmu4KRange){ VIDEO_REGION_PA, VIDEO_REGION_PA, VIDEO_REGION_SIZE,
 +        ArmSmmu4KRead | ArmSmmu4KWrite, 0, 2 };
-+    ranges[1] = (ArmSmmu4KRange){ VIDC_IOVA_SFR, vidc_sfr_pa, VIDC_SFR_BYTES,
++    ranges[1] = (ArmSmmu4KRange){ VIDC_IOVA_BASE, vidc_qtable_pa, VIDC_QTABLE_ALLOC,
 +        ArmSmmu4KRead | ArmSmmu4KWrite, 0, 2 };
-+    ArmSmmu4KStatus st = ArmSmmu4KBuild(&tcfg, ranges, 2, (uint64_t *)tva,
++    ranges[2] = (ArmSmmu4KRange){ VIDC_IOVA_SFR, vidc_sfr_pa, VIDC_SFR_BYTES,
++        ArmSmmu4KRead | ArmSmmu4KWrite, 0, 2 };
++    ArmSmmu4KStatus st = ArmSmmu4KBuild(&tcfg, ranges, 3, (uint64_t *)tva,
 +        VIDC_SMMU_TABLE_PAGES, &tres);
 +    if (st != ArmSmmu4KSuccess) {
 +        pandora_apps_smmu_unlock();
