@@ -40,6 +40,8 @@
 
 #ifdef PANDORA
 
+#include <sys/param.h>
+#include <sys/systm.h>
 #include <kern/thread.h>
 #include <kern/kalloc.h>
 #include <pexpert/pexpert.h>
