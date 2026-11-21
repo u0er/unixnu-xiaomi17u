@@ -1,0 +1,82 @@
+From: baseband lane
+Subject: 0524 pandora_pas: allocate the metadata best-effort below 4 GiB, never fail because of it
+
+The 2026-11-22 06:30 boot (logs/1795300569) spent its whole window proving nothing, and the reason
+was this file:
+
+  PANDORA MPSS: crossing 2 images with 2 PAS ids, each with its own metadata
+  PANDORA MPSS: modem_dtb.mdt -> pas 4: no call (a0 0)
+  ... four times ...
+  PANDORA PAS: modem_dtb.mdt: pas 38, 3 segments, ... relocatable
+  PANDORA MPSS: modem_dtb.mdt did not load          (no INIT_IMAGE line at all)
+
+0517 constrained the allocation to max_pnum 0x100000 (4 GiB) on the theory that TrustZone wants the
+metadata low.  On this phone the low 4 GiB are entirely taken by the platform's carveouts, so the
+allocation failed, and every path that needs the metadata died before reaching TrustZone.  Before
+0517 the value was silently truncated to 0 (= no constraint) and the probe did make its nine calls.
+
+The constraint stays as a preference and the unconstrained allocation is the fallback, printing which
+one happened.  A diagnostic boot must never be unable to reach the call it exists to observe.
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index efb42a5..6939297 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -261,10 +261,26 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 	 * TrustZone for PIL (carveout 0x8aa00000, DTB 0x99500000, IPA 0x99590000) is below it.
+ 	 * kmem_alloc_contig's min_addr/max_addr were both 0, i.e. no constraint at all; give it one.
+ 	 */
++	/*
++	 * Best effort below 4 GiB, then anywhere.
++	 *
++	 * 0517 constrained the allocation to max_pnum 0x100000 (4 GiB) on the theory that TrustZone
++	 * wants the metadata low.  The 2026-11-22 06:30 boot showed what that actually does on this
++	 * phone: the low 4 GiB are entirely taken by the platform's carveouts, so the allocation
++	 * failed, every probe printed "no call", and the ladder never even reached INIT_IMAGE -- a
++	 * whole window spent proving nothing.  So the constraint stays as a preference and the
++	 * unconstrained allocation is the fallback; whichever one happens is printed.
++	 */
+ 	if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, MD_MAX_PNUM, 0,
+ 	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		err = ENOMEM;
+-		goto out;
++		if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("PANDORA PAS: %s: no metadata buffer (%u bytes), not even unconstrained\n",
++			    name, (unsigned)md_size);
++			err = ENOMEM;
++			goto out;
++		}
++		printf("PANDORA PAS: %s: metadata does not fit below 4 GiB, allocated above\n", name);
+ 	}
+ 	uint64_t md_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)md));
+ 	memcpy((void *)md, hdr, ehdr_size);
+@@ -451,10 +467,26 @@ pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64
+ 	 * TrustZone for PIL (carveout 0x8aa00000, DTB 0x99500000, IPA 0x99590000) is below it.
+ 	 * kmem_alloc_contig's min_addr/max_addr were both 0, i.e. no constraint at all; give it one.
+ 	 */
++	/*
++	 * Best effort below 4 GiB, then anywhere.
++	 *
++	 * 0517 constrained the allocation to max_pnum 0x100000 (4 GiB) on the theory that TrustZone
++	 * wants the metadata low.  The 2026-11-22 06:30 boot showed what that actually does on this
++	 * phone: the low 4 GiB are entirely taken by the platform's carveouts, so the allocation
++	 * failed, every probe printed "no call", and the ladder never even reached INIT_IMAGE -- a
++	 * whole window spent proving nothing.  So the constraint stays as a preference and the
++	 * unconstrained allocation is the fallback; whichever one happens is printed.
++	 */
+ 	if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, MD_MAX_PNUM, 0,
+ 	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		err = ENOMEM;
+-		goto out;
++		if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("PANDORA PAS: %s: no metadata buffer (%u bytes), not even unconstrained\n",
++			    name, (unsigned)md_size);
++			err = ENOMEM;
++			goto out;
++		}
++		printf("PANDORA PAS: %s: metadata does not fit below 4 GiB, allocated above\n", name);
+ 	}
+ 	uint64_t md_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)md));
+ 	memcpy((void *)md, hdr, ehdr_size);
