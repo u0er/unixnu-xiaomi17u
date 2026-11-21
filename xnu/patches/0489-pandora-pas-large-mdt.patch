@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
-index 56132ef..bfc699d 100644
+index 56132ef..7a7c16d 100644
 --- a/bsd/dev/pandora_adsp.c
 +++ b/bsd/dev/pandora_adsp.c
 @@ -753,20 +753,32 @@ pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t me
@@ -109,3 +109,21 @@ index 56132ef..bfc699d 100644
  	} else if ((err = mdt_segment(base, part, &mdt, &ph[hash], hash, (void *)(md + ehdr_size)))) {
  		return err;
  	}
+@@ -826,9 +873,15 @@ pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t me
+ 		return EIO;
+ 	}
+ 	if (reloc) {
+-		scm_smc(SCM_FN(2, 2), SCM_ARGS(3), pas, mem_pa, max - min, 0, &r);
++		/* The span must be page aligned: this platform's TZ rejects an
++		 * unaligned size with 0xffcfffba.  Measured, not assumed -- a round
++		 * that passed `max - min` (0x7ff020 for the VPU, 0x3fc for the ADSP)
++		 * made BOTH mem_setup calls fail with that code, while the aligned
++		 * values 0x800000 / 0x1000 return a0=0 on the same device. */
++		const uint64_t span = max_page - min;
++		scm_smc(SCM_FN(2, 2), SCM_ARGS(3), pas, mem_pa, span, 0, &r);
+ 		printf("PANDORA ADSP: pas %u mem_setup %#llx+%#llx -> a0 %#llx a1 %#llx\n", pas, mem_pa,
+-		    max - min, r.a0, r.a1);
++		    span, r.a0, r.a1);
+ 		if (r.a0 || r.a1) {
+ 			return EIO;
+ 		}
