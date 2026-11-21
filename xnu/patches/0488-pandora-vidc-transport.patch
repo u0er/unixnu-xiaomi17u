@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..28dd7e9
+index 0000000..d88f439
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,1918 @@
+@@ -0,0 +1,1876 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -367,6 +367,7 @@ index 0000000..28dd7e9
 +static uint32_t vidc_qtable_iova;
 +static uint32_t vidc_sfr_iova;
 +static bool     vidc_smmu_on;
++static unsigned vidc_smmu_drop_calls;   /* see vidc_smmu_drop() */
 +static uint32_t vidc_smmu_cb;      /* CB base offset inside apps-smmu */
 +static uint32_t vidc_smmu_bank;
 +/* Fault-capture state for the post-boot-release window. */
@@ -542,10 +543,13 @@ index 0000000..28dd7e9
 +static void
 +vidc_smmu_drop(void)
 +{
-+    if (vidc_smmu_va) {
-+        ml_io_unmap(vidc_smmu_va, (vm_size_t)VIDC_SMMU_SIZE);
-+        vidc_smmu_va = 0;
-+    }
++    /* NOTE: this used to call ml_io_unmap().  That is illegal for a window made
++     * by ml_io_map(): it is a PERMANENT VM map entry and removing it panics
++     * (`vm_map_delete: Attempting to remove permanent VM map entry`,
++     * restart type 4 at 0.207 s on 2026-11-21 23:36).  The window therefore
++     * stays mapped for the lifetime of the driver, exactly like every other
++     * pandora_* driver's register window. */
++    vidc_smmu_drop_calls++;
 +}
 +
 +static inline uint32_t
@@ -1237,7 +1241,7 @@ index 0000000..28dd7e9
 +    vidc_branch_on(0x8090u);           /* mvs0a (APV)   */
 +    /* NoC reset handshake BEFORE the bridge reset, matching upstream order
 +     * (iris_vpu4x.c:318-336: NOC handshake, then CORE_BRIDGE_SW_RESET). */
-+    if (vidc_wait_idle() != 0) failed++;    /* idle, then LPI, then NoC reset */
++    (void)vidc_wait_idle();                /* informational: 0 here, 0x7fff later */
 +    if (vidc_noc_lpi() != 0) failed++;
 +    if (vidc_noc_reset() != 0) failed++;
 +    vidc_bridge_reset();
@@ -1257,18 +1261,6 @@ index 0000000..28dd7e9
 +    }
 +    printf("PANDORA VIDC: videocc powered (%d/5 GDSC failed), CORE_PWR=%08x CORE_CLK=%08x\n",
 +        failed, vidc_rd(R_WRAPPER_CORE_PWR), clk_cfg);
-+    /* GCC only existed to open the two AXI branches and videocc only to run the
-+     * GDSC/branch sequence; both are done by here.  Release them before the long
-+     * tail (queues/pas/publish/HFI) so our peak does not overlap other drivers'
-+     * allocations. */
-+    if (vidc_gcc) {
-+        ml_io_unmap(vidc_gcc, (vm_size_t)GCC_SIZE);
-+        vidc_gcc = 0;
-+    }
-+    if (vidc_cc) {
-+        ml_io_unmap(vidc_cc, (vm_size_t)VIDEOCC_SIZE);
-+        vidc_cc = 0;
-+    }
 +    vidc_snap("after power");
 +    /* A branch reading CLK_OFF=0 only means the *gate* is open; if its RCG has no
 +     * root enabled or no source selected, the core still gets no clock and never
@@ -1291,16 +1283,8 @@ index 0000000..28dd7e9
 +     * dump), so hand them back before the long tail starts.  The ordering is
 +     * load-bearing: releasing first made the snapshot print zeros and hid the
 +     * RCG configuration -- the very evidence this driver exists to produce. */
-+    if (vidc_gcc) {
-+        ml_io_unmap(vidc_gcc, (vm_size_t)GCC_SIZE);
-+        vidc_gcc = 0;
-+    }
-+    if (vidc_cc) {
-+        ml_io_unmap(vidc_cc, (vm_size_t)VIDEOCC_SIZE);
-+        vidc_cc = 0;
-+    }
-+    printf("PANDORA VIDC: released gcc+videocc windows (%#x)\n",
-+        (unsigned)(GCC_SIZE + VIDEOCC_SIZE));
++    printf("PANDORA VIDC: gcc+videocc windows kept mapped (%#x) -- unmapping "
++           "ml_io_map entries panics\n", (unsigned)(GCC_SIZE + VIDEOCC_SIZE));
 +    return failed ? -1 : 0;
 +}
 +
@@ -1848,38 +1832,12 @@ index 0000000..28dd7e9
 +            vidc_rd(R_WRAPPER_EFUSE), vidc_rd(R_WRAPPER_CORE_PWR),
 +            vidc_rd(R_WRAPPER_CORE_CLK), vidc_rd(R_VCODEC_SS_IDLE));
 +
-+    /* Hand the apps-smmu window straight back.  The bank/ASID/CB programming
-+     * lives in the SMMU, not in this mapping, so dropping the 1 MiB of kernel
-+     * VA costs nothing after the context is built -- and it is exactly the kind
-+     * of permanent kernel_map that made an unrelated 1 MiB kmem_alloc fail at
-+     * 9.180 s (`failed with 3 @vm_kern.c:178`). */
-+    unsigned released = 0;
-+    if (vidc_smmu_va) {
-+        ml_io_unmap(vidc_smmu_va, VIDC_SMMU_SIZE);
-+        vidc_smmu_va = 0;
-+        released += VIDC_SMMU_SIZE;
-+    }
-+    /* The video register windows are only needed while the ladder runs.  Both
-+     * readers and writers now tolerate a released window, so drop them too: the
-+     * whole point is that this driver must not keep ~5 MiB of kernel_map on a
-+     * machine where the GPU lane already maps a 2 GiB pool. */
-+    if (vidc_gcc) {
-+        ml_io_unmap(vidc_gcc, GCC_SIZE);
-+        vidc_gcc = 0;
-+        released += GCC_SIZE;
-+    }
-+    if (vidc_cc) {
-+        ml_io_unmap(vidc_cc, VIDEOCC_SIZE);
-+        vidc_cc = 0;
-+        released += VIDEOCC_SIZE;
-+    }
-+    if (vidc_mmio_on) {
-+        vidc_mmio_on = false;
-+        ml_io_unmap(vidc_mmio, VIDC_SIZE);
-+        vidc_mmio = 0;
-+        released += VIDC_SIZE;
-+    }
-+    printf("PANDORA VIDC: released %#x bytes of kernel VA after the ladder\n", released);
++    /* Every register window taken by ml_io_map() is a PERMANENT VM map entry.
++     * Unmapping one panics ("Attempting to remove permanent VM map entry",
++     * restart type 4 at 0.207 s on 2026-11-21 23:36), so the windows stay mapped
++     * for the driver's lifetime -- same as every other pandora_* driver.  The
++     * earlier "release early to shrink the footprint" idea was simply illegal. */
++    printf("PANDORA VIDC: ladder done; MMA windows kept mapped (permanent entries)\n");
 +}
 +
 +/* ------------------------------------------------------------------ */
