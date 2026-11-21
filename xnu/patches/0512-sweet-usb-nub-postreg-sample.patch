@@ -1,0 +1,60 @@
+From: CarPlay C0 lane (2026-11-21)
+Subject: 0512 sweet_nub: sample the published controller five seconds after registration
+
+S4 in the runbook asks "did anything match the ConfigurationType we published", but Apple's
+configurator logs only under a debug flag; a silent logger and "nothing matched" look identical in
+the kernel log. This adds a device-side sample instead: five seconds after registerService the
+probe prints whether the controller became active (IOService::isInactive false), its retain count
+(clients hold a reference), and its children in the IOService plane, with each child's class name.
+
+Those three answers separate the failure modes that currently look the same from outside:
+  * inactive, retain 1, no children -> nothing matched the personality;
+  * active, retain > 1, children   -> the configurator ran createUSBDevice;
+  * active, no children            -> matched but device construction stopped early.
+
+The sample sleeps in the probe's own kernel thread, so it cannot block anything, and it is
+read-only (no property writes after registration).
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -27,6 +27,8 @@
+ #include <libkern/c++/OSMetaClass.h>
+ #include <libkern/c++/OSSymbol.h>
+ #include <libkern/c++/OSSharedPtr.h>
++#include <libkern/c++/OSIterator.h>
++#include <libkern/c++/OSPtr.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -218,6 +220,31 @@
+ 	    run_start == 2 ? "" : "; pass 2 for iBridge");
+ 	ctl->registerService();
+ 	printf("SWEET NUB: registered as %s; mux/configurator should now match\n", personality);
++
++	/*
++	 * 0512: device-side evidence for S4/S5. Apple's configurator may stay silent unless a debug
++	 * flag is set, and a silent logger looks exactly like "nothing matched". So sample the object
++	 * we published five seconds later: did anything start it, retain it, or parent something to
++	 * it? Those three answers separate "nobody matched" from "matched but createUSBDevice failed".
++	 */
++	(void)tsleep(&sweet_nub_wait, PZERO, "sweetnub2", 5 * hz);
++	int started_now = ctl->isInactive() ? 0 : 1;
++	printf("SWEET NUB: after 5 s: started %d, retain %d\n", started_now, ctl->getRetainCount());
++	OSPtr<OSIterator> children_it = ctl->getChildIterator(gIOServicePlane);
++	int children = 0;
++	if (children_it) {
++		while (OSObject *obj = children_it->getNextObject()) {
++			IOService *child = OSDynamicCast(IOService, obj);
++			if (child != NULL) {
++				printf("SWEET NUB: child[%d] %s\n", children,
++				    child->getMetaClass()->getClassName());
++			} else {
++				printf("SWEET NUB: child[%d] (non-IOService)\n", children);
++			}
++			children++;
++		}
++	}
++	printf("SWEET NUB: children %d\n", children);
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
