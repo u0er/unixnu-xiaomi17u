@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..93e254766349ebfe045194ad461228452e7b9a15
+index 0000000..b843278511754ab2b09a351a56b1663fc98c82f2
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4615 @@
+@@ -0,0 +1,4620 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3966,6 +3966,11 @@ index 0000000..93e254766349ebfe045194ad461228452e7b9a15
 +		if (*got >= cap) {
 +			return EMSGSIZE;
 +		}
++	}
++	if (dropped != 0u || vstate != 0u) {
++		printf("PANDORA BT: %s: window closed with %u byte(s) dropped, record state %u\n",
++		    what, dropped, vstate);
++		pandora_log_sync();
 +	}
 +	return ETIMEDOUT;
 +}
