@@ -1,6 +1,6 @@
 --- a/bsd/sweet_hfs/core/hfs_vfsutils.c
 +++ b/bsd/sweet_hfs/core/hfs_vfsutils.c
-@@ -2489,6 +2489,18 @@
+@@ -2489,6 +2489,19 @@
  	devvp = hfsmp->hfs_devvp;
  	dev_name = vnode_getname_printable(devvp);
 
@@ -22,7 +22,7 @@
  		arg_tbufsz = args->journal_tbuffer_size;
 --- a/bsd/sweet_hfs/core/hfs_vfsops.c
 +++ b/bsd/sweet_hfs/core/hfs_vfsops.c
-@@ -1583,8 +1583,21 @@
+@@ -1583,7 +1583,19 @@
  		if (   (SWAP_BE32(vhp->lastMountedVersion) == kHFSJMountVersion)
  			&& (SWAP_BE32(vhp->attributes) & kHFSVolumeJournaledMask)
  			&& !jnl_disable) {
