@@ -968,7 +968,13 @@ vidc_probe(void)
  * Without these the Xtensa cannot move a single beat over the bus, which is
  * exactly the observed all-reset state. */
 #define GCC_PA                 0x00100000u
-#define GCC_SIZE               0x00040000u
+/* Only the two video AXI branch registers are needed (0x32018 / 0x3202c), so map
+ * a single 4 KiB page at 0x32000 instead of 256 KiB.  Measured reason: with the
+ * 256 KiB window the kernel died at 5.166 s on someone else's 864 KiB
+ * kmem_alloc (`failed with 3 @vm_kern.c:178`), and ml_io_map windows cannot be
+ * released (unmapping a permanent entry panics). */
+#define GCC_MAP_OFF            0x00032000u
+#define GCC_SIZE               0x00001000u
 #define GCC_VIDEO_AXI0_CLK     0x00032018u
 #define GCC_VIDEO_AXI1_CLK     0x0003202Cu
 
@@ -1202,14 +1208,14 @@ vidc_power_up(void)
      * Upstream order is AXI, HW_FREERUN, HW, BSE_HW, VPP0, VPP1, APV. */
     /* AXI first, exactly like upstream's enable_hardware_clocks order. */
     if (!vidc_gcc) {
-        vidc_gcc = ml_io_map(GCC_PA, GCC_SIZE);
+        vidc_gcc = ml_io_map(GCC_PA + GCC_MAP_OFF, GCC_SIZE);
     }
     if (!vidc_gcc) {
         printf("PANDORA VIDC: ml_io_map(GCC) failed; AXI clocks cannot be voted\n");
         failed++;
     } else {
-        if (vidc_gcc_branch_on(GCC_VIDEO_AXI0_CLK, "video_axi0") != 0) failed++;
-        if (vidc_gcc_branch_on(GCC_VIDEO_AXI1_CLK, "video_axi1") != 0) failed++;
+        if (vidc_gcc_branch_on(GCC_VIDEO_AXI0_CLK - GCC_MAP_OFF, "video_axi0") != 0) failed++;
+        if (vidc_gcc_branch_on(GCC_VIDEO_AXI1_CLK - GCC_MAP_OFF, "video_axi1") != 0) failed++;
     }
     vidc_branch_on(0x8164u);           /* mvs0c (AXI)   */
     /* 0x80e4 is NOT a plain branch: its captured clock object has no +0x30/+0x34
