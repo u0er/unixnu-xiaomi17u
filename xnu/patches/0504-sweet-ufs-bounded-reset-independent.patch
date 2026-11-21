@@ -1,0 +1,74 @@
+From: GPU lane (2026-11-21)
+Subject: 0504 sweet_ufs pl_thread: make pandora_reboot_after independent of the log file
+
+The bounded reset used to be checked after pl_flush(), and one failed UFS write
+returned from the logging thread entirely, silently cancelling the reset for the
+rest of the boot: the phone stays in iOS with USB enumerated until it is reset by
+hand. Check the deadline first, and keep the thread (and the deadline) alive after
+logging stops.
+
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -2219,25 +2219,15 @@
+ 	nanoseconds_to_absolutetime((uint64_t)iostats * NSEC_PER_SEC, &io_every);
+ 	for (;;) {
+ 		(void)tsleep(&pl_chan, PZERO, "pandoralog", hz * (int)secs);
+-		lck_mtx_lock(&sweet_ufs_lock);
+-		uint64_t now = mach_absolute_time();
+-		if (io_every && now - io_last >= io_every) {
+-			pio_print(now - io_last);
+-			io_last = now;
+-		}
+-		int error = pl_flush();
+-		if (!error && os_atomic_load(&pfd_state, acquire) == 2) {
+-			int e = pfd_write();
+-			printf("PANDORA FBDUMP: %u bytes -> log file block %u: %d\n", pfd_len,
+-			    PFD_FIRST_BLOCK, e);
+-			os_atomic_store(&pfd_state, 0, release);
+-		}
+-		lck_mtx_unlock(&sweet_ufs_lock);
+-		if (error) {
+-			printf("PANDORA LOG: write failed (%d), log stopped\n", error);
+-			pl_ready = false;
+-			return;
+-		}
++		/*
++		 * 0504: the bounded reset must not be hostage to the log file. The
++		 * deadline used to be checked AFTER pl_flush(), and a single failed
++		 * write returned from this thread entirely -- which silently cancelled
++		 * pandora_reboot_after for the rest of the boot and left the phone
++		 * sitting in iOS with USB enumerated until somebody reset it by hand.
++		 * Check the deadline before touching the disk; when logging has already
++		 * stopped, keep waking up and keep honouring the deadline.
++		 */
+ 		if (limit && mach_absolute_time() - start >= limit) {
+ 			printf("PANDORA: pandora_reboot_after=%u reached, resetting\n", reboot_after);
+ 			pandora_amp_final("pandora_reboot_after");      /* 0298: the speaker amps down first */
+@@ -2245,6 +2235,27 @@
+ 			(void)pl_flush();
+ 			lck_mtx_unlock(&sweet_ufs_lock);
+ 			pl_psci_reset();
++		}
++		if (!pl_ready) {
++			continue;
++		}
++		lck_mtx_lock(&sweet_ufs_lock);
++		uint64_t now = mach_absolute_time();
++		if (io_every && now - io_last >= io_every) {
++			pio_print(now - io_last);
++			io_last = now;
++		}
++		int error = pl_flush();
++		if (!error && os_atomic_load(&pfd_state, acquire) == 2) {
++			int e = pfd_write();
++			printf("PANDORA FBDUMP: %u bytes -> log file block %u: %d\n", pfd_len,
++			    PFD_FIRST_BLOCK, e);
++			os_atomic_store(&pfd_state, 0, release);
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++		if (error) {
++			printf("PANDORA LOG: write failed (%d), log stopped\n", error);
++			pl_ready = false;      /* stop logging, but keep the bounded reset alive */
+ 		}
+ 	}
+ }
