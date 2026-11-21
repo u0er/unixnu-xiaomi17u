@@ -1104,6 +1104,24 @@ vidc_publish_queues(void)
     printf("PANDORA VIDC: queue table publish TIMEOUT (stat=%08x boot=%08x spare0=%08x)\n",
         vidc_rd(R_CPU_QUEUE_TABLE_STAT), vidc_rd(R_CPU_BOOT_CTRL),
         vidc_rd(R_WRAPPER_SPARE_0));
+    /* If the core never reports ready, the only way to tell "not executing"
+     * from "executing and stuck" is to read the blocks the core itself would
+     * write.  Dump the CPU block (0xA0000-0xA0070), the TZ wrapper (0xC0000-
+     * 0xC0020) and the outer wrapper (0xB0080-0xB0090) in full: any non-reset
+     * word is a breadcrumb the firmware left. */
+    for (unsigned base = 0; base < 0x70u; base += 0x10u) {
+        printf("PANDORA VIDC: A00%02x: %08x %08x %08x %08x\n", base,
+            vidc_rd(CPU_BASE_OFFS + base), vidc_rd(CPU_BASE_OFFS + base + 4),
+            vidc_rd(CPU_BASE_OFFS + base + 8), vidc_rd(CPU_BASE_OFFS + base + 0xC));
+    }
+    for (unsigned base = 0; base < 0x20u; base += 0x10u) {
+        printf("PANDORA VIDC: C00%02x: %08x %08x %08x %08x\n", base,
+            vidc_rd(0xC0000u + base), vidc_rd(0xC0000u + base + 4),
+            vidc_rd(0xC0000u + base + 8), vidc_rd(0xC0000u + base + 0xC));
+    }
+    printf("PANDORA VIDC: B00[80..9c]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+        vidc_rd(0xB0080u), vidc_rd(0xB0084u), vidc_rd(0xB0088u), vidc_rd(0xB008Cu),
+        vidc_rd(0xB0090u), vidc_rd(0xB0094u), vidc_rd(0xB0098u), vidc_rd(0xB009Cu));
     /* Why the Xtensa never reports ready, measured rather than guessed.
      *
      * Vendor fact (msm_video.ko): __power_on_iris4 / _controller / _hardware
