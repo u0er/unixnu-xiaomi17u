@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..8d1ffa3
+index 0000000..10881bf
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,1917 @@
+@@ -0,0 +1,1926 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -212,6 +212,13 @@ index 0000000..8d1ffa3
 + * firmware looks up its SFR here, so without it HFI can never initialise and
 + * CTRL_STATUS (0xA004C) stays zero forever -- which is the observed state. */
 +#define R_CPU_SFR_ADDR          (CPU_BASE_OFFS + 0x05Cu)
++/* [M] iris patch v7 ("Handle CPU_CS_SCIACMDARG3 write via program bootup
++ * registers hook") adds after the SFR_ADDR write:
++ *     writel(0x1, core->reg_base + CPU_CS_SCIACMDARG3);   // CPU_CS + 0x58
++ * Our vendor disassembly never writes 0x58, but upstream's newest boot path
++ * does, and publish is the only stage still failing -- so it is the single
++ * variable for the next trial. */
++#define R_CPU_SCIACMDARG3       (CPU_BASE_OFFS + 0x058u)
 +#define VIDC_CORE_ARCH          1u
 +#define R_CPU_QUEUE_TABLE_STAT  (CPU_BASE_OFFS + 0x04Cu)  /* bit0 ready, bits1-3 err */
 +#define R_CPU_CP_SPAN_A         (CPU_BASE_OFFS + 0x024u)  /* CP span size */
@@ -1356,6 +1363,8 @@ index 0000000..8d1ffa3
 +        vidc_wr(R_CPU_QUEUE_TABLE_ADDR2, vidc_sfr_da());
 +        /* SFR_ADDR must carry sfr + core_arch (upstream), not the bare DA. */
 +        vidc_wr(R_CPU_SFR_ADDR, vidc_sfr_da() + VIDC_CORE_ARCH);
++        vidc_wr(R_CPU_SCIACMDARG3, 1);
++        printf("PANDORA VIDC: SCIACMDARG3 (0xA0058) = %08x\n", vidc_rd(R_CPU_SCIACMDARG3));
 +    }
 +    printf("PANDORA VIDC: published DA=%08x SFR=%08x (smmu %s) "
 +           "regs A0064/A0068/A0054/A0050/A0060\n", da, vidc_sfr_da(),
