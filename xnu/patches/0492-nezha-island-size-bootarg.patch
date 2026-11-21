@@ -1,0 +1,60 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c34cad6..d837f04 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -292,6 +292,40 @@ sweetfb_gpu_frames(void)
+ 	return on != 0;
+ }
+ 
++/*
++ * Mask geometry in 375-point units, overridable per boot.
++ *
++ * Defaults are the ORIGINAL Pro Max style 110x32 capsule, so an image built from
++ * this source is byte-compatible with the long-validated look. nezha_island_w /
++ * nezha_island_h override it, which keeps "which size" and "does the functional
++ * layer work" as independent single variables instead of costing one kernel build
++ * per size. The y anchor comes from the historical centre row (29.5 pt at 375),
++ * so a smaller capsule shrinks about its centre instead of drifting upward.
++ */
++static uint32_t
++nezha_island_logical_w(void)
++{
++	static uint32_t value;
++	if (value == 0) {
++		int parsed = 0;
++		value = (PE_parse_boot_argn("nezha_island_w", &parsed, sizeof(parsed)) &&
++		         parsed >= 40 && parsed <= 375) ? (uint32_t)parsed : 110;
++	}
++	return value;
++}
++
++static uint32_t
++nezha_island_logical_h(void)
++{
++	static uint32_t value;
++	if (value == 0) {
++		int parsed = 0;
++		value = (PE_parse_boot_argn("nezha_island_h", &parsed, sizeof(parsed)) &&
++		         parsed >= 10 && parsed <= 375) ? (uint32_t)parsed : 32;
++	}
++	return value;
++}
++
+ /* Static iPhone 18 Pro small Dynamic Island mask, after the GPU fence and before
+  * either display path. Coordinates scale with the composed frame; no UI process
+  * or input handler. */
+@@ -304,8 +338,12 @@ nezha_draw_capsule(SweetSurface *s)
+ 	    (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
+ 		return;
+ 	}
+-	const uint32_t w = s->width * 70 / 375, h = s->width * 26 / 375;
+-	const uint32_t x0 = (s->width - w) / 2, y0 = s->width * 59 / 750 - h / 2;
++	const uint32_t w = s->width * nezha_island_logical_w() / 375;
++	const uint32_t h = s->width * nezha_island_logical_h() / 375;
++	const uint32_t x0 = (s->width - w) / 2;
++	/* Historical centre row: 29.5 pt at 375 -> 59/750 of the surface width. */
++	const uint32_t centre = s->width * 59 / 750;
++	const uint32_t y0 = centre > h / 2 ? centre - h / 2 : 0;
+ 	uintptr_t pixels = s->kernelAddress();
+ 	if (!pixels || y0 + h > s->height) {
+ 		return;
