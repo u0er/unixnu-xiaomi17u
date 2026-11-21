@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..2ed11527c40268fbe23a13bd3004d4053a18f432
+index 0000000..57e6153f9d77131c0355de86b36e30c745c33d7d
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4738 @@
+@@ -0,0 +1,4742 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3900,7 +3900,6 @@ index 0000000..2ed11527c40268fbe23a13bd3004d4053a18f432
 + * The filter only runs while no event byte has been accepted yet: 0xfc is a
 + * legal payload byte inside the 0xfc00 Command Complete (04 0e 05 01 00 fc 00
 + * 1e), so filtering mid-event would corrupt the very event being read. */
-+static int
 +/* Record-skip state must survive a window boundary: a 34 00 ff <plen> record can
 + * be split between two calls, and restarting at "look for 0x34" would scan the
 + * leftover payload as if it were event starts (a stray 0x04 there can swallow the
@@ -3915,6 +3914,7 @@ index 0000000..2ed11527c40268fbe23a13bd3004d4053a18f432
 +	bt_vskip = 0;
 +}
 +
++static int
 +bt_peri_cc_read(unsigned window_ms, uint8_t *ev, unsigned cap, unsigned *got,
 +    unsigned *wakes, const char *what, bool skip_records)
 +{
@@ -4033,6 +4033,7 @@ index 0000000..2ed11527c40268fbe23a13bd3004d4053a18f432
 +static int
 +bt_peri_tlv_stage(const uint8_t *fw, unsigned size, const char *what, uint8_t sub06)
 +{
++	bt_peri_record_state_reset();
 +	uint8_t frame[BT_FW_SEG_MAX + 8u];
 +	unsigned sent = 0;
 +	unsigned seg = 0;
@@ -4176,6 +4177,7 @@ index 0000000..2ed11527c40268fbe23a13bd3004d4053a18f432
 +bt_peri_hci_stage(const uint8_t *fw, unsigned size, const char *what,
 +    bool per_frame_cc)
 +{
++	bt_peri_record_state_reset();
 +	uint8_t frame[6u + BT_FW_SEG_MAX];
 +	/* The ROM's answers are not 8 bytes in general: the 0x23 reply is 11 B and
 +	 * the 0x20 build-info reply is 117 B. A 16-byte buffer made the very first
@@ -4295,6 +4297,7 @@ index 0000000..2ed11527c40268fbe23a13bd3004d4053a18f432
 +static int
 +bt_peri_vs_cmd(uint8_t sub, unsigned window_ms, const char *what)
 +{
++	bt_peri_record_state_reset();
 +	uint8_t request[5] = { 0x01, 0x00, 0xfc, 0x01, 0x00 };
 +	uint8_t ev[BT_PERI_EVT_MAX] = {0};
 +	unsigned got = 0;
@@ -4362,6 +4365,7 @@ index 0000000..2ed11527c40268fbe23a13bd3004d4053a18f432
 +static void
 +bt_peri_bulk_drain(unsigned window_ms, const char *what)
 +{
++	bt_peri_record_state_reset();
 +	uint8_t ev[BT_PERI_EVT_MAX] = {0};
 +	unsigned got = 0;
 +	unsigned wakes = 0;
