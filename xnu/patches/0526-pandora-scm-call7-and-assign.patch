@@ -1,0 +1,223 @@
+From: baseband lane
+Subject: 0526 pandora_adsp/mpss: the seven-value SMC form, and a correct memory assign
+
+Two things, both about the same call family.
+
+1. adsp.c gains pandora_scm_call7().  QCOM_SCM_ARGS(7, ...) takes seven arguments in x2..x8 and the
+   existing wrappers stop at four values, so a seven-argument call could not be expressed at all.
+
+2. mp_assign_dsm() is rewritten to the shape Linux's qcom_scm_assign_mem actually builds, read from
+   upstream's __qcom_scm_assign_mem:
+
+     arginfo = QCOM_SCM_ARGS(7, RO, VAL, RO, VAL, RO, VAL, VAL) = 0x1117   (this port already had it)
+     args[0] = phys of { u64 addr; u64 size; }        args[1] = 16
+     args[2] = phys of the src vmid list (u32 each)   args[3] = 4 * count
+     args[4] = phys of { u32 vmid, perm, ctx, ctx_size }   args[5] = 16 * count
+     args[6] = 0
+
+   The old code passed a bare region address and size in the first two slots and then two more
+   addresses where sizes belong, and TrustZone answered 0xffffffffffffffff -- the SMC rejecting a
+   malformed descriptor, not a verdict on the memory.  Recorded because that -1 was read as a TZ
+   answer for a while.
+
+   The structures all live in one freshly allocated page, flushed before the call.
+
+Assign still runs only with pandora_mpss_assign=1, and it is not what blocks step 4: upstream calls
+qcom_scm_assign_mem *after* auth_and_reset, not before INIT_IMAGE.
+
+diff --git a/bsd/dev/pandora_adsp.c b/b/bsd/dev/pandora_adsp.c
+old mode 100644
+new mode 100755
+index 5a1b7be..59f5848
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -282,6 +282,64 @@ pandora_scm_call5(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint6
+ 	*a1 = r.a1;
+ }
+ 
++/*
++ * The seven-value form.
++ *
++ * QCOM_SCM_ARGS(7, ...) needs seven arguments and those live in x2..x8.  Memory protection is the
++ * caller that needs it: `qcom_scm_assign_mem` passes (mem_region, mem_sz, src, src_sz, dest,
++ * dest_sz, 0) -- three of them are physical addresses of structures, so a four-value wrapper cannot
++ * express the call at all.  The first version of this port passed bare addresses in the length
++ * positions and TrustZone answered 0xffffffffffffffff (the SMC's own "bad call"), which is what a
++ * malformed descriptor looks like from here.
++ *
++ * The lock and the interrupted-retry are the same as scm_smc's; the queue/wake protocol is not
++ * replicated because a memory-protection call does not queue.
++ */
++void pandora_scm_call7(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4,
++    uint64_t x5, uint64_t x6, uint64_t x7, uint64_t x8, uint64_t *a0, uint64_t *a1);
++
++void
++pandora_scm_call7(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5,
++    uint64_t x6, uint64_t x7, uint64_t x8, uint64_t *a0, uint64_t *a1)
++{
++	struct scm_res r = { 0, 0, 0, 0 };
++
++	lck_mtx_lock(&ad_scm_lock);
++	uint64_t call = fn, session = x6;
++	for (int tries = 0; tries < 1000; tries++) {
++		register uint64_t r0 __asm__("x0") = call;
++		register uint64_t r1 __asm__("x1") = arginfo;
++		register uint64_t r2 __asm__("x2") = x2;
++		register uint64_t r3 __asm__("x3") = x3;
++		register uint64_t r4 __asm__("x4") = x4;
++		register uint64_t r5 __asm__("x5") = x5;
++		register uint64_t r6 __asm__("x6") = session;
++		register uint64_t r7 __asm__("x7") = x7;
++		register uint64_t r8 __asm__("x8") = x8;
++		__asm__ volatile ("smc #0"
++		    : "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3), "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7),
++		      "+r"(r8)
++		    :
++		    : "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		r.a0 = r0;
++		r.a1 = r1;
++		r.a2 = r2;
++		r.a3 = r3;
++		if (r0 != 1) {
++			break;
++		}
++		call = 1;
++		session = r6;
++	}
++	lck_mtx_unlock(&ad_scm_lock);
++	if (a0) {
++		*a0 = r.a0;
++	}
++	if (a1) {
++		*a1 = r.a1;
++	}
++}
++
+ static int
+ scm_call_avail(unsigned svc, unsigned cmd)
+ {
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 2e87095..0c2fb41 100755
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -64,6 +64,8 @@ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ extern int pandora_rpmh_arc(const char *name, uint32_t level);
+ extern void pandora_scm_call5(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4,
+     uint64_t x5, uint64_t *a0, uint64_t *a1);
++extern void pandora_scm_call7(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4,
++    uint64_t x5, uint64_t x6, uint64_t x7, uint64_t x8, uint64_t *a0, uint64_t *a1);
+ /* The two-value form the PAS_IS_SUPPORTED probe uses (defined in pandora_adsp.c beside the other
+  * wrappers).  Without this declaration CI's clang rejects the call as implicit -- locally it only
+  * produced a warning, which is why 0516 built file-by-file and failed in CI. */
+@@ -276,6 +278,69 @@ mp_option(const char *name)
+  * i.e. the vmid list at +64 and the permission list at +240 inside the same page.
+  * Off by default; enable with pandora_mpss_assign=1 so one boot can test it.
+  */
++/*
++ * Hand a memory region to the modem, in the shape TrustZone actually expects.
++ *
++ * Linux's __qcom_scm_assign_mem builds three structures in one buffer and passes their PHYSICAL
++ * ADDRESSES alongside their sizes:
++ *
++ *   args[0] = mem_region (phys)   struct { u64 addr; u64 size; }        args[1] = sizeof = 16
++ *   args[2] = src (phys)          array of u32 vmids                    args[3] = 4 * count
++ *   args[4] = dest (phys)         array of { u32 vmid, perm, ctx, ctx_size }  args[5] = 16 * count
++ *   args[6] = 0
++ *   arginfo = QCOM_SCM_ARGS(7, RO, VAL, RO, VAL, RO, VAL, VAL) = 0x1117
++ *
++ * This file used to pass (region_pa, size, vmids_pa, perms_pa) -- addresses in the length positions
++ * -- and TrustZone answered 0xffffffffffffffff, which is the SMC's own rejection of a malformed
++ * descriptor rather than a judgement about the memory.
++ */
++static bool
++mp_assign_region(uint64_t region_pa, uint64_t region_size)
++{
++	struct {
++		uint64_t addr;
++		uint64_t size;
++	} mem_map;
++	struct {
++		uint32_t vmid;
++		uint32_t perm;
++		uint32_t ctx;
++		uint32_t ctx_size;
++	} dest;
++	vm_offset_t page = 0;
++	uint32_t *src;
++	uint64_t pa, a0 = 0, a1 = 0;
++
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO, VM_KERN_MEMORY_IOKIT) !=
++	    KERN_SUCCESS) {
++		printf("PANDORA MPSS: no page for the assign structures\n");
++		return false;
++	}
++	mem_map.addr = region_pa;
++	mem_map.size = region_size;
++	src = (uint32_t *)(page + 64);
++	src[0] = PANDORA_VMID_HLOS;                     /* the current owner: HLOS */
++	dest.vmid = PANDORA_VMID_MSS_MSA;               /* the new owner: the modem's MSA */
++	dest.perm = 6u;                                 /* RW */
++	dest.ctx = 0;
++	dest.ctx_size = 0;
++	memcpy((void *)(page + 0), &mem_map, sizeof(mem_map));
++	memcpy((void *)(page + 128), &dest, sizeof(dest));
++	pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)page));
++	flush_dcache64((addr64_t)pa, PAGE_SIZE, TRUE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	pandora_scm_call7(PANDORA_SCM_MP_ASSIGN, PANDORA_SCM_ASSIGN_ARGUMENTS,
++	    pa + 0, 16, pa + 64, 4, pa + 128, 16, 0, &a0, &a1);
++	printf("PANDORA MPSS: assign %#llx+%#llx to MSS -> a0 %#llx a1 %#llx %s\n", region_pa,
++	    region_size, a0, a1, (a0 || a1) ? "REFUSED" : "ok");
++	kmem_free(kernel_map, page, PAGE_SIZE);
++	return (a0 == 0 && a1 == 0);
++}
++
++/*
++ * The two DSM regions canoe's modem node lists, assigned to HLOS+MSS as Linux does.
++ * Off by default; pandora_mpss_assign=1 enables it.
++ */
+ static bool
+ mp_assign_dsm(void)
+ {
+@@ -285,37 +350,16 @@ mp_assign_dsm(void)
+ 		{ 0x85000000ull, 0x4f00000ull },
+ 		{ 0x89f00000ull, 0x100000ull },
+ 	};
+-	vm_offset_t page = 0;
++	bool ok = true;
+ 
+ 	if (!mp_option("pandora_mpss_assign")) {
+ 		return true;
+ 	}
+-	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO, VM_KERN_MEMORY_IOKIT) !=
+-	    KERN_SUCCESS) {
+-		printf("PANDORA MPSS: no page for the assign lists\n");
+-		return false;
+-	}
+-	uint32_t *vmids = (uint32_t *)(page + 64);
+-	uint32_t *perms = (uint32_t *)(page + 240);
+-	vmids[0] = PANDORA_VMID_HLOS;
+-	vmids[1] = PANDORA_VMID_MSS_MSA;
+-	perms[0] = 6u;                          /* RW */
+-	perms[1] = 6u;                          /* RW */
+-	uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)page));
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	bool ok = true;
+ 	for (unsigned i = 0; i < sizeof(dsm) / sizeof(dsm[0]); i++) {
+-		uint64_t a0 = 0, a1 = 0;
+-
+-		/* a1 must be its own variable: passing &page here would overwrite the mapping's
+-		 * address with TrustZone's second result word and then free a wrong pointer. */
+-		pandora_scm_call5(PANDORA_SCM_MP_ASSIGN, PANDORA_SCM_ASSIGN_ARGUMENTS, dsm[i].pa,
+-		    dsm[i].size, pa + 64, pa + 240, &a0, &a1);
+-		printf("PANDORA MPSS: assign %#llx+%#llx to HLOS+MSS -> a0 %#llx a1 %#llx %s\n",
+-		    dsm[i].pa, dsm[i].size, a0, a1, (a0 || a1) ? "REFUSED" : "ok");
+-		ok = ok && a0 == 0 && a1 == 0;
++		if (!mp_assign_region(dsm[i].pa, dsm[i].size)) {
++			ok = false;
++		}
+ 	}
+-	kmem_free(kernel_map, page, PAGE_SIZE);
+ 	return ok;
+ }
+ 
