@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..cb251f6
+index 0000000..9243cca
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,1763 @@
+@@ -0,0 +1,1799 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -506,6 +506,20 @@ index 0000000..cb251f6
 +
 +static vm_offset_t vidc_smmu_va;
 +
++/* Release the apps-smmu window if it is still mapped.  Idempotent: the failure
++ * paths of vidc_smmu_up() and its success path both call it, and so does the
++ * ladder teardown.  This exists because the original code unmapped ONLY on
++ * success, so every early return leaked 1 MiB of kernel_map -- the same kind of
++ * permanent footprint that produced the 5.177 s kmem_alloc failure. */
++static void
++vidc_smmu_drop(void)
++{
++    if (vidc_smmu_va) {
++        ml_io_unmap(vidc_smmu_va, (vm_size_t)VIDC_SMMU_SIZE);
++        vidc_smmu_va = 0;
++    }
++}
++
 +static inline uint32_t
 +vidc_smmu_rd(uint32_t off)
 +{
@@ -647,6 +661,7 @@ index 0000000..cb251f6
 +    }
 +    if (nroute != VIDC_NSIDS) {
 +        pandora_apps_smmu_unlock();
++        vidc_smmu_drop();
 +        printf("PANDORA VIDC: only %u idle SMR slots for %u video SIDs\n", nroute,
 +            VIDC_NSIDS);
 +        return -1;
@@ -667,6 +682,7 @@ index 0000000..cb251f6
 +    }
 +    if (bank >= banks) {
 +        pandora_apps_smmu_unlock();
++        vidc_smmu_drop();
 +        printf("PANDORA VIDC: no free apps-smmu bank (%u banks, s2banks %u)\n",
 +            banks, s2banks);
 +        return -1;
@@ -675,6 +691,7 @@ index 0000000..cb251f6
 +    while (asid < 256 && asid_used[asid]) asid++;
 +    if (asid == 256) {
 +        pandora_apps_smmu_unlock();
++        vidc_smmu_drop();
 +        printf("PANDORA VIDC: no free ASID\n");
 +        return -1;
 +    }
@@ -683,6 +700,7 @@ index 0000000..cb251f6
 +    vm_offset_t tva = vidc_contig((uint64_t)VIDC_SMMU_TABLE_PAGES * 0x1000, &tpa);
 +    if (!tva) {
 +        pandora_apps_smmu_unlock();
++        vidc_smmu_drop();
 +        printf("PANDORA VIDC: no table pool\n");
 +        return -1;
 +    }
@@ -690,6 +708,7 @@ index 0000000..cb251f6
 +    const unsigned encoding = (id2 >> 4) & 15;
 +    if (encoding >= 6) {
 +        pandora_apps_smmu_unlock();
++        vidc_smmu_drop();
 +        printf("PANDORA VIDC: unencodable OAS field %u\n", encoding);
 +        return -1;
 +    }
@@ -697,6 +716,7 @@ index 0000000..cb251f6
 +    if ((vidc_qtable_pa + VIDC_QTABLE_ALLOC) >> oas ||
 +        (vidc_sfr_pa + VIDC_SFR_BYTES) >> oas) {
 +        pandora_apps_smmu_unlock();
++        vidc_smmu_drop();
 +        printf("PANDORA VIDC: buffers exceed the %u-bit output address space\n", oas);
 +        return -1;
 +    }
@@ -725,6 +745,7 @@ index 0000000..cb251f6
 +        VIDC_SMMU_TABLE_PAGES, &tres);
 +    if (st != ArmSmmu4KSuccess) {
 +        pandora_apps_smmu_unlock();
++        vidc_smmu_drop();
 +        printf("PANDORA VIDC: SMMU tables status %d\n", (int)st);
 +        return -1;
 +    }
@@ -734,11 +755,13 @@ index 0000000..cb251f6
 +    ArmSmmu4KIo io;
 +    if (ArmSmmu4KBindMmio(&mmio, &io) != ArmSmmu4KSuccess) {
 +        pandora_apps_smmu_unlock();
++        vidc_smmu_drop();
 +        printf("PANDORA VIDC: SMMU mmio bind failed\n");
 +        return -1;
 +    }
 +    if (ArmSmmu4KCheckFaultedStreams(&io, route, VIDC_NSIDS, bank, &sres) != ArmSmmu4KSuccess) {
 +        pandora_apps_smmu_unlock();
++        vidc_smmu_drop();
 +        printf("PANDORA VIDC: SMMU reports faulted streams before attach\n");
 +        return -1;
 +    }
@@ -749,6 +772,7 @@ index 0000000..cb251f6
 +    st = ArmSmmu4KProgramDisabledContext(&io, bank, &ctx, 1000, &prog);
 +    if (st != ArmSmmu4KSuccess) {
 +        pandora_apps_smmu_unlock();
++        vidc_smmu_drop();
 +        printf("PANDORA VIDC: SMMU context status %d (sctlr %08x)\n", (int)st,
 +            prog.readback.sctlr);
 +        return -1;
@@ -756,6 +780,7 @@ index 0000000..cb251f6
 +    if (ArmSmmu4KAttachStreams(&io, &sstate, route, VIDC_NSIDS, bank, &ctx, &sres) !=
 +        ArmSmmu4KSuccess) {
 +        pandora_apps_smmu_unlock();
++        vidc_smmu_drop();
 +        printf("PANDORA VIDC: SMMU stream attach failed\n");
 +        return -1;
 +    }
@@ -764,6 +789,7 @@ index 0000000..cb251f6
 +    uint32_t sctlr = vidc_smmu_rd(cb_off);
 +    vidc_smmu_wr(cb_off, sctlr & ~(1u << 6));
 +    pandora_apps_smmu_unlock();
++    vidc_smmu_drop();
 +
 +    vidc_qtable_iova = (uint32_t)VIDC_IOVA_BASE;
 +    vidc_sfr_iova = (uint32_t)VIDC_IOVA_SFR;
@@ -776,8 +802,6 @@ index 0000000..cb251f6
 +     * (`failed with 3 @vm_kern.c:178`), i.e. we were still holding ~5.5 MiB.
 +     * The bank/ASID/CB programming lives in the SMMU hardware, so the mapping
 +     * is dead weight the moment attach succeeds. */
-+    ml_io_unmap(vidc_smmu_va, (vm_size_t)VIDC_SMMU_SIZE);
-+    vidc_smmu_va = 0;
 +    printf("PANDORA VIDC: released %#x bytes of apps-smmu VA after attach\n",
 +        VIDC_SMMU_SIZE);
 +    printf("PANDORA VIDC: apps-smmu bank %u asid %u cb %#x sctlr %08x/%08x "
@@ -1142,8 +1166,6 @@ index 0000000..cb251f6
 +        ml_io_unmap(vidc_cc, (vm_size_t)VIDEOCC_SIZE);
 +        vidc_cc = 0;
 +    }
-+    printf("PANDORA VIDC: released gcc+videocc windows (%#x)\n",
-+        (unsigned)(GCC_SIZE + VIDEOCC_SIZE));
 +    vidc_snap("after power");
 +    /* A branch reading CLK_OFF=0 only means the *gate* is open; if its RCG has no
 +     * root enabled or no source selected, the core still gets no clock and never
@@ -1162,6 +1184,20 @@ index 0000000..cb251f6
 +            vidc_cc_rd(rcgs[i].off + 8), vidc_cc_rd(rcgs[i].off + 0xC),
 +            vidc_cc_rd(rcgs[i].off + 0x10));
 +    }
++    /* Every reader of the GCC/videocc windows has now run (snapshot + RCG
++     * dump), so hand them back before the long tail starts.  The ordering is
++     * load-bearing: releasing first made the snapshot print zeros and hid the
++     * RCG configuration -- the very evidence this driver exists to produce. */
++    if (vidc_gcc) {
++        ml_io_unmap(vidc_gcc, (vm_size_t)GCC_SIZE);
++        vidc_gcc = 0;
++    }
++    if (vidc_cc) {
++        ml_io_unmap(vidc_cc, (vm_size_t)VIDEOCC_SIZE);
++        vidc_cc = 0;
++    }
++    printf("PANDORA VIDC: released gcc+videocc windows (%#x)\n",
++        (unsigned)(GCC_SIZE + VIDEOCC_SIZE));
 +    return failed ? -1 : 0;
 +}
 +
