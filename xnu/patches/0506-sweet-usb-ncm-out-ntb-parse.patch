@@ -1,0 +1,65 @@
+From: CarPlay C0 lane (2026-11-21)
+Subject: 0506 sweet_usb: accept the host's NCM datagram layout, and log the first NTBs
+
+The 2026-11-21 14:25 boot (CI 44872390640, with 0505) finally made Windows group the
+CDC-NCM pair: one function node, adapter up, SET_INTERFACE alt 1, GET_NTB_PARAMETERS
+0x80 answered 28 bytes, MAC string read. The host then sent NTBs -- 12 of them,
+100/372/188/108 bytes -- and every one parsed to zero frames.
+
+The parser required the datagram index to be at least NCM_NTB_PAYLOAD_OFF (56), which
+is the offset OUR transmit builder uses. That is not a protocol requirement: a host
+may place datagrams immediately after its own NDP table, which is below 56. So the
+bound rejected exactly the traffic a real host sends. The bound becomes "after this
+NDP table", which every legal NTB satisfies.
+
+The first four received NTBs now print their NTH16/NDP16/DPE fields (capped static
+counter). If this is not the whole cause, those numbers are the next step instead of
+another guess.
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -801,6 +801,15 @@
+ 	}
+ 	uint32_t block = ud_get16(ntb + 8);
+ 	uint32_t ndp = ud_get16(ntb + 10);
++	/* 0506: the OUT NTB layout belongs to the host, so the first four headers are
++	 * logged verbatim.  A capped static counter keeps this to four lines a boot. */
++	static unsigned ntb_diag;
++	if (ntb_diag < 4) {
++		ntb_diag++;
++		printf("SWEET USB: ntb[%u] len %u sig %08x hdrlen %u seq %u block %u ndp %u\n",
++		    ntb_diag, len, ud_get32(ntb), ud_get16(ntb + 4), ud_get16(ntb + 6),
++		    block, ndp);
++	}
+ 	if (block > len) {
+ 		block = len;
+ 	}
+@@ -818,6 +827,12 @@
+ 	unsigned pairs = (nlen - NCM_NDP16_LEN) / NCM_DPE16_LEN;
+ 	if (pairs == 0) {
+ 		return 0;
++	}
++	if (ntb_diag <= 4 && pairs >= 2) {
++		printf("SWEET USB: ntb ndp sig %08x nlen %u next %u pairs %u dpe0 %u/%u dpe1 %u/%u\n",
++		    sig, nlen, ud_get16(ntb + ndp + 6), pairs,
++		    ud_get16(ntb + ndp + 8), ud_get16(ntb + ndp + 10),
++		    ud_get16(ntb + ndp + 12), ud_get16(ntb + ndp + 14));
+ 	}
+ 	unsigned usable = pairs - 1;    /* the last pair is the terminator */
+ 	for (unsigned i = 0; i < usable; i++) {
+@@ -831,7 +846,14 @@
+ 		if (dlen < ETHER_HDR_LEN || dlen > ETHER_MAX_LEN - ETHER_CRC_LEN) {
+ 			continue;
+ 		}
+-		if (index < NCM_NTB_PAYLOAD_OFF || index + dlen > block) {
++		/*
++		 * 0506: the datagrams of a received NTB start after THAT NDP table, which
++		 * is the host's choice -- not at NCM_NTB_PAYLOAD_OFF, which only describes
++		 * our own transmit layout.  With the old bound every datagram of a real
++		 * host was rejected: the 2026-11-21 boot logged 12 NTBs at 100/372/188/108
++		 * bytes and delivered 0 frames, because their first datagram sat below 56.
++		 */
++		if (index < ndp + nlen || index + dlen > block) {
+ 			continue;
+ 		}
+ 		if (ud_if_input(ntb + index, dlen)) {
