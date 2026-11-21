@@ -886,6 +886,12 @@ vidc_gdsc_on(const struct vidc_gdsc_desc *g)
     return -1;
 }
 
+static inline uint32_t
+vidc_cc_rd(uint32_t off)
+{
+    return *(volatile uint32_t *)(vidc_cc + off);
+}
+
 static void
 vidc_branch_on(uint32_t off)
 {
@@ -983,6 +989,23 @@ vidc_power_up(void)
     }
     printf("PANDORA VIDC: videocc powered (%d/5 GDSC failed), CORE_PWR=%08x CORE_CLK=%08x\n",
         failed, vidc_rd(R_WRAPPER_CORE_PWR), clk_cfg);
+    /* A branch reading CLK_OFF=0 only means the *gate* is open; if its RCG has no
+     * root enabled or no source selected, the core still gets no clock and never
+     * executes.  RCG2 layout is CFG_RCGR @+0, CMD_RCGR @+4, M/N/D @+8/+0xC/+0x10
+     * [K clock_regs.txt:202-290 __clk_rcg2_configure]; base offsets come from the
+     * captured videocc-canoe.ko objects.  Read-only: this decides "gated" vs
+     * "configured but core still idle" without another guess. */
+    static const struct { const char *name; uint32_t off; } rcgs[] = {
+        { "mvs0a", 0x8000u }, { "mvs0b", 0x8018u }, { "mvs0", 0x8030u },
+        { "mvs0c", 0x8048u }, { "ahb",   0x8060u },
+    };
+    for (unsigned i = 0; i < sizeof(rcgs) / sizeof(rcgs[0]); i++) {
+        printf("PANDORA VIDC: rcg %-5s cfg=%08x cmd=%08x m/n/d=%08x/%08x/%08x\n",
+            rcgs[i].name,
+            vidc_cc_rd(rcgs[i].off), vidc_cc_rd(rcgs[i].off + 4),
+            vidc_cc_rd(rcgs[i].off + 8), vidc_cc_rd(rcgs[i].off + 0xC),
+            vidc_cc_rd(rcgs[i].off + 0x10));
+    }
     return failed ? -1 : 0;
 }
 
