@@ -752,6 +752,16 @@ vidc_smmu_up(void)
     vidc_smmu_cb = cb_off;
     vidc_smmu_bank = bank;
     vidc_smmu_on = true;
+    /* Give the 1 MiB of apps-smmu VA back NOW, not at the end of the ladder.
+     * Measured: with the teardown only at the end, the kernel died at 5.177 s
+     * inside HFI polling on someone else's 864 KiB kmem_alloc
+     * (`failed with 3 @vm_kern.c:178`), i.e. we were still holding ~5.5 MiB.
+     * The bank/ASID/CB programming lives in the SMMU hardware, so the mapping
+     * is dead weight the moment attach succeeds. */
+    ml_io_unmap(vidc_smmu_va, (vm_size_t)VIDC_SMMU_SIZE);
+    vidc_smmu_va = 0;
+    printf("PANDORA VIDC: released %#x bytes of apps-smmu VA after attach\n",
+        VIDC_SMMU_SIZE);
     printf("PANDORA VIDC: apps-smmu bank %u asid %u cb %#x sctlr %08x/%08x "
            "tcr %08x ttbr0 %#llx pages %zu\n", bank, asid, cb_off, sctlr,
         prog.readback.sctlr, prog.readback.tcr, prog.readback.ttbr0,
@@ -976,6 +986,7 @@ vidc_snap(const char *when)
 static inline uint32_t
 vidc_cc_rd(uint32_t off)
 {
+    if (!vidc_cc) return 0;           /* videocc window released after power-up */
     return *(volatile uint32_t *)(vidc_cc + off);
 }
 
@@ -1101,6 +1112,20 @@ vidc_power_up(void)
     }
     printf("PANDORA VIDC: videocc powered (%d/5 GDSC failed), CORE_PWR=%08x CORE_CLK=%08x\n",
         failed, vidc_rd(R_WRAPPER_CORE_PWR), clk_cfg);
+    /* GCC only existed to open the two AXI branches and videocc only to run the
+     * GDSC/branch sequence; both are done by here.  Release them before the long
+     * tail (queues/pas/publish/HFI) so our peak does not overlap other drivers'
+     * allocations. */
+    if (vidc_gcc) {
+        ml_io_unmap(vidc_gcc, (vm_size_t)GCC_SIZE);
+        vidc_gcc = 0;
+    }
+    if (vidc_cc) {
+        ml_io_unmap(vidc_cc, (vm_size_t)VIDEOCC_SIZE);
+        vidc_cc = 0;
+    }
+    printf("PANDORA VIDC: released gcc+videocc windows (%#x)\n",
+        (unsigned)(GCC_SIZE + VIDEOCC_SIZE));
     vidc_snap("after power");
     /* A branch reading CLK_OFF=0 only means the *gate* is open; if its RCG has no
      * root enabled or no source selected, the core still gets no clock and never
