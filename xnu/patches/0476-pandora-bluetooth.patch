@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..367d0ad57fef43d8a3999263d1cc706e9ed448b2
+index 0000000..25a2b4b0970a0dbfca59f811648d6bd89368386e
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4496 @@
+@@ -0,0 +1,4549 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3856,6 +3856,13 @@ index 0000000..367d0ad57fef43d8a3999263d1cc706e9ed448b2
 +{
 +	static const uint8_t ack = 0xfc;
 +	unsigned dropped = 0;
++	/* The ROM also emits 0x34 vendor records: 34 00 ff <plen> <plen bytes>.
++	 * Their payload is arbitrary binary and routinely contains 0x04, which the
++	 * resync below would otherwise mistake for an HCI event header - that is how
++	 * a real Command Complete ended up being parsed as "event 04 8f status 242".
++	 * Skip the whole record by its declared length instead. */
++	unsigned vstate = 0;
++	unsigned vskip = 0;
 +	uint64_t deadline;
 +
 +	*got = 0;
@@ -3868,6 +3875,31 @@ index 0000000..367d0ad57fef43d8a3999263d1cc706e9ed448b2
 +			continue;
 +		}
 +		b = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++		if (vstate != 0u) {
++			if (vstate == 1u && b == 0x00u) {
++				vstate = 2u;
++			} else if (vstate == 2u && b == 0xffu) {
++				vstate = 3u;
++			} else if (vstate == 3u) {
++				vskip = b;
++				vstate = (vskip != 0u) ? 4u : 0u;
++			} else if (vstate == 4u) {
++				if (--vskip == 0u) {
++					vstate = 0u;
++				}
++			} else {
++				/* not the expected shape: give up on this record and
++				 * treat the byte as ordinary input */
++				vstate = 0u;
++				dropped++;
++				continue;
++			}
++			continue;
++		}
++		if (b == 0x34u && *got == 0u) {
++			vstate = 1u;
++			continue;
++		}
 +		if (*got == 0u) {
 +			if (b == 0xfdu) {
 +				printf("PANDORA BT: %s: wake 0xfd answered 0xfc\n", what);
@@ -3895,6 +3927,11 @@ index 0000000..367d0ad57fef43d8a3999263d1cc706e9ed448b2
 +		}
 +		ev[(*got)++] = b;
 +		if (*got >= 3u && *got >= 3u + ev[2]) {
++			if (dropped != 0u) {
++				printf("PANDORA BT: %s: %u byte(s) dropped before event %02x %02x\n",
++				    what, dropped, ev[0], ev[1]);
++				pandora_log_sync();
++			}
 +			return 0;
 +		}
 +		if (*got >= cap) {
@@ -4061,7 +4098,7 @@ index 0000000..367d0ad57fef43d8a3999263d1cc706e9ed448b2
 +				if (ev[0] == 0x04u && ev[1] == 0x0eu && got >= 8u &&
 +				    ev[2] == 0x05u && ev[3] == 0x01u &&
 +				    ev[4] == 0x00u && ev[5] == 0xfcu &&
-+				    ev[6] == 0x00u) {
++				    ev[6] == 0x00u && ev[7] == 0x1eu) {
 +					acked = true;
 +					last_sub = ev[7];
 +					ccs++;
@@ -4154,13 +4191,24 @@ index 0000000..367d0ad57fef43d8a3999263d1cc706e9ed448b2
 +	unsigned got = 0;
 +	unsigned wakes = 0;
 +
-+	if (bt_peri_cc_read(window_ms, ev, sizeof(ev), &got, &wakes, what) == 0) {
-+		printf("PANDORA BT: %s: bulk answer event %02x %02x len %u\n",
-+		    what, ev[0], got > 1u ? ev[1] : 0u, got > 2u ? ev[2] : 0u);
++	/* Drain what the ROM left, not just the first event: a single leftover
++	 * event would otherwise be consumed by the next VS command and the real
++	 * reply would stall phase C until its 8 tries are gone. */
++	unsigned n = 0;
++	while (n < 8u) {
++		if (bt_peri_cc_read(window_ms, ev, sizeof(ev), &got, &wakes, what) != 0) {
++			break;
++		}
++		n++;
++		printf("PANDORA BT: %s: bulk answer %u event %02x %02x len %u\n",
++		    what, n, ev[0], got > 1u ? ev[1] : 0u, got > 2u ? ev[2] : 0u);
 +		bt_dump_wide("PERI bulk answer", ev, got);
-+	} else {
++	}
++	if (n == 0u) {
 +		printf("PANDORA BT: %s: no bulk answer in %u ms (%u wake(s))\n",
 +		    what, window_ms, wakes);
++	} else {
++		printf("PANDORA BT: %s: %u bulk answer(s) drained\n", what, n);
 +	}
 +	pandora_log_sync();
 +}
@@ -4299,8 +4347,13 @@ index 0000000..367d0ad57fef43d8a3999263d1cc706e9ed448b2
 +	 * the ROM's diagnostic dump instead of the 12-byte ACK + sub-09 build
 +	 * info push. The only known state difference at TLV end time was that
 +	 * ActivateSS had never been sent, so replay the trace order here. */
-+	(void)bt_peri_getver_peri();
-+	(void)bt_peri_activate_ss();
++	/* Only level 20 replays the trace's ActivateSS position. A plain level-19
++	 * run must keep the exact wire sequence it was accepted with, so these two
++	 * frames stay out of that path. */
++	if (bt_level >= 20) {
++		(void)bt_peri_getver_peri();
++		(void)bt_peri_activate_ss();
++	}
 +	err = bt_peri_arbitrate();
 +	if (err) {
 +		return err;
