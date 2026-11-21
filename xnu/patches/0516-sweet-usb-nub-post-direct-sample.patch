@@ -1,0 +1,44 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0516 sweet_nub: sample again after the direct createUSBDevice call
+
+0512's sample runs five seconds after registerService, i.e. BEFORE 0513's direct fallback, so it
+cannot report what the fallback built. Three seconds after the direct call the probe now prints
+whether the controller became active, its retain count, and its IOService-plane children with
+class names. Those children are the IOUSBDeviceInterface objects createUSBDevice constructs; if
+they appear, S5 is answered on the device instead of being inferred from silence.
+
+Prepared while the phone was off-USB (2026-11-22 02:24 hang, other lane's boot). Dispatch is held
+until the S02/S3d/S3ibd boots show whether the configurator or the fallback path is the one that
+runs, so this only ships if it is actually needed.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -312,6 +312,28 @@
+ 				uint32_t ir = ((uint32_t (*)(IOService *, OSDictionary *))
+ 				    SWEET_NUB_CREATE_USBDEVICE)(ctl, desc);
+ 				printf("SWEET NUB: direct createUSBDevice -> 0x%08x\n", ir);
++				/*
++				 * 0516: the 5 s sample ran BEFORE this call, so it cannot show what the call
++				 * built. Sample again three seconds later: interfaces created by Apple's
++				 * createUSBDevice are children in the IOService plane, and a started controller
++				 * flips isInactive() to false.
++				 */
++				(void)tsleep(&sweet_nub_wait, PZERO, "sweetnub3", 3 * hz);
++				printf("SWEET NUB: after direct call: started %d, retain %d\n",
++				    ctl->isInactive() ? 0 : 1, ctl->getRetainCount());
++				auto made_it = ctl->getChildIterator(gIOServicePlane);
++				int made = 0;
++				if (made_it) {
++					while (OSObject *obj = made_it->getNextObject()) {
++						IOService *child = OSDynamicCast(IOService, obj);
++						if (child != NULL) {
++							printf("SWEET NUB: made[%d] %s\n", made,
++							    child->getMetaClass()->getClassName());
++						}
++						made++;
++					}
++				}
++				printf("SWEET NUB: after direct call: children %d\n", made);
+ 			} else {
+ 				printf("SWEET NUB: cannot allocate the description values\n");
+ 			}
