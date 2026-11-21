@@ -74,7 +74,8 @@ to the file that 0508 creates.
 +	 */
 +	if (vt == NULL || (uint64_t)vt < SWEET_NUB_KERNEL_BASE)
  		return false;
- 	if ((vt[SWEET_NUB_START_SLOT] & 0xfffffff000000000ULL) != SWEET_NUB_KERNEL_BASE)
+-	if ((vt[SWEET_NUB_START_SLOT] & 0xfffffff000000000ULL) != SWEET_NUB_KERNEL_BASE)
++	if (((uint64_t)vt[SWEET_NUB_START_SLOT] & 0xfffffff000000000ULL) != SWEET_NUB_KERNEL_BASE)
  		return false;
 -	for (unsigned i = 0; i < sizeof(sweet_nub_pure_slots) / sizeof(sweet_nub_pure_slots[0]); i++) {
 -		uint64_t target = vt[sweet_nub_pure_slots[i]];
