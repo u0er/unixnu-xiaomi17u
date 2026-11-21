@@ -1,0 +1,76 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0519 sweet_nub: construct the abstract controller instance ourselves
+
+The 0518 boot answered why S2 never passed: the explicit kext load works (three load -> 0x0
+lines, metaclass 0xfffffff006a9a708 found) but mc->alloc() returns NULL while getClassSize()
+reports 504. That is the IOKit abstract-class shape (OSDefineMetaClassAndAbstractStructors):
+MetaClass::alloc() is the base "return NULL", and the 18 __cxa_pure_virtual slots we censused
+are the same fact. The registry can therefore never hand us an IOUSBDeviceController.
+
+0519 prints control allocations (IOService, IOUSBDeviceConfigurator, IOUSBDeviceInterface,
+AppleSynopsysOTGDevice, AppleVirtIOUSBDeviceController) and then builds the instance the way
+alloc would have: OSObject::operator new (zeroed kheap memory) + install the class's published
+vtable + one retain. init() stays where it already is in the probe flow, after the vtable copy
+is patched, so a failure there is reported and skipped instead of patching a live object.
+
+Found on the device, not from a guess: 0518 S02 printed "alloc -> 0, classSize 504" at 10.194 s.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -181,6 +181,56 @@
+ 	IOService *ctl = (IOService *)mc->alloc();
+ 	printf("SWEET NUB: alloc -> %p, classSize %u, own class %s\n", ctl, mc->getClassSize(),
+ 	    ctl != NULL ? ctl->getMetaClass()->getClassName() : "-");
++	if (ctl == NULL) {
++		/*
++		 * 0519: on the 0518 boot this line was `alloc -> 0, classSize 504`. A registered class
++		 * whose alloc returns NULL while reporting a plausible instance size is the IOKit
++		 * abstract-class shape: OSDefineMetaClassAndAbstractStructors defines MetaClass::alloc()
++		 * as the base "return NULL" (OSObject::MetaClass::alloc), and the 18 __cxa_pure_virtual
++		 * vtable slots we censused are the other half of the same fact. So the base cannot be
++		 * allocated through the registry at all; the probe has to build the instance itself,
++		 * which is what it was always going to patch anyway.
++		 *
++		 * First print the control allocations: IOService must succeed, the two shipped concrete
++		 * subclasses say which provider classes this build actually has. Then construct the
++		 * base the way alloc would have: operator new (zeroed, kheap) + install the class's
++		 * published vtable + one retain for the probe's own owner count. init() stays where it
++		 * is in the normal flow (after the vtable copy is patched).
++		 */
++		static const char *probe_classes[] = {
++			"IOService",
++			"IOUSBDeviceController",
++			"IOUSBDeviceConfigurator",
++			"IOUSBDeviceInterface",
++			"AppleSynopsysOTGDevice",
++			"AppleVirtIOUSBDeviceController",
++		};
++		for (unsigned i = 0; i < sizeof(probe_classes) / sizeof(probe_classes[0]); i++) {
++			const OSSymbol *sym = OSSymbol::withCStringNoCopy(probe_classes[i]);
++			const OSMetaClass *m = sym != NULL ? OSMetaClass::getMetaClassWithName(sym) : NULL;
++			OSObject *o = m != NULL ? m->alloc() : NULL;
++			printf("SWEET NUB: probe-alloc %s: meta %p size %u -> %p%s%s\n",
++			    probe_classes[i], m, m != NULL ? m->getClassSize() : 0, o,
++			    o != NULL ? " class " : "",
++			    o != NULL ? o->getMetaClass()->getClassName() : "");
++			if (o != NULL) {
++				o->release();
++			}
++		}
++		{
++			size_t size = (size_t)mc->getClassSize();
++			void *mem = OSObject::operator new(size);
++			printf("SWEET NUB: manual construction of %s: %u bytes at %p\n", SWEET_NUB_CLASS,
++			    (unsigned)size, mem);
++			if (mem != NULL) {
++				*(void ***)mem = (void **)SWEET_NUB_CTL_VTABLE;
++				ctl = (IOService *)mem;
++				ctl->retain();
++				printf("SWEET NUB: manual -> %p, own class %s\n", ctl,
++				    ctl->getMetaClass()->getClassName());
++			}
++		}
++	}
+ 	if (ctl == NULL) {
+ 		return;
+ 	}
