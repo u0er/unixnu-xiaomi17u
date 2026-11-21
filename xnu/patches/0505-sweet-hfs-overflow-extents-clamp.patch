@@ -1,0 +1,123 @@
+From: usb/afc + IPA/sideload lane (2026-11-21)
+Subject: 0505 sweet_hfs: do not clamp a fork whose tail lives in the extents overflow tree
+
+The catalog reader validates a file fork by summing only the eight resident
+extents, then, if that sum is shorter than the record's totalBlocks and the
+eighth slot is empty, it marks the volume inconsistent and clamps totalBlocks
+in memory (hfs_catalog.c, "Adjust for any missing blocks").  A fork whose tail
+is in the extents overflow tree is perfectly consistent but matches that
+condition, so every append-heavy log or trace file gets reported as runtime
+corruption on every read and silently shortened.
+
+Evidence on the repaired 128-GiB volume (2026-11-21): one 180-second boot
+produced 13,405 "hfs_mark_inconsistent: Runtime corruption detected on iOSRoot"
+messages while a post-boot allocation audit found zero overlap and zero
+referenced-but-free blocks.  Two files (cnid 321405 logdata.statistics.0.txt,
+cnid 1242857 ...tracev3) also had totalBlocks that did not match their extent
+tree until salvaged by hand.
+
+Fix: ask the extents overflow tree whether the continuation exists before
+declaring corruption.  The predicate returns the conservative 0 (keep the old
+clamp) when the extents B-tree is not loaded yet, so the early-mount path is
+unchanged.  FindExtentRecord now also fails instead of dereferencing a NULL
+iterator, because this read path can run under memory pressure.
+
+Regression (next CI kernel + one bounded 180 s boot):
+  * block_count_anomalies must stay 0 for files that grow during the boot;
+  * hfs_mark_inconsistent must stay 0;
+  * the 180 s timer must still return the phone to Android.
+
+Signed-off-by: usb/afc + sideload lane
+---
+--- a/bsd/sweet_hfs/core/FileExtentMapping.c
++++ b/bsd/sweet_hfs/core/FileExtentMapping.c
+@@ -218,6 +218,11 @@
+ 	fcb = GetFileControlBlock(vcb->extentsRefNum);
+ 
+ 	btIterator = hfs_malloc_type(struct BTreeIterator);
++	/* 0505: callers now include the catalog read path; fail rather than
++	 * dereference a NULL iterator under memory pressure. */
++	if (btIterator == NULL) {
++		return memFullErr;
++	}
+ 
+ 	/* HFS Plus / HFSX */
+ 	if (vcb->vcbSigWord != kHFSSigWord) {
+@@ -1978,3 +1983,34 @@
+ 	return TRUE;
+ }
+ 
++
++/*
++ * 0505: exported predicate for the catalog reader.  A resident extent record
++ * holds at most eight extents; a fork whose tail lives in the extents overflow
++ * tree is consistent, not corrupt.  The catalog reader must ask that tree
++ * before it clamps totalBlocks and marks the volume inconsistent.
++ *
++ * Returns 0 (the conservative answer, which keeps the historical clamp) when
++ * the extents B-tree is not loaded yet or cannot be searched.
++ */
++int
++hfs_fork_has_overflow_extents(struct hfsmount *hfsmp, u_int8_t forkType,
++                              u_int32_t fileID, u_int32_t startBlock)
++{
++	HFSPlusExtentKey	foundKey;
++	HFSPlusExtentRecord	foundData;
++
++	if (hfsmp == NULL || hfsmp->extentsRefNum <= 0) {
++		return 0;
++	}
++	bzero(&foundKey, sizeof(foundKey));
++	bzero(&foundData, sizeof(foundData));
++	if (FindExtentRecord((const ExtendedVCB *)hfsmp, forkType, fileID,
++	                     startBlock, FALSE, &foundKey,
++	                     foundData, NULL) != noErr) {
++		return 0;
++	}
++	return (foundKey.fileID == fileID &&
++	        foundKey.forkType == forkType &&
++	        foundKey.startBlock == startBlock) ? 1 : 0;
++}
+--- a/bsd/sweet_hfs/core/hfs_catalog.h
++++ b/bsd/sweet_hfs/core/hfs_catalog.h
+@@ -504,6 +504,16 @@
+ 			      struct cat_attr *attrp, 
+ 			      struct cat_fork *rsrcforkp);
+ 
++/*
++ * 0505: Does the extents overflow tree hold a record for this fork starting at
++ * startBlock?  The catalog reader uses this so a fork whose tail lives outside
++ * the eight resident extents is not mistaken for a corrupt one.
++ */
++struct hfsmount;
++extern int hfs_fork_has_overflow_extents(struct hfsmount *hfsmp,
++                                         u_int8_t forkType, u_int32_t fileID,
++                                         u_int32_t startBlock);
++
+ #endif /* __APPLE_API_PRIVATE */
+ #endif /* KERNEL */
+ #endif /* __HFS_CATALOG__ */
+--- a/bsd/sweet_hfs/core/hfs_catalog.c
++++ b/bsd/sweet_hfs/core/hfs_catalog.c
+@@ -942,8 +942,19 @@
+ 					validblks += forkp->cf_extents[i].blockCount;
+ 				}
+ 			}
+-			/* Adjust for any missing blocks. */
+-			if ((validblks < forkp->cf_blocks) && (forkp->cf_extents[7].blockCount == 0)) {
++			/*
++			 * Adjust for any missing blocks.
++			 *
++			 * 0505: the resident record only holds eight extents.  A fork
++			 * whose tail lives in the extents overflow tree is consistent,
++			 * not corrupt; ask that tree before clamping totalBlocks or
++			 * marking the volume inconsistent.  Without this check every
++			 * append-heavy log or trace file with an empty eighth slot is
++			 * reported as runtime corruption on every read and silently
++			 * shortened in memory.
++			 */
++			if ((validblks < forkp->cf_blocks) && (forkp->cf_extents[7].blockCount == 0) &&
++			    !hfs_fork_has_overflow_extents(HFSTOVCB(hfsmp), kHFSDataForkType, cnid, validblks)) {
+ 				off_t psize;
+ 
+ 				/* 
