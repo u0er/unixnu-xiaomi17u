@@ -1,0 +1,210 @@
+From: baseband lane
+Subject: 0510 pandora_pas/mpss: probe the DTB's PAS id in one boot (INIT_IMAGE only)
+
+The first hardware run of the DTB stage (kernel 0509) reached TrustZone and came back
+
+  PANDORA PAS: pas 38 init_image (4044 bytes) -> a0 0xffcfffbb (-3145797) a1 0
+
+with the board still reaching the desktop.  Nothing panics any more; the metadata blob's shape was
+checked field by field against qcom_mdt_read_metadata() and agrees.  What is left is the pas id:
+canoe's device tree carries qcom,pas-id for every other processor (trustedvm 0x1c, oemvm 0x22,
+hfi-core 0x3f, cvp 0x1a, ipa_fws 0x0f, icp 0x21/0x32) but NOT for the modem, so the 4 / 0x26 this
+port uses came from a decoded resource blob.
+
+`pandora_mpss_pas_probe=1` makes step 4 try INIT_IMAGE once per candidate id and print
+ACCEPTED/refused for each, so one bounded boot maps the space instead of one window per guess.
+It calls a new `pandora_pas_init_only()` rather than the full loader on purpose: since 0507 the
+carveout mapping is never released, and a probe that went through the full path would pile up one
+permanent mapping per candidate.
+
+Also: the arginfo is printed, and pandora_pas.c records why it is `2 | (2 << 6)` -- upstream's
+QCOM_SCM_ARGS_IMPL packs TWO-bit fields from bit 4 (drivers/firmware/qcom/qcom_scm.h), so
+QCOM_SCM_ARGS(2, VAL, RW) is 0x82.  An intermediate review mis-read the stride as six bits and
+moved the type to bit 12; that was reverted before it ever booted, and the comment now says so.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 551b46b..2eeac6d 100644
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -775,9 +775,40 @@ step_mailbox(void)
+ 
+ /* ---- step 4: the modem's DTB image (pas 38) ------------------------------------------- */
+ 
++/*
++ * A probe, for one boot: try INIT_IMAGE for a list of candidate PAS ids with the same metadata
++ * blob and print what TrustZone answers for each.
++ *
++ * Why: the first hardware run of the DTB stage came back a0 0xffcfffbb (-3145797), and canoe's
++ * device tree carries a qcom,pas-id for every other processor but NOT for the modem, so the id
++ * this port uses was decoded from a resource blob rather than read from the DT.  Rather than burn
++ * one window per guess, this maps the whole candidate space in a single bounded boot.
++ * Enabled only by pandora_mpss_pas_probe=1; it is not part of the bring-up.
++ */
++int pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64_t *answer);
++
++static void
++mp_probe_pas_ids(void)
++{
++	static const unsigned ids[] = {4, 0x26, 0x18, 0x1c, 0x22, 0x0f, 0x21, 0x3f, 0};
++	if (!mp_option("pandora_mpss_pas_probe")) {
++		return;
++	}
++	printf("PANDORA MPSS: probing INIT_IMAGE for %u candidate PAS ids with the DTB's metadata\n",
++	    (unsigned)(sizeof(ids) / sizeof(ids[0])));
++	for (unsigned i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
++		uint64_t answer = 0;
++		if (pandora_pas_init_only(MP_FW_PART, "modem_dtb", ids[i], &answer) == 0) {
++			printf("PANDORA MPSS: probe pas %u -> %s (a0 %#llx)\n", ids[i],
++			    answer ? "refused" : "ACCEPTED", answer);
++		}
++	}
++}
++
+ static bool
+ step_dtb(void)
+ {
++	mp_probe_pas_ids();
+ 	if (pandora_pas_load(MP_FW_PART, "modem_dtb", MP_PAS_DTB, MP_DTB_PA, MP_DTB_SIZE)) {
+ 		printf("PANDORA MPSS: modem_dtb.mdt did not load\n");
+ 		return false;
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index 00b9c47..e55b7d9 100644
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -195,9 +195,23 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 	}
+ 	flush_dcache64((addr64_t)md_pa, (unsigned)md_size, TRUE);
+ 	uint64_t a0 = 0, a1 = 0;
+-	pandora_scm_call(SCM_PAS_INIT_IMAGE, SCM_ARGS(2) | (SCM_RW << 6), pas, md_pa, &a0, &a1);
+-	printf("PANDORA PAS: pas %u init_image (%u bytes) -> a0 %#llx (%d) a1 %#llx\n", pas,
+-	    ehdr_size + hash_size, a0, (int)(int32_t)a0, a1);
++	/*
++	 * arginfo = QCOM_SCM_ARGS(2, QCOM_SCM_VAL, QCOM_SCM_RW), and upstream packs it as
++	 *   (((a) & 0x3) << 4) | (((b) & 0x3) << 6) | ... | (num & 0xf)
++	 * (drivers/firmware/qcom/qcom_scm.h, QCOM_SCM_ARGS_IMPL) -- two-bit fields, argument 0 at
++	 * bit 4, argument 1 at bit 6.  With a = VAL(0) and b = RW(2) that is exactly
++	 * `2 | (2 << 6)` = 0x82, which is what this port had and what HakiOS's
++	 * SCM_VALUE_AND_BUFFER is.  (An intermediate review mis-read the field stride as six bits
++	 * and moved it to bit 12; that is wrong and was reverted before it ever booted.)
++	 *
++	 * The blob address and the arginfo are printed because the first hardware run of this call
++	 * (2026-11-21) came back a0 0xffcfffbb (-3145797), and the next log has to show exactly
++	 * what was sent.
++	 */
++	uint64_t arginfo = SCM_ARGS(2) | (SCM_RW << 6);
++	pandora_scm_call(SCM_PAS_INIT_IMAGE, arginfo, pas, md_pa, &a0, &a1);
++	printf("PANDORA PAS: pas %u init_image (%u bytes, arginfo %#llx, blob %#llx) -> a0 %#llx (%d) a1 %#llx\n",
++	    pas, ehdr_size + hash_size, arginfo, md_pa, a0, (int)(int32_t)a0, a1);
+ 	if (a0 || a1) {
+ 		kmem_free(kernel_map, md, (vm_size_t)md_size);
+ 		err = EIO;
+@@ -265,6 +279,109 @@ out:
+ 	return err;
+ }
+ 
++/*
++ * Metadata + INIT_IMAGE only, for one PAS id, and nothing else.
++ *
++ * The bring-up path (pandora_pas_load) also maps the carveout and copies the segments in; a probe
++ * must not, because since patch 0507 the carveout mapping is deliberately never released, so a
++ * probe that went through the full path would pile up one permanent mapping per candidate id.
++ * Returns TrustZone's answer in *answer and 0 when the call was made at all.
++ */
++int
++pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64_t *answer);
++
++int
++pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64_t *answer)
++{
++	char name[PAS_FW_NAME];
++	struct pandora_fw *mdt = NULL;
++	uint64_t mdt_size = 0;
++	int err;
++
++	if (answer) {
++		*answer = 0;
++	}
++	if (strchr(base, '.')) {
++		strlcpy(name, base, sizeof(name));
++	} else {
++		snprintf(name, sizeof(name), "%s.mdt", base);
++	}
++	err = pandora_fw_open(prefix, name, &mdt, &mdt_size);
++	if (err || mdt_size < 52 || mdt_size > PAS_MDT_MAX) {
++		printf("PANDORA PAS: probe: %s missing in %s (%d)\n", name, prefix, err);
++		if (!err) {
++			pandora_fw_close(mdt);
++		}
++		return err ? err : ENOENT;
++	}
++	uint8_t *hdr = (uint8_t *)kalloc_data(PAS_MDT_MAX, Z_WAITOK);
++	if (!hdr) {
++		pandora_fw_close(mdt);
++		return ENOMEM;
++	}
++	err = pandora_fw_file_read(mdt, 0, hdr, mdt_size);
++	if (err) {
++		goto out;
++	}
++	uint32_t phoff;
++	uint32_t phnum;
++	memcpy(&phoff, hdr + 28, 4);
++	phnum = (uint32_t)(hdr[44] | (hdr[45] << 8));
++	if (memcmp(hdr, "\177ELF", 4) || hdr[4] != 1 || phnum < 2 || phnum > PAS_MAX_SEGMENTS ||
++	    (uint64_t)phoff + (uint64_t)phnum * sizeof(struct elf32_phdr) > mdt_size) {
++		err = EINVAL;
++		goto out;
++	}
++	const struct elf32_phdr *ph = (const struct elf32_phdr *)(hdr + phoff);
++	unsigned hash = 0;
++	for (unsigned i = 1; i < phnum; i++) {
++		if ((ph[i].p_flags & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
++			hash = i;
++			break;
++		}
++	}
++	if (!hash || ph[0].p_type == 1) {
++		err = EINVAL;
++		goto out;
++	}
++	uint32_t ehdr_size = ph[0].p_filesz;
++	uint32_t hash_size = ph[hash].p_filesz;
++	uint64_t md_size = ((uint64_t)ehdr_size + hash_size + 0xfff) & ~0xfffull;
++	vm_offset_t md = 0;
++	if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		err = ENOMEM;
++		goto out;
++	}
++	uint64_t md_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)md));
++	memcpy((void *)md, hdr, ehdr_size);
++	if (ehdr_size + hash_size == mdt_size) {
++		memcpy((void *)(md + ehdr_size), hdr + ehdr_size, hash_size);
++	} else if ((uint64_t)ph[hash].p_offset + hash_size <= mdt_size) {
++		memcpy((void *)(md + ehdr_size), hdr + ph[hash].p_offset, hash_size);
++	} else {
++		err = mdt_segment(prefix, base, mdt, &ph[hash], hash, (void *)(md + ehdr_size));
++		if (err) {
++			kmem_free(kernel_map, md, (vm_size_t)md_size);
++			goto out;
++		}
++	}
++	flush_dcache64((addr64_t)md_pa, (unsigned)md_size, TRUE);
++	uint64_t a0 = 0, a1 = 0, arginfo = SCM_ARGS(2) | (SCM_RW << 6);
++	pandora_scm_call(SCM_PAS_INIT_IMAGE, arginfo, pas, md_pa, &a0, &a1);
++	kmem_free(kernel_map, md, (vm_size_t)md_size);
++	if (answer) {
++		*answer = a0;
++	}
++	printf("PANDORA PAS: probe pas %u init_image -> a0 %#llx (%d) a1 %#llx\n", pas, a0,
++	    (int)(int32_t)a0, a1);
++	err = 0;
++out:
++	kfree_data(hdr, PAS_MDT_MAX);
++	pandora_fw_close(mdt);
++	return err;
++}
++
+ /* PAS_AUTH_AND_RESET: lets the processor out of reset. */
+ int
+ pandora_pas_auth(unsigned pas)
