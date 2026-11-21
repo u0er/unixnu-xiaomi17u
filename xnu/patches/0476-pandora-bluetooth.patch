@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..2110e1716d41d49bb5e459ebe09da4c97df95be2
+index 0000000..b18e4ad1700415f197fcbd4a8a51fea0d0572422
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4627 @@
+@@ -0,0 +1,4642 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -1997,6 +1997,24 @@ index 0000000..2110e1716d41d49bb5e459ebe09da4c97df95be2
 +	}
 +}
 +
++/* Level 20.27: an abort is asynchronous. The old failure paths wrote
++ * GENI_CMD_ABORT, cleared the IRQ and returned immediately, so the sequencer
++ * could still be finishing the frame while the next stage began writing - a
++ * half frame on the wire shifts every later frame boundary. Wait (bounded) for
++ * M_ACTIVE to drop, then drop whatever is left in the TX FIFO. */
++static void
++bt_tx_abort_settle(void)
++{
++	bt_wr(BT_W_SE, SE_M_CMD_CTRL, GENI_CMD_ABORT);
++	for (unsigned waited = 0; waited < 50u; waited++) {
++		if (!(bt_rd(BT_W_SE, SE_STATUS) & GENI_STATUS_M_ACTIVE)) {
++			break;
++		}
++		delay(1);
++	}
++	bt_wr(BT_W_SE, SE_M_IRQ_CLR, 0xffffffffu);
++}
++
 +/* Level 20.23: the map stages send 1,715 frames back to back. Logging one line
 + * per frame is not free - every printf goes through the kernel log path, and
 + * the ROM is waiting on the wire while it happens. Android's HAL logs nothing
@@ -2043,8 +2061,7 @@ index 0000000..2110e1716d41d49bb5e459ebe09da4c97df95be2
 +	if (!(bt_rd(BT_W_SE, SE_M_IRQ) & M_TX_WM)) {
 +		printf("PANDORA BT: %s: TX FIFO never opened (irq %#x)\n", what,
 +		    bt_rd(BT_W_SE, SE_M_IRQ));
-+		bt_wr(BT_W_SE, SE_M_CMD_CTRL, GENI_CMD_ABORT);
-+		bt_wr(BT_W_SE, SE_M_IRQ_CLR, 0xffffffffu);
++		bt_tx_abort_settle();
 +		return ETIMEDOUT;
 +	}
 +	while (written < len) {
@@ -2061,8 +2078,7 @@ index 0000000..2110e1716d41d49bb5e459ebe09da4c97df95be2
 +			if (!(bt_rd(BT_W_SE, SE_M_IRQ) & M_TX_WM)) {
 +				printf("PANDORA BT: %s: watermark lost at %u/%u bytes (irq %#x)\n",
 +				    what, written, len, bt_rd(BT_W_SE, SE_M_IRQ));
-+				bt_wr(BT_W_SE, SE_M_CMD_CTRL, GENI_CMD_ABORT);
-+				bt_wr(BT_W_SE, SE_M_IRQ_CLR, 0xffffffffu);
++				bt_tx_abort_settle();
 +				return ETIMEDOUT;
 +			}
 +		}
@@ -2075,8 +2091,7 @@ index 0000000..2110e1716d41d49bb5e459ebe09da4c97df95be2
 +	if (!(bt_rd(BT_W_SE, SE_M_IRQ) & M_CMD_DONE)) {
 +		printf("PANDORA BT: %s: command not done (irq %#x status %#x)\n", what,
 +		    bt_rd(BT_W_SE, SE_M_IRQ), bt_rd(BT_W_SE, SE_STATUS));
-+		bt_wr(BT_W_SE, SE_M_CMD_CTRL, GENI_CMD_ABORT);
-+		bt_wr(BT_W_SE, SE_M_IRQ_CLR, 0xffffffffu);
++		bt_tx_abort_settle();
 +		return ETIMEDOUT;
 +	}
 +	bt_wr(BT_W_SE, SE_M_IRQ_CLR, M_CMD_DONE);
