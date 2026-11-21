@@ -1,0 +1,59 @@
+From: baseband lane
+Subject: 0522 pandora_mpss: optionally shut the peripheral down before the first INIT_IMAGE
+
+The ladder shuts the modem down at step 5, which is AFTER step 4 has already made its first
+INIT_IMAGE call.  But the modem is whatever the previous boot left it when this kernel starts:
+Android boots the modem on every start, and a warm reset does not necessarily leave it in reset.
+
+If the secure world requires a peripheral to be in reset before it accepts a fresh image, then every
+INIT_IMAGE from this ladder would be refused regardless of how correct the id, the metadata, the
+bridge and the DSM assignment are -- and every one of those has now been checked against upstream or
+against the firmware bytes.
+
+pandora_mpss_shutdown_first=1 now issues PAS_SHUTDOWN for the main id and the DTB id at the top of
+step 4, before anything else.  PAS_SHUTDOWN on an id that is not running is harmless.
+
+Off by default, so it can be crossed with the other experiments in one diagnostic boot:
+
+    pandora_mpss_step=4 pandora_mpss_shutdown_first=1 pandora_mpss_assign=1
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index a269ff3..53eb080 100755
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -935,9 +935,35 @@ mp_probe_cross(void)
+ 	}
+ }
+ 
++/*
++ * Put the peripheral back into reset before asking TrustZone anything.
++ *
++ * The ladder shuts the modem down at step 5, i.e. AFTER step 4's first INIT_IMAGE.  But when this
++ * kernel starts, the modem is whatever the previous boot left it: Android boots the modem on every
++ * start, and a warm reset does not necessarily clear it.  If the secure world insists that a
++ * peripheral be in reset before it will accept a fresh image, every INIT_IMAGE from here would be
++ * refused no matter how correct the metadata or the bridge is.
++ *
++ * Off by default; pandora_mpss_shutdown_first=1 enables it.  PAS_SHUTDOWN on an id that is not
++ * running is harmless (it answers something other than 0 and nothing else changes).
++ */
++static void
++mp_shutdown_first(void)
++{
++	static const unsigned ids[] = { MP_PAS, MP_PAS_DTB };
++
++	if (!mp_option("pandora_mpss_shutdown_first")) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
++		(void)pandora_pas_shutdown(ids[i]);
++	}
++}
++
+ static bool
+ step_dtb(void)
+ {
++	mp_shutdown_first();
+ 	mp_probe_pas_ids();
+ 	mp_probe_cross();
+ 	if (!mp_assign_dsm()) {
