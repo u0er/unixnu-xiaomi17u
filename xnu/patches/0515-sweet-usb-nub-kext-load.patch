@@ -1,0 +1,56 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0515 sweet_nub: load the device stack, because its classes are not registered yet
+
+The 2026-11-22 01:55 boot (image build/carplay-0511/composite, kernel 0511) settled the S2
+question with a number instead of a theory:
+
+  [    0.192] SWEET NUB: probe deferred by 10 s
+  [   10.190] SWEET NUB: IOUSBDeviceController metaclass 0
+  [   10.190] SWEET NUB: class not registered yet; S2 skipped
+
+C0 itself passed on that boot (C0a/C0b/C0c/C0d, twelve NTBs each parsed to >0 frames), so the
+kernel, the gadget and the parser are fine. What fails is kext instantiation: the boot KC parser
+creates OSKext objects for the prelinked kexts, but their start routines -- the code that actually
+registers the OSMetaClasses -- run only when the kext is loaded. Nothing asks for
+IOUSBDeviceFamily before a controller exists, and the personality we need is in that same kext, so
+the wait can never resolve itself.
+
+0515 calls OSKext::loadKextWithIdentifier() for IOUSBDeviceFamily, AppleUSBDeviceMux and
+AppleUSBDeviceNCM before the lookup, logging each OSReturn. Only then can the metaclass exist and
+the vtable/start path be exercised.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -26,6 +26,7 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <libkern/c++/OSArray.h>
+ #include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSKext.h>
+ #include <libkern/c++/OSMetaClass.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSString.h>
+@@ -152,6 +153,24 @@
+ 		printf("SWEET NUB: cannot intern the class name\n");
+ 		return;
+ 	}
++	/*
++	 * 0515: the first real boot proved the classes are not registered at T+10 s
++	 * ("SWEET NUB: IOUSBDeviceController metaclass 0" at 10.190 s). Prelinked kexts are only
++	 * *instantiated* by the boot KC parser; their start routines -- which is what registers the
++	 * OSMetaClasses -- run when the kext is loaded. Nothing in a stock system asks for
++	 * IOUSBDeviceFamily until a USB device controller exists, and the personality we rely on lives
++	 * in that same kext, so waiting can never resolve itself. Load the device stack explicitly.
++	 */
++	static const char *device_stack[] = {
++		"com.apple.iokit.IOUSBDeviceFamily",
++		"com.apple.driver.AppleUSBDeviceMux",
++		"com.apple.driver.AppleUSBDeviceNCM",
++	};
++	for (unsigned i = 0; i < sizeof(device_stack) / sizeof(device_stack[0]); i++) {
++		OSReturn loaded = OSKext::loadKextWithIdentifier(device_stack[i]);
++		printf("SWEET NUB: load %s -> 0x%x\n", device_stack[i], loaded);
++	}
++
+ 	const OSMetaClass *mc = OSMetaClass::getMetaClassWithName(name);
+ 	printf("SWEET NUB: %s metaclass %p\n", SWEET_NUB_CLASS, mc);
+ 	if (mc == NULL) {
