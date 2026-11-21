@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..ccd489df203f6564fdbeca19d746f6f1a578fe45
+index 0000000..3e5dbe16c98f267f9dddfa9672c228a502eaeb7b
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4732 @@
+@@ -0,0 +1,4724 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4101,7 +4101,7 @@ index 0000000..ccd489df203f6564fdbeca19d746f6f1a578fe45
 +	static const uint8_t want[8] = { 0x04, 0x0e, 0x05, 0x01, 0x00, 0xfc, 0x00, 0x1e };
 +	uint8_t win[8] = {0};
 +	unsigned filled = 0;
-+	unsigned dropped = 0;
++	uint64_t total = 0;      /* every byte read, for an exact drop count */
 +	uint64_t deadline;
 +
 +	clock_interval_to_deadline(window_ms, NSEC_PER_MSEC, &deadline);
@@ -4119,6 +4119,7 @@ index 0000000..ccd489df203f6564fdbeca19d746f6f1a578fe45
 +			(void)bt_uart_tx(&ack, 1, "PERI CC8 wake ACK FC");
 +			continue;
 +		}
++		total++;
 +		if (filled < sizeof(win)) {
 +			win[filled++] = b;
 +		} else {
@@ -4134,18 +4135,18 @@ index 0000000..ccd489df203f6564fdbeca19d746f6f1a578fe45
 +			for (unsigned i = 0; i < sizeof(win); i++) {
 +				ev[i] = win[i];
 +			}
-+			if (dropped != 0u) {
-+				printf("PANDORA BT: %s: %u byte(s) before the Command Complete\n",
-+				    what, dropped);
++			if (total > sizeof(win)) {
++				/* exact: everything read minus the eight that matched */
++				printf("PANDORA BT: %s: %llu byte(s) before the Command Complete\n",
++				    what, (unsigned long long)(total - sizeof(win)));
 +				pandora_log_sync();
 +			}
 +			return 0;
 +		}
-+		dropped++;
 +	}
-+	if (dropped != 0u) {
-+		printf("PANDORA BT: %s: window closed after %u byte(s) without a CC\n",
-+		    what, dropped);
++	if (total != 0u) {
++		printf("PANDORA BT: %s: window closed after %llu byte(s) without a CC\n",
++		    what, (unsigned long long)total);
 +		pandora_log_sync();
 +	}
 +	return ETIMEDOUT;
@@ -4230,34 +4231,25 @@ index 0000000..ccd489df203f6564fdbeca19d746f6f1a578fe45
 +			 * at 40 ms caps the stage at 9.1 s in the worst case. */
 +			while (!acked && tries < 4u) {
 +				tries++;
-+				got = 0;
++				/* bt_peri_wait_cc8() returns only when the exact 8-byte
++				 * Command Complete has been matched, so there is nothing left
++				 * to validate here - and nothing that can fail. An earlier
++				 * revision kept the old got>=8 && ev[2]==5 checks after the
++				 * switch to the matcher, but `got` is never advanced by it:
++				 * those tests were permanently false and phase C would have
++				 * failed on every frame even with a perfect ack. */
 +				err = bt_peri_wait_cc8(40u, ev, what);
 +				if (err) {
 +					bt_tx_long_quiet = false;
-+					printf("PANDORA BT: %s: frame %u/%u got no Command Complete (error %d, %u byte(s))\n",
-+					    what, seg, nseg, err, got);
++					printf("PANDORA BT: %s: frame %u/%u got no Command Complete (error %d)\n",
++					    what, seg, nseg, err);
 +					pandora_log_sync();
 +					return err;
 +				}
-+				if (ev[0] == 0x04u && ev[1] == 0x0eu && got >= 8u &&
-+				    ev[2] == 0x05u && ev[3] == 0x01u &&
-+				    ev[4] == 0x00u && ev[5] == 0xfcu &&
-+				    ev[6] == 0x00u && ev[7] == 0x1eu) {
-+					acked = true;
-+					last_sub = ev[7];
-+					ccs++;
-+					continue;
-+				}
-+				if (ev[0] == 0x04u && ev[1] == 0x0eu && got >= 7u) {
-+					printf("PANDORA BT: %s: frame %u/%u late event %02x %02x len %u status %u sub %02x (skipped)\n",
-+					    what, seg, nseg, ev[0], ev[1], ev[2],
-+					    ev[6], got >= 8u ? ev[7] : 0x00u);
-+				} else {
-+					printf("PANDORA BT: %s: frame %u/%u unexpected event %02x %02x (%u byte(s), skipped)\n",
-+					    what, seg, nseg, ev[0], ev[1], got);
-+					bt_dump("PERI HCI unexpected event", ev, got);
-+				}
-+				pandora_log_sync();
++				acked = true;
++				last_sub = ev[7];
++				ccs++;
++				continue;
 +			}
 +			if (!acked) {
 +				bt_tx_long_quiet = false;
