@@ -38,10 +38,10 @@ index fe06655..3849ade 100644
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/libkern/c++/sweet_nub.cpp b/libkern/c++/sweet_nub.cpp
 new file mode 100644
-index 0000000..b9b9229
+index 0000000..8f4ed1d
 --- /dev/null
 +++ b/libkern/c++/sweet_nub.cpp
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,150 @@
 +/*
 + * 0508 CarPlay C1: controller-nub probe / first instantiation.
 + *
@@ -88,6 +88,8 @@ index 0000000..b9b9229
 +
 +static void *sweet_nub_vtable[SWEET_NUB_CTL_SLOTS];
 +
++extern "C" void sweet_nub_probe(void);
++
 +extern "C" uint64_t sweet_nub_stub0(void *, ...);
 +extern "C" uint64_t sweet_nub_stub1(void *, ...);
 +extern "C" uint64_t sweet_nub_stub_speed(void *, ...);
@@ -130,7 +132,7 @@ index 0000000..b9b9229
 +extern "C" void
 +sweet_nub_probe(void)
 +{
-+	const OSSymbol *name = OSSymbol::withCStringNoCopy(SWEET_NUB_CLASS).get();
++	const OSSymbol *name = OSSymbol::withCStringNoCopy(SWEET_NUB_CLASS);
 +	if (name == NULL) {
 +		printf("SWEET NUB: cannot intern the class name\n");
 +		return;
