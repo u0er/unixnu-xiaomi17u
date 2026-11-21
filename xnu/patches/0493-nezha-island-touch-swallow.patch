@@ -1,0 +1,80 @@
+diff --git a/bsd/dev/pandora_touch.c b/bsd/dev/pandora_touch.c
+index 95c8345..3b029e0 100644
+--- a/bsd/dev/pandora_touch.c
++++ b/bsd/dev/pandora_touch.c
+@@ -42,6 +42,56 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern int PE_parse_boot_argn(const char *arg, void *result, int maxlen);
++
++/*
++ * Dynamic Island hit test (210x78 at the presented width).
++ *
++ * The kernel paints the island as a pure mask, so without this every tap on the black
++ * capsule lands on whatever UI sits underneath it -- invisible but interactive. Touch
++ * coordinates here are already in the presented 1125x2436 space (see the conversion a
++ * few hundred lines below), and the capsule is drawn with exactly the same geometry
++ * (SweetFramebuffer nezha_draw_capsule: centre row 59/750 of the width, width/height in
++ * 375-point units scaled by the surface width), so the rectangle is recomputed the same
++ * way: 70x26 point units at 1125 -> 210x78 pixels, centred on the capsule's centre row.
++ *
++ * Gated by nezha_island (same switch as the mask) so a trial that does not ask for the
++ * island cannot have its touches eaten. nezha_island_w/_h are honoured so the hit box
++ * follows patch 0492's configurable size instead of drifting from it.
++ */
++#define NEZHA_ISLAND_FRAME_W 1125        /* presented display width, see 1125x2436 above */
++static bool
++nezha_island_swallows(int x, int y)
++{
++	static int enabled = -1, logical_w, logical_h;
++	if (enabled < 0) {
++		int on = 0, w = 110, h = 32;
++		enabled = PE_parse_boot_argn("nezha_island", &on, sizeof(on)) && on != 0;
++		if (PE_parse_boot_argn("nezha_island_w", &w, sizeof(w)) && (w < 40 || w > 375)) {
++			w = 110;
++		}
++		if (PE_parse_boot_argn("nezha_island_h", &h, sizeof(h)) && (h < 10 || h > 375)) {
++			h = 32;
++		}
++		logical_w = w;
++		logical_h = h;
++	}
++	if (!enabled || (x | y) < 0) {
++		return false;
++	}
++	const int w = NEZHA_ISLAND_FRAME_W * logical_w / 375;
++	const int h = NEZHA_ISLAND_FRAME_W * logical_h / 375;
++	const int x0 = (NEZHA_ISLAND_FRAME_W - w) / 2;
++	const int centre = NEZHA_ISLAND_FRAME_W * 59 / 750;
++	const int y0 = centre > h / 2 ? centre - h / 2 : 0;
++	return x >= x0 && x < x0 + w && y >= y0 && y < y0 + h;
++}
++
++/* Fingers whose down was swallowed, so the matching up is swallowed too. Injecting an
++ * up without its down would leave iOS with an orphan release (frequently decoded as a
++ * stray tap elsewhere). */
++static uint32_t nezha_island_swallowed;
++
+ extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation,
+     void *parameter, integer_t priority, thread_t *new_thread);
+ extern int sweet_fb_display_off;       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+@@ -1329,10 +1379,18 @@ pt_deliver(uint32_t mask, const int *px, const int *py)
+ 		pt.py[id] = py[id];
+ 		pt.x[id] = x;
+ 		pt.y[id] = y;
++		if (nezha_island_swallows(x, y)) {
++			nezha_island_swallowed |= (1u << id);
++			continue;
++		}
+ 		sweet_hid_touch((int)id, 1, x, y);
+ 	}
+ 	for (unsigned id = 0; id < PT_MAX; id++) {
+ 		if ((pt.active & (1u << id)) && !(mask & (1u << id))) {
++			if (nezha_island_swallowed & (1u << id)) {
++				nezha_island_swallowed &= ~(1u << id);
++				continue;
++			}
+ 			sweet_hid_touch((int)id, 0, pt.x[id], pt.y[id]);
+ 		}
+ 	}
