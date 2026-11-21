@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..c309da7410cc3a12b8c6c250145d1115ea253305
+index 0000000..93e254766349ebfe045194ad461228452e7b9a15
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4561 @@
+@@ -0,0 +1,4615 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3830,8 +3830,14 @@ index 0000000..c309da7410cc3a12b8c6c250145d1115ea253305
 +	static const uint8_t ack = 0xfc;
 +	unsigned taken = 0;
 +
++	uint8_t head[32];
++	unsigned hlen = 0;
++
 +	while (taken < limit && (bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
 +		uint8_t b = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++		if (hlen < sizeof(head)) {
++			head[hlen++] = b;
++		}
 +		if (b == 0xfdu) {
 +			(void)bt_uart_tx(&ack, 1, "PERI flush wake ACK FC");
 +			if (wakes != NULL) {
@@ -3839,6 +3845,22 @@ index 0000000..c309da7410cc3a12b8c6c250145d1115ea253305
 +			}
 +		}
 +		taken++;
++	}
++	/* A silent stage that still flushed 543 bytes means the ROM was talking
++	 * and we were discarding it unread - which is exactly how a real reply can
++	 * vanish while the stage still reports success. Show the first few chunks
++	 * once each so the next run can identify what was thrown away. */
++	if (taken != 0u && hlen != 0u) {
++		static unsigned flush_shown;
++		if (flush_shown < 4u) {
++			flush_shown++;
++			printf("PANDORA BT: flush took %u byte(s), first %u:",
++			    taken, hlen);
++			for (unsigned i = 0; i < hlen && i < 16u; i++) {
++				printf(" %02x", head[i]);
++			}
++			printf("\n");
++		}
 +	}
 +	if (bytes != NULL) {
 +		*bytes += taken;
@@ -4004,7 +4026,12 @@ index 0000000..c309da7410cc3a12b8c6c250145d1115ea253305
 +		}
 +		sent += len;
 +		seg++;
-+		bt_peri_flush(64u, &flushed, &wakes);
++		/* Do not flush after the final frame: the ROM's bulk answer arrives
++		 * exactly then, and flush discards everything that is not 0xfd. The
++		 * caller's bt_peri_bulk_drain is what should read it. */
++		if (sent < size) {
++			bt_peri_flush(64u, &flushed, &wakes);
++		}
 +		if ((seg & 63u) == 0u) {
 +			pandora_log_sync();
 +		}
@@ -4130,7 +4157,9 @@ index 0000000..c309da7410cc3a12b8c6c250145d1115ea253305
 +				return EPROTO;
 +			}
 +		}
-+		if (!per_frame_cc && (seg & 63u) == 0u) {
++		if (!per_frame_cc && (seg & 63u) == 0u && sent < size) {
++			/* Same rule as tlv_stage: keep the last frame's answer for the
++			 * caller's drain instead of throwing it away here. */
 +			bt_peri_flush(4096u, &flushed, &wakes);
 +			pandora_log_sync();
 +		}
@@ -4167,10 +4196,35 @@ index 0000000..c309da7410cc3a12b8c6c250145d1115ea253305
 +		pandora_log_sync();
 +		return err;
 +	}
-+	err = bt_peri_cc_read(window_ms, ev, sizeof(ev), &got, &wakes, what);
++	/* The ROM echoes the subcommand in ev[7]: the trace answers 0x19 with
++	 * 04 0e 05 01 00 fc 00 19, 0x23 with ... 00 23 and 0x20 with ... 00 20.
++	 * Accepting any event here let a stale reply stand in for this command
++	 * (the real one was then eaten by the next stage), so match the echo and
++	 * skip up to four foreign events before giving up. */
++	err = ETIMEDOUT;
++	for (unsigned tries = 0; tries < 4u; tries++) {
++		unsigned w = (tries == 0u) ? window_ms : 50u;
++		err = bt_peri_cc_read(w, ev, sizeof(ev), &got, &wakes, what);
++		if (err) {
++			break;
++		}
++		if (ev[0] == 0x04u && ev[1] == 0x0eu && got >= 8u && ev[7] == sub) {
++			if (ev[6] != 0x00u) {
++				printf("PANDORA BT: %s: VS command %02x answered status %u\n",
++				    what, sub, ev[6]);
++				pandora_log_sync();
++			}
++			err = 0;
++			break;
++		}
++		printf("PANDORA BT: %s: VS command %02x skipped foreign event %02x %02x len %u echo %02x\n",
++		    what, sub, ev[0], got > 1u ? ev[1] : 0u, got > 2u ? ev[2] : 0u,
++		    got >= 8u ? ev[7] : 0x00u);
++		pandora_log_sync();
++	}
 +	if (err) {
-+		printf("PANDORA BT: %s: VS command answered nothing in %u ms (error %d)\n",
-+		    what, window_ms, err);
++		printf("PANDORA BT: %s: VS command %02x answered nothing in %u ms (error %d)\n",
++		    what, sub, window_ms, err);
 +		pandora_log_sync();
 +		return err;
 +	}
