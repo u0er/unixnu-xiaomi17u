@@ -1,0 +1,41 @@
+From: baseband lane
+Subject: 0507 pandora_pas: stop unmapping the carveout -- ml_io_unmap panics on a permanent entry
+
+Step 4 is the first PAS load (the modem's DTB, pas 38).  On the 2026-11-21 hardware run the DTB
+loaded and then the boot died before any TrustZone call:
+
+  PANDORA PAS: modem_dtb.mdt: pas 38, 3 segments, hash 2 (3896 bytes), load 0x99500000-0x99516000 relocatable, carveout 0x99500000+0x80000
+  PANDORA PAS: pasvm_map_delete(...): Attempting to remove permanent VM map entry 0xfffffff1500da740
+
+ml_io_map_unmappable() creates VM_MAP_ENTRY_PERMANENT entries; ml_io_unmap() on one panics in
+osfmk/vm/vm_map.c:7937.  bsd/dev/pandora_dpu.c:13 and pandora_gpu.c:1955 both record this exact
+trap and both leave their mappings in place.  The carveout is mapped once or twice per boot, so
+this does the same.
+
+Note: bsd/dev/pandora_adsp.c:915 has the same ml_io_unmap-after-ml_io_map_unmappable pattern; that
+file belongs to the ADSP lane and is deliberately NOT touched here.
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index 5f2344c..27df73d 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -231,7 +231,18 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 		total += ph[i].p_filesz;
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	ml_io_unmap(mem, (vm_size_t)((mem_size + 0xfff) & ~0xfffull));
++	/*
++	 * The carveout mapping stays.
++	 *
++	 * ml_io_map_unmappable() creates VM_MAP_ENTRY_PERMANENT entries, and ml_io_unmap() on one
++	 * panics with "Attempting to remove permanent VM map entry" (osfmk/vm/vm_map.c:7937) --
++	 * exactly what happened on 2026-11-21 at step 4, the first PAS load: the DTB loaded fine
++	 * and the unmap killed the boot before any TrustZone call was made.
++	 *
++	 * bsd/dev/pandora_dpu.c:13 and bsd/dev/pandora_gpu.c:1955 record the same trap.  The
++	 * carveout is mapped once or twice per boot, so leaving it mapped is bounded and is what
++	 * those two files already do.
++	 */
+ 	kmem_free(kernel_map, md, (vm_size_t)md_size);
+ 	if (!err) {
+ 		printf("PANDORA PAS: %s: %llu bytes loaded at %#llx\n", name, total, mem_pa);
