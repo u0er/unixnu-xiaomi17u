@@ -1,0 +1,41 @@
+From: baseband lane
+Subject: 0509 pandora_pas: the metadata buffer must not be KMA_PERMANENT -- kmem_free panics on it
+
+0507 removed an `ml_io_unmap` that panicked on a permanent map entry.  One line later in the same
+function, every exit path calls `kmem_free(kernel_map, md, md_size)` on a buffer allocated with
+KMA_PERMANENT -- and that panics for the same reason:
+
+  osfmk/vm/vm_kern.c:900        if (flags & KMA_PERMANENT) { vmk_flags.vmf_permanent = true; }
+  osfmk/vm/vm_map.c:8181-8188   in the kernel map, if (entry->vme_permanent)
+                                __vm_map_delete_permanent_panic(...)   // unconditional
+
+so the next boot would have failed at the free instead of the unmap.  This buffer is temporary
+(it is freed as soon as INIT_IMAGE returns) and physically contiguous either way; KMA_PERMANENT
+only makes the entry undeletable.
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index 27df73d..00b9c47 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -166,8 +166,20 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 		goto out;
+ 	}
+ 	vm_offset_t md = 0;
++	/*
++	 * NOT KMA_PERMANENT.
++	 *
++	 * KMA_PERMANENT sets vmf_permanent on the map entry (osfmk/vm/vm_kern.c:900), and for an
++	 * entry in the kernel map osfmk/vm/vm_map.c:8181-8188 panics unconditionally when it is
++	 * removed -- "Attempting to remove permanent VM map entry" -- whatever flags the removal
++	 * passes.  This buffer is freed at every exit below, so it must not be permanent.
++	 *
++	 * This is the second half of the same trap that killed the 2026-11-21 step-4 boot: the
++	 * unmap panic was found first (patch 0507), and the kmem_free one line later would have
++	 * been the next boot's failure.
++	 */
+ 	if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		err = ENOMEM;
+ 		goto out;
+ 	}
