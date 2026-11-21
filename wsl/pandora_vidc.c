@@ -554,6 +554,9 @@ vidc_alloc_buffers(void)
             return -1;
         }
     }
+    /* Now that our window is held, probe again: the pair of lines says exactly
+     * how much the allocation cost, which is what the 5.17 s failure was about. */
+    vidc_map_budget("after qtable");
     if (!vidc_sfr_va) {
         vidc_sfr_va = vidc_contig(VIDC_SFR_BYTES, &vidc_sfr_pa);
         if (!vidc_sfr_va) {
