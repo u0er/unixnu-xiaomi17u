@@ -58,6 +58,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <kern/thread.h>
+#include <kern/sched_prim.h>   /* thread_block */
 #include <kern/kalloc.h>
 #include <pexpert/pexpert.h>
 #include <vm/pmap.h>
@@ -322,6 +323,8 @@ static bool     vidc_smmu_on;
 static uint32_t vidc_smmu_cb;      /* CB base offset inside apps-smmu */
 static uint32_t vidc_smmu_bank;
 /* Fault-capture state for the post-boot-release window. */
+static int      vidc_defer_ms = 9000;   /* see vidc_thread: keeps the peak
+                                         * out of the 5.2 s boot window */
 static bool     vc_smmu_faults_done;
 static unsigned vc_smmu_faults;
 
@@ -886,6 +889,22 @@ vidc_gdsc_on(const struct vidc_gdsc_desc *g)
     return -1;
 }
 
+/* Snapshot of the registers that only the firmware (or a reset default)
+ * would change.  Reading the same four values at probe, after power-up and
+ * after boot release separates "reset default" from "firmware wrote it"
+ * without another guess: 0xB0010 is never written by this driver. */
+static void
+vidc_snap(const char *when)
+{
+    if (!vidc_mmio_on) return;
+    printf("PANDORA VIDC: snap %-12s int=%08x/%08x tz=%08x/%08x/%08x "
+           "core=%08x/%08x idle=%08x\n", when,
+        vidc_rd(R_WRAPPER_INTR_STATUS), vidc_rd(R_WRAPPER_INTR_MASK),
+        vidc_rd(0xC0010u), vidc_rd(0xC0014u), vidc_rd(0xC0018u),
+        vidc_rd(R_WRAPPER_CORE_PWR), vidc_rd(R_WRAPPER_CORE_CLK),
+        vidc_rd(R_VCODEC_SS_IDLE));
+}
+
 static inline uint32_t
 vidc_cc_rd(uint32_t off)
 {
@@ -989,6 +1008,7 @@ vidc_power_up(void)
     }
     printf("PANDORA VIDC: videocc powered (%d/5 GDSC failed), CORE_PWR=%08x CORE_CLK=%08x\n",
         failed, vidc_rd(R_WRAPPER_CORE_PWR), clk_cfg);
+    vidc_snap("after power");
     /* A branch reading CLK_OFF=0 only means the *gate* is open; if its RCG has no
      * root enabled or no source selected, the core still gets no clock and never
      * executes.  RCG2 layout is CFG_RCGR @+0, CMD_RCGR @+4, M/N/D @+8/+0xC/+0x10
@@ -1082,9 +1102,26 @@ vidc_publish_queues(void)
     printf("PANDORA VIDC: boot released (spare0=%08x boot=%08x stat=%08x)\n",
         vidc_rd(R_WRAPPER_SPARE_0), vidc_rd(R_CPU_BOOT_CTRL),
         vidc_rd(R_CPU_QUEUE_TABLE_STAT));
+    vidc_snap("after boot");
 
-    for (unsigned i = 0; i < 1000; i++) {
+    /* Vendor gate [K __prepare_pc_iris4 0x15e64-0x1602c]: proceed only when
+     *   (0xA004C & BIT(30)) && (0xC0010 & BIT(0))
+     * and then poll 0xC0010 bit0 with `read_register_with_poll_timeout(..., 250, 2500)`
+     * -- a 2.5 s budget.  Our previous 100 us x 1000 = 100 ms window was an
+     * order of magnitude too short, and it watched the wrong register pair.
+     * 0xC0010 is WRAPPER_TZ_CPU_STATUS; bit0 says the Xtensa is up. */
+    for (unsigned i = 0; i < 25000; i++) {
         uint32_t s = vidc_rd(R_CPU_QUEUE_TABLE_STAT);
+        const uint32_t tz = vidc_rd(0xC0010u);
+        if ((s & (1u << 30)) && (tz & 1u)) {
+            printf("PANDORA VIDC: pc ready after %u us (0xA004C=%08x 0xC0010=%08x)\n",
+                i * 100u, s, tz);
+            if (s & 1u) {
+                vidc_wr(R_CPU_H2XSOFTINTEN, 1);
+                vidc_wr(R_CPU_X2RPMH, 0);
+            }
+            return 0;
+        }
         /* While the core boots it starts touching memory through the SMMU.
          * A single latched FSR only tells us the FIRST address; the pattern is
          * what identifies the window the firmware expects.  So sample often,
@@ -1435,6 +1472,28 @@ vidc_bringup(void)
     vidc_verdict("probe", rc);
     if (rc == 0) vidc_pass_mask |= VIDC_STAGE_PROBE;
 
+    /* Bisection levels, so one image can answer "which stage eats memory":
+     *   2 = full (default ladder), 3 = probe + alloc only, 4 = probe + alloc + smmu.
+     * They exist because `=2` panics at 5.17 s with a failed 128 KiB kmem_alloc
+     * while `=0` and `=1` run to the 135 s timer, and each answer otherwise costs
+     * a whole CI round plus a device window. */
+    if (vidc_level < 2) return;
+    if (vidc_level == 3) {
+        rc = vidc_alloc_buffers();
+        vidc_verdict("alloc", rc);
+        if (rc == 0) vidc_pass_mask |= VIDC_STAGE_ALLOC;
+        goto summary;
+    }
+    if (vidc_level == 4) {
+        rc = vidc_alloc_buffers();
+        vidc_verdict("alloc", rc);
+        if (rc == 0) vidc_pass_mask |= VIDC_STAGE_ALLOC;
+        rc = vidc_smmu_up();
+        vidc_verdict("smmu", rc);
+        if (rc == 0) vidc_pass_mask |= VIDC_STAGE_SMMU;
+        goto summary;
+    }
+
     rc = vidc_power_up();               /* GDSC + branches + bridge reset */
     vidc_verdict("power", rc);
     if (rc == 0) vidc_pass_mask |= VIDC_STAGE_POWER;
@@ -1473,6 +1532,7 @@ vidc_bringup(void)
     vidc_verdict("hfi", rc);
     if (rc == 0) vidc_pass_mask |= VIDC_STAGE_HFI;
 
+summary:
     printf("PANDORA VIDC: SUMMARY mask=%03x/%03x probe=%u power=%u alloc=%u smmu=%u "
            "queues=%u pas=%u fwcopy=%u publish=%u hfi=%u\n", vidc_pass_mask, VIDC_STAGE_ALL,
         !!(vidc_pass_mask & VIDC_STAGE_PROBE), !!(vidc_pass_mask & VIDC_STAGE_POWER),
@@ -1493,11 +1553,22 @@ static void
 vidc_thread(void *arg, wait_result_t wresult)
 {
     (void)arg; (void)wresult;
+    /* Delay the bring-up so its ~5 MiB of permanent kernel_map (3.06 MiB queue
+     * table + SFR + 16-page SMMU pool + the 2 MiB of MMIO windows) is not taken
+     * while the boot-time drivers are still allocating.  Measured on this board:
+     * with pandora_vidc=0 or =1 the kernel reaches the 135 s timer, but with
+     * =2 the TOUCH driver's 128 KiB pageable kmem_alloc fails at 5.171 s
+     * (`failed with 3 @vm_kern.c:178` -> restart type 4).  The GPU lane maps a
+     * 2 GiB pool, so the kernel_map margin is thin and our peak tips it over.
+     * pandora_vidc_defer_ms defaults to 9000: past the 5.2 s window, and the
+     * 2.5 s vendor ready-poll still ends well inside the 120 s image timer. */
+    if (vidc_defer_ms > 0) delay(vidc_defer_ms * 1000);
     if (vidc_level >= 1) {
         if (vidc_level >= 2) vidc_bringup();
         else vidc_probe();
     }
     thread_terminate(current_thread());
+    thread_block(THREAD_CONTINUE_NULL);
 }
 
 void
@@ -1505,10 +1576,14 @@ pandora_vidc_init(void)
 {
     (void)PE_parse_boot_argn("pandora_vidc", &vidc_level, sizeof(vidc_level));
     if (!vidc_level) return;
-    if (vidc_level < 1 || vidc_level > 2) {
-        printf("PANDORA VIDC: unsupported pandora_vidc=%d (expected 0..2)\n", vidc_level);
+    if (vidc_level < 1 || vidc_level > 4) {
+        printf("PANDORA VIDC: unsupported pandora_vidc=%d (expected 0..4)\n", vidc_level);
         return;
     }
+    (void)PE_parse_boot_argn("pandora_vidc_defer_ms", &vidc_defer_ms,
+        sizeof(vidc_defer_ms));
+    if (vidc_defer_ms < 0) vidc_defer_ms = 0;
+    printf("PANDORA VIDC: bring-up deferred %d ms\n", vidc_defer_ms);
 
     char fw[64];
     if (PE_parse_boot_arg_str("pandora_vidc_fw", fw, sizeof(fw)) && fw[0])
