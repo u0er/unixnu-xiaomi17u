@@ -1842,6 +1842,12 @@ vidc_bringup(void)
         if (fw == 0) vidc_pass_mask |= VIDC_STAGE_FWCOPY;
     }
 
+    /* Third measurement, at the moment that actually matters: after every one of
+     * our windows exists.  The 5.17 s failure is a 128 KiB
+     * kmem_alloc(KMA_PAGEABLE|KMA_PERMANENT), so if this line already shows `X`
+     * the shortfall is ours to give back; if it still shows `k` for 1 MiB, our
+     * footprint is exonerated and the failure belongs to another driver. */
+    vidc_map_budget("before publish");
     rc = vidc_publish_queues();         /* boot release + 0xA004C poll */
     vidc_verdict("publish", rc);
     if (rc == 0) vidc_pass_mask |= VIDC_STAGE_PUBLISH;
