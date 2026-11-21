@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..b843278511754ab2b09a351a56b1663fc98c82f2
+index 0000000..2110e1716d41d49bb5e459ebe09da4c97df95be2
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4620 @@
+@@ -0,0 +1,4627 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4324,10 +4324,10 @@ index 0000000..b843278511754ab2b09a351a56b1663fc98c82f2
 +		bt_peri_raw_dump(2000u, "PERI TME-L map A failure raw");
 +		return err;
 +	}
-+	/* The trace puts the 0x19 that opens phase B 54 ms after phase A's last
-+	 * frame, and phase A itself produces no ROM traffic at all, so this drain
-+	 * is only long enough to answer a wake request if one shows up. */
-+	bt_peri_bulk_drain(150u, "PERI TME-L map A");
++	/* Measured from the trace: phase A's last frame to the 0x19 command is
++	 * 54.1 ms, and phase A produces no ROM traffic, so 60 ms covers a wake
++	 * request without holding the next command back by the old 150 ms. */
++	bt_peri_bulk_drain(60u, "PERI TME-L map A");
 +	/* Phase B (trace 10.199460 start command, then 1374 frames to 11.189057):
 +	 * the 333,868-byte gngbtfw20.mbn as HCI 0xfc00/subcmd 0x1e frames of 243
 +	 * bytes (last 229). Wire speed: Android's stage spans 0.99 s for 342 KB,
@@ -4345,7 +4345,11 @@ index 0000000..b843278511754ab2b09a351a56b1663fc98c82f2
 +		bt_peri_raw_dump(2000u, "PERI TME-L map B failure raw");
 +		return err;
 +	}
-+	bt_peri_bulk_drain(1000u, "PERI TME-L map B");
++	/* Measured: phase B's last frame is answered at t=11.209250, 100 us before
++	 * the 0x23 command itself (20.3 ms after the frame). The old 1000 ms window
++	 * delayed the next command by ~980 ms for no reason; 40 ms still catches
++	 * that trailing Command Complete. */
++	bt_peri_bulk_drain(40u, "PERI TME-L map B");
 +	/* Phase C (trace 11.209352 0x23, then 57 frames to 11.380534): the nv
 +	 * stage carries gngbtnv20.bin behind a 4-byte 04 22 4c 00 header. This
 +	 * is the only stage the ROM answers frame by frame, so it runs with the
@@ -4373,7 +4377,10 @@ index 0000000..b843278511754ab2b09a351a56b1663fc98c82f2
 +			return err;
 +		}
 +	}
-+	bt_peri_bulk_drain(1000u, "PERI TME-L map C");
++	/* Measured: the 0x20 close command follows phase C's last frame by 380.9 ms
++	 * in the trace, so 400 ms keeps our cadence where Android's is instead of
++	 * 1000 ms. */
++	bt_peri_bulk_drain(400u, "PERI TME-L map C");
 +	/* Phase D (trace 11.761406): the closing 0x20, answered with the 117-byte
 +	 * build-info event whose payload carries "oBTFW.GANGES.". Android reaches
 +	 * a live HCI state right after it. */
