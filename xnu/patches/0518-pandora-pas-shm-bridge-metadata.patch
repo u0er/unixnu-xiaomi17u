@@ -1,0 +1,160 @@
+From: baseband lane
+Subject: 0518 pandora_pas: put the PIL metadata behind an SHM bridge, as qcom_tzmem does
+
+Everything else has been ruled out by hardware evidence from 2026-11-21:
+
+  * nine PAS ids, including pas 0, all gave a0 0xffcfffbb for the same metadata blob;
+  * shm_bridge_enable returns a0 0 and the next INIT_IMAGE still gives 0xffcfffbb;
+  * the metadata blob's construction was checked field by field against qcom_mdt_read_metadata().
+
+Upstream's qcom_tzmem.c wraps that metadata in an SHM bridge, and only uses the plain path when the
+bridge is unsupported:
+
+    pfn_and_ns_perm = paddr | QCOM_SCM_PERM_RW;          // 0x6
+    ipfn_and_s_perm = paddr | QCOM_SCM_PERM_RW;
+    size_and_flags  = size | (1 << QCOM_SHM_BRIDGE_NUM_VM_SHIFT);   // 9
+    qcom_scm_shm_bridge_create(pfn_and_ns_perm, ipfn_and_s_perm, size_and_flags,
+                               QCOM_SCM_VMID_HLOS, &handle);        // svc 0xc, cmd 0x1e
+
+with the handle in a1 and a delete (svc 0xc, cmd 0x1d) once AUTH_AND_RESET has been made.  This adds
+exactly that: the bridge is created before INIT_IMAGE, its handle lives with the metadata slot, and
+it is deleted by pas_meta_release() after auth or shutdown.
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index 8aad40c..194dc99 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -38,9 +38,13 @@ extern void pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_
+  * rest. Both serialize on the same lock and both handle a queued call. */
+ extern void pandora_scm_call3(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4,
+     uint64_t *a0);
++extern void pandora_scm_call5(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4,
++    uint64_t x5, uint64_t *a0, uint64_t *a1);
+ 
+-/* Defined below; the two INIT_IMAGE call sites above the definition use it too. */
++/* Defined below; the two INIT_IMAGE call sites above the definitions use them too. */
+ static void pas_enable_shm_bridge(void);
++static uint64_t pas_bridge_create(uint64_t pa, uint64_t size);
++static void pas_bridge_delete(uint64_t handle, unsigned pas);
+ 
+ /*
+  * The metadata segment has to stay accessible to the secure world from INIT_IMAGE until
+@@ -58,11 +62,12 @@ struct pas_meta {
+ 	bool used;
+ 	vm_offset_t md;
+ 	uint64_t size;
++	uint64_t bridge;                /* SHM bridge handle over md, or 0 */
+ };
+ static struct pas_meta pas_meta[PAS_META_SLOTS];
+ 
+ static void
+-pas_meta_hold(unsigned pas, vm_offset_t md, uint64_t size)
++pas_meta_hold(unsigned pas, vm_offset_t md, uint64_t size, uint64_t bridge)
+ {
+ 	for (unsigned i = 0; i < PAS_META_SLOTS; i++) {
+ 		if (!pas_meta[i].used) {
+@@ -70,11 +75,13 @@ pas_meta_hold(unsigned pas, vm_offset_t md, uint64_t size)
+ 			pas_meta[i].pas = pas;
+ 			pas_meta[i].md = md;
+ 			pas_meta[i].size = size;
++			pas_meta[i].bridge = bridge;
+ 			return;
+ 		}
+ 	}
+ 	/* No free slot: release here rather than leak silently. */
+ 	printf("PANDORA PAS: no slot for pas %u's metadata; releasing it now\n", pas);
++	pas_bridge_delete(bridge, pas);
+ 	kmem_free(kernel_map, md, (vm_size_t)size);
+ }
+ 
+@@ -84,6 +91,8 @@ pas_meta_release(unsigned pas)
+ {
+ 	for (unsigned i = 0; i < PAS_META_SLOTS; i++) {
+ 		if (pas_meta[i].used && pas_meta[i].pas == pas) {
++			pas_bridge_delete(pas_meta[i].bridge, pas);
++			pas_meta[i].bridge = 0;
+ 			kmem_free(kernel_map, pas_meta[i].md, (vm_size_t)pas_meta[i].size);
+ 			pas_meta[i].used = false;
+ 			return;
+@@ -267,6 +276,7 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 	}
+ 	flush_dcache64((addr64_t)md_pa, (unsigned)md_size, TRUE);
+ 	pas_enable_shm_bridge();
++	uint64_t bridge = pas_bridge_create(md_pa, md_size);
+ 	uint64_t a0 = 0, a1 = 0;
+ 	/*
+ 	 * arginfo = QCOM_SCM_ARGS(2, QCOM_SCM_VAL, QCOM_SCM_RW), and upstream packs it as
+@@ -349,8 +359,9 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 		 * AUTH_AND_RESET (see the pas_meta table at the top).  pas_meta_release() frees it
+ 		 * once the auth call has been made, or on shutdown.
+ 		 */
+-		pas_meta_hold(pas, md, md_size);
++		pas_meta_hold(pas, md, md_size, bridge);
+ 	} else {
++		pas_bridge_delete(bridge, pas);
+ 		kmem_free(kernel_map, md, (vm_size_t)md_size);
+ 	}
+ out:
+@@ -458,9 +469,10 @@ pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64
+ 	}
+ 	flush_dcache64((addr64_t)md_pa, (unsigned)md_size, TRUE);
+ 	pas_enable_shm_bridge();
++	uint64_t probe_bridge = pas_bridge_create(md_pa, md_size);
+ 	uint64_t a0 = 0, a1 = 0, arginfo = SCM_ARGS(2) | (SCM_RW << 6);
+ 	pandora_scm_call(SCM_PAS_INIT_IMAGE, arginfo, pas, md_pa, &a0, &a1);
+-	pas_meta_hold(pas, md, md_size);
++	pas_meta_hold(pas, md, md_size, probe_bridge);
+ 	if (answer) {
+ 		*answer = a0;
+ 	}
+@@ -502,6 +514,50 @@ pas_enable_shm_bridge(void)
+ 	pas_bridge_on = (a0 == 0 && a1 == 0);
+ }
+ 
++/*
++ * Make the metadata blob reachable by the secure world through an SHM bridge.
++ *
++ * Upstream's qcom_tzmem.c creates one for the PIL metadata when shm_bridge_enable() succeeded:
++ *     pfn_and_ns_perm = paddr | PERM_RW;  ipfn_and_s_perm = paddr | PERM_RW;
++ *     size_and_flags  = size | (1 << QCOM_SHM_BRIDGE_NUM_VM_SHIFT);   // NUM_VM_SHIFT = 9
++ *     qcom_scm_shm_bridge_create(..., QCOM_SCM_VMID_HLOS, &handle)    // svc 0xc, cmd 0x1e
++ * and deletes it once AUTH_AND_RESET has been made (svc 0xc, cmd 0x1d).  The handle comes back in
++ * a1.  Without the bridge TrustZone answers INIT_IMAGE with 0xffcfffbb on this generation, which is
++ * the answer nine different PAS ids gave on 2026-11-21.
++ */
++#define PAS_PERM_RW          0x6u
++#define PAS_VMID_HLOS        3u
++#define PAS_NUM_VM_SHIFT     9u
++#define PAS_SCM_SHIM_CREATE  SCM_FN(0xc, 0x1e)
++#define PAS_SCM_SHIM_DELETE  SCM_FN(0xc, 0x1d)
++
++static uint64_t
++pas_bridge_create(uint64_t pa, uint64_t size)
++{
++	uint64_t a0 = 0, a1 = 0;
++
++	if (!pas_bridge_on) {
++		return 0;
++	}
++	pandora_scm_call5(PAS_SCM_SHIM_CREATE, SCM_ARGS(4), pa | PAS_PERM_RW, pa | PAS_PERM_RW,
++	    size | (1ull << PAS_NUM_VM_SHIFT), PAS_VMID_HLOS, &a0, &a1);
++	printf("PANDORA PAS: shm_bridge_create(%#llx+%#llx) -> a0 %#llx (%d) handle %#llx\n", pa, size,
++	    a0, (int)(int32_t)a0, a1);
++	return (a0 || a1 == 0) ? 0 : a1;
++}
++
++static void
++pas_bridge_delete(uint64_t handle, unsigned pas)
++{
++	uint64_t a0 = 0, a1 = 0;
++
++	if (handle == 0) {
++		return;
++	}
++	pandora_scm_call(PAS_SCM_SHIM_DELETE, SCM_ARGS(1), handle, 0, &a0, &a1);
++	printf("PANDORA PAS: shm_bridge_delete(pas %u, *%#llx) -> a0 %#llx a1 %#llx\n", pas, handle, a0, a1);
++}
++
+ /* PAS_AUTH_AND_RESET: lets the processor out of reset. */
+ int
+ pandora_pas_auth(unsigned pas)
