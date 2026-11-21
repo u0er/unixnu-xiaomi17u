@@ -1,74 +1,72 @@
-From: GPU lane (2026-11-21)
+From: GPU lane (diagnosis 2026-11-21); rebased to the real CI baseline by baseband lane 2026-11-21
 Subject: 0504 sweet_ufs pl_thread: make pandora_reboot_after independent of the log file
 
-The bounded reset used to be checked after pl_flush(), and one failed UFS write
-returned from the logging thread entirely, silently cancelling the reset for the
-rest of the boot: the phone stays in iOS with USB enumerated until it is reset by
-hand. Check the deadline first, and keep the thread (and the deadline) alive after
-logging stops.
+The bounded reset used to be checked at the bottom of pl_thread's loop, after pl_flush(), and one
+failed UFS write returned from the logging thread entirely, silently cancelling the reset for the
+rest of the boot: the phone stays in iOS with USB enumerated until it is reset by hand.
 
+2026-11-21: this actually happened.  A 30-minute trial ran from 08:51 and the phone did not come
+back for eight hours; every lane waiting for the device was blocked behind it.  The ceiling the
+user has now set for any trial is 180 s, and a cancelled deadline makes any ceiling meaningless.
+
+Why this version: the earlier 0504 (and its CarPlay rebase) were written against a body that ends
+the deadline branch with the orderly-shutdown path, and they do not apply to the tree the CI
+actually compiles -- `git apply` fails at bsd/dev/sweet_ufs.c:2219/2224 because this baseline still
+uses pl_psci_reset().  Re-expressed here on the body that is really there: the deadline block moves
+to the top of the loop, and a write failure only clears pl_ready instead of returning.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index fe9aa8d..89ef8d0 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -2219,25 +2219,15 @@
+@@ -2206,6 +2206,34 @@ pl_thread(__unused void *arg, __unused wait_result_t wr)
  	nanoseconds_to_absolutetime((uint64_t)iostats * NSEC_PER_SEC, &io_every);
  	for (;;) {
  		(void)tsleep(&pl_chan, PZERO, "pandoralog", hz * (int)secs);
--		lck_mtx_lock(&sweet_ufs_lock);
--		uint64_t now = mach_absolute_time();
--		if (io_every && now - io_last >= io_every) {
--			pio_print(now - io_last);
--			io_last = now;
--		}
--		int error = pl_flush();
--		if (!error && os_atomic_load(&pfd_state, acquire) == 2) {
--			int e = pfd_write();
--			printf("PANDORA FBDUMP: %u bytes -> log file block %u: %d\n", pfd_len,
--			    PFD_FIRST_BLOCK, e);
--			os_atomic_store(&pfd_state, 0, release);
--		}
--		lck_mtx_unlock(&sweet_ufs_lock);
--		if (error) {
--			printf("PANDORA LOG: write failed (%d), log stopped\n", error);
--			pl_ready = false;
--			return;
--		}
 +		/*
-+		 * 0504: the bounded reset must not be hostage to the log file. The
-+		 * deadline used to be checked AFTER pl_flush(), and a single failed
-+		 * write returned from this thread entirely -- which silently cancelled
-+		 * pandora_reboot_after for the rest of the boot and left the phone
-+		 * sitting in iOS with USB enumerated until somebody reset it by hand.
-+		 * Check the deadline before touching the disk; when logging has already
-+		 * stopped, keep waking up and keep honouring the deadline.
++		 * 0504: the bounded reset must not be hostage to the log file.
++		 *
++		 * The deadline used to be checked at the bottom of this loop, after pl_flush(), and
++		 * one failed write returned from the thread entirely.  pl_flush() ->
++		 * ufs_write_blocks() -> ufs_scsi() is a blocking disk write that can return
++		 * ETIMEDOUT, so a single transient failure silently cancelled pandora_reboot_after
++		 * for the rest of the boot: the phone stayed in iOS with USB enumerated until
++		 * somebody reset it by hand (2026-11-21, eight hours).
++		 *
++		 * So the deadline is now checked first, before anything touches the disk, and a
++		 * write failure only stops the logging -- never the reset.
 +		 */
- 		if (limit && mach_absolute_time() - start >= limit) {
- 			printf("PANDORA: pandora_reboot_after=%u reached, resetting\n", reboot_after);
- 			pandora_amp_final("pandora_reboot_after");      /* 0298: the speaker amps down first */
-@@ -2245,6 +2235,27 @@
- 			(void)pl_flush();
- 			lck_mtx_unlock(&sweet_ufs_lock);
- 			pl_psci_reset();
++		if (limit && mach_absolute_time() - start >= limit) {
++			printf("PANDORA: pandora_reboot_after=%u reached, resetting\n", reboot_after);
++			pandora_amp_final("pandora_reboot_after");      /* 0298: the speaker amps down first */
++			lck_mtx_lock(&sweet_ufs_lock);
++			(void)pl_flush();
++			lck_mtx_unlock(&sweet_ufs_lock);
++			pl_psci_reset();
 +		}
++		/*
++		 * Logging has stopped (a write failed once): keep waking up so the deadline above
++		 * keeps firing, but stay off the disk entirely from here on.
++		 */
 +		if (!pl_ready) {
 +			continue;
 +		}
-+		lck_mtx_lock(&sweet_ufs_lock);
-+		uint64_t now = mach_absolute_time();
-+		if (io_every && now - io_last >= io_every) {
-+			pio_print(now - io_last);
-+			io_last = now;
-+		}
-+		int error = pl_flush();
-+		if (!error && os_atomic_load(&pfd_state, acquire) == 2) {
-+			int e = pfd_write();
-+			printf("PANDORA FBDUMP: %u bytes -> log file block %u: %d\n", pfd_len,
-+			    PFD_FIRST_BLOCK, e);
-+			os_atomic_store(&pfd_state, 0, release);
-+		}
-+		lck_mtx_unlock(&sweet_ufs_lock);
-+		if (error) {
-+			printf("PANDORA LOG: write failed (%d), log stopped\n", error);
-+			pl_ready = false;      /* stop logging, but keep the bounded reset alive */
+ 		lck_mtx_lock(&sweet_ufs_lock);
+ 		uint64_t now = mach_absolute_time();
+ 		if (io_every && now - io_last >= io_every) {
+@@ -2223,15 +2251,6 @@ pl_thread(__unused void *arg, __unused wait_result_t wr)
+ 		if (error) {
+ 			printf("PANDORA LOG: write failed (%d), log stopped\n", error);
+ 			pl_ready = false;
+-			return;
+-		}
+-		if (limit && mach_absolute_time() - start >= limit) {
+-			printf("PANDORA: pandora_reboot_after=%u reached, resetting\n", reboot_after);
+-			pandora_amp_final("pandora_reboot_after");      /* 0298: the speaker amps down first */
+-			lck_mtx_lock(&sweet_ufs_lock);
+-			(void)pl_flush();
+-			lck_mtx_unlock(&sweet_ufs_lock);
+-			pl_psci_reset();
  		}
  	}
  }
