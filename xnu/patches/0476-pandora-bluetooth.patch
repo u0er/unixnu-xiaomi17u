@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..86e922b12f6a2f9a8e785cc84080bd443fe1edd0
+index 0000000..1adc12639b2ab038486cffd43e62a8ae215627a9
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4655 @@
+@@ -0,0 +1,4660 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4150,10 +4150,15 @@ index 0000000..86e922b12f6a2f9a8e785cc84080bd443fe1edd0
 +			unsigned tries = 0;
 +			bool acked = false;
 +
-+			while (!acked && tries < 8u) {
++			/* Time budget. The trace spaces phase C one frame every 2.70 ms
++			 * and the ROM answers inside 2 ms, so 40 ms per try is a 15x
++			 * margin. Eight 200 ms tries would allow 1.6 s per frame and
++			 * 91 s for the 57 frames - past the whole 30 s trial. Four tries
++			 * at 40 ms caps the stage at 9.1 s in the worst case. */
++			while (!acked && tries < 4u) {
 +				tries++;
 +				got = 0;
-+				err = bt_peri_cc_read(200u, ev, sizeof(ev), &got,
++				err = bt_peri_cc_read(40u, ev, sizeof(ev), &got,
 +				    &wakes, what);
 +				if (err) {
 +					bt_tx_long_quiet = false;
