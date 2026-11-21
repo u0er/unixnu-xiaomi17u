@@ -195,7 +195,9 @@ void pandora_vidc_init(void);
  *   0x300000   end of published window
  */
 #define VIDC_QTABLE_BYTES       0x00300000u   /* [K] CPU+0x68 constant */
-#define VIDC_QTABLE_ALLOC       (VIDC_QTABLE_BYTES + 0x00010000u)
+/* Exactly the published window: header 456 B + three 1 MiB rings ends at
+ * 0x300000, so the old +64 KiB slack was pure permanent kernel_map waste. */
+#define VIDC_QTABLE_ALLOC       VIDC_QTABLE_BYTES
 #define IFACEQ_RING_OFFS(i)     (0x001000u + (i) * 0x00100000u)  /* 0x1000/0x101000/0x201000 */
 #define IFACEQ_QUEUE_SIZE       0x000FF000u   /* 1 MiB - 4 KiB, rings stay disjoint */
 #define IFACEQ_QUEUE_WORDS      (IFACEQ_QUEUE_SIZE / 4u)
@@ -307,7 +309,7 @@ static uint64_t vidc_sfr_pa;
  * wired footprint small: at 64 pages the extra 192 KiB of wired memory
  * contributed to a kernel-map exhaustion (kmem_alloc 128 KiB failing with
  * KERN_NO_SPACE at 5.17 s on the first level-4 run). */
-#define VIDC_SMMU_TABLE_PAGES   16u
+#define VIDC_SMMU_TABLE_PAGES   12u
 /* Leaves actually mapped: carveout 8 MiB (2048) + qtable 0x310000 (784) +
  * SFR 4 KiB (1) = 2836, so the budget must exceed that or ArmSmmu4KBuild
  * refuses with ArmSmmu4KBudget. */
@@ -903,6 +905,8 @@ vidc_snap(const char *when)
         vidc_rd(0xC0010u), vidc_rd(0xC0014u), vidc_rd(0xC0018u),
         vidc_rd(R_WRAPPER_CORE_PWR), vidc_rd(R_WRAPPER_CORE_CLK),
         vidc_rd(R_VCODEC_SS_IDLE));
+    printf("PANDORA VIDC: x2rpmh=%08x core_power_on=%u (MSK_CORE_POWER_ON=BIT1)\n",
+        vidc_rd(R_CPU_X2RPMH), (vidc_rd(R_CPU_X2RPMH) >> 1) & 1u);
 }
 
 static inline uint32_t
