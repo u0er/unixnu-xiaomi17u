@@ -1,0 +1,54 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0514 sweet_nub: disambiguate withNumber(0) and stop naming OSPtr outside a return type
+
+CI run 44929577157 failed exactly here (full 50 MB log, not a truncated one):
+
+  sweet_nub.cpp:275:25: error: call to 'withNumber' is ambiguous
+      OSNumber *maxpower = OSNumber::withNumber(0, 32);
+  candidates: withNumber(unsigned long long, unsigned int)
+              withNumber(const char *, unsigned int)
+
+`0` is both an integer and a null pointer constant, so both overloads are viable. The fix is
+0ULL (and ULL on the other numeric literals, so no future literal can pick the string overload).
+The same compile also warned
+
+  sweet_nub.cpp:243:2: warning: use of OSPtr outside of a return type [-Wossharedptr-misuse]
+
+for `OSPtr<OSIterator> children_it = ...`. `auto` keeps the code indifferent to whether OSPtr is
+a raw pointer (today) or a shared pointer (if IOKIT_ENABLE_SHARED_PTR is ever enabled), which is
+exactly what the header's own comment asks for. OSPtr.h is therefore no longer included.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -32,7 +32,6 @@
+ #include <libkern/c++/OSSymbol.h>
+ #include <libkern/c++/OSSharedPtr.h>
+ #include <libkern/c++/OSIterator.h>
+-#include <libkern/c++/OSPtr.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -240,7 +239,7 @@
+ 	(void)tsleep(&sweet_nub_wait, PZERO, "sweetnub2", 5 * hz);
+ 	int started_now = ctl->isInactive() ? 0 : 1;
+ 	printf("SWEET NUB: after 5 s: started %d, retain %d\n", started_now, ctl->getRetainCount());
+-	OSPtr<OSIterator> children_it = ctl->getChildIterator(gIOServicePlane);
++	auto children_it = ctl->getChildIterator(gIOServicePlane);
+ 	int children = 0;
+ 	if (children_it) {
+ 		while (OSObject *obj = children_it->getNextObject()) {
+@@ -271,10 +270,10 @@
+ 		if (desc == NULL || configs == NULL || config == NULL || ifaces == NULL) {
+ 			printf("SWEET NUB: cannot allocate the direct description\n");
+ 		} else {
+-			OSNumber *attributes = OSNumber::withNumber(224, 32);
+-			OSNumber *maxpower = OSNumber::withNumber(0, 32);
+-			OSNumber *vendor = OSNumber::withNumber(0x1209, 32);
+-			OSNumber *product = OSNumber::withNumber(0x0001, 32);
++			OSNumber *attributes = OSNumber::withNumber(224ULL, 32);
++			OSNumber *maxpower = OSNumber::withNumber(0ULL, 32);
++			OSNumber *vendor = OSNumber::withNumber(0x1209ULL, 32);
++			OSNumber *product = OSNumber::withNumber(0x0001ULL, 32);
+ 			OSString *fn_mux = OSString::withCString("AppleUSBMux");
+ 			OSString *fn_ctl = OSString::withCString("AppleUSBNCMControl");
+ 			OSString *fn_dat = OSString::withCString("AppleUSBNCMData");
