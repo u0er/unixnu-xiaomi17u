@@ -1,0 +1,61 @@
+From: baseband lane
+Subject: 0517 pandora_pas: 0512 passed a byte address where kmem_alloc_contig wants a page number
+
+kmem_alloc_contig's contract in this tree is
+
+  kmem_alloc_contig(map, addrp, size, mask, ppnum_t max_pnum, ppnum_t pnum_mask, flags, tag)
+
+-- the fifth argument is a maximum PHYSICAL PAGE NUMBER, 32-bit.  0512 passed 0x100000000ull
+intending "4 GiB" as bytes; clang said so at build time
+
+  warning: implicit conversion from 'unsigned long long' to 'ppnum_t' (aka 'unsigned int')
+           changes value from 4294967296 to 0
+
+so the constraint never applied, which is why the 2026-11-21 run still placed the metadata blob at
+0x8d0575000, above 4 GiB.  0x100000 pages is 4 GiB, and that is what both sites pass now.
+
+(Recorded because it is the second time this lane has mistaken a unit: the first was reading
+TrustZone's argument type field stride as six bits.)
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index 3557e0c..8aad40c 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -92,6 +92,15 @@ pas_meta_release(unsigned pas)
+ }
+ 
+ 
++/*
++ * kmem_alloc_contig's fifth argument is a maximum PHYSICAL PAGE NUMBER (ppnum_t, 32-bit), not a
++ * byte address: 0x100000 pages = 4 GiB.  The first version of this constraint passed
++ * 0x100000000ull and clang said so -- "implicit conversion from 'unsigned long long' to
++ * 'ppnum_t' changes value from 4294967296 to 0" -- which is why the blob still landed at
++ * 0x8d0575000 above 4 GiB on the 2026-11-21 run.
++ */
++#define MD_MAX_PNUM 0x100000u
++
+ #define PAS_MAX_SEGMENTS 64
+ #define PAS_MDT_MAX      0x10000
+ 
+@@ -241,8 +250,8 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 	 * TrustZone for PIL (carveout 0x8aa00000, DTB 0x99500000, IPA 0x99590000) is below it.
+ 	 * kmem_alloc_contig's min_addr/max_addr were both 0, i.e. no constraint at all; give it one.
+ 	 */
+-	if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0,
+-	    0x100000000ull, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, MD_MAX_PNUM, 0,
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		err = ENOMEM;
+ 		goto out;
+ 	}
+@@ -429,8 +438,8 @@ pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64
+ 	 * TrustZone for PIL (carveout 0x8aa00000, DTB 0x99500000, IPA 0x99590000) is below it.
+ 	 * kmem_alloc_contig's min_addr/max_addr were both 0, i.e. no constraint at all; give it one.
+ 	 */
+-	if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0,
+-	    0x100000000ull, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, MD_MAX_PNUM, 0,
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		err = ENOMEM;
+ 		goto out;
+ 	}
