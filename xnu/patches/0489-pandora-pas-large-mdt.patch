@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
-index 56132ef..fa99123 100644
+index 56132ef..bfc699d 100644
 --- a/bsd/dev/pandora_adsp.c
 +++ b/bsd/dev/pandora_adsp.c
 @@ -753,20 +753,32 @@ pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t me
@@ -38,7 +38,49 @@ index 56132ef..fa99123 100644
  		printf("PANDORA ADSP: %s is not a 32-bit ELF header\n", name);
  		return EINVAL;
  	}
-@@ -803,11 +815,25 @@ pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t me
+@@ -783,17 +795,38 @@ pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t me
+ 		}
+ 		reloc |= (ph[i].p_flags & MDT_RELOCATABLE) != 0;
+ 		min = MIN(min, (uint64_t)ph[i].p_paddr);
+-		max = MAX(max, ((uint64_t)ph[i].p_paddr + ph[i].p_memsz + 0xfff) & ~0xfffull);
++		/* Upstream qcom_mdt_load passes `max_addr - min_addr` untouched to
++		 * qcom_scm_pas_mem_setup; it never page-aligns it.  Keep the exact end
++		 * of the last segment, and align only where a mapping/length is needed
++		 * (max_page below), so mem_setup matches the reference byte for byte. */
++		max = MAX(max, (uint64_t)ph[i].p_paddr + ph[i].p_memsz);
+ 	}
++	const uint64_t max_page = (max + 0xfff) & ~0xfffull;
+ 	if (!hash || ph[0].p_type == 1 || min == ~0ull) {
+ 		printf("PANDORA ADSP: %s: no hash segment\n", name);
+ 		return EINVAL;
+ 	}
+-	uint32_t ehdr_size = ph[0].p_filesz, hash_size = ph[hash].p_filesz;
++	/* The metadata blob TZ authenticates is the ELF header plus the program
++	 * header table, i.e. e_phoff + e_phnum * e_phentsize (52 + 22*32 = 756 for
++	 * the VPU image).  ph[0].p_filesz happens to equal that for this image
++	 * because segment 0 is a PT_NULL canary, but relying on it would break for
++	 * any image without that canary.  Require the canary shape, then use the
++	 * real formula. */
++	if (ph[0].p_type != 0) {
++		printf("PANDORA ADSP: %s: no PT_NULL canary in segment 0\n", name);
++		return EINVAL;
++	}
++	uint32_t ehdr_size = phoff + (uint32_t)phnum * (uint32_t)sizeof(struct elf32_phdr);
++	if (ehdr_size > ph[0].p_filesz) {
++		printf("PANDORA ADSP: %s: header table %u exceeds segment 0 (%u)\n", name,
++		    ehdr_size, ph[0].p_filesz);
++		return EINVAL;
++	}
++	uint32_t hash_size = ph[hash].p_filesz;
+ 	uint64_t md_size = ((uint64_t)ehdr_size + hash_size + 0xfff) & ~0xfffull;
+ 	printf("PANDORA ADSP: %s (%s): %u segments, hash %u (%u bytes), load %#llx-%#llx%s\n", name,
+ 	    part ? "firmware partition" : "pack", phnum, hash, hash_size, min, max, reloc ? " relocatable" : "");
+-	if (max - min > mem_size) {
++	if (max_page - min > mem_size) {
+ 		printf("PANDORA ADSP: %s does not fit its carveout\n", name);
+ 		return EINVAL;
+ 	}
+@@ -803,11 +836,25 @@ pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t me
  		return ENOMEM;
  	}
  	uint64_t md_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)md));
