@@ -325,8 +325,11 @@ static bool     vidc_smmu_on;
 static uint32_t vidc_smmu_cb;      /* CB base offset inside apps-smmu */
 static uint32_t vidc_smmu_bank;
 /* Fault-capture state for the post-boot-release window. */
-static int      vidc_defer_ms = 9000;   /* see vidc_thread: keeps the peak
-                                         * out of the 5.2 s boot window */
+/* Default 0 = bring-up at init.  Deferring to 9 s dodged the TOUCH 128 KiB
+ * failure at 5.171 s but then our 3 MiB queue table made a later 1 MiB
+ * kmem_alloc fail at 9.180 s, so the problem is what we KEEP, not when.
+ * The teardown below frees the SMMU window as soon as the ladder ends. */
+static int      vidc_defer_ms = 0;
 static bool     vc_smmu_faults_done;
 static unsigned vc_smmu_faults;
 
@@ -476,12 +479,14 @@ static vm_offset_t vidc_smmu_va;
 static inline uint32_t
 vidc_smmu_rd(uint32_t off)
 {
+    if (!vidc_smmu_va) return 0;      /* window released after the ladder */
     return vidc_ld32(vidc_smmu_va, off);
 }
 
 static inline void
 vidc_smmu_wr(uint32_t off, uint32_t v)
 {
+    if (!vidc_smmu_va) return;
     vidc_st32(vidc_smmu_va, off, v);
     __asm__ volatile ("dsb sy" ::: "memory");
 }
@@ -1548,6 +1553,18 @@ summary:
         printf("PANDORA VIDC: final EFUSE=%08x CORE_PWR=%08x CORE_CLK=%08x IDLE=%08x\n",
             vidc_rd(R_WRAPPER_EFUSE), vidc_rd(R_WRAPPER_CORE_PWR),
             vidc_rd(R_WRAPPER_CORE_CLK), vidc_rd(R_VCODEC_SS_IDLE));
+
+    /* Hand the apps-smmu window straight back.  The bank/ASID/CB programming
+     * lives in the SMMU, not in this mapping, so dropping the 1 MiB of kernel
+     * VA costs nothing after the context is built -- and it is exactly the kind
+     * of permanent kernel_map that made an unrelated 1 MiB kmem_alloc fail at
+     * 9.180 s (`failed with 3 @vm_kern.c:178`). */
+    if (vidc_smmu_va) {
+        ml_io_unmap(vidc_smmu_va, VIDC_SMMU_SIZE);
+        vidc_smmu_va = 0;
+        printf("PANDORA VIDC: released %#x bytes of apps-smmu kernel VA\n",
+            VIDC_SMMU_SIZE);
+    }
 }
 
 /* ------------------------------------------------------------------ */
