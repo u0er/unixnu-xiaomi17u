@@ -1,0 +1,78 @@
+From: baseband lane
+Subject: 0520 pandora_mpss: cross each image with each PAS id (the first probe conflated two failures)
+
+0510's probe sent the DTB's metadata for nine candidate ids and every one came back 0xffcfffbb,
+which was read as "the id is not the problem".  That reading is unsound: it sent ONE image's
+metadata to every id, so two different failures look identical --
+
+  * the id is unknown to the secure world, or
+  * the id exists but the metadata does not describe that id's image (TrustZone comparing the
+    hash against the image it expects).
+
+0520 asks four questions instead, each image with its own metadata:
+
+    (modem_dtb.mdt, pas 0x26)   the path the ladder uses
+    (modem_dtb.mdt, pas 4)
+    (modem.mdt,     pas 4)      the main image with its own metadata
+    (modem.mdt,     pas 0x26)
+
+Both blobs are the tail-copy branch of qcom_mdt_read_metadata(): for modem.mdt
+ehdr 948 + hash 6304 = 7252 == file size, and for modem_dtb.mdt 148 + 3896 = 4044 == file size, which
+was verified against the files themselves (.temp/modem.mdt, .temp/modem_dtb.mdt).
+
+Off by default; pandora_mpss_pas_probe2=1 enables it.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index b0205e1..a269ff3 100755
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -897,10 +897,49 @@ mp_probe_pas_ids(void)
+ 	}
+ }
+ 
++/*
++ * Cross the two images with the two PAS ids, each image with its OWN metadata.
++ *
++ * The first probe (0510) sent the DTB's metadata for all nine candidate ids, so its "every id is
++ * refused" result cannot separate two very different failures:
++ *   - the id is unknown to TrustZone, or
++ *   - the id exists but the metadata does not describe that id's image.
++ * TrustZone may well compare the metadata's hash against the image it expects for a given id, and
++ * a DTB blob sent for the main image's id would then be refused for the second reason while looking
++ * exactly like the first.
++ *
++ * 0520 therefore asks four questions in one boot:
++ *     (modem_dtb.mdt, pas 0x26)   the path the ladder actually uses
++ *     (modem_dtb.mdt, pas 4)
++ *     (modem.mdt,     pas 4)      the main image with its own metadata
++ *     (modem.mdt,     pas 0x26)
++ * Off by default; pandora_mpss_pas_probe2=1 enables it.
++ */
++static void
++mp_probe_cross(void)
++{
++	static const char *const images[] = { "modem_dtb", "modem" };
++	static const unsigned ids[] = { MP_PAS, MP_PAS_DTB };
++
++	if (!mp_option("pandora_mpss_pas_probe2")) {
++		return;
++	}
++	printf("PANDORA MPSS: crossing 2 images with 2 PAS ids, each with its own metadata\n");
++	for (unsigned i = 0; i < sizeof(images) / sizeof(images[0]); i++) {
++		for (unsigned j = 0; j < sizeof(ids) / sizeof(ids[0]); j++) {
++			uint64_t answer = 0;
++			int err = pandora_pas_init_only(MP_FW_PART, images[i], ids[j], &answer);
++			printf("PANDORA MPSS: %s.mdt -> pas %u: %s (a0 %#llx)\n", images[i], ids[j],
++			    err ? "no call" : (answer ? "refused" : "ACCEPTED"), answer);
++		}
++	}
++}
++
+ static bool
+ step_dtb(void)
+ {
+ 	mp_probe_pas_ids();
++	mp_probe_cross();
+ 	if (!mp_assign_dsm()) {
+ 		printf("PANDORA MPSS: the DSM regions were not assigned; continuing anyway\n");
+ 	}
