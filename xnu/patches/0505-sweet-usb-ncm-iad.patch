@@ -29,7 +29,13 @@ sweetusb=5:  the 109-byte configuration becomes 117 bytes with one IAD (if1..if2
  	9, 4, 0, 0, 1, 0x02, 0x0d, 0x00, 0,             /* if0 alt0: comm, NCM subclass 0Dh, 1 endpoint */
  	5, 0x24, 0x00, 0x10, 0x01,                      /* CDC header, bcdCDC 0x0110 */
  	5, 0x24, 0x06, 0, 1,                            /* union: master 0, slave 1 */
-@@ -468,10 +469,11 @@
+@@ -463,15 +464,16 @@
+  *   5 + 5 + 13 + 6           CDC header, union, ethernet, NCM
+  *   7                        interrupt EP 0x83
+  *   9 + 9 + 7 + 7            interface 2 alt 0, alt 1, and their bulk EPs
+- * = 109 bytes.  The array is declared without a bound so sizeof() is the exact
++ * = 117 bytes (109 + the 8-byte IAD).  The array is declared without a bound so sizeof() is the exact
+  * element count; the typedefs below turn a wrong count into a compile error
   * instead of a configuration a host silently rejects.
   */
  static const uint8_t ud_carplay_cfg_desc[] = {
@@ -42,3 +48,12 @@ sweetusb=5:  the 109-byte configuration becomes 117 bytes with one IAD (if1..if2
  	9, 4, 1, 0, 1, 0x02, 0x0d, 0x00, 0,          /* if1 alt0: CDC-NCM control, 1 endpoint */
  	5, 0x24, 0x00, 0x10, 0x01,                   /* CDC header, bcdCDC 0x0110 */
  	5, 0x24, 0x06, 1, 2,                         /* union: master if1, slave if2 */
+@@ -493,7 +495,7 @@
+ };
+ 
+ typedef char ud_carplay_dev_desc_must_be_18_bytes[(sizeof(ud_carplay_dev_desc) == 18) ? 1 : -1];
+-typedef char ud_carplay_cfg_desc_must_be_109_bytes[(sizeof(ud_carplay_cfg_desc) == 109) ? 1 : -1];
++typedef char ud_carplay_cfg_desc_must_be_117_bytes[(sizeof(ud_carplay_cfg_desc) == 117) ? 1 : -1];
+ 
+ /*
+  * Personality predicates.  UD_CARPLAY runs both functions, so every place that
