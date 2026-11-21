@@ -13,7 +13,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..2b8d2952c711cc8c7fa043775aea1845e3635739
+index 0000000..caa7e2214762d36e10e479aa0b542e73f344a1b2
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
 @@ -0,0 +1,4747 @@
@@ -4248,7 +4248,7 @@ index 0000000..2b8d2952c711cc8c7fa043775aea1845e3635739
 +			 * margin. Eight 200 ms tries would allow 1.6 s per frame and
 +			 * 91 s for the 57 frames - past the whole 30 s trial. Four tries
 +			 * at 40 ms caps the stage at 9.1 s in the worst case. */
-+			while (!acked && tries < 4u) {
++			while (!acked && tries < 1u) {
 +				tries++;
 +				/* bt_peri_wait_cc8() returns only when the exact 8-byte
 +				 * Command Complete has been matched, so there is nothing left
@@ -4257,7 +4257,7 @@ index 0000000..2b8d2952c711cc8c7fa043775aea1845e3635739
 +				 * switch to the matcher, but `got` is never advanced by it:
 +				 * those tests were permanently false and phase C would have
 +				 * failed on every frame even with a perfect ack. */
-+				err = bt_peri_wait_cc8(40u, ev, what);
++				err = bt_peri_wait_cc8(200u, ev, what);
 +				if (err) {
 +					bt_tx_long_quiet = false;
 +					printf("PANDORA BT: %s: frame %u/%u got no Command Complete (error %d)\n",
