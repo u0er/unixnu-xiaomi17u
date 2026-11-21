@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..5e77b9d
+index 0000000..cf31f79
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,1955 @@
+@@ -0,0 +1,1958 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -572,6 +572,9 @@ index 0000000..5e77b9d
 +            return -1;
 +        }
 +    }
++    /* Now that our window is held, probe again: the pair of lines says exactly
++     * how much the allocation cost, which is what the 5.17 s failure was about. */
++    vidc_map_budget("after qtable");
 +    if (!vidc_sfr_va) {
 +        vidc_sfr_va = vidc_contig(VIDC_SFR_BYTES, &vidc_sfr_pa);
 +        if (!vidc_sfr_va) {
