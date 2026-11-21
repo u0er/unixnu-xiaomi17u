@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..b18e4ad1700415f197fcbd4a8a51fea0d0572422
+index 0000000..86e922b12f6a2f9a8e785cc84080bd443fe1edd0
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4642 @@
+@@ -0,0 +1,4655 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -2000,17 +2000,26 @@ index 0000000..b18e4ad1700415f197fcbd4a8a51fea0d0572422
 +/* Level 20.27: an abort is asynchronous. The old failure paths wrote
 + * GENI_CMD_ABORT, cleared the IRQ and returned immediately, so the sequencer
 + * could still be finishing the frame while the next stage began writing - a
-+ * half frame on the wire shifts every later frame boundary. Wait (bounded) for
-+ * M_ACTIVE to drop, then drop whatever is left in the TX FIFO. */
++ * half frame on the wire shifts every later frame boundary.
++ *
++ * This waits (bounded, 50 ms) for M_ACTIVE to drop and then clears the IRQs.
++ * It deliberately does NOT try to flush the TX FIFO: this file has no verified
++ * GENI flush sequence for this hardware, and guessing one could wedge the
++ * sequencer worse than the half frame it is meant to clean up. What the abort
++ * leaves in the FIFO is therefore unknown - if a later run shows frame
++ * boundaries slipping after a failed frame, that is the thing to investigate. */
 +static void
 +bt_tx_abort_settle(void)
 +{
 +	bt_wr(BT_W_SE, SE_M_CMD_CTRL, GENI_CMD_ABORT);
++	/* delay() takes MICROSECONDS in XNU, so delay(1) is one microsecond - a
++	 * polling loop built on it waits almost nothing. bt_sleep() also takes
++	 * microseconds but blocks properly, so poll once per millisecond. */
 +	for (unsigned waited = 0; waited < 50u; waited++) {
 +		if (!(bt_rd(BT_W_SE, SE_STATUS) & GENI_STATUS_M_ACTIVE)) {
 +			break;
 +		}
-+		delay(1);
++		bt_sleep(1000);
 +	}
 +	bt_wr(BT_W_SE, SE_M_IRQ_CLR, 0xffffffffu);
 +}
@@ -2084,8 +2093,12 @@ index 0000000..b18e4ad1700415f197fcbd4a8a51fea0d0572422
 +		}
 +	}
 +	bt_wr(BT_W_SE, SE_M_IRQ_CLR, M_TX_WM);
-+	/* Same bound as the proven one-shot bt_uart_tx: a 251-byte frame at
-+	 * 4 Mbps needs ~0.63 ms of wire time, so 2 s is a generous bound. */
++	/* Bounded at 2000 x delay(1) = 2 ms, not 2 s: XNU's delay() takes
++	 * MICROSECONDS, so this is "a few times the 0.63 ms a 251-byte frame needs
++	 * at 4 Mbps" rather than the generous second the original comment claimed.
++	 * It has held for every frame so far because the watermark path is the one
++	 * that actually paces the bytes; kept tight so a wedged sequencer fails
++	 * fast instead of stalling a 30 s trial. */
 +	for (i = 0; i < 2000 && !(bt_rd(BT_W_SE, SE_M_IRQ) & M_CMD_DONE); i++)
 +		delay(1);
 +	if (!(bt_rd(BT_W_SE, SE_M_IRQ) & M_CMD_DONE)) {
