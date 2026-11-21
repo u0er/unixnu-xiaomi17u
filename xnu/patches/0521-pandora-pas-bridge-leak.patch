@@ -1,0 +1,106 @@
+From: baseband lane
+Subject: 0521 pandora_pas: delete the SHM bridge on every failure path (it leaked one per refusal)
+
+Found by re-reading the file rather than by a failing run.
+
+0518 creates a bridge over the metadata blob before INIT_IMAGE and deletes it after AUTH_AND_RESET.
+But four failure paths between those two points freed the blob and left the bridge alive:
+
+    INIT_IMAGE refused          -> kmem_free(md);                              (leak)
+    MEM_SETUP refused           -> kmem_free(md);                              (leak)
+    carveout mapping failed     -> kmem_free(md);                              (leak)
+    segment copy failed         -> already deleted the bridge                  (ok)
+
+Each leak costs a TrustZone bridge plus a pinned page, and while INIT_IMAGE is being refused a
+failure is the NORMAL outcome: the id sweep alone makes nine calls, the cross sweep four.  If the
+secure world's bridge table is finite, this lane would have been poisoning its own later attempts --
+so the leak is a candidate cause for later refusals, not just untidiness.
+
+Fixed with pas_release_meta(), which deletes the bridge and then frees the blob, used by all four
+paths.
+
+Also: pandora_pas_init_only() (the probe entry point) used to hold the blob whatever the answer was.
+Only an ACCEPTED call has anything to keep alive -- nothing will ever AUTH an id that was refused --
+so it now releases on refusal.
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index 194dc99..5e97581 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -45,6 +45,7 @@ extern void pandora_scm_call5(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64
+ static void pas_enable_shm_bridge(void);
+ static uint64_t pas_bridge_create(uint64_t pa, uint64_t size);
+ static void pas_bridge_delete(uint64_t handle, unsigned pas);
++static void pas_release_meta(unsigned pas, vm_offset_t md, uint64_t size, uint64_t bridge);
+ 
+ /*
+  * The metadata segment has to stay accessible to the secure world from INIT_IMAGE until
+@@ -296,7 +297,7 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 	printf("PANDORA PAS: pas %u init_image (%u bytes, arginfo %#llx, blob %#llx) -> a0 %#llx (%d) a1 %#llx\n",
+ 	    pas, ehdr_size + hash_size, arginfo, md_pa, a0, (int)(int32_t)a0, a1);
+ 	if (a0 || a1) {
+-		kmem_free(kernel_map, md, (vm_size_t)md_size);
++		pas_release_meta(pas, md, md_size, bridge);
+ 		err = EIO;
+ 		goto out;
+ 	}
+@@ -306,7 +307,7 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 		printf("PANDORA PAS: pas %u mem_setup %#llx+%#llx -> a0 %#llx (%d)\n", pas, mem_pa, max - min,
+ 		    a0, (int)(int32_t)a0);
+ 		if (a0) {
+-			kmem_free(kernel_map, md, (vm_size_t)md_size);
++			pas_release_meta(pas, md, md_size, bridge);
+ 			err = EIO;
+ 			goto out;
+ 		}
+@@ -315,7 +316,7 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 	    VM_WIMG_WCOMB);
+ 	if (!mem) {
+ 		printf("PANDORA PAS: %s: carveout %#llx+%#llx not mapped\n", name, mem_pa, mem_size);
+-		kmem_free(kernel_map, md, (vm_size_t)md_size);
++		pas_release_meta(pas, md, md_size, bridge);
+ 		err = ENOMEM;
+ 		goto out;
+ 	}
+@@ -472,7 +473,17 @@ pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64
+ 	uint64_t probe_bridge = pas_bridge_create(md_pa, md_size);
+ 	uint64_t a0 = 0, a1 = 0, arginfo = SCM_ARGS(2) | (SCM_RW << 6);
+ 	pandora_scm_call(SCM_PAS_INIT_IMAGE, arginfo, pas, md_pa, &a0, &a1);
+-	pas_meta_hold(pas, md, md_size, probe_bridge);
++	/*
++	 * Only a call that was ACCEPTED has anything to keep alive: if TrustZone refused, nothing will
++	 * ever AUTH this id, so holding the blob (and its bridge) would be a pure leak.  The probe makes
++	 * thirteen calls with the id sweep plus the cross sweep, which is enough to matter against a
++	 * finite bridge table.
++	 */
++	if (a0 == 0 && a1 == 0) {
++		pas_meta_hold(pas, md, md_size, probe_bridge);
++	} else {
++		pas_release_meta(pas, md, md_size, probe_bridge);
++	}
+ 	if (answer) {
+ 		*answer = a0;
+ 	}
+@@ -558,6 +569,22 @@ pas_bridge_delete(uint64_t handle, unsigned pas)
+ 	printf("PANDORA PAS: shm_bridge_delete(pas %u, *%#llx) -> a0 %#llx a1 %#llx\n", pas, handle, a0, a1);
+ }
+ 
++/*
++ * Every failure path after the bridge was created must delete it before freeing the blob.
++ *
++ * The first version of 0518 freed the blob on four error paths (INIT_IMAGE refused, MEM_SETUP
++ * refused, carveout mapping failed, a segment copy failed) and left the bridge alive each time.
++ * That leaks one TrustZone bridge plus one pinned page per failure -- and while INIT_IMAGE is being
++ * refused, failures are the norm: the id probe alone makes nine calls.  If the secure world's
++ * bridge table is finite this would poison every later attempt, so the leak is not cosmetic.
++ */
++static void
++pas_release_meta(unsigned pas, vm_offset_t md, uint64_t size, uint64_t bridge)
++{
++	pas_bridge_delete(bridge, pas);
++	kmem_free(kernel_map, md, (vm_size_t)size);
++}
++
+ /* PAS_AUTH_AND_RESET: lets the processor out of reset. */
+ int
+ pandora_pas_auth(unsigned pas)
