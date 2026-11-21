@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..3e5dbe16c98f267f9dddfa9672c228a502eaeb7b
+index 0000000..2ed11527c40268fbe23a13bd3004d4053a18f432
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4724 @@
+@@ -0,0 +1,4738 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3901,6 +3901,20 @@ index 0000000..3e5dbe16c98f267f9dddfa9672c228a502eaeb7b
 + * legal payload byte inside the 0xfc00 Command Complete (04 0e 05 01 00 fc 00
 + * 1e), so filtering mid-event would corrupt the very event being read. */
 +static int
++/* Record-skip state must survive a window boundary: a 34 00 ff <plen> record can
++ * be split between two calls, and restarting at "look for 0x34" would scan the
++ * leftover payload as if it were event starts (a stray 0x04 there can swallow the
++ * real ack). File scope + a reset at every protocol-phase entry keeps it honest. */
++static unsigned bt_vstate;
++static unsigned bt_vskip;
++
++static void
++bt_peri_record_state_reset(void)
++{
++	bt_vstate = 0;
++	bt_vskip = 0;
++}
++
 +bt_peri_cc_read(unsigned window_ms, uint8_t *ev, unsigned cap, unsigned *got,
 +    unsigned *wakes, const char *what, bool skip_records)
 +{
@@ -3917,8 +3931,7 @@ index 0000000..3e5dbe16c98f267f9dddfa9672c228a502eaeb7b
 +	 * resync below would otherwise mistake for an HCI event header - that is how
 +	 * a real Command Complete ended up being parsed as "event 04 8f status 242".
 +	 * Skip the whole record by its declared length instead. */
-+	unsigned vstate = 0;
-+	unsigned vskip = 0;
++
 +	uint64_t deadline;
 +
 +	*got = 0;
@@ -3931,26 +3944,26 @@ index 0000000..3e5dbe16c98f267f9dddfa9672c228a502eaeb7b
 +			continue;
 +		}
 +		b = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
-+		if (vstate != 0u) {
++		if (bt_vstate != 0u) {
 +			bool matched = true;
 +
-+			if (vstate == 1u && b == 0x00u) {
-+				vstate = 2u;
-+			} else if (vstate == 2u && b == 0xffu) {
-+				vstate = 3u;
-+			} else if (vstate == 3u) {
-+				vskip = b;
-+				vstate = (vskip != 0u) ? 4u : 0u;
-+			} else if (vstate == 4u) {
-+				if (--vskip == 0u) {
-+					vstate = 0u;
++			if (bt_vstate == 1u && b == 0x00u) {
++				bt_vstate = 2u;
++			} else if (bt_vstate == 2u && b == 0xffu) {
++				bt_vstate = 3u;
++			} else if (bt_vstate == 3u) {
++				bt_vskip = b;
++				bt_vstate = (bt_vskip != 0u) ? 4u : 0u;
++			} else if (bt_vstate == 4u) {
++				if (--bt_vskip == 0u) {
++					bt_vstate = 0u;
 +				}
 +			} else {
 +				/* Not the expected 34 00 ff shape. Abandon the record and
 +				 * fall through, so this byte still gets a chance to be the
 +				 * first byte of a real event - dropping it could throw a
 +				 * genuine 0x04 away. */
-+				vstate = 0u;
++				bt_vstate = 0u;
 +				matched = false;
 +			}
 +			if (matched) {
@@ -3960,7 +3973,7 @@ index 0000000..3e5dbe16c98f267f9dddfa9672c228a502eaeb7b
 +		if (skip_records && b == 0x34u && *got == 0u) {
 +			/* Start of a 34 00 ff <plen> vendor record: validated and
 +			 * skipped by the state machine above on the next bytes. */
-+			vstate = 1u;
++			bt_vstate = 1u;
 +			continue;
 +		}
 +		if (*got == 0u) {
@@ -4001,9 +4014,9 @@ index 0000000..3e5dbe16c98f267f9dddfa9672c228a502eaeb7b
 +			return EMSGSIZE;
 +		}
 +	}
-+	if (dropped != 0u || vstate != 0u) {
++	if (dropped != 0u || bt_vstate != 0u) {
 +		printf("PANDORA BT: %s: window closed with %u byte(s) dropped, record state %u\n",
-+		    what, dropped, vstate);
++		    what, dropped, bt_vstate);
 +		pandora_log_sync();
 +	}
 +	return ETIMEDOUT;
@@ -4190,7 +4203,6 @@ index 0000000..3e5dbe16c98f267f9dddfa9672c228a502eaeb7b
 +	bt_tx_long_bytes = 0;
 +	while (sent < size) {
 +		unsigned len = size - sent;
-+		unsigned got = 0;
 +
 +		if (len > BT_FW_SEG_MAX) {
 +			len = BT_FW_SEG_MAX;
@@ -4386,6 +4398,7 @@ index 0000000..3e5dbe16c98f267f9dddfa9672c228a502eaeb7b
 +static int
 +bt_peri_level20(void)
 +{
++	bt_peri_record_state_reset();
 +	int err;
 +
 +	printf("PANDORA BT: level 20: TME-L map A %u B (TLV) + B %u B + C %u B (HCI 0xfc00) (20.24)\n",
@@ -4503,6 +4516,7 @@ index 0000000..3e5dbe16c98f267f9dddfa9672c228a502eaeb7b
 +static int
 +bt_peri_download(void)
 +{
++	bt_peri_record_state_reset();
 +	uint16_t bid = 0xffff;
 +	int err;
 +
