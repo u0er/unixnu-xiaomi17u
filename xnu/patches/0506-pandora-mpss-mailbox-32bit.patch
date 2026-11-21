@@ -1,0 +1,62 @@
+From: baseband lane
+Subject: 0506 pandora_mpss: the mailbox window takes 32-bit stores; stage into an aligned buffer
+
+Follow-up to 0505.  The 16-byte vectorised memset was one hazard; the access width is another.
+
+0505 replaced the memset with byte-wise writes through a volatile pointer.  The strict-alignment
+fault went away, but the next hardware run left no trace at all -- not a panic (a panic does get
+flushed into the pinned ring; the earlier step-4 run proved that), more like a stalled bus and a
+watchdog reset.  A register window at offset 0x38 of an AOP mailbox is the kind of block that
+expects 32-bit accesses.
+
+So: zero and fill a stack buffer that is explicitly 16-byte aligned (making the memset/memcpy
+vectorisation safe), then copy it into the window with 32-bit stores only.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index b937dc6..8efbea2 100755
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -719,23 +719,29 @@ mp_mailbox_send(const char *text)
+ 		len = QMP_MESSAGE - 1;
+ 	}
+ 	/*
+-	 * Byte-wise through a volatile pointer, deliberately.
++	 * The box is a register window at offset 0x38, so it is 8-byte aligned but NOT 16-byte
++	 * aligned, and like most of this block it wants 32-bit accesses.  Two separate hazards,
++	 * two separate answers:
+ 	 *
+-	 * The mailbox's box is at offset 0x38 of the mapping, so it is 8-byte aligned but NOT
+-	 * 16-byte aligned.  `memset(box, 0, 64)` is a 64-byte zeroing that clang vectorises into
+-	 * 16-byte NEON stores (`stp q0, q1`), and this kernel runs with strict alignment: the very
+-	 * first store faults with "Unaligned kernel data abort", esr 0x96000061, far = box + 0.
+-	 * That is exactly what happened on 2026-11-21 at step 3 (pc _step_mailbox + 0x18c), and it
+-	 * is why step 4 never reached its TrustZone call.
++	 *   16-byte alignment: `memset(box, 0, 64)` is a 64-byte zeroing that clang vectorises into
++	 *     16-byte NEON stores (`stp q0, q1`), and this kernel runs with strict alignment -- the
++	 *     2026-11-21 fault (esr 0x96000061, far = box + 0) was exactly that.  Fixed by staging
++	 *     into a stack buffer that is explicitly 16-byte aligned.
+ 	 *
+-	 * A byte loop cannot be misaligned whatever the compiler does with it.
++	 *   access width: writing the window byte by byte was the first fix, and on the next run
++	 *     the boot stopped leaving any trace at all (not a panic -- a panic does get flushed to
++	 *     the ring; this looked like a stalled bus and a watchdog reset).  So the window is only
++	 *     ever touched with 32-bit stores, which is what the hardware expects.
+ 	 */
+-	volatile uint8_t *box = (volatile uint8_t *)(mp_qmp + QMP_OUR_BOX);
+-	for (unsigned i = 0; i < QMP_MESSAGE; i++) {
+-		box[i] = 0;
+-	}
+-	for (unsigned i = 0; i < len; i++) {
+-		box[i] = (uint8_t)text[i];
++	uint8_t staged[QMP_MESSAGE] __attribute__((aligned(16)));
++	memset(staged, 0, sizeof(staged));
++	memcpy(staged, text, len);
++	volatile uint32_t *box = (volatile uint32_t *)(mp_qmp + QMP_OUR_BOX);
++	for (unsigned i = 0; i < QMP_MESSAGE / 4; i++) {
++		uint32_t word;
++
++		memcpy(&word, staged + i * 4, 4);
++		box[i] = word;
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	mp_wr(mp_ipcc, IPCC_SEND, 0u << 16 | 0u);       /* IPCC client 0 (the AOP), signal 0 */
