@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..36a6ed2
+index 0000000..28dd7e9
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,1886 @@
+@@ -0,0 +1,1918 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -177,7 +177,16 @@ index 0000000..36a6ed2
 +#define R_CPU_QUEUE_TABLE_SIZE  (CPU_BASE_OFFS + 0x068u)  /* write 0x300000 */
 +#define R_CPU_QUEUE_TABLE_DA2   (CPU_BASE_OFFS + 0x054u)  /* qtable device addr */
 +#define R_CPU_QUEUE_TABLE_EN    (CPU_BASE_OFFS + 0x050u)  /* write 1 */
-+#define R_CPU_QUEUE_TABLE_ADDR2 (CPU_BASE_OFFS + 0x060u)  /* SFR device addr */
++#define R_CPU_QUEUE_TABLE_ADDR2 (CPU_BASE_OFFS + 0x060u)  /* vendor writes sfr here too */
++/* [M] iris_vpu_common.c iris_vpu_setup_ucregion_memory_map():
++ *     #define SFR_ADDR (CPU_CS_BASE_OFFS + 0x5C)
++ *     if (core->sfr_daddr) writel(sfr_daddr + core_arch, SFR_ADDR);
++ * The vendor does exactly this at 0xA005C with `core[0x12c8] + 1`, which pins
++ * core_arch = 1 for this platform.  We never wrote this register at all: the
++ * firmware looks up its SFR here, so without it HFI can never initialise and
++ * CTRL_STATUS (0xA004C) stays zero forever -- which is the observed state. */
++#define R_CPU_SFR_ADDR          (CPU_BASE_OFFS + 0x05Cu)
++#define VIDC_CORE_ARCH          1u
 +#define R_CPU_QUEUE_TABLE_STAT  (CPU_BASE_OFFS + 0x04Cu)  /* bit0 ready, bits1-3 err */
 +#define R_CPU_CP_SPAN_A         (CPU_BASE_OFFS + 0x024u)  /* CP span size */
 +#define R_CPU_CP_SPAN_B         (CPU_BASE_OFFS + 0x028u)  /* CP span size */
@@ -1099,6 +1108,25 @@ index 0000000..36a6ed2
 + * (iris_vpu4x.c:108-118 and :308-318).  REQ_POWER_DOWN_PREP is written to the
 + * control register and the status must report DONE; a DENY/ACTIVE status means
 + * the NoC is busy elsewhere, which is worth seeing in the log. */
++/* Upstream polls VCODEC_SS_IDLE_STATUSN before the NoC handshake
++ * (iris_vpu4x.c:297) so it never resets the NoC while a video client is busy.
++ * On this board the register reads 0x7fff (all idle), so this normally passes
++ * on the first iteration -- but it is part of the documented order and it is
++ * cheap, so it is checked rather than assumed. */
++static int
++vidc_wait_idle(void)
++{
++    uint32_t v = 0;
++    unsigned i;
++    for (i = 0; i < 1000; i++) {
++        v = vidc_rd(R_VCODEC_SS_IDLE);
++        if (v) break;                 /* any non-zero = subsystem reports idle */
++        delay(1);
++    }
++    printf("PANDORA VIDC: idle status %08x after %u us\n", v, i);
++    return v ? 0 : -1;
++}
++
 +static int
 +vidc_noc_lpi(void)
 +{
@@ -1209,7 +1237,8 @@ index 0000000..36a6ed2
 +    vidc_branch_on(0x8090u);           /* mvs0a (APV)   */
 +    /* NoC reset handshake BEFORE the bridge reset, matching upstream order
 +     * (iris_vpu4x.c:318-336: NOC handshake, then CORE_BRIDGE_SW_RESET). */
-+    if (vidc_noc_lpi() != 0) failed++;      /* LPI first, then the NoC reset */
++    if (vidc_wait_idle() != 0) failed++;    /* idle, then LPI, then NoC reset */
++    if (vidc_noc_lpi() != 0) failed++;
 +    if (vidc_noc_reset() != 0) failed++;
 +    vidc_bridge_reset();
 +
@@ -1313,6 +1342,8 @@ index 0000000..36a6ed2
 +    vidc_wr(R_CPU_QUEUE_TABLE_EN, 1);
 +    if (vidc_sfr_da()) {
 +        vidc_wr(R_CPU_QUEUE_TABLE_ADDR2, vidc_sfr_da());
++        /* SFR_ADDR must carry sfr + core_arch (upstream), not the bare DA. */
++        vidc_wr(R_CPU_SFR_ADDR, vidc_sfr_da() + VIDC_CORE_ARCH);
 +    }
 +    printf("PANDORA VIDC: published DA=%08x SFR=%08x (smmu %s) "
 +           "regs A0064/A0068/A0054/A0050/A0060\n", da, vidc_sfr_da(),
@@ -1329,8 +1360,9 @@ index 0000000..36a6ed2
 +     * protected playback and own no CP table, so the vendor-equivalent action
 +     * is to write nothing -- not to invent a span for video_region.  Both
 +     * registers and 0xA005C are therefore left at their reset values. */
-+    printf("PANDORA VIDC: CP span 0xA0024/0xA0028 and 0xA005C skipped "
-+           "(no TZ CP table, vendor-equivalent path)\n");
++    printf("PANDORA VIDC: SFR published at 0xA005C=%08x (sfr+core_arch) and "
++           "0xA0060=%08x; CP span 0xA0024/0xA0028 skipped (no TZ CP table)\n",
++        vidc_rd(R_CPU_SFR_ADDR), vidc_rd(R_CPU_QUEUE_TABLE_ADDR2));
 +
 +    /* Assert MSK_CORE_POWER_ON (BIT1) before releasing the core.  The register
 +     * definition is explicit: CPU_CS_X2RPMH bit1 is the core power-on request
