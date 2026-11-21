@@ -1484,14 +1484,26 @@ vidc_publish_queues(void)
  * 8 MiB carveout, so a wrong PAS id shows up as a loud SCM failure. */
 extern int pandora_pas_load_auth(const char *file, unsigned pas,
     uint64_t mem_pa, uint64_t mem_size);
+extern int pandora_pas_load_auth_src(const char *file, unsigned pas, uint64_t mem_pa,
+    uint64_t mem_size, bool part);
 
 #define VIDC_PAS_ID 9u
 
 static int
 vidc_auth_reset(void)
 {
-    int err = pandora_pas_load_auth(vidc_fw_name, VIDC_PAS_ID,
-        VIDEO_REGION_PA, VIDEO_REGION_SIZE);
+    int err = pandora_pas_load_auth_src(vidc_fw_name, VIDC_PAS_ID,
+        VIDEO_REGION_PA, VIDEO_REGION_SIZE, false);
+    if (err != 0) {
+        /* The rebuilt volume carries a different userdata pack (20 files vs 19)
+         * whose VPU image trips the segment bounds check.  The firmware container
+         * was never touched and still holds the known-good image, so retry there
+         * before giving up on the stage. */
+        printf("PANDORA VIDC: pack image failed (err %d); retrying from the "
+               "firmware container\n", err);
+        err = pandora_pas_load_auth_src(vidc_fw_name, VIDC_PAS_ID,
+            VIDEO_REGION_PA, VIDEO_REGION_SIZE, true);
+    }
     if (err != 0) {
         printf("PANDORA VIDC: PAS load/auth failed for %s (err %d)\n", vidc_fw_name, err);
         return -1;
