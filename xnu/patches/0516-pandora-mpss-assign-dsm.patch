@@ -1,0 +1,99 @@
+From: baseband lane
+Subject: 0516 pandora_mpss: optionally assign the modem's two DSM regions to MSS before INIT_IMAGE
+
+canoe's modem node lists five memory-region phandles:
+
+  mpss_region@8aa00000   0x8aa00000 + 0xe100000     (our carveout)
+  q6_mpss_dtb_region     0x99500000 + 0x80000       (our DTB region)
+  linux,cma
+  dsm_partition_1        0x85000000 + 0x4f00000
+  dsm_partition_2        0x89f00000 + 0x100000
+
+and Linux's qcom_q6v5_pas assigns regions [region_assign_idx, +count) -- the two DSMs -- to the
+modem.  This port skipped that on the grounds that it was not needed for B1.  INIT_IMAGE is the
+first call that could notice.
+
+The call reuses the shape pandora_rmtfs.c already runs successfully on this phone:
+pandora_scm(MP_ASSIGN, 0x1117, pa, size, pa + 64, pa + 240, &answer), i.e. the vmid list at +64 and
+the permission list at +240 in the same page, owners {HLOS 3, MSS_MSA 15} with RW (6) each.
+
+Off by default -- `pandora_mpss_assign=1` enables it -- so one boot can test it without disturbing
+any other path, and it runs at the top of step 4 (the first TrustZone stage).
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 48bb1eb..c92eb6e 100755
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -246,6 +246,62 @@ mp_option(const char *name)
+  * neither present it is brought up (spec 9.3's defaults).  mp_option() takes the whole name,
+  * unlike pandora_ipa.c's own ipa_option(), which supplies the pandora_ipa_ prefix itself.
+  */
++/*
++ * Hand the modem's two DSM regions to MSS before anything is asked of TrustZone.
++ *
++ * canoe's modem node lists five memory-region phandles -- mpss_region, q6_mpss_dtb_region,
++ * linux,cma, dsm_partition_1 (0x85000000 + 0x4f00000) and dsm_partition_2 (0x89f00000 + 0x100000)
++ * -- and Linux's qcom_q6v5_pas assigns regions [idx, idx+count) = the two DSMs to the modem.
++ * This port skipped that as "not needed for B1"; INIT_IMAGE is the first call that could notice.
++ *
++ * The call shape is the one pandora_rmtfs.c already uses successfully on this phone:
++ *   pandora_scm(MP_ASSIGN, ARGUMENTS, pa, size, pa + 64, pa + 240, &answer)
++ * i.e. the vmid list at +64 and the permission list at +240 inside the same page.
++ * Off by default; enable with pandora_mpss_assign=1 so one boot can test it.
++ */
++static bool
++mp_assign_dsm(void)
++{
++	static const struct {
++		uint64_t pa, size;
++	} dsm[] = {
++		{ 0x85000000ull, 0x4f00000ull },
++		{ 0x89f00000ull, 0x100000ull },
++	};
++	vm_offset_t page = 0;
++
++	if (!mp_option("pandora_mpss_assign")) {
++		return true;
++	}
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO, VM_KERN_MEMORY_IOKIT) !=
++	    KERN_SUCCESS) {
++		printf("PANDORA MPSS: no page for the assign lists\n");
++		return false;
++	}
++	uint32_t *vmids = (uint32_t *)(page + 64);
++	uint32_t *perms = (uint32_t *)(page + 240);
++	vmids[0] = PANDORA_VMID_HLOS;
++	vmids[1] = PANDORA_VMID_MSS_MSA;
++	perms[0] = 6u;                          /* RW */
++	perms[1] = 6u;                          /* RW */
++	uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)page));
++	__asm__ volatile ("dsb sy" ::: "memory");
++	bool ok = true;
++	for (unsigned i = 0; i < sizeof(dsm) / sizeof(dsm[0]); i++) {
++		uint64_t a0 = 0, a1 = 0;
++
++		/* a1 must be its own variable: passing &page here would overwrite the mapping's
++		 * address with TrustZone's second result word and then free a wrong pointer. */
++		pandora_scm_call5(PANDORA_SCM_MP_ASSIGN, PANDORA_SCM_ASSIGN_ARGUMENTS, dsm[i].pa,
++		    dsm[i].size, pa + 64, pa + 240, &a0, &a1);
++		printf("PANDORA MPSS: assign %#llx+%#llx to HLOS+MSS -> a0 %#llx a1 %#llx %s\n",
++		    dsm[i].pa, dsm[i].size, a0, a1, (a0 || a1) ? "REFUSED" : "ok");
++		ok = ok && a0 == 0 && a1 == 0;
++	}
++	kmem_free(kernel_map, page, PAGE_SIZE);
++	return ok;
++}
++
+ static bool
+ mp_ipa_wanted(void)
+ {
+@@ -829,6 +885,9 @@ static bool
+ step_dtb(void)
+ {
+ 	mp_probe_pas_ids();
++	if (!mp_assign_dsm()) {
++		printf("PANDORA MPSS: the DSM regions were not assigned; continuing anyway\n");
++	}
+ 	if (pandora_pas_load(MP_FW_PART, "modem_dtb", mp_pas_dtb, MP_DTB_PA, MP_DTB_SIZE)) {
+ 		printf("PANDORA MPSS: modem_dtb.mdt did not load\n");
+ 		return false;
