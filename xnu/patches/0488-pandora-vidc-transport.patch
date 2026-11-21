@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..4ab5f65
+index 0000000..ef037dc
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,1688 @@
+@@ -0,0 +1,1738 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -905,6 +905,25 @@ index 0000000..4ab5f65
 +#define VIDEOCC_PA             0x020F0000u
 +#define VIDEOCC_SIZE           0x00010000u
 +
++/* The video block's AXI bus clocks live in GCC, not videocc, and upstream
++ * enables them FIRST (iris_vpu4x_enable_hardware_clocks: IRIS_AXI_CLK before
++ * everything else).  The vidc node's DT clock-names lists them explicitly:
++ *   gcc_video_axi1_clk -> /soc/clock-controller@100000 args 0xba
++ *   gcc_video_axi0_clk -> /soc/clock-controller@100000 args 0xb9
++ * Registers from the GCC driver source (work/references/
++ * drivers_clk_qcom_gcc-canoe.c:3617-3644):
++ *   gcc_video_axi0_clk enable_reg 0x32018 mask BIT(0) halt_check BRANCH_HALT_SKIP
++ *   gcc_video_axi1_clk enable_reg 0x3202c mask BIT(0) halt_check BRANCH_HALT_SKIP
++ * BRANCH_HALT_SKIP means there is NO halt/CLK_OFF bit to poll -- a driver that
++ * waits for bit31 to clear (like vidc_branch_on does for videocc) would spin
++ * forever, so these two are enabled with a plain bit0 readback.
++ * Without these the Xtensa cannot move a single beat over the bus, which is
++ * exactly the observed all-reset state. */
++#define GCC_PA                 0x00100000u
++#define GCC_SIZE               0x00040000u
++#define GCC_VIDEO_AXI0_CLK     0x00032018u
++#define GCC_VIDEO_AXI1_CLK     0x0003202Cu
++
 +struct vidc_gdsc_desc {
 +    const char *name;
 +    uint32_t    off;        /* relative to VIDEOCC_PA */
@@ -920,6 +939,7 @@ index 0000000..4ab5f65
 +};
 +
 +static vm_offset_t vidc_cc;
++static vm_offset_t vidc_gcc;      /* GCC window for the video AXI branches */
 +
 +static int
 +vidc_gdsc_on(const struct vidc_gdsc_desc *g)
@@ -975,6 +995,20 @@ index 0000000..4ab5f65
 +vidc_cc_rd(uint32_t off)
 +{
 +    return *(volatile uint32_t *)(vidc_cc + off);
++}
++
++/* GCC branch with BRANCH_HALT_SKIP: enable = set bit0, verify bit0 only. */
++static int
++vidc_gcc_branch_on(uint32_t off, const char *name)
++{
++    volatile uint32_t *cbcr = (volatile uint32_t *)(vidc_gcc + off);
++    const uint32_t before = *cbcr;
++    *cbcr = before | 1u;
++    __asm__ volatile ("dmb oshst" ::: "memory");
++    const uint32_t after = *cbcr;
++    printf("PANDORA VIDC: gcc %s (%#x) %08x -> %08x %s\n", name, off, before, after,
++        (after & 1u) ? "enabled" : "DID NOT STICK");
++    return (after & 1u) ? 0 : -1;
 +}
 +
 +static void
@@ -1047,6 +1081,17 @@ index 0000000..4ab5f65
 +     *   mvs0a_clk 0x8090, mvs0_vpp0_clk 0x8134, mvs0_vpp1_clk 0x8108,
 +     *   mvs0_freerun_clk 0x80e4                            [V clock_regs.txt:559-574]
 +     * Upstream order is AXI, HW_FREERUN, HW, BSE_HW, VPP0, VPP1, APV. */
++    /* AXI first, exactly like upstream's enable_hardware_clocks order. */
++    if (!vidc_gcc) {
++        vidc_gcc = ml_io_map(GCC_PA, GCC_SIZE);
++    }
++    if (!vidc_gcc) {
++        printf("PANDORA VIDC: ml_io_map(GCC) failed; AXI clocks cannot be voted\n");
++        failed++;
++    } else {
++        if (vidc_gcc_branch_on(GCC_VIDEO_AXI0_CLK, "video_axi0") != 0) failed++;
++        if (vidc_gcc_branch_on(GCC_VIDEO_AXI1_CLK, "video_axi1") != 0) failed++;
++    }
 +    vidc_branch_on(0x8164u);           /* mvs0c (AXI)   */
 +    /* 0x80e4 is NOT a plain branch: its captured clock object has no +0x30/+0x34
 +     * fields and a write there does not stick (`20010c00 -> 20010c00`), so the
@@ -1638,6 +1683,11 @@ index 0000000..4ab5f65
 +     * readers and writers now tolerate a released window, so drop them too: the
 +     * whole point is that this driver must not keep ~5 MiB of kernel_map on a
 +     * machine where the GPU lane already maps a 2 GiB pool. */
++    if (vidc_gcc) {
++        ml_io_unmap(vidc_gcc, GCC_SIZE);
++        vidc_gcc = 0;
++        released += GCC_SIZE;
++    }
 +    if (vidc_cc) {
 +        ml_io_unmap(vidc_cc, VIDEOCC_SIZE);
 +        vidc_cc = 0;
