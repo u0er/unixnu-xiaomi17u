@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..25a2b4b0970a0dbfca59f811648d6bd89368386e
+index 0000000..c309da7410cc3a12b8c6c250145d1115ea253305
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4549 @@
+@@ -0,0 +1,4561 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3876,6 +3876,8 @@ index 0000000..25a2b4b0970a0dbfca59f811648d6bd89368386e
 +		}
 +		b = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
 +		if (vstate != 0u) {
++			bool matched = true;
++
 +			if (vstate == 1u && b == 0x00u) {
 +				vstate = 2u;
 +			} else if (vstate == 2u && b == 0xffu) {
@@ -3888,15 +3890,20 @@ index 0000000..25a2b4b0970a0dbfca59f811648d6bd89368386e
 +					vstate = 0u;
 +				}
 +			} else {
-+				/* not the expected shape: give up on this record and
-+				 * treat the byte as ordinary input */
++				/* Not the expected 34 00 ff shape. Abandon the record and
++				 * fall through, so this byte still gets a chance to be the
++				 * first byte of a real event - dropping it could throw a
++				 * genuine 0x04 away. */
 +				vstate = 0u;
-+				dropped++;
++				matched = false;
++			}
++			if (matched) {
 +				continue;
 +			}
-+			continue;
 +		}
 +		if (b == 0x34u && *got == 0u) {
++			/* Start of a 34 00 ff <plen> vendor record: validated and
++			 * skipped by the state machine above on the next bytes. */
 +			vstate = 1u;
 +			continue;
 +		}
@@ -4196,7 +4203,12 @@ index 0000000..25a2b4b0970a0dbfca59f811648d6bd89368386e
 +	 * reply would stall phase C until its 8 tries are gone. */
 +	unsigned n = 0;
 +	while (n < 8u) {
-+		if (bt_peri_cc_read(window_ms, ev, sizeof(ev), &got, &wakes, what) != 0) {
++		/* Only the first read may use the caller's full window: passing
++		 * window_ms to every iteration turned a 1,000 ms drain into eight
++		 * seconds and would have eaten a 30 s trial on its own. Later
++		 * events are already queued, so a short settle is enough. */
++		unsigned wait = (n == 0u) ? window_ms : 30u;
++		if (bt_peri_cc_read(wait, ev, sizeof(ev), &got, &wakes, what) != 0) {
 +			break;
 +		}
 +		n++;
