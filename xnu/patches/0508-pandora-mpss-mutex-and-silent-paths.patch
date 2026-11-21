@@ -1,0 +1,129 @@
+From: baseband lane
+Subject: 0508 pandora_mpss: make three silent paths say something, and expose the TCSR mutex
+
+All three changes come from boots that produced no usable evidence.
+
+1. `pandora_mpss_init()` used to return with no output when neither `pandora_mpss_step` nor
+   `pandora_mpss=1` was present.  On 2026-11-21 two boots logged nothing from the modem at all and
+   it was impossible to tell "the argument never reached the kernel" from "the windows failed to
+   map" from "it ran and had nothing to do".  It now prints one line either way.
+
+2. `mp_map_windows()` reported only "windows not mapped"; it now names which window failed and
+   prints the TCSR mutex address it will use.
+
+3. The TCSR mutex base is HakiOS's constant for Redwood (`hakios.mpss.c:1610`) and the spec calls
+   it confirmed for canoe, but canoe's device tree says the hwlock provider is
+   `syscon = <&syscon@1f40000 0x0 0x1000>`, so a DT-derived lock word would be `0x1f40000 + 4*id`
+   and the two readings disagree.  Rather than change the default on no evidence, the base and the
+   lock id are now boot arguments (`pandora_mpss_mutex`, `pandora_mpss_lock`), the address is
+   printed, and a failure to take it prints the address instead of returning silently.  One boot
+   with `pandora_mpss_step=7` settles which reading is right.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 8efbea2..551b46b 100755
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -98,8 +98,20 @@ extern void pandora_scm_call5(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64
+ #define MP_IPCC_SIZE      0x1000u
+ #define MP_SMEM_PA        0x81d00000u    /* smem_region@81d00000 */
+ #define MP_SMEM_SIZE      0x00200000u
++/*
++ * The TCSR hardware mutex that SMEM allocation takes.
++ *
++ * 0x01f43000 is HakiOS's constant (hakios.mpss.c:1610) for Redwood, and the porting spec calls it
++ * "confirmed for canoe (TCSR at 0x1f40000, hwlock 3)".  That is a coincidence claim, not evidence:
++ * canoe's own device tree says the hwlock provider is
++ *     hwlock { compatible = "qcom,tcsr-mutex"; syscon = <&syscon@1f40000 0x0 0x1000>; }
++ * so a DT-derived lock word would be 0x1f40000 + 4 * id, and the two readings differ.  Rather than
++ * pick one without proof, both the base and the lock id are boot arguments and the code prints
++ * what it actually uses -- one boot with pandora_mpss_step=7 settles it.
++ */
+ #define MP_MUTEX_PA       0x01f43000u    /* the TCSR hardware mutex SMEM allocation takes */
+ #define MP_MUTEX_SIZE     0x1000u
++#define MP_MUTEX_LOCK     0u             /* the lock word inside the window */
+ 
+ #define MP_CLIENT         2u
+ #define MP_SIG_GLINK      0u
+@@ -131,6 +143,7 @@ extern void pandora_scm_call5(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64
+ #define MP_STEPS          11
+ 
+ static vm_offset_t mp_qmp, mp_ipcc, mp_smem_va, mp_mutex;
++static uint32_t mp_mutex_off, mp_mutex_pa;
+ static QcomSmem mp_smem;
+ static QcomSmp2p mp_p2p;
+ static QcomSmemPartition mp_part;
+@@ -820,19 +833,26 @@ static bool
+ mp_mutex_take(void)
+ {
+ 	for (int i = 0; i < 1000; i++) {
+-		mp_wr(mp_mutex, 0, 1);
+-		if (mp_rd(mp_mutex, 0) == 1) {
++		mp_wr(mp_mutex, mp_mutex_off, 1);
++		if (mp_rd(mp_mutex, mp_mutex_off) == 1) {
+ 			return true;
+ 		}
+ 		delay(10);
+ 	}
++	/*
++	 * Never silent.  A failure here stops step 7 with no other symptom, and the difference
++	 * between "the lock word is at the wrong address" and "the lock is held by somebody else"
++	 * is exactly what the printed address is for.
++	 */
++	printf("PANDORA MPSS: the TCSR mutex at %#x+%#x did not come free in 1000 tries\n", mp_mutex_pa,
++	    mp_mutex_off);
+ 	return false;
+ }
+ 
+ static void
+ mp_mutex_give(void)
+ {
+-	mp_wr(mp_mutex, 0, 0);
++	mp_wr(mp_mutex, mp_mutex_off, 0);
+ }
+ 
+ static int
+@@ -1308,11 +1328,19 @@ mp_map_windows(void)
+ 	mp_qmp = mp_map(MP_QMP_PA, MP_QMP_SIZE, VM_WIMG_IO);
+ 	mp_ipcc = mp_map(MP_IPCC_PA, MP_IPCC_SIZE, VM_WIMG_IO);
+ 	mp_smem_va = mp_map(MP_SMEM_PA, MP_SMEM_SIZE, VM_WIMG_IO);
+-	mp_mutex = mp_map(MP_MUTEX_PA, MP_MUTEX_SIZE, VM_WIMG_IO);
++	uint32_t mutex_pa = MP_MUTEX_PA, mutex_lock = MP_MUTEX_LOCK;
++	(void)PE_parse_boot_argn("pandora_mpss_mutex", &mutex_pa, sizeof(mutex_pa));
++	(void)PE_parse_boot_argn("pandora_mpss_lock", &mutex_lock, sizeof(mutex_lock));
++	mp_mutex_pa = mutex_pa;
++	mp_mutex_off = mutex_lock * 4;
++	mp_mutex = mp_map(mutex_pa, MP_MUTEX_SIZE, VM_WIMG_IO);
+ 	if (!mp_qmp || !mp_ipcc || !mp_smem_va || !mp_mutex) {
+-		printf("PANDORA MPSS: windows not mapped\n");
++		printf("PANDORA MPSS: windows not mapped (qmp %d ipcc %d smem %d mutex %d)\n", mp_qmp != 0,
++		    mp_ipcc != 0, mp_smem_va != 0, mp_mutex != 0);
+ 		return ENOMEM;
+ 	}
++	printf("PANDORA MPSS: TCSR mutex at %#x lock %u (word %#x + %#x)\n", mutex_pa, mutex_lock,
++	    mutex_pa, mp_mutex_off);
+ 	mp_smem.base = (volatile uint8_t *)mp_smem_va;
+ 	mp_smem.size = MP_SMEM_SIZE;
+ 	mp_mapped = true;
+@@ -1359,9 +1387,21 @@ pandora_mpss_init(void)
+ 	thread_t thread;
+ 
+ 	PE_parse_boot_argn("pandora_mpss_step", &mp_last_step, sizeof(mp_last_step));
+-	if (mp_last_step == 0 && (!PE_parse_boot_argn("pandora_mpss", &on, sizeof(on)) || on != 1)) {
++	bool whole = PE_parse_boot_argn("pandora_mpss", &on, sizeof(on)) && on == 1;
++	/*
++	 * Say which way this went, always.
++	 *
++	 * On 2026-11-21 two boots produced no modem line at all and there was no way to tell
++	 * "the step argument never reached the kernel" from "the windows failed to map" from
++	 * "the machine ran and did nothing" -- all three look like silence.  One line here makes
++	 * the three distinguishable, and it costs nothing when the feature is off.
++	 */
++	if (mp_last_step == 0 && !whole) {
++		printf("PANDORA MPSS: not started (pandora_mpss_step absent or 0, and pandora_mpss is "
++		    "not 1); no modem work will be done this boot\n");
+ 		return;
+ 	}
++	printf("PANDORA MPSS: asked for step %u%s\n", mp_last_step, whole ? " (whole stack)" : "");
+ 	if (mp_map_windows()) {
+ 		return;
+ 	}
