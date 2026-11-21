@@ -1,0 +1,39 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0520 sweet_nub: account the manually built instance in its metaclass
+
+0519 proved the construction itself works: the probe printed
+  manual construction of IOUSBDeviceController: 504 bytes at 0xfffffff94fc5d000
+  manual -> 0xfffffff94fc5d000, own class IOUSBDeviceController
+and the S2 gate passed for the first time (S0=True, S2=True). One millisecond later the kernel
+died at the S2-only path's release():
+
+  OSMetaClass: Class IOUSBDeviceController - bad retain (-1)
+  Break 0x0001 instruction exception from kernel. Panic (by design)
+
+The generated class constructor does two things, and the manual path only did one: it set the
+object retain count (retain()) but never called gMetaClass.instanceConstructed(). With the
+metaclass count still 0, the first release() drives it to -1 and OSMetaClass panics. 0520 calls
+mc->instanceConstructed() right after retain(), so construction/destruction accounting matches
+what `new IOUSBDeviceController` would have done.
+
+Device evidence: outputs/data-a-live-nezha/device/private/logs/1795299155 (kernel.txt, line 770+).
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -226,6 +226,16 @@
+ 				*(void ***)mem = (void **)SWEET_NUB_CTL_VTABLE;
+ 				ctl = (IOService *)mem;
+ 				ctl->retain();
++				/*
++				 * 0520: the class's generated constructor does two things: sets the object's
++				 * retain count to 1 (what retain() just did) and calls
++				 * gMetaClass.instanceConstructed(). Skipping the second one makes the metaclass
++				 * count stay 0, so the first release() drives it to -1 and the kernel breaks:
++				 * the 0519 boot died at 10.195 s with "OSMetaClass: Class IOUSBDeviceController
++				 * - bad retain (-1)" right after the S2 sample tried to release the object.
++				 * instanceConstructed() is public (OSMetaClass.h) and propagates to superclasses.
++				 */
++				mc->instanceConstructed();
+ 				printf("SWEET NUB: manual -> %p, own class %s\n", ctl,
+ 				    ctl->getMetaClass()->getClassName());
+ 			}
