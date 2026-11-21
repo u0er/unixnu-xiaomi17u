@@ -1,0 +1,44 @@
+From: baseband lane
+Subject: 0515 pandora_mpss: ask TrustZone whether it even knows the modem's PAS ids
+
+Two hypotheses are now refuted by hardware evidence from 2026-11-21:
+
+  1. the PAS id is not the problem -- nine ids (4 / 0x26 / 24 / 28 / 34 / 15 / 33 / 63 / 0), including
+     pas 0 which cannot exist, all returned a0 0xffcfffbb (-3145797) for the same metadata blob;
+  2. shm_bridge_enable is not the problem -- with it added (0513) the call returns a0 0, and the
+     very next INIT_IMAGE still returns 0xffcfffbb.
+
+The cheapest question left is whether TrustZone knows these ids at all.  PAS_IS_SUPPORTED
+(SCM_FN(2,7)) answers it, and this device's own ADSP probe shows the convention:
+`pas_is_supported(36) -> a0 0 a1 0x1`, where 36 then loads successfully -- the answer is in a1.
+Upstream returns `!!res.result[0]`, so a non-zero answer means supported.
+
+The probe now asks for 4, 0x26, 13, 36 and 0 first, and prints a0/a1 and supported/NOT supported for
+each.  If 38 and 4 come back unsupported the id question reopens; if they are supported and
+INIT_IMAGE still refuses, the remaining suspects are the metadata's protection/ownership
+(the carveout being assigned to MSS before INIT_IMAGE).
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index f60d79c..48bb1eb 100755
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -801,6 +801,19 @@ mp_probe_pas_ids(void)
+ 	if (!mp_option("pandora_mpss_pas_probe")) {
+ 		return;
+ 	}
++	/*
++	 * First ask whether TrustZone even knows these ids: PAS_IS_SUPPORTED (SCM_FN(2,7)) answers in
++	 * a1 on this device -- the ADSP's own probe logs `pas_is_supported(36) -> a0 0 a1 0x1` for an
++	 * id that then loads fine.  Upstream returns `!!res.result[0]`, so a non-zero answer means
++	 * supported.
++	 */
++	static const unsigned asked[] = {4, 0x26, 13, 36, 0};
++	for (unsigned i = 0; i < sizeof(asked) / sizeof(asked[0]); i++) {
++		uint64_t a0 = 0, a1 = 0;
++		pandora_scm_call(SCM_FN(2, 7), SCM_ARGS(1), asked[i], 0, &a0, &a1);
++		printf("PANDORA MPSS: pas_is_supported(%u) -> a0 %#llx a1 %#llx (%s)\n", asked[i], a0, a1,
++		    (a0 == 0 && a1) ? "supported" : "NOT supported");
++	}
+ 	printf("PANDORA MPSS: probing INIT_IMAGE for %u candidate PAS ids with the DTB's metadata\n",
+ 	    (unsigned)(sizeof(ids) / sizeof(ids[0])));
+ 	for (unsigned i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
