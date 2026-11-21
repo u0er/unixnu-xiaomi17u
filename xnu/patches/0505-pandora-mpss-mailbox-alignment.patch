@@ -1,0 +1,48 @@
+From: baseband lane
+Subject: 0505 pandora_mpss: the AOP mailbox's box is 8-byte aligned, not 16 -- zero it byte-wise
+
+Step 3 of the modem bring-up died with "Unaligned kernel data abort" (esr 0x96000061,
+far = mp_qmp + 0x38, pc = _step_mailbox + 0x18c) on the first hardware run, 2026-11-21.
+
+QMP_OUR_BOX is offset 0x38 of the mailbox mapping, so the box is 8-byte aligned but not 16.
+`memset(box, 0, QMP_MESSAGE)` is a 64-byte zeroing that clang vectorises into 16-byte NEON
+stores; this kernel runs with strict alignment, so the first `stp q` faults.  Replaced with a
+byte loop through a volatile pointer, which cannot be misaligned whatever the compiler does.
+
+Evidence: the fault dump in device/private/logs/1795238956 (step 4 run) - steps 1 and 2 had
+already passed on hardware ("the firmware is whole: ... ends 0x98200000 with 0x900000 to spare"),
+and PANDORA PAS never printed, which localises the fault to step 3.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index e8f25f8..b937dc6 100755
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -718,9 +718,25 @@ mp_mailbox_send(const char *text)
+ 	if (len >= QMP_MESSAGE) {
+ 		len = QMP_MESSAGE - 1;
+ 	}
+-	uint8_t *box = (uint8_t *)(mp_qmp + QMP_OUR_BOX);
+-	memset(box, 0, QMP_MESSAGE);
+-	memcpy(box, text, len);
++	/*
++	 * Byte-wise through a volatile pointer, deliberately.
++	 *
++	 * The mailbox's box is at offset 0x38 of the mapping, so it is 8-byte aligned but NOT
++	 * 16-byte aligned.  `memset(box, 0, 64)` is a 64-byte zeroing that clang vectorises into
++	 * 16-byte NEON stores (`stp q0, q1`), and this kernel runs with strict alignment: the very
++	 * first store faults with "Unaligned kernel data abort", esr 0x96000061, far = box + 0.
++	 * That is exactly what happened on 2026-11-21 at step 3 (pc _step_mailbox + 0x18c), and it
++	 * is why step 4 never reached its TrustZone call.
++	 *
++	 * A byte loop cannot be misaligned whatever the compiler does with it.
++	 */
++	volatile uint8_t *box = (volatile uint8_t *)(mp_qmp + QMP_OUR_BOX);
++	for (unsigned i = 0; i < QMP_MESSAGE; i++) {
++		box[i] = 0;
++	}
++	for (unsigned i = 0; i < len; i++) {
++		box[i] = (uint8_t)text[i];
++	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	mp_wr(mp_ipcc, IPCC_SEND, 0u << 16 | 0u);       /* IPCC client 0 (the AOP), signal 0 */
+ 	printf("PANDORA MPSS: told the AOP: %s\n", text);
