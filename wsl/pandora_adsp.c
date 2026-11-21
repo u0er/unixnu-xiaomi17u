@@ -982,10 +982,16 @@ int
 pandora_pas_load_auth(const char *file, unsigned pas, uint64_t mem_pa, uint64_t mem_size)
 {
 	uint64_t bridge = 0;
+	/* fw_dir() fills the shared ad_dir/ad_nfiles too, so it belongs inside the
+	 * same critical section as the load -- otherwise two lanes can rebuild the
+	 * pack directory on top of each other.  (pas_load_locked is used here on
+	 * purpose: calling the pas_load wrapper would re-take a non-recursive lock.) */
+	lck_mtx_lock(&ad_pas_lock);
 	int err = ad_nfiles ? 0 : fw_dir();
 	if (!err) {
-		err = pas_load(file, false, pas, mem_pa, mem_size, &bridge);
+		err = pas_load_locked(file, false, pas, mem_pa, mem_size, &bridge);
 	}
+	lck_mtx_unlock(&ad_pas_lock);
 	if (!err) {
 		err = pas_auth(pas);
 	}
@@ -1006,10 +1012,12 @@ pandora_pas_load_auth_src(const char *file, unsigned pas, uint64_t mem_pa,
     uint64_t mem_size, bool part)
 {
 	uint64_t bridge = 0;
+	lck_mtx_lock(&ad_pas_lock);
 	int err = part ? fw_dir() : (ad_nfiles ? 0 : fw_dir());
 	if (!err) {
-		err = pas_load(file, part, pas, mem_pa, mem_size, &bridge);
+		err = pas_load_locked(file, part, pas, mem_pa, mem_size, &bridge);
 	}
+	lck_mtx_unlock(&ad_pas_lock);
 	if (!err) {
 		err = pas_auth(pas);
 	}
