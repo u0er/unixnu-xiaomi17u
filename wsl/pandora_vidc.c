@@ -317,9 +317,19 @@ static uint64_t vidc_sfr_pa;
  * refuses with ArmSmmu4KBudget. */
 #define VIDC_SMMU_LEAF_BUDGET   4096u
 #define VIDC_SMMU_ACTLR         0x103u        /* DT qcom,actlr for these SIDs */
+/* All four NON-SECURE video streams, from the DT contexts [V vidc-dt-audit]:
+ *   non_secure_cb       (qcom,vidc,cb-ns,     phandle 0x5bd) -> 0x1940 / 0x1a20 / 0x1944
+ *   non_secure_pixel_cb (qcom,vidc,cb-ns-pxl, phandle 0x5bb) -> 0x1943
+ * The pixel one was missing, and that matters: if the Xtensa's fetch or its
+ * buffer traffic uses 0x1943, that stream keeps whatever handoff SMR state the
+ * bootloader left, which can abort the very first access while the core is
+ * still silent.  All four now share one context bank, so every access the core
+ * can make resolves through our tables. */
 #define VIDC_SID_NONSEC         0x1940u
 #define VIDC_SID_NONSEC_ALT     0x1A20u
 #define VIDC_SID_NONSEC_ALT2    0x1944u
+#define VIDC_SID_NONSEC_PIXEL   0x1943u
+#define VIDC_NSIDS               4u
 
 static uint32_t vidc_qtable_iova;
 static uint32_t vidc_sfr_iova;
@@ -550,8 +560,9 @@ vidc_smmu_up(void)
         return -1;
     }
 
-    const uint16_t sids[3] = { VIDC_SID_NONSEC, VIDC_SID_NONSEC_ALT, VIDC_SID_NONSEC_ALT2 };
-    ArmSmmu4KStream route[3];
+    const uint16_t sids[VIDC_NSIDS] = { VIDC_SID_NONSEC, VIDC_SID_NONSEC_ALT,
+        VIDC_SID_NONSEC_ALT2, VIDC_SID_NONSEC_PIXEL };
+    ArmSmmu4KStream route[VIDC_NSIDS];
     ArmSmmu4KStreamState sstate = { 0 };
     ArmSmmu4KStreamResult sres;
     unsigned nroute = 0;
@@ -592,15 +603,17 @@ vidc_smmu_up(void)
             nroute++;
             break;
         }
-        if (nroute == 3) break;
+        if (nroute == VIDC_NSIDS) break;
     }
-    if (nroute != 3) {
+    if (nroute != VIDC_NSIDS) {
         pandora_apps_smmu_unlock();
-        printf("PANDORA VIDC: only %u idle SMR slots for 3 video SIDs\n", nroute);
+        printf("PANDORA VIDC: only %u idle SMR slots for %u video SIDs\n", nroute,
+            VIDC_NSIDS);
         return -1;
     }
-    printf("PANDORA VIDC: stream slots %u/%u/%u for SIDs %#x/%#x/%#x\n",
-        route[0].slot, route[1].slot, route[2].slot, sids[0], sids[1], sids[2]);
+    printf("PANDORA VIDC: stream slots %u/%u/%u/%u for SIDs %#x/%#x/%#x/%#x\n",
+        route[0].slot, route[1].slot, route[2].slot, route[3].slot,
+        sids[0], sids[1], sids[2], sids[3]);
 
     unsigned bank = banks;
     for (unsigned b = s2banks; b < banks; b++) {
@@ -684,7 +697,7 @@ vidc_smmu_up(void)
         printf("PANDORA VIDC: SMMU mmio bind failed\n");
         return -1;
     }
-    if (ArmSmmu4KCheckFaultedStreams(&io, route, 3, bank, &sres) != ArmSmmu4KSuccess) {
+    if (ArmSmmu4KCheckFaultedStreams(&io, route, VIDC_NSIDS, bank, &sres) != ArmSmmu4KSuccess) {
         pandora_apps_smmu_unlock();
         printf("PANDORA VIDC: SMMU reports faulted streams before attach\n");
         return -1;
@@ -700,7 +713,7 @@ vidc_smmu_up(void)
             prog.readback.sctlr);
         return -1;
     }
-    if (ArmSmmu4KAttachStreams(&io, &sstate, route, 3, bank, &ctx, &sres) !=
+    if (ArmSmmu4KAttachStreams(&io, &sstate, route, VIDC_NSIDS, bank, &ctx, &sres) !=
         ArmSmmu4KSuccess) {
         pandora_apps_smmu_unlock();
         printf("PANDORA VIDC: SMMU stream attach failed\n");
