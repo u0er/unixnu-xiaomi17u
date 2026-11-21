@@ -954,6 +954,30 @@ pandora_pas_load_auth(const char *file, unsigned pas, uint64_t mem_pa, uint64_t 
 	return err;
 }
 
+/* Source-selectable variant.  `part` chooses the firmware container over the
+ * pack that lives in userdata.  This exists because the rebuilt 128 GiB volume
+ * carries a DIFFERENT userdata pack (20 files vs 19) whose VPU image trips the
+ * segment bounds check, while the firmware container itself was never changed
+ * and still holds the known-good vpu40_2v_v1.mbn (2,462,860 B).  Callers can
+ * therefore fall back to the container instead of failing the stage. */
+int pandora_pas_load_auth_src(const char *file, unsigned pas, uint64_t mem_pa,
+    uint64_t mem_size, bool part);
+
+int
+pandora_pas_load_auth_src(const char *file, unsigned pas, uint64_t mem_pa,
+    uint64_t mem_size, bool part)
+{
+	uint64_t bridge = 0;
+	int err = part ? fw_dir() : (ad_nfiles ? 0 : fw_dir());
+	if (!err) {
+		err = pas_load(file, part, pas, mem_pa, mem_size, &bridge);
+	}
+	if (!err) {
+		err = pas_auth(pas);
+	}
+	return err;
+}
+
 /* ---- the remote processors' links: SMEM, IPCC doorbells, SMP2P, GLINK ----------------- */
 
 /*
