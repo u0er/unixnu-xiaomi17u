@@ -1,0 +1,73 @@
+From: baseband lane
+Subject: 0519 pandora_mpss: declare what this file calls (fixes the 0515/0516 build break)
+
+0516 made step 4's probe call PAS_IS_SUPPORTED itself:
+
+    pandora_scm_call(SCM_FN(2, 7), SCM_ARGS(1), asked[i], 0, &a0, &a1);
+
+Three things were undeclared in this translation unit:
+
+  SCM_FN / SCM_ARGS   defined in pandora_pas.c.  Locally this surfaced only at link time
+                      ("Undefined symbols: _SCM_FN, _SCM_ARGS"); CI's clang rejects the implicit
+                      declarations outright.
+  pandora_scm_call    declared in pandora_adsp.c, not in a shared header.
+  pmap_find_phys      on arm its prototype is in osfmk/arm/pmap/pmap.h, which is not on this file's
+                      include path (vm/pmap.h does not declare it).
+
+So 0516 (run 44923632026) and 0518 (run 44925946313) both failed in Build while the same sources
+compiled file-by-file here.  Verified by diffing the failed run's own xnu-buildtree artifact against
+this tree: that file lacked exactly these declarations and nothing else differed.
+
+Fixed here with local definitions and prototypes copied verbatim from their headers, and the file
+now compiles with no -Wimplicit-function-declaration at all.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index c92eb6e..b0205e1 100755
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -43,6 +43,10 @@
+ #include <pexpert/pexpert.h>
+ #include <vm/vm_kern.h>
+ #include <vm/pmap.h>
++/* pmap_find_phys lives in osfmk/arm/pmap/pmap.h on arm, which is not on this file's include path;
++ * without a prototype clang treats the call as an implicit declaration, which is an error in CI.
++ * The prototype below is copied verbatim from that header. */
++extern ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
+ #include "qcom/QcomSmem.h"
+ #include "qcom/QcomSmp2p.h"
+ #include "qcom/QcomGlink.h"
+@@ -60,6 +64,11 @@ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ extern int pandora_rpmh_arc(const char *name, uint32_t level);
+ extern void pandora_scm_call5(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4,
+     uint64_t x5, uint64_t *a0, uint64_t *a1);
++/* The two-value form the PAS_IS_SUPPORTED probe uses (defined in pandora_adsp.c beside the other
++ * wrappers).  Without this declaration CI's clang rejects the call as implicit -- locally it only
++ * produced a warning, which is why 0516 built file-by-file and failed in CI. */
++extern void pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3,
++    uint64_t *a0, uint64_t *a1);
+ 
+ /* ---- the phone's own numbers (devicetree: work/device-recon/01-reserved-memory-decoded.txt) ---- */
+ 
+@@ -120,6 +129,13 @@ static unsigned mp_pas = MP_PAS, mp_pas_dtb = MP_PAS_DTB;
+ #define MP_MUTEX_SIZE     0x1000u
+ #define MP_MUTEX_LOCK     0u             /* the lock word inside the window */
+ 
++/* SCM encoding for the one query this file makes itself (pandora_pas.c has its own copy, but its
++ * macros are not visible here -- using them from this translation unit linked as calls to
++ * undefined functions _SCM_FN / _SCM_ARGS). */
++#define MP_SCM_FN(svc, cmd)  ((1ULL << 30) | (2ULL << 24) | (((uint64_t)(svc) & 0xff) << 8) | \
++                              ((uint64_t)(cmd) & 0xff))
++#define MP_SCM_ARGS(n)       ((uint64_t)(n) & 0xf)
++
+ #define MP_CLIENT         2u
+ #define MP_SIG_GLINK      0u
+ #define MP_SIG_SMP2P      2u
+@@ -866,7 +882,7 @@ mp_probe_pas_ids(void)
+ 	static const unsigned asked[] = {4, 0x26, 13, 36, 0};
+ 	for (unsigned i = 0; i < sizeof(asked) / sizeof(asked[0]); i++) {
+ 		uint64_t a0 = 0, a1 = 0;
+-		pandora_scm_call(SCM_FN(2, 7), SCM_ARGS(1), asked[i], 0, &a0, &a1);
++		pandora_scm_call(MP_SCM_FN(2, 7), MP_SCM_ARGS(1), asked[i], 0, &a0, &a1);
+ 		printf("PANDORA MPSS: pas_is_supported(%u) -> a0 %#llx a1 %#llx (%s)\n", asked[i], a0, a1,
+ 		    (a0 == 0 && a1) ? "supported" : "NOT supported");
+ 	}
