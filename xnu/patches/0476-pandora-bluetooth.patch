@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..1adc12639b2ab038486cffd43e62a8ae215627a9
+index 0000000..ccd489df203f6564fdbeca19d746f6f1a578fe45
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4660 @@
+@@ -0,0 +1,4732 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3902,11 +3902,17 @@ index 0000000..1adc12639b2ab038486cffd43e62a8ae215627a9
 + * 1e), so filtering mid-event would corrupt the very event being read. */
 +static int
 +bt_peri_cc_read(unsigned window_ms, uint8_t *ev, unsigned cap, unsigned *got,
-+    unsigned *wakes, const char *what)
++    unsigned *wakes, const char *what, bool skip_records)
 +{
 +	static const uint8_t ack = 0xfc;
 +	unsigned dropped = 0;
-+	/* The ROM also emits 0x34 vendor records: 34 00 ff <plen> <plen bytes>.
++	/* Records are only skipped when the caller asks for it. Phase C reads one
++	 * exact Command Complete per frame and must never swallow payload bytes:
++	 * a record header seen mid-stream (its start was drained by the previous
++	 * stage) would otherwise make us skip 252 bytes that contain the real ack,
++	 * which is exactly the timeout the 21:40 trial produced.
++	 *
++	 * The ROM also emits 0x34 vendor records: 34 00 ff <plen> <plen bytes>.
 +	 * Their payload is arbitrary binary and routinely contains 0x04, which the
 +	 * resync below would otherwise mistake for an HCI event header - that is how
 +	 * a real Command Complete ended up being parsed as "event 04 8f status 242".
@@ -3951,7 +3957,7 @@ index 0000000..1adc12639b2ab038486cffd43e62a8ae215627a9
 +				continue;
 +			}
 +		}
-+		if (b == 0x34u && *got == 0u) {
++		if (skip_records && b == 0x34u && *got == 0u) {
 +			/* Start of a 34 00 ff <plen> vendor record: validated and
 +			 * skipped by the state machine above on the next bytes. */
 +			vstate = 1u;
@@ -4078,6 +4084,73 @@ index 0000000..1adc12639b2ab038486cffd43e62a8ae215627a9
 +	return 0;
 +}
 +
++/* Level 20.30: match the phase-C Command Complete by exact byte pattern.
++ *
++ * The generic event parser is the wrong tool here. Phase C must return exactly
++ * one known ack per frame, and the stream around it also carries dump payload:
++ * eight consecutive 0x04 bytes (common inside a 34 00 ff record) each start a
++ * bogus "event" with plen=4, and two retries of the generic parser then consume
++ * the real ack before it can be read - verified by replay, not assumed.
++ *
++ * A sliding 8-byte window cannot be fooled that way: it looks only for the one
++ * pattern the ROM sends as a per-frame ack, 04 0e 05 01 00 fc 00 1e, and drops
++ * everything else. */
++static int
++bt_peri_wait_cc8(unsigned window_ms, uint8_t *ev, const char *what)
++{
++	static const uint8_t want[8] = { 0x04, 0x0e, 0x05, 0x01, 0x00, 0xfc, 0x00, 0x1e };
++	uint8_t win[8] = {0};
++	unsigned filled = 0;
++	unsigned dropped = 0;
++	uint64_t deadline;
++
++	clock_interval_to_deadline(window_ms, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		uint8_t b;
++
++		if (!(bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
++			bt_sleep(100);
++			continue;
++		}
++		b = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++		if (b == 0xfdu) {
++			const uint8_t ack = 0xfc;
++
++			(void)bt_uart_tx(&ack, 1, "PERI CC8 wake ACK FC");
++			continue;
++		}
++		if (filled < sizeof(win)) {
++			win[filled++] = b;
++		} else {
++			for (unsigned i = 1; i < sizeof(win); i++) {
++				win[i - 1u] = win[i];
++			}
++			win[sizeof(win) - 1u] = b;
++		}
++		if (filled < sizeof(win)) {
++			continue;
++		}
++		if (__builtin_memcmp(win, want, sizeof(want)) == 0) {
++			for (unsigned i = 0; i < sizeof(win); i++) {
++				ev[i] = win[i];
++			}
++			if (dropped != 0u) {
++				printf("PANDORA BT: %s: %u byte(s) before the Command Complete\n",
++				    what, dropped);
++				pandora_log_sync();
++			}
++			return 0;
++		}
++		dropped++;
++	}
++	if (dropped != 0u) {
++		printf("PANDORA BT: %s: window closed after %u byte(s) without a CC\n",
++		    what, dropped);
++		pandora_log_sync();
++	}
++	return ETIMEDOUT;
++}
++
 +/* Level 20.21: one HCI 0xfc00 data stage. Frame layout is the one the trace
 + * and PatchDLManager::FrameHciPkt agree on:
 + *     01 00 fc <seglen+2> 1e <seglen> <seglen bytes>
@@ -4158,8 +4231,7 @@ index 0000000..1adc12639b2ab038486cffd43e62a8ae215627a9
 +			while (!acked && tries < 4u) {
 +				tries++;
 +				got = 0;
-+				err = bt_peri_cc_read(40u, ev, sizeof(ev), &got,
-+				    &wakes, what);
++				err = bt_peri_wait_cc8(40u, ev, what);
 +				if (err) {
 +					bt_tx_long_quiet = false;
 +					printf("PANDORA BT: %s: frame %u/%u got no Command Complete (error %d, %u byte(s))\n",
@@ -4242,7 +4314,7 @@ index 0000000..1adc12639b2ab038486cffd43e62a8ae215627a9
 +	err = ETIMEDOUT;
 +	for (unsigned tries = 0; tries < 4u; tries++) {
 +		unsigned w = (tries == 0u) ? window_ms : 50u;
-+		err = bt_peri_cc_read(w, ev, sizeof(ev), &got, &wakes, what);
++		err = bt_peri_cc_read(w, ev, sizeof(ev), &got, &wakes, what, true);
 +		if (err) {
 +			break;
 +		}
@@ -4300,7 +4372,7 @@ index 0000000..1adc12639b2ab038486cffd43e62a8ae215627a9
 +		 * seconds and would have eaten a 30 s trial on its own. Later
 +		 * events are already queued, so a short settle is enough. */
 +		unsigned wait = (n == 0u) ? window_ms : 30u;
-+		if (bt_peri_cc_read(wait, ev, sizeof(ev), &got, &wakes, what) != 0) {
++		if (bt_peri_cc_read(wait, ev, sizeof(ev), &got, &wakes, what, true) != 0) {
 +			break;
 +		}
 +		n++;
