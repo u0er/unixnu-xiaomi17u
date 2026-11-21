@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..57e6153f9d77131c0355de86b36e30c745c33d7d
+index 0000000..2b8d2952c711cc8c7fa043775aea1845e3635739
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4742 @@
+@@ -0,0 +1,4747 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4022,6 +4022,11 @@ index 0000000..57e6153f9d77131c0355de86b36e30c745c33d7d
 +	return ETIMEDOUT;
 +}
 +
++/* One place for the version the driver prints. It used to be a literal inside the
++ * banner and fell seven levels behind (the log said 20.24 while the code was
++ * 20.35), which makes any post-hoc reading of a log attribute the wrong revision. */
++#define BT_PERI_VER "20.35"
++
 +/* Level 20.21: phase A at the trace's own cadence.
 + *
 + * The 4 ms/segment pacing 20.13 introduced was a guess made before the Android
@@ -4405,7 +4410,7 @@ index 0000000..57e6153f9d77131c0355de86b36e30c745c33d7d
 +	bt_peri_record_state_reset();
 +	int err;
 +
-+	printf("PANDORA BT: level 20: TME-L map A %u B (TLV) + B %u B + C %u B (HCI 0xfc00) (20.24)\n",
++	printf("PANDORA BT: level 20: TME-L map A %u B (TLV) + B %u B + C %u B (HCI 0xfc00) (" BT_PERI_VER ")\n",
 +	    (unsigned)sizeof(pandora_peri_tmel_elf),
 +	    (unsigned)sizeof(pandora_peri_tmel_mbn),
 +	    (unsigned)sizeof(pandora_peri_tmel_nvm));
