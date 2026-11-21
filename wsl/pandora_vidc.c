@@ -134,6 +134,12 @@ void pandora_vidc_init(void);
 #define R_AON_NOC_LPI_CTRL      (AON_BASE_OFFS + 0x000u)
 #define R_AON_NOC_LPI_STATUS    (AON_BASE_OFFS + 0x004u)
 #define R_AON_NOC_RESET_REQ     (AON_MVP_NOC_RESET + 0x000u)
+#define R_AON_NOC_RESET_SYNCRST (AON_MVP_NOC_RESET + 0x008u)
+/* [M] iris_vpu4x.c:319-330 -- the hardware power-on path asserts this mask,
+ * waits for it on the ACK register, then drops SYNCRST and REQ and waits for
+ * ACK to fall to zero.  Without this handshake the video NoC stays in reset
+ * and the Xtensa cannot fetch a single beat. */
+#define MVP_NOC_RESET_REQ_MASK  0x00070103u
 #define R_AON_NOC_RESET_ACK     (AON_MVP_NOC_RESET + 0x004u)
 
 /* Host->firmware qtable publish.  Every offset below is what
@@ -425,6 +431,19 @@ static inline uint32_t
 vidc_qt_rd(uint32_t off)
 {
     return vidc_ld32(vidc_qtable_va, off);
+}
+
+/* Dword read that wraps inside one ring.  The HFI rings are circular, so a
+ * packet near ring_end continues at ring_off; reading it with plain
+ * vidc_qt_rd(q_off + n) would silently return the next ring's bytes.  Latent
+ * while the core is silent, but wrong-by-construction once HFI works. */
+static inline uint32_t
+vidc_ring_rd(uint32_t ring_off, uint32_t ring_end, uint32_t off)
+{
+    if (off >= ring_end) {
+        off = ring_off + (off - ring_end);
+    }
+    return vidc_qt_rd(off);
 }
 
 static inline void
@@ -1055,6 +1074,57 @@ vidc_branch_on(uint32_t off)
  * order is power_on -> fw_load -> boot_firmware -> switch_to_hwmode]; doing it
  * before firmware release is the conservative order we can verify by register
  * read-back, so keep it here and note the difference. */
+/* AON MVP NOC reset handshake, verbatim from upstream's power_on_hardware.
+ * Returns 0 on a completed handshake.  Every value is logged: if the ACK never
+ * mirrors the request, that is itself the finding (the NoC is held elsewhere). */
+/* AON LPI handshake that upstream performs immediately before the NoC reset
+ * (iris_vpu4x.c:108-118 and :308-318).  REQ_POWER_DOWN_PREP is written to the
+ * control register and the status must report DONE; a DENY/ACTIVE status means
+ * the NoC is busy elsewhere, which is worth seeing in the log. */
+static int
+vidc_noc_lpi(void)
+{
+    static const uint32_t done = 1u << 0, deny = 1u << 1, active = 1u << 2;
+    vidc_wr(R_AON_NOC_LPI_CTRL, 1);
+    uint32_t st = 0;
+    unsigned i;
+    for (i = 0; i < 1000; i++) {
+        st = vidc_rd(R_AON_NOC_LPI_STATUS);
+        if ((st & done) || !(st & (deny | active))) break;
+        vidc_wr(R_AON_NOC_LPI_CTRL, 0);
+        delay(10);
+    }
+    printf("PANDORA VIDC: noc lpi ctrl=%08x status=%08x %s\n",
+        vidc_rd(R_AON_NOC_LPI_CTRL), st, (st & done) ? "done" : "not-done");
+    return (st & done) ? 0 : -1;
+}
+
+static int
+vidc_noc_reset(void)
+{
+    vidc_wr(R_AON_NOC_RESET_REQ, MVP_NOC_RESET_REQ_MASK);
+    uint32_t ack = 0;
+    unsigned i;
+    for (i = 0; i < 2000; i++) {
+        ack = vidc_rd(R_AON_NOC_RESET_ACK);
+        if ((ack & MVP_NOC_RESET_REQ_MASK) == MVP_NOC_RESET_REQ_MASK) break;
+        delay(1);
+    }
+    const uint32_t ack_req = ack;
+    const int req_ok = (i < 2000);
+    vidc_wr(R_AON_NOC_RESET_SYNCRST, 0);
+    vidc_wr(R_AON_NOC_RESET_REQ, 0);
+    for (i = 0; i < 2000; i++) {
+        ack = vidc_rd(R_AON_NOC_RESET_ACK);
+        if (ack == 0) break;
+        delay(1);
+    }
+    printf("PANDORA VIDC: noc reset req=%08x ack=%08x %s; released ack=%08x %s\n",
+        MVP_NOC_RESET_REQ_MASK, ack_req, req_ok ? "handshaked" : "TIMEOUT",
+        ack, (i < 2000) ? "clear" : "STUCK");
+    return (req_ok && i < 2000) ? 0 : -1;
+}
+
 static void
 vidc_bridge_reset(void)
 {
@@ -1119,6 +1189,10 @@ vidc_power_up(void)
     vidc_branch_on(0x8134u);           /* vpp0          */
     vidc_branch_on(0x8108u);           /* vpp1          */
     vidc_branch_on(0x8090u);           /* mvs0a (APV)   */
+    /* NoC reset handshake BEFORE the bridge reset, matching upstream order
+     * (iris_vpu4x.c:318-336: NOC handshake, then CORE_BRIDGE_SW_RESET). */
+    if (vidc_noc_lpi() != 0) failed++;      /* LPI first, then the NoC reset */
+    if (vidc_noc_reset() != 0) failed++;
     vidc_bridge_reset();
 
     /* WRAPPER_CORE_CLOCK_CONFIG semantics are inverted from the name:
@@ -1520,6 +1594,7 @@ vidc_hfi_poll(void)
     uint32_t start = vidc_qt_rd(moff + offsetof(struct vidc_queue_header, start_addr));
     uint32_t ring_off = start - vidc_qtable_da();
     uint32_t q_off = ring_off + r * 4u;
+    const uint32_t ring_end = ring_off + (uint32_t)IFACEQ_QUEUE_SIZE;
     if (q_off + 8u > VIDC_QTABLE_BYTES) {
         printf("PANDORA VIDC: msg queue index out of range (r=%u w=%u start=%08x)\n", r, w, start);
         vidc_qt_wr(moff + offsetof(struct vidc_queue_header, read_idx), w);
@@ -1528,7 +1603,6 @@ vidc_hfi_poll(void)
     }
     /* One packet is at most IFACEQ_CORE_PKT_SIZE, and it may wrap at the ring
      * end, so invalidate the tail and (when wrapping) the head separately. */
-    uint32_t ring_end = ring_off + (uint32_t)IFACEQ_QUEUE_SIZE;
     uint32_t span = 20u + 128u;                  /* header + property head */
     if (q_off + span <= ring_end) {
         vidc_sync_in(q_off, span);
@@ -1536,8 +1610,8 @@ vidc_hfi_poll(void)
         vidc_sync_in(q_off, ring_end - q_off);
         vidc_sync_in(ring_off, span - (ring_end - q_off));
     }
-    uint32_t size = vidc_qt_rd(q_off);
-    uint32_t type = vidc_qt_rd(q_off + 4u);
+    uint32_t size = vidc_ring_rd(ring_off, ring_end, q_off);
+    uint32_t type = vidc_ring_rd(ring_off, ring_end, q_off + 4u);
     printf("PANDORA VIDC: response size=%u type=%08x read_idx=%u write_idx=%u (words)\n",
         size, type, r, w);
 
@@ -1550,9 +1624,9 @@ vidc_hfi_poll(void)
     /* Property response layout [M iris_hfi]: header (8) + property_id (4) +
      * flags (4) + payload_size (4) + payload. */
     if (size >= 20u) {
-        uint32_t pid = vidc_qt_rd(q_off + 8u);
-        uint32_t flags = vidc_qt_rd(q_off + 12u);
-        uint32_t psize = vidc_qt_rd(q_off + 16u);
+        uint32_t pid = vidc_ring_rd(ring_off, ring_end, q_off + 8u);
+        uint32_t flags = vidc_ring_rd(ring_off, ring_end, q_off + 12u);
+        uint32_t psize = vidc_ring_rd(ring_off, ring_end, q_off + 16u);
         printf("PANDORA VIDC: prop=%08x flags=%u payload=%u\n", pid, flags, psize);
         if (pid == HFI_PROP_IMAGE_VERSION && psize && psize <= 128u) {
             /* The ring was clean+invalidated above, so byte access through the
