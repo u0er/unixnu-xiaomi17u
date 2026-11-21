@@ -1,0 +1,43 @@
+From: baseband lane
+Subject: 0525 pandora_mpss: add the ADSP's id to the shutdown probe as a control
+
+PAS_IS_SUPPORTED says the secure world knows 4 and 38, yet PAS_SHUTDOWN and PAS_INIT_IMAGE refuse
+both with their own codes (0xffcfffb8 and 0xffcfffbb), while the ADSP's 13 is accepted by
+INIT_IMAGE in the very same boot (logs/1795302306, logs/1795302772: `pas 13 init_image -> a0 0`,
+`auth_and_reset -> a0 0`).
+
+Nothing so far separates "this id may not be touched" from "that peripheral simply is not running".
+Shutting the ADSP's 13 down in the same probe separates them:
+
+  * 13 -> 0          then 0xffcfffb8 for 4/38 means the modem ids are treated differently;
+  * 13 -> non-zero   then 0xffcfffb8 is just "not running" and says nothing.
+
+It costs one entry in the id table and one line of output.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 53eb080..2e87095 100755
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -101,6 +101,7 @@ extern void pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_
+  */
+ #define MP_PAS            4u             /* canoe_mpss_resource, decoded from qcom_q6v5_pas.ko */
+ #define MP_PAS_DTB        0x26u          /* 38 */
++#define MP_PAS_CONTROL    13u            /* the ADSP's zap id: known-good for INIT_IMAGE */
+ static unsigned mp_pas = MP_PAS, mp_pas_dtb = MP_PAS_DTB;
+ #define MP_IPA_FW_PA      0x99580000ull  /* ipa_fw_region@99580000: 0x10000 */
+ #define MP_IPA_FW_SIZE    0x10000ull
+@@ -950,7 +951,13 @@ mp_probe_cross(void)
+ static void
+ mp_shutdown_first(void)
+ {
+-	static const unsigned ids[] = { MP_PAS, MP_PAS_DTB };
++	/*
++	 * The third id is a CONTROL, not a target: the ADSP's 13 is accepted by INIT_IMAGE in the same
++	 * boot this runs in (logs/1795302306 and 1795302772 show `pas 13 init_image -> a0 0`), so its
++	 * answer to PAS_SHUTDOWN says whether 0xffcfffb8 means "this id may not be touched" or merely
++	 * "that peripheral is not running".
++	 */
++	static const unsigned ids[] = { MP_PAS, MP_PAS_DTB, MP_PAS_CONTROL };
+ 
+ 	if (!mp_option("pandora_mpss_shutdown_first")) {
+ 		return;
