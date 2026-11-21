@@ -1,0 +1,125 @@
+From: baseband lane
+Subject: 0514 pandora_pas: keep the metadata blob alive until AUTH_AND_RESET
+
+From SM8450 onwards the secure world keeps a reference to the PIL metadata between INIT_IMAGE and
+AUTH_AND_RESET:
+
+  "some new security enhancements ... require keeping the metadata segment accessible by the
+   secure world from init_image() until auth_and_reset()"
+  -- the pas_metadata context series, https://lkml.org/lkml/2023/5/24/560
+
+This file freed the blob as soon as INIT_IMAGE returned, so even a successful INIT_IMAGE would have
+been followed by a rejected AUTH.
+
+The blob is now held per pas id in a small table (16 slots), released by pas_meta_release() after
+the AUTH_AND_RESET call, and also on PAS_SHUTDOWN so a stage that never auths cannot hold it for the
+whole boot.  The probe path (pandora_pas_init_only) holds it the same way, so a probe run exercises
+the same lifetime as the real one.
+
+Together with 0513 this makes one boot answer two questions, and the log separates them:
+`shm_bridge_enable -> a0`, then `init_image -> a0`, then `auth_and_reset -> a0`.
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index cd883dd..3557e0c 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -42,6 +42,56 @@ extern void pandora_scm_call3(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64
+ /* Defined below; the two INIT_IMAGE call sites above the definition use it too. */
+ static void pas_enable_shm_bridge(void);
+ 
++/*
++ * The metadata segment has to stay accessible to the secure world from INIT_IMAGE until
++ * AUTH_AND_RESET, from SM8450 onwards:
++ *   "some new security enhancements ... require keeping the metadata segment accessible by the
++ *    secure world from init_image() until auth_and_reset()"
++ *   -- the pas_metadata context series, <https://lkml.org/lkml/2023/5/24/560#1>
++ * This file used to free the blob as soon as INIT_IMAGE returned, so even a successful INIT_IMAGE
++ * would have been followed by a rejected AUTH.  The blob is now held per pas id and released only
++ * after the auth call (or on shutdown, so a failed stage cannot leak it for the whole boot).
++ */
++#define PAS_META_SLOTS 16
++struct pas_meta {
++	unsigned pas;
++	bool used;
++	vm_offset_t md;
++	uint64_t size;
++};
++static struct pas_meta pas_meta[PAS_META_SLOTS];
++
++static void
++pas_meta_hold(unsigned pas, vm_offset_t md, uint64_t size)
++{
++	for (unsigned i = 0; i < PAS_META_SLOTS; i++) {
++		if (!pas_meta[i].used) {
++			pas_meta[i].used = true;
++			pas_meta[i].pas = pas;
++			pas_meta[i].md = md;
++			pas_meta[i].size = size;
++			return;
++		}
++	}
++	/* No free slot: release here rather than leak silently. */
++	printf("PANDORA PAS: no slot for pas %u's metadata; releasing it now\n", pas);
++	kmem_free(kernel_map, md, (vm_size_t)size);
++}
++
++/* Frees the metadata of pas -- only after INIT_IMAGE has been told to forget it. */
++static void
++pas_meta_release(unsigned pas)
++{
++	for (unsigned i = 0; i < PAS_META_SLOTS; i++) {
++		if (pas_meta[i].used && pas_meta[i].pas == pas) {
++			kmem_free(kernel_map, pas_meta[i].md, (vm_size_t)pas_meta[i].size);
++			pas_meta[i].used = false;
++			return;
++		}
++	}
++}
++
++
+ #define PAS_MAX_SEGMENTS 64
+ #define PAS_MDT_MAX      0x10000
+ 
+@@ -283,9 +333,16 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 	 * carveout is mapped once or twice per boot, so leaving it mapped is bounded and is what
+ 	 * those two files already do.
+ 	 */
+-	kmem_free(kernel_map, md, (vm_size_t)md_size);
+ 	if (!err) {
+ 		printf("PANDORA PAS: %s: %llu bytes loaded at %#llx\n", name, total, mem_pa);
++		/*
++		 * The blob stays alive: the secure world has to keep reaching it until
++		 * AUTH_AND_RESET (see the pas_meta table at the top).  pas_meta_release() frees it
++		 * once the auth call has been made, or on shutdown.
++		 */
++		pas_meta_hold(pas, md, md_size);
++	} else {
++		kmem_free(kernel_map, md, (vm_size_t)md_size);
+ 	}
+ out:
+ 	kfree_data(hdr, PAS_MDT_MAX);
+@@ -394,7 +451,7 @@ pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64
+ 	pas_enable_shm_bridge();
+ 	uint64_t a0 = 0, a1 = 0, arginfo = SCM_ARGS(2) | (SCM_RW << 6);
+ 	pandora_scm_call(SCM_PAS_INIT_IMAGE, arginfo, pas, md_pa, &a0, &a1);
+-	kmem_free(kernel_map, md, (vm_size_t)md_size);
++	pas_meta_hold(pas, md, md_size);
+ 	if (answer) {
+ 		*answer = a0;
+ 	}
+@@ -445,6 +502,8 @@ pandora_pas_auth(unsigned pas)
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+ 	printf("PANDORA PAS: pas %u auth_and_reset -> a0 %#llx (%d) a1 %#llx (%llu ms)\n", pas, a0,
+ 	    (int)(int32_t)a0, a1, ns / 1000000);
++	/* The secure world is done with the metadata now. */
++	pas_meta_release(pas);
+ 	return (a0 || a1) ? EIO : 0;
+ }
+ 
+@@ -455,5 +514,6 @@ pandora_pas_shutdown(unsigned pas)
+ 	uint64_t a0 = 0, a1 = 0;
+ 	pandora_scm_call(SCM_PAS_SHUTDOWN, SCM_ARGS(1), pas, 0, &a0, &a1);
+ 	printf("PANDORA PAS: pas %u shutdown -> a0 %#llx (%d) a1 %#llx\n", pas, a0, (int)(int32_t)a0, a1);
++	pas_meta_release(pas);
+ 	return (a0 || a1) ? EIO : 0;
+ }
