@@ -899,7 +899,12 @@ pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t me
 		}
 		uint64_t off = (uint64_t)ph[i].p_paddr - reloc_base;
 		if ((int64_t)off < 0 || off + ph[i].p_memsz > mem_size || ph[i].p_filesz > ph[i].p_memsz) {
-			printf("PANDORA ADSP: %s segment %u outside the carveout\n", name, i);
+			printf("PANDORA ADSP: %s segment %u outside the carveout "
+			    "(pa %#llx memsz %#x filesz %#x off %#llx mem_size %#llx "
+			    "reloc_base %#llx)\n", name, i,
+			    (unsigned long long)ph[i].p_paddr, ph[i].p_memsz, ph[i].p_filesz,
+			    (unsigned long long)off, (unsigned long long)mem_size,
+			    (unsigned long long)reloc_base);
 			err = EINVAL;
 			break;
 		}
