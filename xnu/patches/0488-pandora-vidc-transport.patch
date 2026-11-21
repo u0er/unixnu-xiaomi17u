@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..0537724
+index 0000000..0051e9c
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,1894 @@
+@@ -0,0 +1,1928 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -229,12 +229,28 @@ index 0000000..0537724
 + *   0x2FF000 +--------------------------+
 + *   0x300000   end of published window
 + */
-+#define VIDC_QTABLE_BYTES       0x00300000u   /* [K] CPU+0x68 constant */
++/* Queue window is runtime-sized (boot-arg pandora_vidc_ring, KiB per ring,
++ * default 1024).  The 3 MiB window plus the other MMA windows made an unrelated
++ * 864 KiB kmem_alloc fail at 5.17 s (`failed with 3 @vm_kern.c:178`) and panic
++ * the boot.  ml_io_map entries are permanent, so the window cannot be released
++ * afterwards -- the only legitimate lever is to map less. */
++#define VIDC_RING_KB_DEFAULT    1024u
++#define VIDC_RING_KB_MIN        64u
++#define VIDC_RING_KB_MAX        4096u
++/* Default to 256 KiB per ring (0xC1000 window) so the boot survives the 5.17 s
++ * 864 KiB kmem_alloc that the 3 MiB window used to trigger.  pandora_vidc_ring
++ * can restore 1024 for the vendor-identical 0x300000 window when A/B testing.
++ * The initialisers below keep the geometry valid even if a probe touches it
++ * before pandora_vidc_init runs. */
++#define VIDC_RING_KB_ACTIVE     256u
++static uint32_t vidc_ring_bytes = (VIDC_RING_KB_ACTIVE << 10);
++static uint32_t vidc_qtable_bytes = 0x1000u + 3u * (VIDC_RING_KB_ACTIVE << 10);
++#define VIDC_QTABLE_BYTES       vidc_qtable_bytes
 +/* Exactly the published window: header 456 B + three 1 MiB rings ends at
 + * 0x300000, so the old +64 KiB slack was pure permanent kernel_map waste. */
-+#define VIDC_QTABLE_ALLOC       VIDC_QTABLE_BYTES
-+#define IFACEQ_RING_OFFS(i)     (0x001000u + (i) * 0x00100000u)  /* 0x1000/0x101000/0x201000 */
-+#define IFACEQ_QUEUE_SIZE       0x000FF000u   /* 1 MiB - 4 KiB, rings stay disjoint */
++#define VIDC_QTABLE_ALLOC       vidc_qtable_bytes
++#define IFACEQ_RING_OFFS(i)     (0x001000u + (i) * vidc_ring_bytes)
++#define IFACEQ_QUEUE_SIZE       (vidc_ring_bytes - 0x001000u)   /* rings stay disjoint */
 +#define IFACEQ_QUEUE_WORDS      (IFACEQ_QUEUE_SIZE / 4u)
 +
 +#define VIDC_SFR_BYTES          0x00004000u   /* [M] SFR_SIZE = 4 KiB */
@@ -314,6 +330,23 @@ index 0000000..0537724
 + * pandora_gpu.c:1095 / pandora_adsp.c:814: it never leaves a dirty line that
 + * could later be written back over firmware-owned data, and it never lets the
 + * CPU read a stale line after the VPU wrote. */
++/* Pin the queue geometry before every user of it (called from pandora_vidc_init). */
++static void
++vidc_set_ring_geometry(void)
++{
++    unsigned kb = VIDC_RING_KB_ACTIVE;
++    (void)PE_parse_boot_argn("pandora_vidc_ring", &kb, sizeof(kb));
++    if (kb < VIDC_RING_KB_MIN || kb > VIDC_RING_KB_MAX || (kb & (kb - 1u)) != 0) {
++        printf("PANDORA VIDC: pandora_vidc_ring=%u invalid (power of two, %u..%u KiB); using %u\n",
++            kb, VIDC_RING_KB_MIN, VIDC_RING_KB_MAX, VIDC_RING_KB_DEFAULT);
++        kb = VIDC_RING_KB_DEFAULT;
++    }
++    vidc_ring_bytes = kb << 10;
++    vidc_qtable_bytes = 0x1000u + IFACEQ_NUMQ * vidc_ring_bytes;
++    printf("PANDORA VIDC: queue geometry: %u KiB per ring, window %#x, q_size %#x words\n",
++        kb, vidc_qtable_bytes, (vidc_ring_bytes - 0x1000u) / 4u);
++}
++
 +static vm_offset_t vidc_qtable_va;
 +static uint64_t vidc_qtable_pa;
 +static vm_offset_t vidc_sfr_va;
@@ -1886,6 +1919,7 @@ index 0000000..0537724
 +void
 +pandora_vidc_init(void)
 +{
++    vidc_set_ring_geometry();
 +    (void)PE_parse_boot_argn("pandora_vidc", &vidc_level, sizeof(vidc_level));
 +    if (!vidc_level) return;
 +    if (vidc_level < 1 || vidc_level > 4) {
