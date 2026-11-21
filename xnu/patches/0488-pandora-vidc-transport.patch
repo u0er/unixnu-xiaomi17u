@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..10881bf
+index 0000000..85d6abd
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,1926 @@
+@@ -0,0 +1,1932 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -1860,6 +1860,12 @@ index 0000000..10881bf
 +        if (fw == 0) vidc_pass_mask |= VIDC_STAGE_FWCOPY;
 +    }
 +
++    /* Third measurement, at the moment that actually matters: after every one of
++     * our windows exists.  The 5.17 s failure is a 128 KiB
++     * kmem_alloc(KMA_PAGEABLE|KMA_PERMANENT), so if this line already shows `X`
++     * the shortfall is ours to give back; if it still shows `k` for 1 MiB, our
++     * footprint is exonerated and the failure belongs to another driver. */
++    vidc_map_budget("before publish");
 +    rc = vidc_publish_queues();         /* boot release + 0xA004C poll */
 +    vidc_verdict("publish", rc);
 +    if (rc == 0) vidc_pass_mask |= VIDC_STAGE_PUBLISH;
