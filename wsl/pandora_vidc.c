@@ -788,6 +788,7 @@ vidc_fill_queues(void)
 static inline uint32_t
 vidc_rd(uint32_t off)
 {
+    if (!vidc_mmio_on) return 0;      /* MMIO window released after the ladder */
     uint32_t v = *(volatile uint32_t *)(vidc_mmio + off);
     __asm__ volatile ("dmb oshld" ::: "memory");
     return v;
@@ -796,6 +797,7 @@ vidc_rd(uint32_t off)
 static inline void
 vidc_wr(uint32_t off, uint32_t v)
 {
+    if (!vidc_mmio_on) return;
     *(volatile uint32_t *)(vidc_mmio + off) = v;
     __asm__ volatile ("dmb oshst" ::: "memory");
 }
@@ -1559,12 +1561,28 @@ summary:
      * VA costs nothing after the context is built -- and it is exactly the kind
      * of permanent kernel_map that made an unrelated 1 MiB kmem_alloc fail at
      * 9.180 s (`failed with 3 @vm_kern.c:178`). */
+    unsigned released = 0;
     if (vidc_smmu_va) {
         ml_io_unmap(vidc_smmu_va, VIDC_SMMU_SIZE);
         vidc_smmu_va = 0;
-        printf("PANDORA VIDC: released %#x bytes of apps-smmu kernel VA\n",
-            VIDC_SMMU_SIZE);
+        released += VIDC_SMMU_SIZE;
     }
+    /* The video register windows are only needed while the ladder runs.  Both
+     * readers and writers now tolerate a released window, so drop them too: the
+     * whole point is that this driver must not keep ~5 MiB of kernel_map on a
+     * machine where the GPU lane already maps a 2 GiB pool. */
+    if (vidc_cc) {
+        ml_io_unmap(vidc_cc, VIDEOCC_SIZE);
+        vidc_cc = 0;
+        released += VIDEOCC_SIZE;
+    }
+    if (vidc_mmio_on) {
+        vidc_mmio_on = false;
+        ml_io_unmap(vidc_mmio, VIDC_SIZE);
+        vidc_mmio = 0;
+        released += VIDC_SIZE;
+    }
+    printf("PANDORA VIDC: released %#x bytes of kernel VA after the ladder\n", released);
 }
 
 /* ------------------------------------------------------------------ */
