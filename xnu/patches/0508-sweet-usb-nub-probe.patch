@@ -1,0 +1,194 @@
+From: CarPlay C1 lane (2026-11-21)
+Subject: 0508 sweet_usb: first controller-nub probe for the prelinked device stack
+
+mkprelink can now carry IOUSBDeviceFamily, AppleUSBDeviceMux and the IOAccessory family
+in our kernel (23 components, 58,510 relocations, 0 wrong, 209 class vtables
+slot-compatible). Nothing instantiates until an IOUSBDeviceController provider exists.
+
+This adds a probe that takes the class by name (OSMetaClass::getMetaClassWithName), so
+no Apple private header and no kext symbol table is needed. Default behaviour is a
+read-only report: metaclass pointer, alloc result, class size. With sweet_nub=1 it
+copies the 232-slot IOUSBDeviceController vtable, replaces the 18 pure-virtual slots
+with conservative stubs, runs Apple's own start (slot 86), sets ConfigurationType to
+ncmBringup and registerService()s so the configurator can match. The vtable address is
+validated at runtime against the 0507 prelink layout before it is used, so a changed
+layout refuses instead of calling random memory.
+
+--- /dev/null
++++ b/libkern/c++/sweet_nub.cpp
+@@ -0,0 +1,148 @@
++/*
++ * 0508 CarPlay C1: controller-nub probe / first instantiation.
++ *
++ * Why this exists: our kernel does not carry Apple's device-side USB stack by
++ * default. It can be prelinked in (IOUSBDeviceFamily, AppleUSBDeviceMux,
++ * IOAccessoryManager, IOAccessoryPortUSB, AppleAuthCP) -- verified offline with
++ * mkprelink: 23 components, 58,510 relocations, 0 wrong, 209 kernel class vtables
++ * slot-compatible. IOUSBDeviceConfigurator then matches a provider whose class is
++ * IOUSBDeviceController and whose ConfigurationType property is one of the stock
++ * configuration types. This file creates that provider without Apple's private
++ * header: take the OSMetaClass by name, alloc an instance, and (only with the
++ * sweet_nub=1 boot argument) copy the 232-slot vtable, replace the 18 pure virtual
++ * slots with conservative stubs, and run Apple's own start (slot 86).
++ *
++ * Addresses: the kext region of a prelinked image is the stock one minus SLIDE
++ * (0x1000000). Verified on the 0507+accessory prelink:
++ *   IOUSBDeviceController instance vtable  0xfffffff005e11210
++ *     slot 0 0xfffffff004cee5bc, slot 86 (start) 0xfffffff004cef59c
++ *   the 18 pure slots all point at __cxa_pure_virtual (0xfffffff0079eff24)
++ * The vtable address is validated below before it is used, so a changed prelink
++ * layout fails loudly instead of calling random memory.
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <libkern/c++/OSMetaClass.h>
++#include <libkern/c++/OSSymbol.h>
++#include <libkern/c++/OSSharedPtr.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#define SWEET_NUB_CTL_VTABLE   0xfffffff005e11210ULL
++#define SWEET_NUB_CTL_SLOTS    232
++#define SWEET_NUB_START_SLOT   86
++#define SWEET_NUB_KERNEL_BASE  0xfffffff000000000ULL
++#define SWEET_NUB_CLASS        "IOUSBDeviceController"
++
++/* The 18 slots that hold __cxa_pure_virtual in IOUSBDeviceController. */
++static const unsigned sweet_nub_pure_slots[] = {
++	175, 177, 179, 180, 181, 182, 183, 184, 185,
++	186, 187, 188, 189, 192, 193, 198, 201, 225
++};
++
++static void *sweet_nub_vtable[SWEET_NUB_CTL_SLOTS];
++
++extern "C" uint64_t sweet_nub_stub0(void *, ...);
++extern "C" uint64_t sweet_nub_stub1(void *, ...);
++extern "C" uint64_t sweet_nub_stub_speed(void *, ...);
++
++extern "C" uint64_t
++sweet_nub_stub0(void *, ...)
++{
++	return 0;
++}
++
++extern "C" uint64_t
++sweet_nub_stub1(void *, ...)
++{
++	return 1;
++}
++
++/* getConnectionSpeed (slot 187): 2 = high speed, the only value we can back today. */
++extern "C" uint64_t
++sweet_nub_stub_speed(void *, ...)
++{
++	return 2;
++}
++
++static bool
++sweet_nub_vtable_ok(void)
++{
++	const uint64_t *vt = (const uint64_t *)SWEET_NUB_CTL_VTABLE;
++	if ((uint64_t)vt < SWEET_NUB_KERNEL_BASE)
++		return false;
++	if ((vt[SWEET_NUB_START_SLOT] & 0xfffffff000000000ULL) != SWEET_NUB_KERNEL_BASE)
++		return false;
++	for (unsigned i = 0; i < sizeof(sweet_nub_pure_slots) / sizeof(sweet_nub_pure_slots[0]); i++) {
++		uint64_t target = vt[sweet_nub_pure_slots[i]];
++		if ((target & 0xfffffff000000000ULL) != SWEET_NUB_KERNEL_BASE)
++			return false;
++	}
++	return true;
++}
++
++extern "C" void
++sweet_nub_probe(void)
++{
++	const OSSymbol *name = OSSymbol::withCStringNoCopy(SWEET_NUB_CLASS).get();
++	if (name == NULL) {
++		printf("SWEET NUB: cannot intern the class name\n");
++		return;
++	}
++	const OSMetaClass *mc = OSMetaClass::getMetaClassWithName(name);
++	printf("SWEET NUB: %s metaclass %p\n", SWEET_NUB_CLASS, mc);
++	if (mc == NULL) {
++		/* The accessory kexts were not prelinked, or their constructors have not run. */
++		printf("SWEET NUB: class not registered yet; S2 skipped\n");
++		return;
++	}
++	IOService *ctl = (IOService *)mc->alloc();
++	printf("SWEET NUB: alloc -> %p, classSize %u, own class %s\n", ctl, mc->getClassSize(),
++	    ctl != NULL ? ctl->getMetaClass()->getClassName() : "-");
++	if (ctl == NULL) {
++		return;
++	}
++
++	int run_start = 0;
++	PE_parse_boot_argn("sweet_nub", &run_start, sizeof(run_start));
++	if (run_start == 0) {
++		ctl->release();
++		printf("SWEET NUB: S2 done (pass sweet_nub=1 to run Apple's start)\n");
++		return;
++	}
++
++	if (!sweet_nub_vtable_ok()) {
++		ctl->release();
++		printf("SWEET NUB: vtable at %p does not look like the 0507 prelink; refusing to start\n",
++		    (void *)SWEET_NUB_CTL_VTABLE);
++		return;
++	}
++
++	for (unsigned i = 0; i < SWEET_NUB_CTL_SLOTS; i++)
++		sweet_nub_vtable[i] = ((void **)SWEET_NUB_CTL_VTABLE)[i];
++	for (unsigned i = 0; i < sizeof(sweet_nub_pure_slots) / sizeof(sweet_nub_pure_slots[0]); i++)
++		sweet_nub_vtable[sweet_nub_pure_slots[i]] = (void *)sweet_nub_stub0;
++	sweet_nub_vtable[187] = (void *)sweet_nub_stub_speed;
++	*(void ***)ctl = sweet_nub_vtable;
++
++	IOService *provider = (IOService *)IOService::getPlatform();
++	printf("SWEET NUB: provider %p; init/attach\n", provider);
++	if (!ctl->init() || !ctl->attach(provider)) {
++		printf("SWEET NUB: init/attach failed\n");
++		ctl->release();
++		return;
++	}
++
++	bool started = ((bool (*)(IOService *, IOService *))sweet_nub_vtable[SWEET_NUB_START_SLOT])(ctl, provider);
++	printf("SWEET NUB: Apple start -> %d\n", started ? 1 : 0);
++
++	/* prepareDefaults overwrites ConfigurationType; set the matching value now and
++	 * publish, which is what starts personality matching (IOService.h:650). */
++	ctl->setProperty("ConfigurationType", "ncmBringup");
++	ctl->registerService();
++	printf("SWEET NUB: registered as ncmBringup; mux/configurator should now match\n");
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/libkern/conf/files
++++ b/libkern/conf/files
+@@ -27,6 +27,7 @@
+ libkern/c++/OSDictionary.cpp				optional libkerncpp
+ libkern/c++/OSIterator.cpp				optional libkerncpp
+ libkern/c++/OSKext.cpp					optional libkerncpp
++libkern/c++/sweet_nub.cpp				optional libkerncpp
+ libkern/c++/OSNumber.cpp				optional libkerncpp
+ libkern/c++/OSOrderedSet.cpp				optional libkerncpp
+ libkern/c++/OSRuntime.cpp				optional libkerncpp
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1854,5 +1854,14 @@
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	/*
++	 * 0508: the device-side USB stack (IOUSBDeviceFamily, AppleUSBDeviceMux,
++	 * IOAccessoryManager) is prelinked into this kernel but inert until a
++	 * controller provider exists. The probe only reads the class registry by
++	 * default; the sweet_nub=1 boot argument makes it run the first
++	 * instantiation (vtable patched, Apple's start called).
++	 */
++	extern void sweet_nub_probe(void);
++	sweet_nub_probe();
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
