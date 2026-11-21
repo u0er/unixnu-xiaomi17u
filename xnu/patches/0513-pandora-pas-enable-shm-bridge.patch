@@ -1,0 +1,88 @@
+From: baseband lane
+Subject: 0513 pandora_pas: enable the SHM bridge before INIT_IMAGE, like the ADSP does
+
+Found by comparing this file against the ADSP path in the same kernel, which loads firmware
+successfully on this very phone (logs 1795244094 / 1795244470):
+
+  PANDORA ADSP: shm_bridge_enable -> a0 0 a1 0
+  PANDORA ADSP: pas 13 init_image (4244 bytes) -> a0 0 (0)
+  PANDORA ADSP: pas 36 init_image -> a0 0          (adsp_dtb, 175688 bytes)
+  PANDORA ADSP: pas 1  init_image -> a0 0          (adsp.mdt, 33 MB)
+
+Everything else in the two paths is identical: same kmem_alloc_contig with PAGE_MASK and no
+address constraint, same KMA_ZERO, same flush_dcache64(md_pa, md_size, TRUE), same
+SCM_ARGS(2) | (SCM_RW << 6) with (pas, md_pa).  The single difference is that
+bsd/dev/pandora_adsp.c calls SCM_FN(0xc, 0x1c) once before its first INIT_IMAGE, while the
+modem's boot arguments run with pandora_adsp=0, so nothing had ever enabled it.
+
+Meanwhile the 2026-11-21 probe sent the same modem DTB blob for nine PAS ids -- including pas 0,
+which cannot exist -- and TrustZone answered 0xffcfffbb (-3145797, EINVAL) every time, which is an
+answer about the call rather than about the id.  This adds the enable, once per boot, printing its
+result, and keeps the sub-4GiB constraint from 0512.
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index 147c20b..cd883dd 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -39,6 +39,9 @@ extern void pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_
+ extern void pandora_scm_call3(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4,
+     uint64_t *a0);
+ 
++/* Defined below; the two INIT_IMAGE call sites above the definition use it too. */
++static void pas_enable_shm_bridge(void);
++
+ #define PAS_MAX_SEGMENTS 64
+ #define PAS_MDT_MAX      0x10000
+ 
+@@ -204,6 +207,7 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 		goto out;
+ 	}
+ 	flush_dcache64((addr64_t)md_pa, (unsigned)md_size, TRUE);
++	pas_enable_shm_bridge();
+ 	uint64_t a0 = 0, a1 = 0;
+ 	/*
+ 	 * arginfo = QCOM_SCM_ARGS(2, QCOM_SCM_VAL, QCOM_SCM_RW), and upstream packs it as
+@@ -387,6 +391,7 @@ pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64
+ 		}
+ 	}
+ 	flush_dcache64((addr64_t)md_pa, (unsigned)md_size, TRUE);
++	pas_enable_shm_bridge();
+ 	uint64_t a0 = 0, a1 = 0, arginfo = SCM_ARGS(2) | (SCM_RW << 6);
+ 	pandora_scm_call(SCM_PAS_INIT_IMAGE, arginfo, pas, md_pa, &a0, &a1);
+ 	kmem_free(kernel_map, md, (vm_size_t)md_size);
+@@ -402,6 +407,35 @@ out:
+ 	return err;
+ }
+ 
++/*
++ * SHM bridge enable, once per boot, before any INIT_IMAGE.
++ *
++ * This is the one difference between this path and the ADSP's, which works on this very phone:
++ * bsd/dev/pandora_adsp.c calls SCM_FN(0xc, 0x1c) once (its log shows `shm_bridge_enable -> a0 0`)
++ * before its `pas 13/36/1 init_image -> a0 0` calls, while the modem's boot arguments run with
++ * pandora_adsp=0, so nothing had ever enabled it.  The metadata buffer, its flags, its cache
++ * maintenance and the arginfo (0x82) are otherwise identical between the two files.
++ *
++ * The 2026-11-21 probe sent the same blob for nine PAS ids, including pas 0, and TrustZone
++ * answered 0xffcfffbb (-3145797) every time -- an answer about the call, not about the id.
++ */
++static bool pas_bridge_on;
++static bool pas_bridge_ready;
++
++static void
++pas_enable_shm_bridge(void)
++{
++	uint64_t a0 = 0, a1 = 0;
++
++	if (pas_bridge_ready) {
++		return;
++	}
++	pas_bridge_ready = true;
++	pandora_scm_call(SCM_FN(0xc, 0x1c), SCM_ARGS(0), 0, 0, &a0, &a1);
++	printf("PANDORA PAS: shm_bridge_enable -> a0 %#llx (%d) a1 %#llx\n", a0, (int)(int32_t)a0, a1);
++	pas_bridge_on = (a0 == 0 && a1 == 0);
++}
++
+ /* PAS_AUTH_AND_RESET: lets the processor out of reset. */
+ int
+ pandora_pas_auth(unsigned pas)
