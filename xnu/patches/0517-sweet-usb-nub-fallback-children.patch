@@ -1,0 +1,77 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0517 sweet_nub: gate the direct fallback on children==0, not on isInactive
+
+0513 armed the direct createUSBDevice fallback when the controller was still inactive five
+seconds after registerService. That condition can never hold: the probe calls Apple's start
+(vtable slot 86) on the same object earlier in the probe thread, and a successful start clears
+isInactive(). So the fallback was dead code in every sweet_nub mode and S6 could never be
+observed on the device.
+
+0517 gates it on the measurement that answers the question -- zero children five seconds after
+registration, i.e. the configurator built no device tree -- and prints which branch ran
+("fallback armed ..." / "direct fallback not needed: children N"). It also prints each created
+child's USBDeviceFunction property, the tag the NCM/Mux personalities match on, so a child
+without the expected tag explains a later "personality never attached" without a second boot.
+
+Found by reading 0516's own flow (setProperty/registerService/start order) while the phone was
+off-USB after the 02:24 hang; no boot was spent on the dead path.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -276,12 +276,20 @@
+ 
+ 	/*
+ 	 * 0513: IOUSBDeviceConfigurator::start is nothing but getProperty("DeviceDescription") plus a
+-	 * direct call to createUSBDevice(this = provider). If the published personality did not get
+-	 * us that far (still inactive after five seconds), do its one job here with the same
++	 * direct call to createUSBDevice(this = provider). Do its one job here with the same
+ 	 * dictionary the personality carries (contents read out of __PRELINK_INFO: Attributes 224,
+ 	 * MaxPower 0, Interfaces = the function names, and the NCM/Mux variant is selectable).
+-	 */
+-	if (!started_now && direct_fallback) {
++	 *
++	 * 0517: 0513 gated this on !started_now, but the probe has already called Apple's start
++	 * (slot 86) on the same object a few lines above, and a successful start clears
++	 * isInactive(). So in every sweet_nub mode started_now is 1 by construction and the direct
++	 * call was dead code -- S6 could never produce evidence. Gate on the measurement that
++	 * actually answers the question instead: five seconds after registerService the controller
++	 * still has zero children, i.e. nothing built a device tree for it.
++	 */
++	if (direct_fallback && children == 0) {
++		printf("SWEET NUB: fallback armed: children 0 five seconds after registration, "
++		    "calling createUSBDevice directly\n");
+ 		OSDictionary *desc = OSDictionary::withCapacity(8);
+ 		OSArray *configs = OSArray::withCapacity(1);
+ 		OSDictionary *config = OSDictionary::withCapacity(4);
+@@ -327,8 +335,17 @@
+ 					while (OSObject *obj = made_it->getNextObject()) {
+ 						IOService *child = OSDynamicCast(IOService, obj);
+ 						if (child != NULL) {
+-							printf("SWEET NUB: made[%d] %s\n", made,
+-							    child->getMetaClass()->getClassName());
++							/* 0517: the function tag is what the NCM/Mux
++							 * personalities match on (IOProviderClass =
++							 * IOUSBDeviceInterface, IOPropertyMatch =
++							 * USBDeviceFunction), so print it: a child
++							 * without the expected tag explains a later
++							 * "personality never attached" without another boot. */
++							OSString *fn = OSDynamicCast(OSString,
++							    child->getProperty("USBDeviceFunction"));
++							printf("SWEET NUB: made[%d] %s fn=%s\n", made,
++							    child->getMetaClass()->getClassName(),
++							    fn != NULL ? fn->getCStringNoCopy() : "(none)");
+ 						}
+ 						made++;
+ 					}
+@@ -349,6 +366,11 @@
+ 		if (config) config->release();
+ 		if (configs) configs->release();
+ 		if (desc) desc->release();
++	} else if (direct_fallback) {
++		/* 0517: state the other branch explicitly. "no direct line" used to mean either
++		 * "not armed" or "armed but skipped", which read the same in the log. */
++		printf("SWEET NUB: direct fallback not needed: children %d five seconds after "
++		    "registration\n", children);
+ 	} else if (!started_now) {
+ 		printf("SWEET NUB: nothing matched; pass sweet_nub=3 (or 4) to call createUSBDevice "
+ 		    "from here\n");
