@@ -5,15 +5,40 @@ mkprelink can now carry IOUSBDeviceFamily, AppleUSBDeviceMux and the IOAccessory
 in our kernel (23 components, 58,510 relocations, 0 wrong, 209 class vtables
 slot-compatible). Nothing instantiates until an IOUSBDeviceController provider exists.
 
-This adds a probe that takes the class by name (OSMetaClass::getMetaClassWithName), so
-no Apple private header and no kext symbol table is needed. Default behaviour is a
-read-only report: metaclass pointer, alloc result, class size. With sweet_nub=1 it
-copies the 232-slot IOUSBDeviceController vtable, replaces the 18 pure-virtual slots
-with conservative stubs, runs Apple's own start (slot 86), sets ConfigurationType to
-ncmBringup and registerService()s so the configurator can match. The vtable address is
-validated at runtime against the 0507 prelink layout before it is used, so a changed
-layout refuses instead of calling random memory.
+The probe takes the class by name (OSMetaClass::getMetaClassWithName), so it needs no
+Apple private header and no kext symbol table. Default behaviour is read-only: report
+the metaclass, the alloc result and the class size. With sweet_nub=1 it copies the
+232-slot vtable, replaces the 18 pure-virtual slots with conservative stubs, runs
+Apple's own start (slot 86), sets ConfigurationType=ncmBringup and registerService()s so
+the configurator can match. The vtable address is validated against the 0507 prelink
+layout at runtime, so a changed layout refuses instead of calling random memory.
 
+Regenerated in git patch format: the first attempt was hand-assembled, patch consumed
+the libkern/conf/files header as part of the new-file hunk, the file never entered the
+build list, and the link failed on sweet_nub_probe (run 44900639188, 178 KB 'kernel').
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index fe06655..3849ade 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1854,5 +1854,14 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	/*
++	 * 0508: the device-side USB stack (IOUSBDeviceFamily, AppleUSBDeviceMux,
++	 * IOAccessoryManager) is prelinked into this kernel but inert until a
++	 * controller provider exists. The probe only reads the class registry by
++	 * default; the sweet_nub=1 boot argument runs the first instantiation
++	 * (vtable patched, Apple's start called).
++	 */
++	extern void sweet_nub_probe(void);
++	sweet_nub_probe();
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/libkern/c++/sweet_nub.cpp b/libkern/c++/sweet_nub.cpp
+new file mode 100644
+index 0000000..b9b9229
 --- /dev/null
 +++ b/libkern/c++/sweet_nub.cpp
 @@ -0,0 +1,148 @@
@@ -165,9 +190,11 @@ layout refuses instead of calling random memory.
 +}
 +
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/libkern/conf/files b/libkern/conf/files
+index 70541f7..777b74e 100644
 --- a/libkern/conf/files
 +++ b/libkern/conf/files
-@@ -27,6 +27,7 @@
+@@ -27,6 +27,7 @@ libkern/c++/OSData.cpp					optional libkerncpp
  libkern/c++/OSDictionary.cpp				optional libkerncpp
  libkern/c++/OSIterator.cpp				optional libkerncpp
  libkern/c++/OSKext.cpp					optional libkerncpp
@@ -175,20 +202,3 @@ layout refuses instead of calling random memory.
  libkern/c++/OSNumber.cpp				optional libkerncpp
  libkern/c++/OSOrderedSet.cpp				optional libkerncpp
  libkern/c++/OSRuntime.cpp				optional libkerncpp
---- a/bsd/dev/sweet_usb.c
-+++ b/bsd/dev/sweet_usb.c
-@@ -1854,5 +1854,14 @@
- 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
- 		thread_deallocate(thread);
- 	}
-+	/*
-+	 * 0508: the device-side USB stack (IOUSBDeviceFamily, AppleUSBDeviceMux,
-+	 * IOAccessoryManager) is prelinked into this kernel but inert until a
-+	 * controller provider exists. The probe only reads the class registry by
-+	 * default; the sweet_nub=1 boot argument makes it run the first
-+	 * instantiation (vtable patched, Apple's start called).
-+	 */
-+	extern void sweet_nub_probe(void);
-+	sweet_nub_probe();
- }
- #endif /* ARM64_BOARD_CONFIG_SWEET */
