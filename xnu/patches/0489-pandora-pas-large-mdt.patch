@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
-index 56132ef..eebd4fe 100644
+index 56132ef..d1ce22b 100644
 --- a/bsd/dev/pandora_adsp.c
 +++ b/bsd/dev/pandora_adsp.c
 @@ -548,6 +548,16 @@ struct fw_ent {
@@ -219,10 +219,27 @@ index 56132ef..eebd4fe 100644
  static int
  pas_auth(unsigned pas)
  {
-@@ -896,6 +992,30 @@ pandora_pas_load_auth(const char *file, unsigned pas, uint64_t mem_pa, uint64_t
- 	return err;
- }
- 
+@@ -886,10 +982,42 @@ int
+ pandora_pas_load_auth(const char *file, unsigned pas, uint64_t mem_pa, uint64_t mem_size)
+ {
+ 	uint64_t bridge = 0;
++	/* fw_dir() fills the shared ad_dir/ad_nfiles too, so it belongs inside the
++	 * same critical section as the load -- otherwise two lanes can rebuild the
++	 * pack directory on top of each other.  (pas_load_locked is used here on
++	 * purpose: calling the pas_load wrapper would re-take a non-recursive lock.) */
++	lck_mtx_lock(&ad_pas_lock);
+ 	int err = ad_nfiles ? 0 : fw_dir();
+ 	if (!err) {
+-		err = pas_load(file, false, pas, mem_pa, mem_size, &bridge);
++		err = pas_load_locked(file, false, pas, mem_pa, mem_size, &bridge);
++	}
++	lck_mtx_unlock(&ad_pas_lock);
++	if (!err) {
++		err = pas_auth(pas);
++	}
++	return err;
++}
++
 +/* Source-selectable variant.  `part` chooses the firmware container over the
 + * pack that lives in userdata.  This exists because the rebuilt 128 GiB volume
 + * carries a DIFFERENT userdata pack (20 files vs 19) whose VPU image trips the
@@ -237,16 +254,12 @@ index 56132ef..eebd4fe 100644
 +    uint64_t mem_size, bool part)
 +{
 +	uint64_t bridge = 0;
++	lck_mtx_lock(&ad_pas_lock);
 +	int err = part ? fw_dir() : (ad_nfiles ? 0 : fw_dir());
 +	if (!err) {
-+		err = pas_load(file, part, pas, mem_pa, mem_size, &bridge);
-+	}
-+	if (!err) {
-+		err = pas_auth(pas);
-+	}
-+	return err;
-+}
-+
- /* ---- the remote processors' links: SMEM, IPCC doorbells, SMP2P, GLINK ----------------- */
- 
- /*
++		err = pas_load_locked(file, part, pas, mem_pa, mem_size, &bridge);
+ 	}
++	lck_mtx_unlock(&ad_pas_lock);
+ 	if (!err) {
+ 		err = pas_auth(pas);
+ 	}
