@@ -76,6 +76,32 @@ extern void pandora_apps_smmu_lock(void);
 extern void pandora_apps_smmu_unlock(void);
 
 extern vm_map_t kernel_map;
+
+/* Measure the kernel_map budget instead of guessing.  kernel_map's
+ * `struct _vm_map` is opaque from bsd/, so ask the allocator itself: try the
+ * size that actually failed at 5.17 s (864 KiB) plus the sizes around it, and
+ * hand each block straight back.  This turns "our 5 MiB is too much" from an
+ * inference into a number in the log. */
+static void
+vidc_map_budget(const char *when)
+{
+    static const vm_size_t want[] = { 64u << 10, 256u << 10, 864u << 10, 1u << 20 };
+    char line[160];
+    unsigned off = (unsigned)snprintf(line, sizeof(line), "PANDORA VIDC: kva budget %-14s", when);
+    for (unsigned i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        vm_offset_t va = 0;
+        /* Same primitive the driver uses for its own windows (kmem_alloc's
+         * 3-arg form is KERNEL_PRIVATE in this tree; contig is what we call). */
+        const kern_return_t kr = kmem_alloc_contig(kernel_map, &va, want[i], PAGE_MASK,
+            0, 0, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT);
+        if (kr == KERN_SUCCESS) {
+            kmem_free(kernel_map, va, want[i]);
+        }
+        off += (unsigned)snprintf(line + off, sizeof(line) - off, " %u%c", (unsigned)(want[i] >> 10),
+            kr == KERN_SUCCESS ? 'k' : 'X');
+    }
+    printf("%s\n", line);
+}
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 extern void clean_dcache64(addr64_t pa, unsigned len, boolean_t to_mem);
 extern void flush_dcache64(addr64_t pa, unsigned len, int phys);
@@ -521,6 +547,7 @@ static int
 vidc_alloc_buffers(void)
 {
     if (!vidc_qtable_va) {
+        vidc_map_budget("before qtable");
         vidc_qtable_va = vidc_contig(VIDC_QTABLE_ALLOC, &vidc_qtable_pa);
         if (!vidc_qtable_va) {
             printf("PANDORA VIDC: no %#x contiguous bytes for qtable\n", VIDC_QTABLE_ALLOC);
