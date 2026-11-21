@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..f95a79d2f0eb58a40bd199dbd168622c202155e9
+index 0000000..367d0ad57fef43d8a3999263d1cc706e9ed448b2
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4481 @@
+@@ -0,0 +1,4496 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3855,6 +3855,7 @@ index 0000000..f95a79d2f0eb58a40bd199dbd168622c202155e9
 +    unsigned *wakes, const char *what)
 +{
 +	static const uint8_t ack = 0xfc;
++	unsigned dropped = 0;
 +	uint64_t deadline;
 +
 +	*got = 0;
@@ -3877,12 +3878,23 @@ index 0000000..f95a79d2f0eb58a40bd199dbd168622c202155e9
 +				}
 +				continue;
 +			}
-+			if (b == 0xfcu || b == 0xfeu || b == 0xffu) {
++			/* An HCI event always starts with 0x04. Anything else before it
++			 * is line noise or a lost byte: record it and drop it instead of
++			 * letting it fill the buffer and turn into a bogus EMSGSIZE.
++			 * The trace shows the ROM's own dump frames start with 0x34, so
++			 * that case is logged once with its first byte. */
++			if (b != 0x04u) {
++				if (dropped < 8u) {
++					printf("PANDORA BT: %s: resync, dropped %#x before an HCI event\n",
++					    what, b);
++					pandora_log_sync();
++				}
++				dropped++;
 +				continue;
 +			}
 +		}
 +		ev[(*got)++] = b;
-+		if (*got >= 3u && ev[0] == 0x04u && *got >= 3u + ev[2]) {
++		if (*got >= 3u && *got >= 3u + ev[2]) {
 +			return 0;
 +		}
 +		if (*got >= cap) {
@@ -3974,7 +3986,10 @@ index 0000000..f95a79d2f0eb58a40bd199dbd168622c202155e9
 +    bool per_frame_cc)
 +{
 +	uint8_t frame[6u + BT_FW_SEG_MAX];
-+	uint8_t ev[16];
++	/* The ROM's answers are not 8 bytes in general: the 0x23 reply is 11 B and
++	 * the 0x20 build-info reply is 117 B. A 16-byte buffer made the very first
++	 * C frame return EMSGSIZE before the event could even be parsed. */
++	uint8_t ev[BT_PERI_EVT_MAX];
 +	unsigned sent = 0;
 +	unsigned seg = 0;
 +	unsigned ccs = 0;
@@ -4157,7 +4172,7 @@ index 0000000..f95a79d2f0eb58a40bd199dbd168622c202155e9
 +{
 +	int err;
 +
-+	printf("PANDORA BT: level 20: TME-L map A %u B (TLV) + B %u B + C %u B (HCI 0xfc00) (20.23)\n",
++	printf("PANDORA BT: level 20: TME-L map A %u B (TLV) + B %u B + C %u B (HCI 0xfc00) (20.24)\n",
 +	    (unsigned)sizeof(pandora_peri_tmel_elf),
 +	    (unsigned)sizeof(pandora_peri_tmel_mbn),
 +	    (unsigned)sizeof(pandora_peri_tmel_nvm));
