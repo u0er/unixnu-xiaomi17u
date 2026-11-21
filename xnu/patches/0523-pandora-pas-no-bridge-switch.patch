@@ -1,0 +1,54 @@
+From: baseband lane
+Subject: 0523 pandora_pas: a switch to leave the SHM bridge OFF (the ADSP proves plain works)
+
+Evidence from logs/1795273470, one boot, both paths side by side at the same moment:
+
+  PANDORA ADSP: pas 13 init_image (4244 bytes) -> a0 0        (accepted)
+  PANDORA ADSP: pas 13 mem_setup 0x9959a000+0x1000 -> a0 0
+  PANDORA ADSP: pas 13 auth_and_reset -> a0 0 (0 ms)
+  ...
+  PANDORA PAS: shm_bridge_enable -> a0 0
+  PANDORA PAS: pas 38 init_image (4044 bytes, arginfo 0x82, blob 0x8d0575000) -> a0 0xffcfffbb
+
+The ADSP path never calls SHM_BRIDGE_ENABLE and its INIT_IMAGE is accepted.  This file's path does
+call it, and its INIT_IMAGE is refused in the same boot on the same hardware.  That makes the bridge
+a variable to REMOVE, not one to add -- 0518 introduced it on the theory that upstream's tzmem wraps
+PIL metadata, but the working path on this device does not.
+
+pandora_pas_no_bridge=1 now leaves the enable out entirely, which makes this file's call look exactly
+like the ADSP's: plain page-aligned buffer, flush_dcache64, arginfo 0x82, same mem_setup size.
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index 5e97581..efb42a5 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -16,6 +16,7 @@
+  * fail (it did: -3145738 from init_image).
+  */
+ #include <sys/param.h>
++#include <pexpert/pexpert.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+@@ -520,6 +521,21 @@ pas_enable_shm_bridge(void)
+ 		return;
+ 	}
+ 	pas_bridge_ready = true;
++	/*
++	 * pandora_pas_no_bridge=1 leaves the bridge OFF.
++	 *
++	 * Why this switch exists: in the 2026-11-22 05:35 ring (logs/1795273470) the ADSP's own path
++	 * accepted INIT_IMAGE at the same moment -- `pas 13 init_image (4244 bytes) -> a0 0`, then
++	 * mem_setup a0 0, then auth a0 0 -- and that path never calls SHM_BRIDGE_ENABLE.  This file's
++	 * path does call it, and its `pas 38 init_image` was refused with 0xffcfffbb in the very same
++	 * boot.  So a plain metadata buffer demonstrably works on this hardware, and the bridge is a
++	 * variable to remove rather than add.
++	 */
++	unsigned no_bridge = 0;
++	if (PE_parse_boot_argn("pandora_pas_no_bridge", &no_bridge, sizeof(no_bridge)) && no_bridge) {
++		printf("PANDORA PAS: pandora_pas_no_bridge=1, leaving the SHM bridge off\n");
++		return;
++	}
+ 	pandora_scm_call(SCM_FN(0xc, 0x1c), SCM_ARGS(0), 0, 0, &a0, &a1);
+ 	printf("PANDORA PAS: shm_bridge_enable -> a0 %#llx (%d) a1 %#llx\n", a0, (int)(int32_t)a0, a1);
+ 	pas_bridge_on = (a0 == 0 && a1 == 0);
