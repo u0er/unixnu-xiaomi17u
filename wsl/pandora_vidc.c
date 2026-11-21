@@ -329,7 +329,7 @@ static uint64_t vidc_sfr_pa;
 #define VIDC_SID_NONSEC_ALT     0x1A20u
 #define VIDC_SID_NONSEC_ALT2    0x1944u
 #define VIDC_SID_NONSEC_PIXEL   0x1943u
-#define VIDC_NSIDS               4u
+#define VIDC_NSIDS               3u
 
 static uint32_t vidc_qtable_iova;
 static uint32_t vidc_sfr_iova;
@@ -561,10 +561,32 @@ vidc_smmu_up(void)
     }
 
     const uint16_t sids[VIDC_NSIDS] = { VIDC_SID_NONSEC, VIDC_SID_NONSEC_ALT,
-        VIDC_SID_NONSEC_ALT2, VIDC_SID_NONSEC_PIXEL };
+        VIDC_SID_NONSEC_ALT2 };
     ArmSmmu4KStream route[VIDC_NSIDS];
     ArmSmmu4KStreamState sstate = { 0 };
     ArmSmmu4KStreamResult sres;
+    /* Read-only: report what the bootloader left in the SMR/S2CR table for all
+     * five video contexts (DT vidc-dt-audit: cb-ns 0x1940/0x1a20/0x1944,
+     * cb-ns-pxl 0x1943, cb-sec-* 0x1941/0x1a21/0x1946).  The 4th non-secure
+     * stream could not be attached because only three SMR slots were idle, and
+     * knowing WHICH bank the pre-assigned one points at is the difference
+     * between "the core's traffic is unrouted" and "it is routed to a bank with
+     * no tables". */
+    {
+        static const uint16_t probe_sids[] = { 0x1940u, 0x1941u, 0x1943u, 0x1944u,
+            0x1946u, 0x1a20u, 0x1a21u };
+        for (unsigned sl = 0; sl < slots; sl++) {
+            const uint32_t smr = vidc_smmu_rd(0x800u + 4u * sl);
+            const uint32_t s2cr = vidc_smmu_rd(0xC00u + 4u * sl);
+            const uint32_t sidv = smr & 0xffffu;
+            for (unsigned k = 0; k < sizeof(probe_sids) / sizeof(probe_sids[0]); k++) {
+                if (sidv != probe_sids[k]) continue;
+                printf("PANDORA VIDC: handoff slot %u sid=%#x smr=%08x s2cr=%08x "
+                       "bank=%u type=%u\n", sl, sidv, smr, s2cr, s2cr & 0xffu,
+                    (s2cr >> 16) & 3u);
+            }
+        }
+    }
     unsigned nroute = 0;
     bool used[128] = {false}, asid_used[256] = {false};
     bool slot_taken[3] = {false, false, false};
@@ -611,9 +633,9 @@ vidc_smmu_up(void)
             VIDC_NSIDS);
         return -1;
     }
-    printf("PANDORA VIDC: stream slots %u/%u/%u/%u for SIDs %#x/%#x/%#x/%#x\n",
-        route[0].slot, route[1].slot, route[2].slot, route[3].slot,
-        sids[0], sids[1], sids[2], sids[3]);
+    printf("PANDORA VIDC: stream slots %u/%u/%u for SIDs %#x/%#x/%#x "
+           "(pixel 0x1943 not attachable: no idle SMR slot)\n",
+        route[0].slot, route[1].slot, route[2].slot, sids[0], sids[1], sids[2]);
 
     unsigned bank = banks;
     for (unsigned b = s2banks; b < banks; b++) {
