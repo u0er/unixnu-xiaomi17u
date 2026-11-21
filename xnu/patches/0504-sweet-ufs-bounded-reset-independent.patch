@@ -1,0 +1,73 @@
+From: GPU lane (diagnosis 2026-11-21); rebased by CarPlay lane 2026-11-21
+Subject: 0504 sweet_ufs pl_thread: make pandora_reboot_after independent of the log file
+
+The bounded reset used to be checked after pl_flush(), and one failed UFS write
+returned from the logging thread entirely, silently cancelling the reset for the
+rest of the boot: the phone stays in iOS with USB enumerated until it is reset by
+hand.  Check the deadline first, and keep the thread (and the deadline) alive after
+logging stops.
+
+Rebase note (CarPlay lane, 2026-11-21): the original 0504 was written against the
+pre-0481 body, which ended the deadline branch with pl_psci_reset().  The tree now
+uses the orderly shutdown path (reboot_kernel(RB_AUTOBOOT, NULL) with the
+process-stop/sync/unmount drain), so that patch no longer applies -- `git apply`
+fails at bsd/dev/sweet_ufs.c:2219 against the buildtree that CI run 44800513767
+actually compiled.  This version is the same intent expressed on the current body:
+the deadline block moves above the lock and the flush, `!pl_ready` continues the
+loop so the deadline keeps firing, and a write failure only clears pl_ready instead
+of returning.  The orderly-shutdown branch is preserved verbatim.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 5fe98eb..d3eaa26 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -2208,4 +2208,28 @@ pl_thread(__unused void *arg, __unused wait_result_t wr)
+ 	for (;;) {
+ 		(void)tsleep(&pl_chan, PZERO, "pandoralog", hz * (int)secs);
++		/*
++		 * 0504: the bounded reset must not be hostage to the log file. The deadline
++		 * used to be checked after pl_flush(), and a single failed write returned from
++		 * this thread entirely -- which silently cancelled pandora_reboot_after for the
++		 * rest of the boot and left the phone sitting in iOS with USB enumerated until
++		 * somebody reset it by hand.  Check the deadline before touching the disk; when
++		 * logging has already stopped, keep waking up and keep honouring the deadline.
++		 */
++		if (limit && mach_absolute_time() - start >= limit) {
++			printf("PANDORA: pandora_reboot_after=%u reached, shutting down cleanly\n", reboot_after);
++			/* A bounded trial is a normal shutdown, not a panic. Non-journaled HFS
++			 * bitmap buffers use delayed writes: resetting here can persist catalog
++			 * extents without their allocation bits and let the next boot reuse live data.
++			 * Use the existing process-stop/sync/unmount/buffer-drain path without the
++			 * UFS lock held. Its final PE_halt_restart still drains the console and resets.
++			 * Never fall back to an unsynced reset if another shutdown owns the system. */
++			int shutdown_error = reboot_kernel(RB_AUTOBOOT, NULL);
++			printf("PANDORA: orderly timed shutdown returned %d; no forced reset\n", shutdown_error);
++			limit = 0; /* do not repeat a shutdown request; retain console evidence */
++		}
++		if (!pl_ready) {
++			/* Logging failed earlier; sleep again so the deadline above still fires. */
++			continue;
++		}
+ 		lck_mtx_lock(&sweet_ufs_lock);
+ 		uint64_t now = mach_absolute_time();
+@@ -2224,18 +2248,7 @@ pl_thread(__unused void *arg, __unused wait_result_t wr)
+ 		if (error) {
+ 			printf("PANDORA LOG: write failed (%d), log stopped\n", error);
++			/* Stop logging, but keep the thread alive: the deadline at the top of this
++			 * loop is what guarantees the phone comes back. Returning here stranded it. */
+ 			pl_ready = false;
+-			return;
+-		}
+-		if (limit && mach_absolute_time() - start >= limit) {
+-			printf("PANDORA: pandora_reboot_after=%u reached, shutting down cleanly\n", reboot_after);
+-			/* A bounded trial is a normal shutdown, not a panic. Non-journaled HFS
+-			 * bitmap buffers use delayed writes: resetting here can persist catalog
+-			 * extents without their allocation bits and let the next boot reuse live data.
+-			 * Use the existing process-stop/sync/unmount/buffer-drain path without the
+-			 * UFS lock held. Its final PE_halt_restart still drains the console and resets.
+-			 * Never fall back to an unsynced reset if another shutdown owns the system. */
+-			int shutdown_error = reboot_kernel(RB_AUTOBOOT, NULL);
+-			printf("PANDORA: orderly timed shutdown returned %d; no forced reset\n", shutdown_error);
+-			limit = 0; /* do not repeat a shutdown request; retain console evidence */
+ 		}
+ 	}
