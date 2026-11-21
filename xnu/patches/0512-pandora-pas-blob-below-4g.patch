@@ -1,0 +1,64 @@
+From: baseband lane
+Subject: 0512 pandora_pas: the metadata blob must live below 4 GiB
+
+The 2026-11-21 probe sent the same DTB metadata blob for nine PAS ids -- including pas 0, which
+cannot exist -- and TrustZone answered 0xffcfffbb (-3145797, invalid parameter) every single time.
+So the rejection is about the buffer, not the id.
+
+The blob the failing run used sat at 0x8d19a6000, above 4 GiB, while every address this platform
+hands TrustZone for PIL is below it: modem carveout 0x8aa00000, DTB region 0x99500000, IPA firmware
+0x99590000.  kmem_alloc_contig's min_addr/max_addr were both 0, i.e. no constraint at all.  They are
+now 0 .. 0x100000000.
+
+Note: the first hardware run of this call (the same log) also shows the full inputs now printed --
+`pas 38 init_image (4044 bytes, arginfo 0x82, blob 0x8d19a6000)` -- so the next log says whether the
+blob moved.
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+old mode 100644
+new mode 100755
+index e55b7d9..147c20b
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -178,8 +178,18 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 	 * unmap panic was found first (patch 0507), and the kmem_free one line later would have
+ 	 * been the next boot's failure.
+ 	 */
+-	if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	/*
++	 * Below 4 GiB on purpose.
++	 *
++	 * The 2026-11-21 probe sent the same metadata blob for nine different PAS ids and TrustZone
++	 * answered 0xffcfffbb (-3145797, "invalid parameter") every time -- including for pas 0, an
++	 * id that cannot exist -- so the rejection is about the buffer, not the id.  The blob the
++	 * first run used sat at 0x8d19a6000, above 4 GiB, while every address this platform hands
++	 * TrustZone for PIL (carveout 0x8aa00000, DTB 0x99500000, IPA 0x99590000) is below it.
++	 * kmem_alloc_contig's min_addr/max_addr were both 0, i.e. no constraint at all; give it one.
++	 */
++	if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0,
++	    0x100000000ull, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		err = ENOMEM;
+ 		goto out;
+ 	}
+@@ -348,8 +358,18 @@ pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64
+ 	uint32_t hash_size = ph[hash].p_filesz;
+ 	uint64_t md_size = ((uint64_t)ehdr_size + hash_size + 0xfff) & ~0xfffull;
+ 	vm_offset_t md = 0;
+-	if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	/*
++	 * Below 4 GiB on purpose.
++	 *
++	 * The 2026-11-21 probe sent the same metadata blob for nine different PAS ids and TrustZone
++	 * answered 0xffcfffbb (-3145797, "invalid parameter") every time -- including for pas 0, an
++	 * id that cannot exist -- so the rejection is about the buffer, not the id.  The blob the
++	 * first run used sat at 0x8d19a6000, above 4 GiB, while every address this platform hands
++	 * TrustZone for PIL (carveout 0x8aa00000, DTB 0x99500000, IPA 0x99590000) is below it.
++	 * kmem_alloc_contig's min_addr/max_addr were both 0, i.e. no constraint at all; give it one.
++	 */
++	if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0,
++	    0x100000000ull, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		err = ENOMEM;
+ 		goto out;
+ 	}
