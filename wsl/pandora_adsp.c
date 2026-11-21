@@ -548,6 +548,16 @@ struct fw_ent {
 	char name[48];
 	uint64_t off, size;
 };
+/* pas_load() stages the ELF header in ONE shared 64 KiB static buffer.  Three
+ * threads call it (VIDC, GPU's zap, ADSP), so without serialisation they
+ * overwrite each other's program-header table mid-call.  Measured 2026-11-22
+ * 03:5x: the VPU image parsed as 22 segments with load range
+ * 0xf500000-0xfcff020, then the GPU's zap load ran at 0.253 s and the VPU load
+ * that followed read the ZAP table instead -- "segment 1 pa 0x1000" -- and
+ * failed with "no segment could be placed".  Serialise the whole load. */
+LCK_GRP_DECLARE(ad_pas_grp, "pandora_pas");
+LCK_MTX_DECLARE(ad_pas_lock, &ad_pas_grp);
+
 static struct fw_ent ad_dir[63];
 static unsigned ad_nfiles;
 static FatVolume ad_fat;
@@ -744,7 +754,8 @@ mdt_segment(const char *base, bool part, const struct fw_file *mdt, const struct
  * the carveout. The bridge handle is returned for deletion after the reset.
  */
 static int
-pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uint64_t *bridge)
+pas_load_locked(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t mem_size,
+    uint64_t *bridge)
 {
 	char name[48];
 	if (strchr(base, '.')) {
@@ -937,6 +948,17 @@ pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t me
 	if (!err) {
 		printf("PANDORA ADSP: %s: %llu bytes loaded at %#llx\n", name, total, mem_pa);
 	}
+	return err;
+}
+
+/* Every caller goes through here so the shared staging buffer is never read by
+ * two threads at once (see ad_pas_lock above). */
+static int
+pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uint64_t *bridge)
+{
+	lck_mtx_lock(&ad_pas_lock);
+	const int err = pas_load_locked(base, part, pas, mem_pa, mem_size, bridge);
+	lck_mtx_unlock(&ad_pas_lock);
 	return err;
 }
 
