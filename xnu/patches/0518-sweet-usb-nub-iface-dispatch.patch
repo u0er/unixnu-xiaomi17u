@@ -1,0 +1,43 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0518 sweet_nub: print the object the NCM/Mux clients dispatch through
+
+The clients forward endpoint requests to ctl+0x110 / ctl+0x120 and then call slot 29 of that
+object's vtable with a tag (census in iface-forwarders.json). Which object that is cannot be
+decided statically -- the vtable is loaded from the instance -- and implementing C1's endpoint
+virtuals from the tag numbers alone would be a guess. This prints both pointers, the vtable
+they carry, and slot 29, so one boot pins down the dispatcher C1 must satisfy.
+
+Prepared while waiting for the device lock on the night of 2026-11-22, after the 0517 fallback
+fix; the dereference is guarded by the kernel text range so a NULL or non-text pointer is
+reported instead of faulting the probe.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -273,6 +273,27 @@
+ 		}
+ 	}
+ 	printf("SWEET NUB: children %d\n", children);
++
++	/*
++	 * 0518: the NCM/Mux clients dispatch their endpoint requests through the objects at
++	 * ctl+0x110 / ctl+0x120, and slot 29 of whatever vtable those objects carry is the tag
++	 * dispatcher C1 has to satisfy. Static analysis cannot identify that vtable (it is read
++	 * from the instance and the controllers are built at runtime), and inventing endpoint
++	 * semantics from the tag numbers alone would be a guess. One printed line pins it.
++	 * The pointers may legitimately be NULL in the direct-create path -- that is information,
++	 * so print them unconditionally and only dereference a pointer that looks like text.
++	 */
++	for (unsigned off = 0x110; off <= 0x120; off += 0x10) {
++		void *obj = *(void **)((char *)ctl + off);
++		printf("SWEET NUB: ctl+0x%x = %p", off, obj);
++		if (obj != NULL) {
++			void **vt = *(void ***)obj;
++			if (vt != NULL && (uint64_t)vt >= SWEET_NUB_KERNEL_BASE) {
++				printf(", vtable %p, slot29 %p", vt, vt[29]);
++			}
++		}
++		printf("\n");
++	}
+ 
+ 	/*
+ 	 * 0513: IOUSBDeviceConfigurator::start is nothing but getProperty("DeviceDescription") plus a
