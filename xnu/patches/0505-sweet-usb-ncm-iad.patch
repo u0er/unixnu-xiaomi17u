@@ -1,0 +1,44 @@
+From: CarPlay C0 lane (2026-11-21)
+Subject: 0505 sweet_usb: put each CDC-NCM function in an Interface Association Descriptor
+
+Windows USBCCGP groups a multi-interface function only through an IAD (or a CDC
+Union, but only when the vendor INF enables CDC/WMCDC enumeration in USBCCGP,
+which no stock INF does for a generic VID/PID).  Without an IAD it creates one
+child device per interface: measured on a Windows 11 host with the 0500 image,
+the NCM adapter appeared (USB\VID_1209&PID_0001&MI_00, Microsoft UsbNcm 10.0.22621)
+while MI_01 was left classless, no GET_NTB_PARAMETERS (0x80) was ever sent, and
+the MAC string (index 4) was never read -- the host had already given up on the pair.
+Apple's own CarPlay-capable NCM profile carries IADs too; the stock bring-up
+personalities do not, which is why this only shows up on Windows hosts.
+
+sweetusb=4:  the 86-byte configuration becomes 94 bytes with one IAD (if0..if1).
+sweetusb=5:  the 109-byte configuration becomes 117 bytes with one IAD (if1..if2);
+             interface 0 is the iAP2 mux and stays its own device by design.
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -405,8 +405,9 @@
+ 	18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
+ 	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
+ };
+-static const uint8_t ud_ncm_cfg_desc[86] = {
+-	9, 2, 86, 0, 2, 1, 0, 0x80, 125,               /* config: 2 interfaces, 250 mA (bMaxPower is in 2 mA units) */
++static const uint8_t ud_ncm_cfg_desc[94] = {
++	9, 2, 94, 0, 2, 1, 0, 0x80, 125,               /* config: 2 interfaces, 250 mA (bMaxPower is in 2 mA units) */
++	8, 0x0b, 0, 2, 0x02, 0x0d, 0x00, 0,            /* IAD: if0..if1 are one CDC-NCM function (Windows groups by IAD; without it usbccgp splits the pair and UsbNcm binds if0 alone) */
+ 	9, 4, 0, 0, 1, 0x02, 0x0d, 0x00, 0,             /* if0 alt0: comm, NCM subclass 0Dh, 1 endpoint */
+ 	5, 0x24, 0x00, 0x10, 0x01,                      /* CDC header, bcdCDC 0x0110 */
+ 	5, 0x24, 0x06, 0, 1,                            /* union: master 0, slave 1 */
+@@ -468,10 +469,11 @@
+  * instead of a configuration a host silently rejects.
+  */
+ static const uint8_t ud_carplay_cfg_desc[] = {
+-	9, 2, 109, 0, 3, 1, 0, 0x80, 125,            /* config: 3 interfaces, bMaxPower 125 (2 mA units) */
++	9, 2, 117, 0, 3, 1, 0, 0x80, 125,            /* config: 3 interfaces, bMaxPower 125 (2 mA units) */
+ 	9, 4, 0, 0, 2, 0xff, 0xfe, 0x02, 0,          /* if0: Apple mux / iAP2, 2 endpoints */
+ 	7, 5, 0x81, 0x02, 0x00, 0x02, 0,             /* EP 0x81 bulk IN 512 */
+ 	7, 5, 0x01, 0x02, 0x00, 0x02, 0,             /* EP 0x01 bulk OUT 512 */
++	8, 0x0b, 1, 2, 0x02, 0x0d, 0x00, 0,             /* IAD: if1..if2 are one CDC-NCM function (the mux interface 0 stays its own device) */
+ 	9, 4, 1, 0, 1, 0x02, 0x0d, 0x00, 0,          /* if1 alt0: CDC-NCM control, 1 endpoint */
+ 	5, 0x24, 0x00, 0x10, 0x01,                   /* CDC header, bcdCDC 0x0110 */
+ 	5, 0x24, 0x06, 1, 2,                         /* union: master if1, slave if2 */
