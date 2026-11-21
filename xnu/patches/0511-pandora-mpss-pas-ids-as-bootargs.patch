@@ -1,0 +1,101 @@
+From: baseband lane
+Subject: 0511 pandora_mpss: the two PAS ids are boot arguments
+
+canoe's device tree names qcom,pas-id for every other processor but NOT for the modem, so the 4 and
+0x26 this port uses were decoded from canoe_mpss_resource.  The 2026-11-21 probe (0510) reports what
+TrustZone accepts for each candidate; this makes the answer usable **without another rebuild**:
+
+  pandora_mpss_pas=<id>       the main image's PAS id      (default 4)
+  pandora_mpss_pas_dtb=<id>   the modem DTB's PAS id       (default 0x26)
+
+The step banner prints both ids, so every log says which ones were used.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+old mode 100644
+new mode 100755
+index 2eeac6d..f60d79c
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -84,8 +84,15 @@ extern void pandora_scm_call5(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64
+ #define MP_MEM_SIZE       0x0e100000ull
+ #define MP_DTB_PA         0x99500000ull  /* q6_mpss_dtb_region@99500000: 0x80000 */
+ #define MP_DTB_SIZE       0x80000ull
++/*
++ * The two PAS ids.  canoe's device tree names qcom,pas-id for every other processor but NOT for
++ * the modem, so these were decoded from canoe_mpss_resource; the 2026-11-21 probe reports what
++ * TrustZone accepts for each candidate.  Both are boot arguments, so the accepted value can be
++ * used without rebuilding the kernel: pandora_mpss_pas= (main image), pandora_mpss_pas_dtb= (DTB).
++ */
+ #define MP_PAS            4u             /* canoe_mpss_resource, decoded from qcom_q6v5_pas.ko */
+ #define MP_PAS_DTB        0x26u          /* 38 */
++static unsigned mp_pas = MP_PAS, mp_pas_dtb = MP_PAS_DTB;
+ #define MP_IPA_FW_PA      0x99580000ull  /* ipa_fw_region@99580000: 0x10000 */
+ #define MP_IPA_FW_SIZE    0x10000ull
+ #define MP_IPA_GSI_PA     0x99590000ull  /* ipa_gsi_region@99590000: 0xa000 -- what the IPA driver picks */
+@@ -809,16 +816,16 @@ static bool
+ step_dtb(void)
+ {
+ 	mp_probe_pas_ids();
+-	if (pandora_pas_load(MP_FW_PART, "modem_dtb", MP_PAS_DTB, MP_DTB_PA, MP_DTB_SIZE)) {
++	if (pandora_pas_load(MP_FW_PART, "modem_dtb", mp_pas_dtb, MP_DTB_PA, MP_DTB_SIZE)) {
+ 		printf("PANDORA MPSS: modem_dtb.mdt did not load\n");
+ 		return false;
+ 	}
+-	if (pandora_pas_auth(MP_PAS_DTB)) {
++	if (pandora_pas_auth(mp_pas_dtb)) {
+ 		printf("PANDORA MPSS: TrustZone refused the DTB image\n");
+ 		return false;
+ 	}
+ 	mp_dtb_written = true;
+-	printf("PANDORA MPSS: the DTB image is in %#llx and authenticated (pas %u)\n", MP_DTB_PA, MP_PAS_DTB);
++	printf("PANDORA MPSS: the DTB image is in %#llx and authenticated (pas %u)\n", MP_DTB_PA, mp_pas_dtb);
+ 	return true;
+ }
+ 
+@@ -836,7 +843,7 @@ step_header(void)
+ 		if (index >= 0 && (qcom_smp2p_in_value(&view, index) & (MP_SLAVE_READY | MP_SLAVE_FATAL))) {
+ 			printf("PANDORA MPSS: the modem's words say %#x: it may be running. Asking it to stop.\n",
+ 			    qcom_smp2p_in_value(&view, index));
+-			(void)pandora_pas_shutdown(MP_PAS);
++			(void)pandora_pas_shutdown(mp_pas);
+ 		}
+ 	}
+ 	(void)in;
+@@ -850,7 +857,7 @@ step_header(void)
+ static bool
+ step_image(void)
+ {
+-	if (pandora_pas_load(MP_FW_PART, "modem", MP_PAS, MP_MEM_PA, MP_MEM_SIZE)) {
++	if (pandora_pas_load(MP_FW_PART, "modem", mp_pas, MP_MEM_PA, MP_MEM_SIZE)) {
+ 		printf("PANDORA MPSS: modem.mdt did not load\n");
+ 		return false;
+ 	}
+@@ -1038,7 +1045,7 @@ step_start(void)
+ 	}
+ 	mp_rails(384);
+ 	mp_mailbox_send("{class: image, res: load_state, name: modem, val: on}");
+-	if (pandora_pas_auth(MP_PAS)) {
++	if (pandora_pas_auth(mp_pas)) {
+ 		printf("PANDORA MPSS: TrustZone refused the modem's image\n");
+ 		return false;
+ 	}
+@@ -1418,6 +1425,8 @@ pandora_mpss_init(void)
+ 	thread_t thread;
+ 
+ 	PE_parse_boot_argn("pandora_mpss_step", &mp_last_step, sizeof(mp_last_step));
++	(void)PE_parse_boot_argn("pandora_mpss_pas", &mp_pas, sizeof(mp_pas));
++	(void)PE_parse_boot_argn("pandora_mpss_pas_dtb", &mp_pas_dtb, sizeof(mp_pas_dtb));
+ 	bool whole = PE_parse_boot_argn("pandora_mpss", &on, sizeof(on)) && on == 1;
+ 	/*
+ 	 * Say which way this went, always.
+@@ -1456,8 +1465,8 @@ pandora_mpss_init(void)
+ 	mp_new_from = mp_last_step;
+ 	PE_parse_boot_argn("pandora_mpss_new", &mp_new_from, sizeof(mp_new_from));
+ 	PE_parse_boot_argn("pandora_mpss_pause", &mp_pause_ms, sizeof(mp_pause_ms));
+-	printf("PANDORA MPSS: steps up to %u; those from %u on wait %u ms after each announcement\n", mp_last_step,
+-	    mp_new_from, mp_pause_ms);
++	printf("PANDORA MPSS: steps up to %u; those from %u on wait %u ms; PAS main %u, DTB %u\n",
++	    mp_last_step, mp_new_from, mp_pause_ms, mp_pas, mp_pas_dtb);
+ 	if (kernel_thread_start(mp_steps_thread, NULL, &thread) != KERN_SUCCESS) {
+ 		printf("PANDORA MPSS: no thread: the steps are not performed\n");
+ 		return;
