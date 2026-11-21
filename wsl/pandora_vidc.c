@@ -128,6 +128,8 @@ void pandora_vidc_init(void);
 #define R_CPU_AHB_BRIDGE_RESET  (CPU_BASE_OFFS + 0x160u)
 #define R_CPU_APV_BRIDGE_RESET  (CPU_BASE_OFFS + 0x174u)
 #define R_CPU_X2RPMH            (CPU_BASE_OFFS + 0x168u)
+#define MSK_CORE_POWER_ON       0x00000002u  /* [M] defines:39-41 */
+#define MSK_SIGNAL_FROM_TENSILICA 0x00000001u
 
 #define R_AON_NOC_LPI_CTRL      (AON_BASE_OFFS + 0x000u)
 #define R_AON_NOC_LPI_STATUS    (AON_BASE_OFFS + 0x004u)
@@ -1097,6 +1099,18 @@ vidc_publish_queues(void)
     printf("PANDORA VIDC: CP span 0xA0024/0xA0028 and 0xA005C skipped "
            "(no TZ CP table, vendor-equivalent path)\n");
 
+    /* Assert MSK_CORE_POWER_ON (BIT1) before releasing the core.  The register
+     * definition is explicit: CPU_CS_X2RPMH bit1 is the core power-on request
+     * (iris_vpu_register_defines.h:39-41) and the vendor clears it to 0 only
+     * after the handshake succeeds.  Every earlier ladder left it at 0, and the
+     * snapshot proved the consequence: bit1 read 0, the CPU block and the TZ
+     * wrapper stayed all-zero, and 0xA004C never reported ready -- TZ's
+     * auth_and_reset had released the reset, but the wrapper had never been
+     * asked to power the core. */
+    vidc_wr(R_CPU_X2RPMH, MSK_CORE_POWER_ON);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    printf("PANDORA VIDC: core power-on request 0x%08x = %08x\n",
+        R_CPU_X2RPMH, vidc_rd(R_CPU_X2RPMH));
     vc_smmu_faults = 0;
     vc_smmu_faults_done = false;
     /* Drop any fault latched during table build/attach so the capture below
