@@ -1487,6 +1487,11 @@ vidc_load_firmware(void)
     printf("PANDORA VIDC: loaded %u firmware segments into carveout\n", loaded);
     ml_io_unmap(carveout, VIDEO_REGION_SIZE);
     return loaded ? 0 : -1;
+    /* NOTE: every error exit above that happens AFTER the carveout mapping was
+     * taken leaks 8 MiB of kernel_map.  Callers only reach this function when
+     * PAS already failed (so the ladder is finished anyway and the teardown at
+     * the end of vidc_bringup covers it), but the leak is real and is recorded
+     * here rather than silently forgotten. */
 }
 
 /* Drain one response packet from the message queue (cmd=0, msg=1, dbg=2).
@@ -1577,6 +1582,14 @@ vidc_hfi_init(void)
     uint32_t coff = (uint32_t)((char *)&t->qhdr[0] - (char *)t);
     if (!vidc_qtable_va) {
         printf("PANDORA VIDC: hfi_init before alloc\n");
+        return -1;
+    }
+    /* Without the SMMU the published address is a truncated physical one, so
+     * `start - vidc_qtable_da()` no longer yields a valid ring offset and the
+     * doorbell would point at nothing.  Refuse instead of scribbling inside our
+     * own mapping (this really happened on the 4-SID attempt, where smmu=FAIL). */
+    if (!vidc_smmu_on) {
+        printf("PANDORA VIDC: hfi_init skipped (no SMMU device address)\n");
         return -1;
     }
     uint32_t start = vidc_qt_rd(coff + offsetof(struct vidc_queue_header, start_addr));
