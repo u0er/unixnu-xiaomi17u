@@ -1,0 +1,41 @@
+From: CarPlay C0 lane (2026-11-21)
+Subject: 0507 sweet_usb: accept a datagram that sits before the NDP table
+
+C0d failed three times for the same class of reason: the receive path assumed a
+layout constant. First it demanded index >= 56 (our own transmit layout), then
+0506 demanded index >= ndp + nlen (payload after the table). The 0506 diagnostics
+printed the real block on the next boot:
+
+  ntb[1] len 372 sig 484d434e hdrlen 12 seq 1 block 372 ndp 356
+  ntb ndp sig 304d434e nlen 16 next 0 pairs 2 dpe0 14/342 dpe1 0/0
+
+That is a legal NTB-16: the datagram occupies [14, 356) and the NDP table starts
+at 356. Payload before table. So the bound becomes a real overlap test: inside
+the block, past the 12-byte NTH16, and disjoint from [ndp, ndp + nlen).
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -847,13 +847,17 @@
+ 			continue;
+ 		}
+ 		/*
+-		 * 0506: the datagrams of a received NTB start after THAT NDP table, which
+-		 * is the host's choice -- not at NCM_NTB_PAYLOAD_OFF, which only describes
+-		 * our own transmit layout.  With the old bound every datagram of a real
+-		 * host was rejected: the 2026-11-21 boot logged 12 NTBs at 100/372/188/108
+-		 * bytes and delivered 0 frames, because their first datagram sat below 56.
++		 * 0507: the host decides where a datagram sits -- BEFORE or after its NDP
++		 * table.  0506 assumed "after" and the very next boot showed the opposite:
++		 *   ntb[1] len 372 ... ndp 356   +   dpe0 14/342
++		 * i.e. the payload runs [14, 356) and the NDP table starts at 356.
++		 * So the datagram only has to stay inside the block, past the NTH16
++		 * header, and clear of that NDP table; "before" and "after" are both legal.
+ 		 */
+-		if (index < ndp + nlen || index + dlen > block) {
++		if (index < NCM_NTH16_LEN || index + dlen > block) {
++			continue;
++		}
++		if (index < ndp + nlen && ndp < index + dlen) {
+ 			continue;
+ 		}
+ 		if (ud_if_input(ntb + index, dlen)) {
