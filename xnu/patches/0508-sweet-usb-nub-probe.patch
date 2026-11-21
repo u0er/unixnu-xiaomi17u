@@ -38,10 +38,10 @@ index fe06655..733eca4 100644
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/libkern/c++/sweet_nub.cpp b/libkern/c++/sweet_nub.cpp
 new file mode 100644
-index 0000000..d00807e
+index 0000000..f4576a3
 --- /dev/null
 +++ b/libkern/c++/sweet_nub.cpp
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,183 @@
 +/*
 + * 0508 CarPlay C1: controller-nub probe / first instantiation.
 + *
@@ -74,6 +74,7 @@ index 0000000..d00807e
 +#include <kern/sched_prim.h>
 +#include <kern/clock.h>
 +#include <sys/param.h>
++#include <sys/kernel.h>
 +#include <sys/systm.h>
 +
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
