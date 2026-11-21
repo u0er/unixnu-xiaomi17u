@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/pandora_touch.c b/bsd/dev/pandora_touch.c
-index 95c8345..3b029e0 100644
+index 95c8345..8319060 100644
 --- a/bsd/dev/pandora_touch.c
 +++ b/bsd/dev/pandora_touch.c
 @@ -42,6 +42,56 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
@@ -59,7 +59,7 @@ index 95c8345..3b029e0 100644
  extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation,
      void *parameter, integer_t priority, thread_t *new_thread);
  extern int sweet_fb_display_off;       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
-@@ -1329,10 +1379,18 @@ pt_deliver(uint32_t mask, const int *px, const int *py)
+@@ -1329,10 +1379,24 @@ pt_deliver(uint32_t mask, const int *px, const int *py)
  		pt.py[id] = py[id];
  		pt.x[id] = x;
  		pt.y[id] = y;
@@ -67,6 +67,12 @@ index 95c8345..3b029e0 100644
 +			nezha_island_swallowed |= (1u << id);
 +			continue;
 +		}
++		/* A fresh touch OUTSIDE the island must not inherit a stale swallow bit: if an
++		 * earlier down inside the island never got its matching up (dropped report or a
++		 * re-used id), the bit would still be set and the up for THIS touch would be
++		 * swallowed too -- leaving iOS with a down that never releases (a stuck pointer).
++		 * Clearing here makes the pair state follow the current gesture. */
++		nezha_island_swallowed &= ~(1u << id);
  		sweet_hid_touch((int)id, 1, x, y);
  	}
  	for (unsigned id = 0; id < PT_MAX; id++) {
