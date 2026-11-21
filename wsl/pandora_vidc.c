@@ -1182,50 +1182,6 @@ vidc_wait_idle(void)
     return v ? 0 : -1;
 }
 
-static int
-vidc_noc_lpi(void)
-{
-    static const uint32_t done = 1u << 0, deny = 1u << 1, active = 1u << 2;
-    vidc_wr(R_AON_NOC_LPI_CTRL, 1);
-    uint32_t st = 0;
-    unsigned i;
-    for (i = 0; i < 1000; i++) {
-        st = vidc_rd(R_AON_NOC_LPI_STATUS);
-        if ((st & done) || !(st & (deny | active))) break;
-        vidc_wr(R_AON_NOC_LPI_CTRL, 0);
-        delay(10);
-    }
-    printf("PANDORA VIDC: noc lpi ctrl=%08x status=%08x %s\n",
-        vidc_rd(R_AON_NOC_LPI_CTRL), st, (st & done) ? "done" : "not-done");
-    return (st & done) ? 0 : -1;
-}
-
-static int
-vidc_noc_reset(void)
-{
-    vidc_wr(R_AON_NOC_RESET_REQ, MVP_NOC_RESET_REQ_MASK);
-    uint32_t ack = 0;
-    unsigned i;
-    for (i = 0; i < 2000; i++) {
-        ack = vidc_rd(R_AON_NOC_RESET_ACK);
-        if ((ack & MVP_NOC_RESET_REQ_MASK) == MVP_NOC_RESET_REQ_MASK) break;
-        delay(1);
-    }
-    const uint32_t ack_req = ack;
-    const int req_ok = (i < 2000);
-    vidc_wr(R_AON_NOC_RESET_SYNCRST, 0);
-    vidc_wr(R_AON_NOC_RESET_REQ, 0);
-    for (i = 0; i < 2000; i++) {
-        ack = vidc_rd(R_AON_NOC_RESET_ACK);
-        if (ack == 0) break;
-        delay(1);
-    }
-    printf("PANDORA VIDC: noc reset req=%08x ack=%08x %s; released ack=%08x %s\n",
-        MVP_NOC_RESET_REQ_MASK, ack_req, req_ok ? "handshaked" : "TIMEOUT",
-        ack, (i < 2000) ? "clear" : "STUCK");
-    return (req_ok && i < 2000) ? 0 : -1;
-}
-
 static void
 vidc_bridge_reset(void)
 {
@@ -1290,11 +1246,14 @@ vidc_power_up(void)
     vidc_branch_on(0x8134u);           /* vpp0          */
     vidc_branch_on(0x8108u);           /* vpp1          */
     vidc_branch_on(0x8090u);           /* mvs0a (APV)   */
-    /* NoC reset handshake BEFORE the bridge reset, matching upstream order
-     * (iris_vpu4x.c:318-336: NOC handshake, then CORE_BRIDGE_SW_RESET). */
     (void)vidc_wait_idle();                /* informational: 0 here, 0x7fff later */
-    if (vidc_noc_lpi() != 0) failed++;
-    if (vidc_noc_reset() != 0) failed++;
+    /* [M] Vendor disassembly of THIS module: 0x1F000 appears ONLY in
+     * __power_off_iris4 / __power_off_iris4_hardware (0x166a4, 0x16720, 0x184a4,
+     * 0x1852c); __power_on_iris4* never touches the AON NoC reset block.  The
+     * upstream iris_vpu4x handshake therefore does not belong in this device's
+     * power-up: asserting it left 0x1F004 at 0 forever and turned a previously
+     * PASSing power stage into FAIL (measured 01:5x and 03:5x).  It belongs to
+     * power-off, and is recorded there instead of being invented here. */
     vidc_bridge_reset();
 
     /* WRAPPER_CORE_CLOCK_CONFIG semantics are inverted from the name:
