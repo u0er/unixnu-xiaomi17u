@@ -1,0 +1,1017 @@
+--- a/bsd/dev/apple_services.c
++++ b/bsd/dev/apple_services.c
+@@ -22,15 +22,19 @@
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
+ #include <sys/vfs_context.h>
++#include <sys/mount.h>
++#include <sys/mount_internal.h>
+ #include <sys/uio.h>
+ #include <sys/uio_internal.h>
+ #include <sys/dirent.h>
+ #include <libkern/libkern.h>
++#include <libkern/crypto/sha1.h>
+ 
+ #include "apple_usb.h"
+ 
+ extern int pandora_mkdir(const char *path, int mode);
+ extern int pandora_rename(const char *from, const char *to);
++extern int pandora_rmdir(const char *path);
+ extern int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);
+ 
+ /* ------------------------------------------------------------------ */
+@@ -551,6 +555,7 @@ struct apple_service apple_lockdown_service = {
+ #define AFC_OP_STATUS    0x01
+ #define AFC_OP_DATA      0x02
+ #define AFC_OP_READ_DIR  0x03
++#define AFC_OP_TRUNCATE  0x07
+ #define AFC_OP_REMOVE    0x08
+ #define AFC_OP_MAKE_DIR  0x09
+ #define AFC_OP_FILE_INFO 0x0A
+@@ -563,27 +568,68 @@ struct apple_service apple_lockdown_service = {
+ #define AFC_OP_FILE_TELL 0x12
+ #define AFC_OP_FILE_TELL_RES 0x13
+ #define AFC_OP_FILE_CLOSE 0x14
++#define AFC_OP_FILE_SET_SIZE 0x15
++#define AFC_OP_GET_CON_INFO 0x16
+ #define AFC_OP_RENAME    0x18
++#define AFC_OP_REMOVE_AND_CONTENTS 0x22
++#define AFC_OP_FILE_WRITE_OFFSET 0x28
+ 
++/*
++ * Status codes, numbered as libimobiledevice's afc.h numbers them.  Only the
++ * ones this server can actually produce are named; anything else is a client
++ * error the host turns into its own string.  The three that matter for
++ * compatibility are UNKNOWN_PACKET_TYPE (what a real device answers for the
++ * opcodes it does not implement), OP_NOT_SUPPORTED (what it answers for the
++ * ones it knows but declines) and WOULD_BLOCK (the honest answer when the
++ * mux ring is full, which the host is expected to retry instead of reading as
++ * end-of-file).
++ */
+ #define AFC_E_SUCCESS    0
+ #define AFC_E_UNKNOWN    1
++#define AFC_E_OP_HEADER_INVALID 2
++#define AFC_E_UNKNOWN_PACKET_TYPE 6
+ #define AFC_E_INVALID    7
+ #define AFC_E_NOTFOUND   8
+ #define AFC_E_ISDIR      9
+ #define AFC_E_PERM      10
++#define AFC_E_OP_NOT_SUPPORTED 15
++#define AFC_E_OBJECT_EXISTS 16
+ #define AFC_E_NOSPACE   18
++#define AFC_E_WOULD_BLOCK 19
+ #define AFC_E_IO        20
++#define AFC_E_DIR_NOT_EMPTY 33
+ 
+ struct afc_file {
+ 	bool     used;
+ 	vnode_t  vp;
+ 	uint64_t off;
++	/*
++	 * The flags the vnode was opened with.  They must come back to
++	 * vnode_close(): vn_close() only does the HFS flush and the
++	 * v_writecount / FWASWRITTEN bookkeeping when FWRITE is present, and
++	 * vnode_rele_ext() panics on a negative writecount, so closing with a
++	 * literal 0 both leaked the write count and skipped the flush.
++	 */
++	int      flags;
++	/*
++	 * Set by FILE_WRITE, consumed by FILE_CLOSE.  Writes are deliberately not
++	 * fsynced per chunk any more (that was the ~0.4 MB/s ceiling); instead the
++	 * close path issues one VNOP_FSYNC for the whole file.
++	 */
++	bool     dirty;
+ };
+ 
+ struct afc_ctx {
+ 	bool     used;
+ 	uint32_t len;
+ 	uint64_t pktno;
++	/*
++	 * The packet_num of the request being answered.  libimobiledevice
++	 * compares every reply header against the number it just sent and
++	 * aborts the connection on a mismatch (afc.c:286), so replies must
++	 * echo the request rather than count up locally.
++	 */
++	uint64_t reqno;
+ 	char     buf[AFC_BUF + 1];
+ 	struct afc_file files[AFC_FILES];
+ };
+@@ -663,7 +709,13 @@ afc_reply(void *conn, struct afc_ctx *c, uint64_t op, const void *payload, uint3
+ 	memcpy(afc_out, "CFA6LPAA", 8);
+ 	apple_put_le64(h + 8, total);
+ 	apple_put_le64(h + 16, total);
+-	apple_put_le64(h + 24, c->pktno++);
++	/*
++	 * Echo the request's packet_num.  libimobiledevice keeps a 1-based
++	 * counter of its own and rejects any reply whose number differs
++	 * (afc.c:286 -> AFC_E_OP_HEADER_INVALID), so a locally incrementing
++	 * counter made every standard client abort on its second packet.
++	 */
++	apple_put_le64(h + 24, c->reqno);
+ 	apple_put_le64(h + 32, op);
+ 	if (len != 0 && payload != NULL) {
+ 		memcpy(afc_out + AFC_HDR, payload, len);
+@@ -690,21 +742,47 @@ afc_errno_to_afc(int err)
+ 		return AFC_E_NOTFOUND;
+ 	case EISDIR:
+ 		return AFC_E_ISDIR;
++	case ENOTDIR:
++		return AFC_E_INVALID;
+ 	case EACCES:
+ 	case EPERM:
+ 		return AFC_E_PERM;
++	case EEXIST:
++		return AFC_E_OBJECT_EXISTS;
+ 	case ENOSPC:
+ 		return AFC_E_NOSPACE;
++	case ENOTEMPTY:
++		return AFC_E_DIR_NOT_EMPTY;
+ 	default:
+ 		return AFC_E_IO;
+ 	}
+ }
+ 
++/*
++ * Handles are 1-based and index 0 is never valid.  libimobiledevice treats a
++ * FILE_OPEN_RES of 0 as a failed open and refuses to write or close through
++ * it (afc.c:891), so the old "index into files[]" handle made the very first
++ * file of every session unusable with a standard client.
++ */
++#define AFC_HANDLE_BASE 1u
++
++/*
++ * Smallest valid directory record: an inode number, the length fields and one
++ * byte of name, rounded up to a 4-byte boundary.  Used instead of
++ * sizeof(struct dirent) as the READ_DIR loop bound because the kernel struct
++ * carries d_name[256] and no real filesystem emits 264-byte records.
++ */
++#define DIRENT_RECLEN_MIN 12u
++
+ static struct afc_file *
+ afc_file_get(struct afc_ctx *c, uint64_t handle)
+ {
+-	uint32_t idx = (uint32_t)handle;
++	uint64_t idx;
+ 
++	if (handle < AFC_HANDLE_BASE) {
++		return NULL;
++	}
++	idx = handle - AFC_HANDLE_BASE;
+ 	if (idx >= AFC_FILES || !c->files[idx].used) {
+ 		return NULL;
+ 	}
+@@ -712,19 +790,26 @@ afc_file_get(struct afc_ctx *c, uint64_t handle)
+ }
+ 
+ static struct afc_file *
+-afc_file_alloc(struct afc_ctx *c, vnode_t vp)
++afc_file_alloc(struct afc_ctx *c, vnode_t vp, int flags)
+ {
+ 	for (uint32_t i = 0; i < AFC_FILES; i++) {
+ 		if (!c->files[i].used) {
+ 			c->files[i].used = true;
+ 			c->files[i].vp = vp;
+ 			c->files[i].off = 0;
++			c->files[i].flags = flags;
+ 			return &c->files[i];
+ 		}
+ 	}
+ 	return NULL;
+ }
+ 
++static uint64_t
++afc_file_handle(struct afc_ctx *c, struct afc_file *f)
++{
++	return (uint64_t)(f - &c->files[0]) + AFC_HANDLE_BASE;
++}
++
+ /* Append "key\0value\0" to a buffer, returns the new length. */
+ static uint32_t
+ afc_kv(char *buf, uint32_t cap, uint32_t off, const char *k, const char *v)
+@@ -750,6 +835,7 @@ afc_open(void *conn, void **ctx)
+ 			afc_pool[i].used = true;
+ 			afc_pool[i].len = 0;
+ 			afc_pool[i].pktno = 0;
++			afc_pool[i].reqno = 0;
+ 			memset(afc_pool[i].files, 0, sizeof(afc_pool[i].files));
+ 			*ctx = &afc_pool[i];
+ 			printf("APPLE AFC: session opened\n");
+@@ -773,7 +859,13 @@ afc_close(void *conn, void *ctx)
+ 	}
+ 	for (uint32_t i = 0; i < AFC_FILES; i++) {
+ 		if (c->files[i].used && c->files[i].vp != NULL) {
+-			vnode_close(c->files[i].vp, 0, vctx);
++			/* Close with the flags the file was opened with, plus
++			 * FWASWRITTEN: vn_close() only flushes HFS and only
++			 * touches v_writecount for a vnode it believes was
++			 * written, and dropping the FWRITE bit here left the
++			 * write count inflated for the lifetime of the mount. */
++			vnode_close(c->files[i].vp,
++			    c->files[i].flags | FWASWRITTEN, vctx);
+ 			c->files[i].used = false;
+ 			c->files[i].vp = NULL;
+ 		}
+@@ -783,16 +875,74 @@ afc_close(void *conn, void *ctx)
+ 	printf("APPLE AFC: session closed\n");
+ }
+ 
++/*
++ * Fill a "key\0value\0..." list describing the volume AFC_ROOT lives on.  The
++ * numbers are what the host uses to decide whether a push fits, so they must
++ * come from the live mount rather than from a constant: a hard-coded 16 GiB
++ * of free space makes every host over-commit a 128 GiB volume.
++ */
++static uint32_t
++afc_volume_kv(char *buf, uint32_t cap, uint32_t n, bool full)
++{
++	struct vfsstatfs *sfs = NULL;
++	char num[32];
++	vnode_t vp = NULLVP;
++	vfs_context_t vctx = vfs_context_kernel();
++
++	if (vnode_lookup(AFC_ROOT, 0, &vp, vctx) == 0) {
++		mount_t mp = vnode_mount(vp);
++		if (mp != NULL) {
++			sfs = vfs_statfs(mp);
++		}
++		vnode_put(vp);
++	}
++	if (sfs == NULL) {
++		snprintf(num, sizeof(num), "%llu", (unsigned long long)(128ULL << 30));
++		n = afc_kv(buf, cap, n, "FSTotalBytes", num);
++		snprintf(num, sizeof(num), "%llu", (unsigned long long)(64ULL << 30));
++		n = afc_kv(buf, cap, n, "FSFreeBytes", num);
++		n = afc_kv(buf, cap, n, "FSBlockSize", "4096");
++		return n;
++	}
++	snprintf(num, sizeof(num), "%llu",
++	    (unsigned long long)sfs->f_blocks * (unsigned long long)sfs->f_bsize);
++	n = afc_kv(buf, cap, n, "FSTotalBytes", num);
++	snprintf(num, sizeof(num), "%llu",
++	    (unsigned long long)sfs->f_bavail * (unsigned long long)sfs->f_bsize);
++	n = afc_kv(buf, cap, n, "FSFreeBytes", num);
++	snprintf(num, sizeof(num), "%u", sfs->f_bsize);
++	n = afc_kv(buf, cap, n, "FSBlockSize", num);
++	if (full) {
++		n = afc_kv(buf, cap, n, "Model", "UniXNU");
++	}
++	return n;
++}
++
+ static void
+ afc_devinfo(void *conn, struct afc_ctx *c)
+ {
+ 	uint32_t n = 0;
+ 
+ 	memset(afc_io, 0, 512);
+-	n = afc_kv((char *)afc_io, 512, n, "Model", "UniXNU");
+-	n = afc_kv((char *)afc_io, 512, n, "FSTotalBytes", "34359738368");
+-	n = afc_kv((char *)afc_io, 512, n, "FSFreeBytes", "17179869184");
+-	n = afc_kv((char *)afc_io, 512, n, "FSBlockSize", "4096");
++	n = afc_volume_kv((char *)afc_io, 512, n, true);
++	afc_reply(conn, c, AFC_OP_DATA, afc_io, n);
++}
++
++/*
++ * GET_CON_INFO (0x16) is what `afcclient info` and pymobiledevice3 read to
++ * learn the protocol version they are talking to.  Real devices answer with a
++ * Version string ("afc-293" on iOS 27.2); the number here is deliberately the
++ * interface generation, not a device build, because nothing in the host stack
++ * branches on the value beyond logging it.
++ */
++static void
++afc_con_info(void *conn, struct afc_ctx *c)
++{
++	uint32_t n = 0;
++
++	memset(afc_io, 0, 512);
++	n = afc_kv((char *)afc_io, 512, n, "Version", "afc-v9");
++	n = afc_kv((char *)afc_io, 512, n, "ExtendedStatus", "1");
+ 	afc_reply(conn, c, AFC_OP_DATA, afc_io, n);
+ }
+ 
+@@ -880,6 +1030,18 @@ afc_read_dir(void *conn, struct afc_ctx *c, const char *rel)
+ 		afc_status(conn, c, AFC_E_ISDIR);
+ 		return;
+ 	}
++	/*
++	 * pymobiledevice3 drops the first two entries of every READ_DIR reply
++	 * unconditionally (services/afc.py: `entries[2:]`), because a real device
++	 * always starts the list with "." and "..".  Omitting them therefore
++	 * silently ate the first two real names of every directory.
++	 */
++	{
++		static const char dot[] = ".\0..\0";
++
++		memcpy(obuf, dot, sizeof(dot) - 1);
++		out = (uint32_t)(sizeof(dot) - 1);
++	}
+ 	/* AFC READ_DIR has no continuation, so the whole list has to come back in
+ 	 * one DATA packet: drain the directory until eofflag or the buffer fills. */
+ 	for (rounds = 0; rounds < 16 && !eofflag; rounds++) {
+@@ -903,15 +1065,32 @@ afc_read_dir(void *conn, struct afc_ctx *c, const char *rel)
+ 		used = 4096 - (uint32_t)uio_resid(uio);
+ 		next = uio_offset(uio);
+ 
+-		for (o = 0; o + sizeof(struct dirent) <= used; ) {
++		/*
++		 * The bound is the record length, not sizeof(struct dirent):
++		 * a kernel struct dirent is 264 bytes (d_name[256]) while HFS
++		 * hands back 12, 16 or 32-byte records, so "o + sizeof(struct
++		 * dirent) <= used" stopped as soon as fewer than 264 bytes were
++		 * left in the 4 KiB buffer -- but VNOP_READDIR had already
++		 * advanced uio_offset past the records that were skipped, so
++		 * those entries were lost for good.  That silently dropped
++		 * 8-16 names per 4 KiB round on any real directory.
++		 */
++		for (o = 0; o + DIRENT_RECLEN_MIN <= used; ) {
+ 			struct dirent *dp = (struct dirent *)(void *)(dbuf + o);
+ 			uint32_t reclen = dp->d_reclen;
+ 			uint32_t namlen = dp->d_namlen;
++			uint32_t maxlen;
+ 
+-			if (reclen == 0 || o + reclen > used) {
++			if (reclen < DIRENT_RECLEN_MIN || o + reclen > used) {
+ 				break;
+ 			}
+-			if (namlen != 0 && dp->d_name[0] != '\0') {
++			/* d_namlen must fit inside the record it came from. */
++			maxlen = reclen - (uint32_t)offsetof(struct dirent, d_name);
++			if (namlen == 0 || namlen >= maxlen) {
++				o += reclen;
++				continue;
++			}
++			if (dp->d_name[0] != '\0') {
+ 				uint32_t n = namlen + 1;
+ 
+ 				if (out + n + 1 > ocap) {
+@@ -942,25 +1121,38 @@ afc_read_dir(void *conn, struct afc_ctx *c, const char *rel)
+ }
+ 
+ static void
+-afc_file_open(void *conn, struct afc_ctx *c, const char *rel, uint32_t mode)
++afc_file_open(void *conn, struct afc_ctx *c, const char *rel, uint64_t mode)
+ {
+ 	char path[512];
+ 	vnode_t vp = NULLVP;
+ 	vfs_context_t vctx = vfs_context_kernel();
+ 	struct afc_file *f;
+ 	int flags, err;
++	bool truncate = false;
+ 
+-	/* mode values follow afc.h's AFC_FOPEN_*; Apple's afc.c opens with
+-	 * O_CREAT but never O_TRUNC, so an overwrite keeps the old tail unless the
+-	 * client unlinks first.  Match that instead of truncating silently. */
++	/*
++	 * Mode values follow afc.h's AFC_FOPEN_*:
++	 *
++	 *   1 r   O_RDONLY                              2 r+  O_RDWR | O_CREAT
++	 *   3 w   O_WRONLY | O_CREAT | O_TRUNC          4 w+  O_RDWR | O_CREAT | O_TRUNC
++	 *   5 a   O_WRONLY | O_APPEND | O_CREAT         6 a+  O_RDWR | O_APPEND | O_CREAT
++	 *
++	 * The truncation on 3 and 4 is part of the protocol, not a convenience:
++	 * `afcclient put` and every pymobiledevice3 push open with mode 3 and then
++	 * expect a file that is exactly as long as what they wrote.  Serving mode
++	 * 3 without the truncation is what left a stale tail behind whenever a
++	 * shorter file replaced a longer one.
++	 */
+ 	switch (mode) {
+ 	case 1: flags = FREAD; break;
+-	case 2: flags = FREAD | FWRITE; break;
+-	case 3: flags = FWRITE | O_CREAT; break;
+-	case 4: flags = FREAD | FWRITE | O_CREAT; break;
++	case 2: flags = FREAD | FWRITE | O_CREAT; break;
++	case 3: flags = FWRITE | O_CREAT; truncate = true; break;
++	case 4: flags = FREAD | FWRITE | O_CREAT; truncate = true; break;
+ 	case 5: flags = FWRITE | O_CREAT | O_APPEND; break;
+ 	case 6: flags = FREAD | FWRITE | O_CREAT | O_APPEND; break;
+-	default: flags = FREAD; break;
++	default:
++		afc_status(conn, c, AFC_E_INVALID);
++		return;
+ 	}
+ 	if (afc_path(rel, path, sizeof(path)) != 0) {
+ 		afc_status(conn, c, AFC_E_PERM);
+@@ -971,7 +1163,21 @@ afc_file_open(void *conn, struct afc_ctx *c, const char *rel, uint32_t mode)
+ 		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
+ 		return;
+ 	}
+-	f = afc_file_alloc(c, vp);
++	if (truncate) {
++		/*
++		 * vnode_open() is not open(2): it never does the O_TRUNC
++		 * processing that open1() does with vnode_setsize(), so the
++		 * size has to be reset here or the previous contents survive
++		 * everything the client writes over them.
++		 */
++		err = vnode_setsize(vp, (off_t)0, 0, vctx);
++		if (err != 0) {
++			vnode_close(vp, flags, vctx);
++			afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++			return;
++		}
++	}
++	f = afc_file_alloc(c, vp, flags);
+ 	if (f == NULL) {
+ 		vnode_close(vp, flags, vctx);
+ 		afc_status(conn, c, AFC_E_UNKNOWN);
+@@ -979,7 +1185,7 @@ afc_file_open(void *conn, struct afc_ctx *c, const char *rel, uint32_t mode)
+ 	}
+ 	{
+ 		uint8_t h[8];
+-		apple_put_le64(h, (uint64_t)(f - &c->files[0]));
++		apple_put_le64(h, afc_file_handle(c, f));
+ 		afc_reply(conn, c, AFC_OP_FILE_OPEN_RES, h, sizeof(h));
+ 	}
+ }
+@@ -1001,13 +1207,17 @@ afc_file_read(void *conn, struct afc_ctx *c, uint64_t handle, uint64_t want)
+ 	/*
+ 	 * Only read what the mux ring can carry: f->off advances by the bytes
+ 	 * handed to the host, so a reply that gets clamped after the read would
+-	 * silently skip that part of the file.
++	 * silently skip that part of the file.  When the ring is full answer
++	 * WOULD_BLOCK instead of saying nothing: a silent drop leaves the host
++	 * waiting for a reply that will never come, and pymobiledevice3 reads the
++	 * resulting timeout as end-of-file and hashes a truncated file.
+ 	 */
+ 	{
+ 		uint32_t space = apple_mux_space(conn);
+ 
+ 		if (space <= AFC_HDR + 1) {
+ 			printf("APPLE AFC: read deferred, mux ring full\n");
++			afc_status(conn, c, AFC_E_WOULD_BLOCK);
+ 			return;
+ 		}
+ 		if (want > space - AFC_HDR) {
+@@ -1035,38 +1245,221 @@ afc_file_read(void *conn, struct afc_ctx *c, uint64_t handle, uint64_t want)
+ 
+ static void
+ afc_file_write(void *conn, struct afc_ctx *c, uint64_t handle, const uint8_t *data,
+-    uint32_t len)
++    uint32_t len, uint64_t off, bool have_off)
+ {
+ 	struct afc_file *f = afc_file_get(c, handle);
+ 	vfs_context_t vctx = vfs_context_kernel();
+-	int resid = 0, err;
++	uint32_t done = 0;
++	int ioflag = 0;
+ 
+ 	if (f == NULL) {
+ 		afc_status(conn, c, AFC_E_INVALID);
+ 		return;
+ 	}
++	/*
++	 * A write larger than one AFC packet is impossible on the wire (AFC_BUF
++	 * bounds the request), but the length is caller-controlled, so clamp it
++	 * rather than trusting the header.
++	 */
+ 	if (len > AFC_IO_MAX) {
+ 		len = AFC_IO_MAX;
+ 	}
++	if (len == 0) {
++		afc_status(conn, c, AFC_E_SUCCESS);
++		return;
++	}
++	/*
++	 * vn_rdwr() may write fewer bytes than it was given.  The old code added
++	 * the requested length to f->off no matter what the filesystem actually
++	 * did, so a short write left a hole: the host believed the whole chunk
++	 * had landed, the stream carried on at the wrong offset, and the file
++	 * ended up with zero bytes where the missing tail should have been -- all
++	 * while every reply said SUCCESS.  There is no residue field on the wire
++	 * either, so the only correct behaviour is to loop until everything is
++	 * written or the filesystem refuses.
++	 */
+ 	memcpy(afc_io, data, len);
+-	err = vn_rdwr(UIO_WRITE, f->vp, (caddr_t)(uintptr_t)afc_io, (int)len,
+-	    (off_t)f->off, UIO_SYSSPACE, IO_SYNC, vfs_context_ucred(vctx),
+-	    &resid, vfs_context_proc(vctx));
++	ioflag = have_off ? 0 : (f->flags & O_APPEND) ? IO_APPEND : 0;
++	/* Do not fsync per chunk: leave the data dirty and flush once in
++	 * FILE_CLOSE.  hfs_update() on every 32 KiB is what pinned this pipe at
++	 * ~0.4 MB/s. */
++	while (done < len) {
++		int resid = 0;
++		int err = vn_rdwr(UIO_WRITE, f->vp,
++		    (caddr_t)(uintptr_t)(afc_io + done), (int)(len - done),
++		    (off_t)((have_off ? off : f->off) + done), UIO_SYSSPACE,
++		    ioflag, vfs_context_ucred(vctx), &resid,
++		    vfs_context_proc(vctx));
++		int wrote;
++
++		if (err != 0) {
++			afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++			return;
++		}
++		wrote = (int)(len - done) - resid;
++		if (wrote <= 0) {
++			/* No forward progress on a blocking VNOP means the
++			 * filesystem cannot take the rest; report an error so
++			 * the host retries instead of losing the tail. */
++			printf("APPLE AFC: write stalled at %u/%u\n", done, len);
++			afc_status(conn, c, AFC_E_IO);
++			return;
++		}
++		done += (uint32_t)wrote;
++	}
++	if (!have_off) {
++		f->off += done;
++	}
++	f->dirty = true;
++	afc_status(conn, c, AFC_E_SUCCESS);
++}
++
++/*
++ * Recursively delete a kernel-space path, for AFC_OP_REMOVE_AND_CONTENTS.
++ * unlink1() refuses directories with EISDIR, so a directory has to be emptied
++ * first; pandora_rmdir() wraps the static rmdirat_internal() and returns
++ * ENOTEMPTY for a directory that still has children, which is exactly the
++ * signal needed to know whether to recurse.
++ */
++static int
++afc_rmtree(const char *path, int depth)
++{
++	char child[512];
++	vnode_t vp = NULLVP;
++	vfs_context_t vctx = vfs_context_kernel();
++	int err, eofflag = 0;
++	UIO_STACKBUF(uio_store, 1);
++	off_t next = 0;
++
++	if (depth > 24) {
++		return ELOOP;
++	}
++	if (pandora_rmdir(path) == 0) {
++		return 0;
++	}
++	err = vnode_lookup(path, 0, &vp, vctx);
++	if (err != 0) {
++		return err;
++	}
++	if (vnode_vtype(vp) != VDIR) {
++		vnode_put(vp);
++		return unlink1(vctx, NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++	}
++	/* Grandchildren are unbounded, so each round costs one lookup. */
++	for (int rounds = 0; rounds < 4096; rounds++) {
++		uint8_t *dbuf = (uint8_t *)afc_io;
++		uio_t uio;
++		uint32_t used, o;
++		int numdirent = 0;
++		bool removed = false;
++
++		memset(dbuf, 0, 4096);
++		uio = uio_createwithbuffer(1, next, UIO_SYSSPACE, UIO_READ,
++		    uio_store, sizeof(uio_store));
++		if (uio == NULL) {
++			err = ENOMEM;
++			break;
++		}
++		uio_addiov(uio, (user_addr_t)(uintptr_t)dbuf, 4096);
++		eofflag = 0;
++		err = VNOP_READDIR(vp, uio, 0, &eofflag, &numdirent, vctx);
++		if (err != 0) {
++			break;
++		}
++		used = 4096 - (uint32_t)uio_resid(uio);
++		next = uio_offset(uio);
++		for (o = 0; o + DIRENT_RECLEN_MIN <= used; ) {
++			struct dirent *dp = (struct dirent *)(void *)(dbuf + o);
++			uint32_t reclen = dp->d_reclen;
++			uint32_t namlen = dp->d_namlen;
++			uint32_t maxlen;
++
++			if (reclen < DIRENT_RECLEN_MIN || o + reclen > used) {
++				break;
++			}
++			maxlen = reclen - (uint32_t)offsetof(struct dirent, d_name);
++			o += reclen;
++			if (namlen == 0 || namlen >= maxlen ||
++			    (namlen == 1 && dp->d_name[0] == '.') ||
++			    (namlen == 2 && dp->d_name[0] == '.' &&
++			    dp->d_name[1] == '.')) {
++				continue;
++			}
++			if (snprintf(child, sizeof(child), "%s/%.*s", path,
++			    (int)namlen, dp->d_name) >= (int)sizeof(child)) {
++				continue;
++			}
++			(void)afc_rmtree(child, depth + 1);
++			removed = true;
++		}
++		if (!removed || (eofflag && removed)) {
++			break;
++		}
++		next = 0;
++	}
++	vnode_put(vp);
++	if (err != 0 && err != ENOENT) {
++		return err;
++	}
++	err = pandora_rmdir(path);
++	if (err == ENOENT) {
++		err = 0;
++	}
++	return err;
++}
++
++static void
++afc_remove_contents(void *conn, struct afc_ctx *c, const char *rel)
++{
++	char path[512];
++
++	if (afc_path(rel, path, sizeof(path)) != 0) {
++		afc_status(conn, c, AFC_E_PERM);
++		return;
++	}
++	afc_status(conn, c, (uint64_t)afc_errno_to_afc(afc_rmtree(path, 0)));
++}
++
++/* TRUNCATE (0x07): [u64 newsize][path\0], the path-addressed counterpart of
++ * FILE_SET_SIZE. */
++static void
++afc_truncate(void *conn, struct afc_ctx *c, const char *rel, uint64_t size)
++{
++	char path[512];
++	vnode_t vp = NULLVP;
++	vfs_context_t vctx = vfs_context_kernel();
++	int err;
++
++	if (afc_path(rel, path, sizeof(path)) != 0) {
++		afc_status(conn, c, AFC_E_PERM);
++		return;
++	}
++	err = vnode_lookup(path, 0, &vp, vctx);
+ 	if (err != 0) {
+ 		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
+ 		return;
+ 	}
+-	f->off += len;
+-	afc_status(conn, c, AFC_E_SUCCESS);
++	if (vnode_vtype(vp) == VDIR) {
++		vnode_put(vp);
++		afc_status(conn, c, AFC_E_ISDIR);
++		return;
++	}
++	err = vnode_setsize(vp, (off_t)size, 0, vctx);
++	vnode_put(vp);
++	afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
+ }
+ 
+ static void
+-afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint32_t len)
++afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl,
++    uint32_t len, const uint8_t *extra, uint32_t extralen)
+ {
+ 	switch (op) {
+ 	case AFC_OP_DEVINFO:
+ 		afc_devinfo(conn, c);
+ 		break;
++	case AFC_OP_GET_CON_INFO:
++		afc_con_info(conn, c);
++		break;
+ 	case AFC_OP_READ_DIR:
+ 		afc_read_dir(conn, c, (const char *)pl);
+ 		break;
+@@ -1074,17 +1467,40 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+ 		afc_file_info(conn, c, (const char *)pl);
+ 		break;
+ 	case AFC_OP_FILE_OPEN: {
+-		size_t nlen = strlen((const char *)pl) + 1;
+-		uint32_t mode;
++		uint64_t mode;
++		const char *rel;
++		size_t nlen;
+ 
+-		if (len < nlen + 4) {
+-			afc_status(conn, c, AFC_E_INVALID);
+-			break;
++		/*
++		 * The documented layout is [u64 mode][path\0]: afc.c writes
++		 * htole64(file_mode) at the head of the payload and the NUL
++		 * terminated name straight after it.  This server used to
++		 * expect [path\0][u32 mode], which is why no standard client
++		 * could open a file.  Both are accepted for one release so an
++		 * older host script still works.
++		 */
++		if (len >= 9 && apple_le64(pl) >= 1 && apple_le64(pl) <= 6 &&
++		    pl[8] != '\0' && memchr(pl + 8, '\0', len - 8) != NULL) {
++			mode = apple_le64(pl);
++			rel = (const char *)(const void *)(pl + 8);
++		} else {
++			const uint8_t *nul = memchr(pl, '\0', len);
++
++			if (nul == NULL) {
++				afc_status(conn, c, AFC_E_INVALID);
++				break;
++			}
++			nlen = (size_t)(nul - pl) + 1;
++			if (len < nlen + 4) {
++				afc_status(conn, c, AFC_E_INVALID);
++				break;
++			}
++			mode = (uint32_t)pl[nlen] | ((uint32_t)pl[nlen + 1] << 8) |
++			    ((uint32_t)pl[nlen + 2] << 16) |
++			    ((uint32_t)pl[nlen + 3] << 24);
++			rel = (const char *)(const void *)pl;
+ 		}
+-		/* The AFC open payload is "path\0" followed by a little-endian u32. */
+-		mode = (uint32_t)pl[nlen] | ((uint32_t)pl[nlen + 1] << 8) |
+-		       ((uint32_t)pl[nlen + 2] << 16) | ((uint32_t)pl[nlen + 3] << 24);
+-		afc_file_open(conn, c, (const char *)pl, mode);
++		afc_file_open(conn, c, rel, mode);
+ 		break;
+ 	}
+ 	case AFC_OP_FILE_READ:
+@@ -1094,15 +1510,54 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+ 		}
+ 		afc_file_read(conn, c, apple_le64(pl), apple_le64(pl + 8));
+ 		break;
+-	case AFC_OP_FILE_WRITE:
++	case AFC_OP_FILE_WRITE: {
++		/*
++		 * [u64 handle] in this part of the packet, and the file bytes
++		 * either in the same part (simple clients, everything this
++		 * server has ever seen) or as the trailing payload of a packet
++		 * whose entire_length exceeds this_length (what afc.c sends
++		 * once a chunk is bigger than its 8-byte handle part).
++		 */
++		const uint8_t *data;
++		uint32_t dlen;
++
+ 		if (len < 8) {
+ 			afc_status(conn, c, AFC_E_INVALID);
+ 			break;
+ 		}
+-		afc_file_write(conn, c, apple_le64(pl), pl + 8, len - 8);
++		if (extralen != 0) {
++			data = extra;
++			dlen = extralen;
++		} else {
++			data = pl + 8;
++			dlen = len - 8;
++		}
++		afc_file_write(conn, c, apple_le64(pl), data, dlen, 0, false);
+ 		break;
++	}
++	case AFC_OP_FILE_WRITE_OFFSET: {
++		/* 0x28: [u64 handle][u64 offset] then the bytes. */
++		const uint8_t *data;
++		uint32_t dlen;
++
++		if (len < 16) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		if (extralen != 0) {
++			data = extra;
++			dlen = extralen;
++		} else {
++			data = pl + 16;
++			dlen = len - 16;
++		}
++		afc_file_write(conn, c, apple_le64(pl), data, dlen,
++		    apple_le64(pl + 8), true);
++		break;
++	}
+ 	case AFC_OP_FILE_CLOSE: {
+ 		struct afc_file *f;
++		vfs_context_t vctx = vfs_context_kernel();
+ 
+ 		if (len < 8) {
+ 			afc_status(conn, c, AFC_E_INVALID);
+@@ -1113,16 +1568,32 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+ 			afc_status(conn, c, AFC_E_INVALID);
+ 			break;
+ 		}
+-		vnode_close(f->vp, 0, vfs_context_kernel());
++		/* One flush per file, at close: this is where the data that
++		 * used to be fsynced every 32 KiB actually gets to disk. */
++		if (f->dirty) {
++			(void)VNOP_FSYNC(f->vp, MNT_WAIT, vctx);
++		}
++		/* FWRITE must be preserved or vn_close() skips both the HFS
++		 * flush hook and the v_writecount release. */
++		vnode_close(f->vp, f->flags | FWASWRITTEN, vctx);
+ 		f->used = false;
+ 		f->vp = NULL;
++		f->dirty = false;
+ 		afc_status(conn, c, AFC_E_SUCCESS);
+ 		break;
+ 	}
+ 	case AFC_OP_FILE_SEEK: {
++		/* 0x11: [u64 handle][u64 whence][i64 offset].  The old code
++		 * read 16 bytes and treated the second word as an absolute
++		 * offset, so every SEEK_CUR/SEEK_END from a standard client
++		 * landed in the wrong place. */
+ 		struct afc_file *f;
++		uint64_t whence;
++		int64_t delta;
++		off_t base;
++		vfs_context_t vctx = vfs_context_kernel();
+ 
+-		if (len < 16) {
++		if (len < 24) {
+ 			afc_status(conn, c, AFC_E_INVALID);
+ 			break;
+ 		}
+@@ -1131,7 +1602,32 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+ 			afc_status(conn, c, AFC_E_INVALID);
+ 			break;
+ 		}
+-		f->off = apple_le64(pl + 8);
++		whence = apple_le64(pl + 8);
++		delta = (int64_t)apple_le64(pl + 16);
++		switch (whence) {
++		case 0:                         /* SEEK_SET */
++			base = 0;
++			break;
++		case 1:                         /* SEEK_CUR */
++			base = (off_t)f->off;
++			break;
++		case 2:                         /* SEEK_END */
++			if (vnode_size(f->vp, &base, vctx) != 0) {
++				base = (off_t)f->off;
++			}
++			break;
++		default:
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		if (whence > 2) {
++			break;
++		}
++		if (base + delta < 0) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		f->off = (uint64_t)(base + delta);
+ 		afc_status(conn, c, AFC_E_SUCCESS);
+ 		break;
+ 	}
+@@ -1152,6 +1648,39 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+ 		afc_reply(conn, c, AFC_OP_FILE_TELL_RES, out, sizeof(out));
+ 		break;
+ 	}
++	case AFC_OP_FILE_SET_SIZE: {
++		/* 0x15: [u64 handle][u64 size].  Ftruncate; leaves the handle's
++		 * position alone, which is what a real device does. */
++		struct afc_file *f;
++		int err;
++
++		if (len < 16) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		f = afc_file_get(c, apple_le64(pl));
++		if (f == NULL) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		err = vnode_setsize(f->vp, (off_t)apple_le64(pl + 8), 0,
++		    vfs_context_kernel());
++		if (err == 0) {
++			f->dirty = true;
++		}
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++		break;
++	}
++	case AFC_OP_TRUNCATE: {
++		/* 0x07: [u64 newsize][path\0]. */
++		if (len < 9 || memchr(pl + 8, '\0', len - 8) == NULL) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		afc_truncate(conn, c, (const char *)(const void *)(pl + 8),
++		    apple_le64(pl));
++		break;
++	}
+ 	case AFC_OP_MAKE_DIR: {
+ 		char path[512];
+ 
+@@ -1180,10 +1709,22 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+ 		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
+ 		break;
+ 	}
++	case AFC_OP_REMOVE_AND_CONTENTS:
++		afc_remove_contents(conn, c, (const char *)pl);
++		break;
+ 	case AFC_OP_RENAME: {
+ 		char from[512], to[512];
+-		size_t n = strlen((const char *)pl) + 1;
++		const uint8_t *nul = memchr(pl, '\0', len);
++		size_t n;
+ 
++		/* RENAME is [from\0][to\0]; find the split inside the declared
++		 * payload instead of trusting strlen() on a buffer the host
++		 * controls. */
++		if (nul == NULL || pl[0] == '\0') {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		n = (size_t)(nul - pl) + 1;
+ 		if (afc_path((const char *)pl, from, sizeof(from)) != 0 ||
+ 		    afc_path((const char *)pl + n, to, sizeof(to)) != 0) {
+ 			afc_status(conn, c, AFC_E_PERM);
+@@ -1193,8 +1734,14 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+ 		break;
+ 	}
+ 	default:
++		/*
++		 * A real device answers UNKNOWN_PACKET_TYPE for an opcode it does
++		 * not implement, and the host prints that as its own error; replying
++		 * with the generic UNKNOWN_ERROR made libimobiledevice map rm -r to
++		 * DIR_NOT_EMPTY and retry forever.
++		 */
+ 		printf("APPLE AFC: unsupported operation 0x%llx\n", (unsigned long long)op);
+-		afc_status(conn, c, AFC_E_UNKNOWN);
++		afc_status(conn, c, AFC_E_UNKNOWN_PACKET_TYPE);
+ 		break;
+ 	}
+ }
+@@ -1207,6 +1754,13 @@ afc_input(void *conn, void *ctx, const uint8_t *buf, uint32_t len)
+ 	if (c == NULL) {
+ 		return;
+ 	}
++	/*
++	 * The reassembly buffer holds one whole packet: header plus the entire
++	 * payload of the current request, including the trailing payload of a
++	 * FILE_WRITE.  A frame that would not fit cannot be served at all, and
++	 * answering would only desync the stream, so drop it -- but say so on the
++	 * console, because the host sees a timeout rather than an error.
++	 */
+ 	if (len > AFC_BUF - c->len) {
+ 		printf("APPLE AFC: packet too large, dropping\n");
+ 		c->len = 0;
+@@ -1216,8 +1770,9 @@ afc_input(void *conn, void *ctx, const uint8_t *buf, uint32_t len)
+ 	c->len += len;
+ 
+ 	for (;;) {
+-		uint64_t total, this_len, op;
+-		uint32_t plen;
++		uint64_t total, this_len, op, pktno;
++		uint32_t plen, extralen;
++		const uint8_t *extra;
+ 
+ 		if (c->len < AFC_HDR) {
+ 			break;
+@@ -1229,7 +1784,18 @@ afc_input(void *conn, void *ctx, const uint8_t *buf, uint32_t len)
+ 		}
+ 		total = apple_le64((const uint8_t *)c->buf + 8);
+ 		this_len = apple_le64((const uint8_t *)c->buf + 16);
++		pktno = apple_le64((const uint8_t *)c->buf + 24);
+ 		op = apple_le64((const uint8_t *)c->buf + 32);
++		/*
++		 * entire_length may exceed this_length: that is how a standard
++		 * host sends a FILE_WRITE whose data does not fit in the same
++		 * 40+N header packet (afc.c sends [u64 handle] as one packet
++		 * and the file bytes as the trailing payload of the same
++		 * logical packet).  The old code only ever consumed this_length
++		 * and then re-parsed the residual bytes as a fresh header, so
++		 * every large write from a real client was dropped as "bad
++		 * magic" and the session never recovered.
++		 */
+ 		if (total < AFC_HDR || total > AFC_BUF || this_len < AFC_HDR ||
+ 		    this_len > total) {
+ 			printf("APPLE AFC: bad lengths %llu/%llu\n",
+@@ -1241,12 +1807,35 @@ afc_input(void *conn, void *ctx, const uint8_t *buf, uint32_t len)
+ 			break;
+ 		}
+ 		plen = (uint32_t)(this_len - AFC_HDR);
+-		/* keep the request readable for the handler: it is NUL terminated
+-		 * only when the host says so, so make sure of it */
+-		if (plen != 0) {
++		extralen = (uint32_t)(total - this_len);
++		extra = (const uint8_t *)c->buf + this_len;
++		/* Keep the request readable for the handler: it is NUL terminated
++		 * only when the host says so, so make sure of it.  The byte at
++		 * this_length is the first byte of the trailing payload when there
++		 * is one, so NUL-terminate in place only when there is no tail.
++		 * Terminate even for an empty payload: a path-carrying opcode with
++		 * plen == 0 would otherwise strlen() stale bytes from an earlier
++		 * request. */
++		if (extralen == 0) {
+ 			c->buf[AFC_HDR + plen] = '\0';
+ 		}
+-		afc_dispatch(conn, c, op, (const uint8_t *)c->buf + AFC_HDR, plen);
++		/*
++		 * Only the two write opcodes carry a trailing payload.  For
++		 * anything else extra bytes mean the header is malformed, and
++		 * since a trailing payload also suppresses the NUL terminator
++		 * (see above) a path-carrying request would then run strlen()
++		 * off the end of the buffer.  Refuse it instead of guessing.
++		 */
++		if (extralen != 0 && op != AFC_OP_FILE_WRITE &&
++		    op != AFC_OP_FILE_WRITE_OFFSET) {
++			printf("APPLE AFC: trailing payload on op 0x%llx\n",
++			    (unsigned long long)op);
++			c->len = 0;
++			break;
++		}
++		c->reqno = pktno;
++		afc_dispatch(conn, c, op, (const uint8_t *)c->buf + AFC_HDR, plen,
++		    extra, extralen);
+ 		if (c->len > total) {
+ 			memmove(c->buf, c->buf + total, c->len - total);
+ 		}

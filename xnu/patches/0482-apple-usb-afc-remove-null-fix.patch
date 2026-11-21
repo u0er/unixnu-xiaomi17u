@@ -1,0 +1,32 @@
+diff --git a/bsd/dev/apple_services.c b/bsd/dev/apple_services.c
+index b36cd4c..a4676ed 100644
+--- a/bsd/dev/apple_services.c
++++ b/bsd/dev/apple_services.c
+@@ -1164,7 +1164,6 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+ 	}
+ 	case AFC_OP_REMOVE: {
+ 		char path[512];
+-		vnode_t vp = NULLVP;
+ 		vfs_context_t vctx = vfs_context_kernel();
+ 		int err;
+ 
+@@ -1172,13 +1171,12 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl, uint
+ 			afc_status(conn, c, AFC_E_PERM);
+ 			break;
+ 		}
+-		err = vnode_lookup(path, 0, &vp, vctx);
+-		if (err != 0) {
+-			afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
+-			break;
+-		}
+-		err = unlink1(vctx, vp, USER_ADDR_NULL, UIO_SYSSPACE, 0);
+-		vnode_put(vp);
++		/* unlink1() takes a START DIRECTORY vnode and a path component, not
++		 * a looked-up target vnode with a NULL path.  The old code passed
++		 * vp as start_dvp and USER_ADDR_NULL as the name, so namei() called
++		 * copystr() on a NULL component and the kernel data-aborted.  Use
++		 * the same NULL-dvp path form as pandora_files.c's "!" handler. */
++		err = unlink1(vctx, NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
+ 		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
+ 		break;
+ 	}

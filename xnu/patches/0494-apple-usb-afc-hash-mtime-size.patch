@@ -1,0 +1,448 @@
+--- a/bsd/dev/apple_services.c
++++ b/bsd/dev/apple_services.c
+@@ -571,6 +571,9 @@ struct apple_service apple_lockdown_service = {
+ #define AFC_OP_FILE_SET_SIZE 0x15
+ #define AFC_OP_GET_CON_INFO 0x16
+ #define AFC_OP_RENAME    0x18
++#define AFC_OP_FILE_HASH 0x1D
++#define AFC_OP_SET_FILE_MOD_TIME 0x1E
++#define AFC_OP_GET_SIZE_OF_PATH_CONTENTS 0x21
+ #define AFC_OP_REMOVE_AND_CONTENTS 0x22
+ #define AFC_OP_FILE_WRITE_OFFSET 0x28
+ 
+@@ -1449,6 +1452,383 @@ afc_truncate(void *conn, struct afc_ctx *c, const char *rel, uint64_t size)
+ 	afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
+ }
+ 
++/*
++ * GET_FILE_HASH (0x1D): [path\0] -> DATA with the raw 20-byte SHA-1 digest.
++ *
++ * Evidence: pymobiledevice3 PR #2128 (merged, "afc: Add hash, set-time,
++ * truncate, tell and positional I/O operations"), probed on iPhone18,4/iOS
++ * 27.2 afc-293 and vphone/iOS 27.0 afc-290.  Its get_file_hash() sends
++ * CSTRING.build(filename) and treats the DATA payload itself as the digest;
++ * the same probe fixes the error behaviour: a directory answers
++ * OBJECT_IS_DIR(9) and an empty file answers INVALID_ARG(7) -- the client has
++ * to special-case st_size == 0 and hash locally -- so this server reproduces
++ * both instead of inventing SHA-1("") for an empty file.
++ *
++ * libimobiledevice's afc.c has no client for 0x1D, so there is no diverging
++ * implementation to reconcile here.
++ *
++ * Why the body is [path\0] and not [u64 handle]: the merged afc.py in the PR
++ * (blob 3d6ad49, same hunk as the opcode enum) implements
++ *
++ *     return await self._do_operation(AfcOpcode.GET_FILE_HASH,
++ *                                     CSTRING.build(filename), filename)
++ *
++ * i.e. the payload is exactly the NUL-terminated name, with no numeric
++ * prefix.  Every handle-addressed op in that file packs a handle explicitly
++ * (ftell: U64_LE.pack(handle); ftruncate: AfcFileSetSizeRequest(handle,size);
++ * pread: AfcFreadOffsetRequest(handle,size,offset)), and the 0x1D tests are
++ * all path-addressed (test_get_file_hash_errors expects OBJECT_IS_DIR(9) for
++ * a directory path, which is meaningless for a handle).  The PR body's table
++ * maps "0x1D GetFileHash ... -> get_file_hash()" the same way.
++ */
++static void
++afc_file_hash(void *conn, struct afc_ctx *c, const char *rel)
++{
++	char path[512];
++	vnode_t vp = NULLVP;
++	vfs_context_t vctx = vfs_context_kernel();
++	struct vnode_attr va;
++	SHA1_CTX ctx;
++	uint8_t digest[SHA_DIGEST_LENGTH];
++	uint64_t size, off = 0;
++	int err;
++
++	if (afc_path(rel, path, sizeof(path)) != 0) {
++		afc_status(conn, c, AFC_E_PERM);
++		return;
++	}
++	err = vnode_open(path, FREAD, 0, 0, &vp, vctx);
++	if (err != 0) {
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++		return;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	err = vnode_getattr(vp, &va, vctx);
++	if (err != 0) {
++		vnode_close(vp, FREAD, vctx);
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++		return;
++	}
++	if (vnode_vtype(vp) == VDIR) {
++		vnode_close(vp, FREAD, vctx);
++		afc_status(conn, c, AFC_E_ISDIR);
++		return;
++	}
++	/*
++	 * A real device rejects an empty file with INVALID_ARG rather than
++	 * answering SHA-1(""); pymobiledevice3 compensates for that exact
++	 * status, so a host that hashes empty files locally only does so when
++	 * it sees 7 here.
++	 */
++	if (va.va_data_size == 0) {
++		vnode_close(vp, FREAD, vctx);
++		afc_status(conn, c, AFC_E_INVALID);
++		return;
++	}
++	size = (uint64_t)va.va_data_size;
++	SHA1Init(&ctx);
++	while (off < size) {
++		uint32_t want = (uint32_t)MIN(size - off,
++		    (uint64_t)AFC_IO_MAX);
++		int resid = 0;
++		uint32_t got;
++
++		err = vn_rdwr(UIO_READ, vp, (caddr_t)(uintptr_t)afc_io,
++		    (int)want, (off_t)off, UIO_SYSSPACE, 0,
++		    vfs_context_ucred(vctx), &resid, vfs_context_proc(vctx));
++		if (err != 0) {
++			vnode_close(vp, FREAD, vctx);
++			afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++			return;
++		}
++		got = want - (uint32_t)resid;
++		/*
++		 * A short read before the size taken above means the file
++		 * shrank or the filesystem returned less than it promised.
++		 * Hashing the prefix would hand the host a digest that matches
++		 * no file at all, so report IO_ERROR instead of a wrong hash.
++		 */
++		if (got == 0) {
++			vnode_close(vp, FREAD, vctx);
++			afc_status(conn, c, AFC_E_IO);
++			return;
++		}
++		SHA1Update(&ctx, afc_io, got);
++		off += got;
++	}
++	vnode_close(vp, FREAD, vctx);
++	SHA1Final(digest, &ctx);
++	afc_reply(conn, c, AFC_OP_DATA, digest, sizeof(digest));
++}
++
++/*
++ * SET_FILE_MOD_TIME (0x1E): [u64 mtime in ns since epoch][path\0] -> STATUS.
++ *
++ * Evidence: afc.c afc_set_file_time() writes htole64(mtime) followed by the
++ * NUL-terminated path (data_len = 8 + strlen(path) + 1) and expects a STATUS
++ * reply through afc_receive_data(NULL, &bytes); pymobiledevice3 PR #2128's
++ * AfcSetFileTimeRequest{mtime: u64, filename: CSTRING} sends the same bytes
++ * and its probe confirms the device stores the value ("microsecond
++ * resolution").  A missing path answers OBJECT_NOT_FOUND(8), which is what
++ * afc_errno_to_afc(ENOENT) already returns.
++ *
++ * The device-side extra ("moves st_birthtime back when mtime is earlier") is
++ * not implemented: it is not part of the wire request, afc.c never mentions
++ * it, and HFS+ create-time semantics through vnode_setattr() are unverified
++ * on this kernel.  Only the wire-visible modification time is set.
++ */
++static void
++afc_set_mtime(void *conn, struct afc_ctx *c, const char *rel,
++    uint64_t mtime_ns)
++{
++	char path[512];
++	vnode_t vp = NULLVP;
++	vfs_context_t vctx = vfs_context_kernel();
++	struct vnode_attr va;
++	struct timespec ts;
++	int err;
++
++	if (afc_path(rel, path, sizeof(path)) != 0) {
++		afc_status(conn, c, AFC_E_PERM);
++		return;
++	}
++	err = vnode_lookup(path, 0, &vp, vctx);
++	if (err != 0) {
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++		return;
++	}
++	ts.tv_sec = (time_t)(mtime_ns / 1000000000ULL);
++	ts.tv_nsec = (long)(mtime_ns % 1000000000ULL);
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_modify_time, ts);
++	err = vnode_setattr(vp, &va, vctx);
++	vnode_put(vp);
++	afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++}
++
++/*
++ * GET_SIZE_OF_PATH_CONTENTS (0x21): [u64 flags][path\0] -> DATA holding the
++ * same NUL-separated key/value text list GET_FILE_INFO uses, with the keys
++ * "st_size" and "st_blocks" (decimal strings).
++ *
++ * Evidence: pymobiledevice3 PR #2128 (merged 2026-10-28, probed on an
++ * iPhone18,4/iOS 27.2 and a vphone/iOS 27.0).  It sends
++ * AfcSizeOfPathContentsRequest{flags: u64, filename: CSTRING} and parses the
++ * reply with list_to_dict(), i.e. the payload is the key/value list and not a
++ * binary struct; get_size_of_path_contents() returns
++ * {"st_size": int, "st_blocks": int}.  The same PR fixes the semantics:
++ * it sums st_size/st_blocks of the regular files below a directory, a path
++ * that is itself a regular file reports zero, flags 0 counts regular files
++ * only and flags 1 additionally counts directories.  The PR author notes the
++ * device's flags=1 totals could not be explained and callers always send 0,
++ * so flags&1 here adds each directory's own size/blocks (the documented
++ * reading) -- inference, flagged in the delivery notes, not a verified byte.
++ *
++ * Symlinks and special files count as nothing: GET_FILE_INFO reports S_IFLNK
++ * / S_IFBLK / ... for them, so they are not "regular files".  Children are
++ * looked up with VNODE_LOOKUP_NOFOLLOW so a link can neither inflate the
++ * total nor form a traversal loop.  A child that disappears between READDIR
++ * and lookup is skipped; any other lookup/getattr/READDIR error aborts the
++ * walk with that errno, so a partial total is never reported as SUCCESS.
++ */
++#define AFC_SIZE_MAXDEPTH 16
++#define AFC_SIZE_DIRBUF   2048
++
++static int
++afc_size_recurse(const char *path, int depth, bool incl_dirs,
++    uint64_t *total_size, uint64_t *total_blocks)
++{
++	/*
++	 * One READDIR buffer and one child-name buffer per depth: a recursive
++	 * call must not clobber the caller's unprocessed records (the shared
++	 * afc_io buffer cannot be used across recursion).  The arrays stay
++	 * static (40 KiB of BSS) only because AFC dispatch is strictly serial
++	 * and non-reentrant, and that is documented by the surrounding code:
++	 *   - apple_services.c line 8: "All of this runs in the gadget event
++	 *     thread, so static buffers are safe."
++	 *   - apple_usbmux.c:15-16: "Everything here runs in the gadget's
++	 *     single event thread (ud_thread), so there are no locks: input,
++	 *     next_tx and the service callbacks never overlap."
++	 *   - amux_tcp_input() (apple_usbmux.c:394) calls svc->input()
++	 *     synchronously at apple_usbmux.c:443-444; the only caller of
++	 *     apple_usbmux_input() is ud_rx_done() in that same thread
++	 *     (sweet_usb.c:598, thread created at sweet_usb.c:1095).  The
++	 *     second thread, ud_log_thread() (sweet_usb.c:976), only drains
++	 *     the log ring and never touches the mux or a service.
++	 *   - afc_input() runs packets synchronously through afc_dispatch(),
++	 *     and afc_reply() -> apple_mux_send() only ring_push()es into
++	 *     c->out (apple_usbmux.c:610-619); no handler can re-enter
++	 *     dispatch.  The other AFC sessions (AFC_SLOTS = 4) can therefore
++	 *     only take the buffers between requests, never inside one.
++	 */
++	static uint8_t dbuf[AFC_SIZE_MAXDEPTH][AFC_SIZE_DIRBUF];
++	static char child[AFC_SIZE_MAXDEPTH][512];
++	vnode_t vp = NULLVP;
++	vfs_context_t vctx = vfs_context_kernel();
++	struct vnode_attr va;
++	UIO_STACKBUF(uio_store, 1);
++	off_t next = 0;
++	int err = 0, eofflag = 0;
++
++	if (depth >= AFC_SIZE_MAXDEPTH) {
++		return ELOOP;
++	}
++	err = vnode_lookup(path, 0, &vp, vctx);
++	if (err != 0) {
++		return err;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	err = vnode_getattr(vp, &va, vctx);
++	if (err != 0) {
++		vnode_put(vp);
++		return err;
++	}
++	if (incl_dirs) {
++		*total_size += (uint64_t)va.va_data_size;
++		*total_blocks += ((uint64_t)va.va_data_size + 511) / 512;
++	}
++	/* Bounded like afc_rmtree(): a directory is read to eofflag, and the
++	 * round cap keeps a broken filesystem from pinning this thread. */
++	for (int rounds = 0; rounds < 4096 && !eofflag; rounds++) {
++		uio_t uio;
++		uint32_t used, o;
++		int numdirent = 0;
++
++		memset(dbuf[depth], 0, AFC_SIZE_DIRBUF);
++		uio = uio_createwithbuffer(1, next, UIO_SYSSPACE, UIO_READ,
++		    uio_store, sizeof(uio_store));
++		if (uio == NULL) {
++			err = ENOMEM;
++			break;
++		}
++		uio_addiov(uio, (user_addr_t)(uintptr_t)dbuf[depth],
++		    AFC_SIZE_DIRBUF);
++		eofflag = 0;
++		err = VNOP_READDIR(vp, uio, 0, &eofflag, &numdirent, vctx);
++		if (err != 0) {
++			break;
++		}
++		used = AFC_SIZE_DIRBUF - (uint32_t)uio_resid(uio);
++		next = uio_offset(uio);
++		if (used == 0 && !eofflag) {
++			err = EIO;      /* no forward progress */
++			break;
++		}
++		for (o = 0; o + DIRENT_RECLEN_MIN <= used; ) {
++			struct dirent *dp =
++			    (struct dirent *)(void *)(dbuf[depth] + o);
++			uint32_t reclen = dp->d_reclen;
++			uint32_t namlen = dp->d_namlen;
++			uint32_t maxlen;
++			vnode_t cvp = NULLVP;
++			struct vnode_attr cva;
++			int cerr;
++
++			if (reclen < DIRENT_RECLEN_MIN || o + reclen > used) {
++				err = EIO;
++				break;
++			}
++			maxlen = reclen -
++			    (uint32_t)offsetof(struct dirent, d_name);
++			o += reclen;
++			if (namlen == 0 || namlen >= maxlen ||
++			    (namlen == 1 && dp->d_name[0] == '.') ||
++			    (namlen == 2 && dp->d_name[0] == '.' &&
++			    dp->d_name[1] == '.')) {
++				continue;
++			}
++			if (snprintf(child[depth], sizeof(child[depth]),
++			    "%s/%.*s", path, (int)namlen, dp->d_name) >=
++			    (int)sizeof(child[depth])) {
++				continue;
++			}
++			cerr = vnode_lookup(child[depth],
++			    VNODE_LOOKUP_NOFOLLOW, &cvp, vctx);
++			if (cerr != 0) {
++				if (cerr == ENOENT) {
++					continue;   /* raced with unlink */
++				}
++				err = cerr;
++				break;
++			}
++			VATTR_INIT(&cva);
++			VATTR_WANTED(&cva, va_type);
++			VATTR_WANTED(&cva, va_data_size);
++			cerr = vnode_getattr(cvp, &cva, vctx);
++			if (cerr != 0) {
++				vnode_put(cvp);
++				err = cerr;
++				break;
++			}
++			if (cva.va_type == VREG) {
++				*total_size += (uint64_t)cva.va_data_size;
++				*total_blocks +=
++				    ((uint64_t)cva.va_data_size + 511) / 512;
++			}
++			vnode_put(cvp);
++			if (cva.va_type == VDIR) {
++				cerr = afc_size_recurse(child[depth],
++				    depth + 1, incl_dirs, total_size,
++				    total_blocks);
++				if (cerr != 0) {
++					err = cerr;
++					break;
++				}
++			}
++		}
++		if (err != 0) {
++			break;
++		}
++	}
++	vnode_put(vp);
++	return err;
++}
++
++static void
++afc_size_of_path_contents(void *conn, struct afc_ctx *c, const char *rel,
++    uint64_t flags)
++{
++	char path[512];
++	char num[32];
++	vnode_t vp = NULLVP;
++	vfs_context_t vctx = vfs_context_kernel();
++	uint64_t total_size = 0, total_blocks = 0;
++	uint32_t n = 0;
++	int err;
++
++	if (afc_path(rel, path, sizeof(path)) != 0) {
++		afc_status(conn, c, AFC_E_PERM);
++		return;
++	}
++	err = vnode_lookup(path, 0, &vp, vctx);
++	if (err != 0) {
++		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++		return;
++	}
++	if (vnode_vtype(vp) != VDIR) {
++		/* A regular file reports zero: the op sums the *contents* of
++		 * a directory, it is not stat(). */
++		vnode_put(vp);
++	} else {
++		vnode_put(vp);
++		err = afc_size_recurse(path, 0, (flags & 1) != 0,
++		    &total_size, &total_blocks);
++		if (err != 0) {
++			afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
++			return;
++		}
++	}
++	memset(afc_io, 0, 128);
++	snprintf(num, sizeof(num), "%llu", (unsigned long long)total_size);
++	n = afc_kv((char *)afc_io, 128, n, "st_size", num);
++	snprintf(num, sizeof(num), "%llu",
++	    (unsigned long long)total_blocks);
++	n = afc_kv((char *)afc_io, 128, n, "st_blocks", num);
++	afc_reply(conn, c, AFC_OP_DATA, afc_io, n);
++}
++
+ static void
+ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl,
+     uint32_t len, const uint8_t *extra, uint32_t extralen)
+@@ -1709,6 +2089,51 @@ afc_dispatch(void *conn, struct afc_ctx *c, uint64_t op, const uint8_t *pl,
+ 		afc_status(conn, c, (uint64_t)afc_errno_to_afc(err));
+ 		break;
+ 	}
++	case AFC_OP_FILE_HASH:
++		/*
++		 * 0x1D: [path\0].  A host-controlled length never promises a
++		 * terminator (the same class of bug 0490 v2 fixed for the
++		 * other path opcodes), so bound the scan by the declared
++		 * payload before afc_path()/strlen() can walk off the
++		 * reassembly buffer.
++		 */
++		if (len < 1 || memchr(pl, '\0', len) == NULL) {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		afc_file_hash(conn, c, (const char *)pl);
++		break;
++	case AFC_OP_SET_FILE_MOD_TIME: {
++		/*
++		 * 0x1E: [u64 mtime_ns][path\0], afc.c afc_set_file_time().
++		 * The shortest legal body is 8 + one name byte + NUL = 10, and
++		 * an empty name is refused explicitly: afc_path("") resolves
++		 * to the sandbox root, so len == 9 would let a host retime it.
++		 */
++		if (len < 10 || memchr(pl + 8, '\0', len - 8) == NULL ||
++		    pl[8] == '\0') {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		afc_set_mtime(conn, c, (const char *)(const void *)(pl + 8),
++		    apple_le64(pl));
++		break;
++	}
++	case AFC_OP_GET_SIZE_OF_PATH_CONTENTS: {
++		/*
++		 * 0x21: [u64 flags][path\0].  Same 10-byte minimum and empty
++		 * path rejection as SET_FILE_MOD_TIME above: afc_path("")
++		 * is the sandbox root and must not be stat'd on request.
++		 */
++		if (len < 10 || memchr(pl + 8, '\0', len - 8) == NULL ||
++		    pl[8] == '\0') {
++			afc_status(conn, c, AFC_E_INVALID);
++			break;
++		}
++		afc_size_of_path_contents(conn, c,
++		    (const char *)(const void *)(pl + 8), apple_le64(pl));
++		break;
++	}
+ 	case AFC_OP_REMOVE_AND_CONTENTS:
+ 		afc_remove_contents(conn, c, (const char *)pl);
+ 		break;
