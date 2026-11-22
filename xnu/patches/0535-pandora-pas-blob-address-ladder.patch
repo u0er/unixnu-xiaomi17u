@@ -1,0 +1,88 @@
+From: baseband lane
+Subject: 0535 pandora_pas/adsp: walk the metadata allocation down from 1 GiB, and print both blobs
+
+The 2026-11-23 03:1x ring says what every recent boot has said:
+
+  PANDORA PAS: modem_dtb.mdt: metadata does not fit below 4 GiB, allocated above
+  PANDORA PAS: shm_bridge_create(0x8caf6c000+0x1000) -> a0 0 ...
+
+so the metadata page is at ~37 GiB and the secure world refuses the call.  0517 asked for "below
+4 GiB" and 0524 fell straight back to "anywhere" when that one request failed; the low 4 GiB are full
+of carveouts, so a single ceiling of 4 GiB has never once been satisfiable.
+
+This walks the ceiling down -- 1 GiB, 2, 3, 4, then anywhere -- so the allocator gets four chances to
+return a low page.  Four failing allocations cost nothing measurable, and the address that comes back
+is already printed, so the next ring says which rung worked.
+
+The ADSP's own INIT_IMAGE line now prints its blob address too.  That path is accepted on this phone
+in the same boot; if its metadata also sits above 4 GiB, the address is not the difference and this
+hypothesis dies with the evidence rather than lingering.  If it sits low, the difference is in front
+of us.
+
+diff --git a/bsd/dev/pandora_adsp.c b/b/bsd/dev/pandora_adsp.c
+index f7e9763..5574dfa 100755
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -945,8 +945,10 @@ pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t me
+ 	struct scm_res r;
+ 	*bridge = 0;
+ 	scm_smc(SCM_FN(2, 1), SCM_ARGS(2) | (SCM_RW << 6), pas, md_pa, 0, 0, &r);
+-	printf("PANDORA ADSP: pas %u init_image (%u bytes) -> a0 %#llx (%d) a1 %#llx\n", pas,
+-	    ehdr_size + hash_size, r.a0, (int)(int32_t)r.a0, r.a1);
++	/* The blob's physical address is printed because the modem path's is above 4 GiB and is
++	 * refused while this one is accepted: the two have to be comparable in one log. */
++	printf("PANDORA ADSP: pas %u init_image (%u bytes, blob %#llx) -> a0 %#llx (%d) a1 %#llx\n",
++	    pas, ehdr_size + hash_size, md_pa, r.a0, (int)(int32_t)r.a0, r.a1);
+ 	if (r.a0 || r.a1) {
+ 		return EIO;
+ 	}
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index 071f3ec..50c52bd 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -292,16 +292,36 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 	 * whole window spent proving nothing.  So the constraint stays as a preference and the
+ 	 * unconstrained allocation is the fallback; whichever one happens is printed.
+ 	 */
+-	if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, MD_MAX_PNUM, 0,
+-	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0, 0,
+-		    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-			printf("PANDORA PAS: %s: no metadata buffer (%u bytes), not even unconstrained\n",
+-			    name, (unsigned)md_size);
+-			err = ENOMEM;
+-			goto out;
++	/*
++	 * A ladder of ceilings, not one ceiling and then none.
++	 *
++	 * 0517 asked for "below 4 GiB" and the 2026-11-22 06:30 boot showed the low 4 GiB are full of
++	 * carveouts, so that request simply failed; 0524 then fell straight back to "anywhere", and
++	 * every boot since has put the metadata at 0x8caf... (about 37 GiB).  The 2026-11-23 03:1x
++	 * ring prints exactly that, and the secure world refuses the call.
++	 *
++	 * Walking the ceiling down -- 1 GiB, 2, 3, 4, then anywhere -- costs four failing allocations
++	 * at worst and gives the platform every chance to hand back a low page, which is the only part
++	 * of this call the code cannot verify before making it.
++	 */
++	static const ppnum_t ceilings[] = { 0x40000u, 0x80000u, 0xc0000u, MD_MAX_PNUM };
++	bool low = false;
++	for (unsigned i = 0; i < sizeof(ceilings) / sizeof(ceilings[0]) && !low; i++) {
++		if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, ceilings[i], 0,
++		    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
++			low = true;
+ 		}
+-		printf("PANDORA PAS: %s: metadata does not fit below 4 GiB, allocated above\n", name);
++	}
++	if (!low && kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("PANDORA PAS: %s: no metadata buffer (%u bytes), not even unconstrained\n",
++		    name, (unsigned)md_size);
++		err = ENOMEM;
++		goto out;
++	}
++	if (!low) {
++		printf("PANDORA PAS: %s: metadata does not fit below 4 GiB at any ceiling, allocated "
++		    "above\n", name);
+ 	}
+ 	uint64_t md_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)md));
+ 	memcpy((void *)md, hdr, ehdr_size);
