@@ -1,0 +1,49 @@
+From: baseband lane
+Subject: 0533 pandora_pas: compare the carved image eight bytes at a time, when it is aligned
+
+The read-back added in 0531/0532 walks the carveout byte by byte.  That carveout is mapped
+write-combining (VM_WIMG_WCOMB, the same flag HakiOS uses), and 67 MiB of byte-at-a-time reads out of
+WC memory is a real slice of the 170 s this lane boots under -- for no benefit, since the comparison
+is on whole words anyway.
+
+Eight bytes at a time, with a byte tail for whatever the segment size leaves over, and a byte-wise
+fallback whenever the carved address or the staging buffer is not eight-byte aligned: an eight-byte
+read out of write-combining memory faults when it is not, and although the carveout base and every
+segment offset this phone ships happen to be page aligned, that is a property of the files rather
+than of the code -- the kind of assumption that has already ended two of this stage's boots.
+
+The zeroed padding check stays byte-wise because it is small.  No change in what is accepted or
+refused.
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index b66cdc2..071f3ec 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -410,7 +410,26 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 				}
+ 				const uint8_t *at = (const uint8_t *)(mem + off);
+ 				const uint8_t *was = (const uint8_t *)tmp;
+-				for (uint32_t k = 0; k < ph[i].p_filesz; k++) {
++				/*
++				 * Eight bytes at a time: the carveout is mapped write-combining (VM_WIMG_WCOMB,
++				 * as HakiOS maps it), and a byte-at-a-time compare of 67 MiB out of WC memory
++				 * would eat a noticeable part of the 170 s budget this lane boots under.  The
++				 * segments are 4-byte aligned by the ELF header, and the tail below handles
++				 * whatever is left.
++				 */
++				uint32_t k = 0;
++				/* An eight-byte read out of write-combining memory must be eight-byte
++				 * aligned or it faults.  The carveout base and the segment offsets are page
++				 * aligned for every image this phone ships, but that is a property of the
++				 * files, not of the code: fall back to bytes when it does not hold. */
++				bool words = ((off & 7) == 0) && ((uint64_t)tmp & 7) == 0;
++				for (; words && (k + 8) <= ph[i].p_filesz; k += 8) {
++					if (*(const uint64_t *)(const void *)(at + k) !=
++					    *(const uint64_t *)(const void *)(was + k)) {
++						differ++;
++					}
++				}
++				for (; k < ph[i].p_filesz; k++) {
+ 					if (at[k] != was[k]) {
+ 						differ++;
+ 					}
