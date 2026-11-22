@@ -450,6 +450,10 @@ static ArmSmmu4KStreamState vidc_smmu_sstate;   /* owned routes, for teardown */
  * (io_submap already full), so the problem was what we KEEP, not when -- see
  * vidc_probe() for why the register windows now live on kernel_map. */
 static int      vidc_defer_ms = 0;
+/* pandora_vidc_rcg=1: trigger the five videocc RCG2 root generators (see
+ * vidc_rcg_trigger()).  Off by default so the ladder stays vendor-faithful; one
+ * boot with it answers "is the core starved of its root clock?" directly. */
+static int      vidc_rcg_on;
 static bool     vc_smmu_faults_done;
 static unsigned vc_smmu_faults;
 
@@ -1298,6 +1302,14 @@ vidc_cc_rd(uint32_t off)
     return *(volatile uint32_t *)(vidc_cc + off);
 }
 
+static inline void
+vidc_cc_wr(uint32_t off, uint32_t v)
+{
+    if (!vidc_cc) return;
+    *(volatile uint32_t *)(vidc_cc + off) = v;
+    __asm__ volatile ("dmb oshst" ::: "memory");
+}
+
 /* GCC branch with BRANCH_HALT_SKIP: enable = set bit0, verify bit0 only. */
 static int
 vidc_gcc_branch_on(uint32_t off, const char *name)
@@ -1331,6 +1343,53 @@ vidc_branch_on(uint32_t off)
         delay(1);
     }
     printf("PANDORA VIDC: branch %#x halt timeout (cbcr=%08x)\n", off, *cbcr);
+}
+
+/* clk-qcom RCG2 root generator trigger.
+ *
+ * The captured vendor clock driver starts an RCG with a one-shot write of BIT(0)
+ * to CMD_RCGR: clk_rcg2_configure() -> update_config() does
+ * regmap_update_bits(regmap, cmd_rcgr, BIT(0), BIT(0)) and then polls until the
+ * hardware clears that bit [K clock_regs.txt:313-392, update_config
+ * 0x12f0c-0x13038: "mov w2,#1 / mov w3,#1" immediately before the regmap
+ * update].  A qcom branch clk gates its parent; if the RCG that feeds it was
+ * never triggered, the branch reads "gate open" (CLK_OFF clear) while the core
+ * still receives no clock.
+ *
+ * On this board nothing in XNU ever runs clk_set_rate() on the video RCGs, so
+ * CFG/M/N/D are still at reset (measured 0/0/0/0 for all five) and the triggers
+ * have never fired.  This is the one visible hardware difference left between
+ * our power-up and the vendor's, so it is worth a single opt-in experiment:
+ *   pandora_vidc_rcg=1  -> trigger the five RCGs and print before/after.
+ * The parent select and divider are NOT invented: CFG is left exactly as found,
+ * so the RCG runs at its reset selection (parent 0, divide-by-1) if it runs at
+ * all.  Every step is read back; a timeout is reported, never assumed. */
+static void
+vidc_rcg_trigger(const char *why)
+{
+    static const struct { const char *name; uint32_t off; } rcgs[] = {
+        { "mvs0a", 0x8000u }, { "mvs0b", 0x8018u }, { "mvs0", 0x8030u },
+        { "mvs0c", 0x8048u }, { "ahb",   0x8060u }, { "xo",   0x8194u },
+    };
+    for (unsigned k = 0; k < sizeof(rcgs) / sizeof(rcgs[0]); k++) {
+        const uint32_t off = rcgs[k].off;
+        const uint32_t cmd = vidc_cc_rd(off);
+        const uint32_t cfg = vidc_cc_rd(off + 4);
+        if (cmd & 1u) {
+            printf("PANDORA VIDC: rcg %-5s (%s) already updating (cmd=%08x)\n",
+                rcgs[k].name, why, cmd);
+            continue;
+        }
+        vidc_cc_wr(off, cmd | 1u);
+        unsigned i = 0;
+        for (; i < 500; i++) {
+            if (!(vidc_cc_rd(off) & 1u)) break;
+            delay(1);
+        }
+        printf("PANDORA VIDC: rcg %-5s (%s) cfg=%08x cmd %08x -> %08x "
+               "(update %s after %u us)\n", rcgs[k].name, why, cfg, cmd,
+            vidc_cc_rd(off), i < 500 ? "done" : "TIMEOUT", i);
+    }
 }
 
 /* Bridge sync reset, mainline iris_vpu4x_set_hwmode order: BIT0|BIT1 ->
@@ -1472,6 +1531,14 @@ vidc_power_up(void)
             vidc_cc_rd(rcgs[i].off + 8), vidc_cc_rd(rcgs[i].off + 0xC),
             vidc_cc_rd(rcgs[i].off + 0x10));
     }
+    if (vidc_rcg_on) {
+        vidc_rcg_trigger("before boot");
+        for (unsigned i = 0; i < sizeof(rcgs) / sizeof(rcgs[0]); i++) {
+            printf("PANDORA VIDC: rcg %-5s after trigger cfg=%08x cmd=%08x\n",
+                rcgs[i].name, vidc_cc_rd(rcgs[i].off + 4),
+                vidc_cc_rd(rcgs[i].off));
+        }
+    }
     /* Every reader of the GCC/videocc windows has now run (snapshot + RCG
      * dump).  The ordering is load-bearing: releasing first made the snapshot
      * print zeros and hid the RCG configuration -- the very evidence this driver
@@ -1550,18 +1617,18 @@ vidc_publish_queues(void)
            "0xA0060=%08x; CP span 0xA0024/0xA0028 skipped (no TZ CP table)\n",
         vidc_rd(R_CPU_SFR_ADDR), vidc_rd(R_CPU_QUEUE_TABLE_ADDR2));
 
-    /* Assert MSK_CORE_POWER_ON (BIT1) before releasing the core.  The register
-     * definition is explicit: CPU_CS_X2RPMH bit1 is the core power-on request
-     * (iris_vpu_register_defines.h:39-41) and the vendor clears it to 0 only
-     * after the handshake succeeds.  Every earlier ladder left it at 0, and the
-     * snapshot proved the consequence: bit1 read 0, the CPU block and the TZ
-     * wrapper stayed all-zero, and 0xA004C never reported ready -- TZ's
-     * auth_and_reset had released the reset, but the wrapper had never been
-     * asked to power the core. */
-    vidc_wr(R_CPU_X2RPMH, MSK_CORE_POWER_ON);
-    __asm__ volatile ("dsb sy" ::: "memory");
-    printf("PANDORA VIDC: core power-on request 0x%08x = %08x\n",
-        R_CPU_X2RPMH, vidc_rd(R_CPU_X2RPMH));
+    /* Do NOT touch CPU_CS_X2RPMH before releasing the core.  0533 change: the
+     * vendor's __boot_firmware_iris4 never writes w21+0x144 (0xA0168) before
+     * 0xA0048 -- the single site in the whole function is the success branch
+     * 0x15CD8, which writes 0 [K 0x15A44+0x308].  Our previous revision
+     * asserted MSK_CORE_POWER_ON (BIT1) unconditionally right before the boot
+     * control write, and the 17:22 boot then read back x2rpmh=00000002 while
+     * both 0xA004C and 0xC0010 stayed all-zero: the Xtensa never started.
+     * The vendor leaves this register at reset 0 until the handshake is done,
+     * so holding BIT1 across the release was the last pure increment we had
+     * over the vendor sequence.  Read it, never write it. */
+    printf("PANDORA VIDC: X2RPMH left at %08x (vendor writes it only on success/power-off)\n",
+        vidc_rd(R_CPU_X2RPMH));
     vc_smmu_faults = 0;
     vc_smmu_faults_done = false;
     /* Drop any fault latched during table build/attach so the capture below
@@ -2136,7 +2203,9 @@ pandora_vidc_init(void)
     (void)PE_parse_boot_argn("pandora_vidc_defer_ms", &vidc_defer_ms,
         sizeof(vidc_defer_ms));
     if (vidc_defer_ms < 0) vidc_defer_ms = 0;
-    printf("PANDORA VIDC: bring-up deferred %d ms\n", vidc_defer_ms);
+    (void)PE_parse_boot_argn("pandora_vidc_rcg", &vidc_rcg_on, sizeof(vidc_rcg_on));
+    printf("PANDORA VIDC: bring-up deferred %d ms, rcg trigger %s\n",
+        vidc_defer_ms, vidc_rcg_on ? "ON" : "off (pandora_vidc_rcg=1 opts in)");
 
     char fw[64];
     if (PE_parse_boot_arg_str("pandora_vidc_fw", fw, sizeof(fw)) && fw[0])
