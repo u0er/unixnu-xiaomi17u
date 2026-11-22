@@ -1,0 +1,65 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0525 sweet_nub: point the descriptor holder at an inert sink, not the controller
+
+0523 installed the holder and createUSBDevice got past the NULL, then died in
+OSData::initWithBytes with a 127 MB length (x2 = 0x079cc4a4). Disassembly explains it exactly:
+the helper calls holder->target->vtable[29] with only (target, value), but the controller's slot 29
+is IORegistryEntry::setProperty(const char*, void*, unsigned) -- the overload that treats x2/x3 as
+bytes and length. The helper never sets x3, so the length is whatever the caller left behind. The
+holder's +0x10 was pointed at the controller on 0523, which selected that 3-argument overload.
+
+0525 gives the holder an inert target instead: a 0x10-byte object whose vtable is 256 entries all
+pointing at an extern "C" stub returning 0. The helper's two calls (slot 29 and slot 18) land
+there, do nothing, and createUSBDevice continues. The 0524 full description is kept.
+
+Device evidence: outputs/data-a-live-nezha/device/private/logs/1795307450 (kernel.txt, after
+"installed descriptor holder ... at ctl+0x130"), plus the slot-29 wrapper disassembly at
+0xfffffff007a30140 (x0=x2, x1=x3, call OSData::withBytes).
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -62,6 +62,23 @@
+ 
+ static void *sweet_nub_vtable[SWEET_NUB_CTL_SLOTS];
+ 
++/*
++ * 0525: createUSBDevice's helper calls holder->target->vtable[29] with only (target, value),
++ * but the controller's slot 29 is IORegistryEntry::setProperty(key, bytes, len) -- it takes the
++ * length from x3, which the helper never sets. That is exactly the 127 MB memcpy seen on 0523:
++ * OSData::initWithBytes with x2 = 0x079cc4a4. So the holder's +0x10 must point at an object whose
++ * slot 29 accepts (key, value); pointing it at the controller picked the wrong overload.
++ *
++ * For bring-up the target only has to survive two calls (slot 29 and slot 18), so give it a table
++ * of functions that return 0. Nothing is logged and nothing is stored; createUSBDevice keeps
++ * running and the next crash (if any) will be a real precondition, not our shim.
++ */
++extern "C" uint64_t sweet_sink_zero(void *, uint64_t, uint64_t, uint64_t)
++{
++	return 0;
++}
++static void *sweet_sink_vtable[256];
++
+ extern "C" void sweet_nub_probe(void);
+ extern "C" void sweet_nub_start(void);
+ 
+@@ -435,11 +452,16 @@
+ 	 */
+ 	{
+ 		void **holder = (void **)OSObject::operator new(0x20);
+-		if (holder != NULL) {
+-			holder[2] = (void *)ctl;                 /* +0x10 */
++		void **sink = (void **)OSObject::operator new(0x10);
++		if (holder != NULL && sink != NULL) {
++			for (unsigned i = 0; i < 256; i++) {
++				sweet_sink_vtable[i] = (void *)sweet_sink_zero;
++			}
++			sink[0] = (void *)sweet_sink_vtable;
++			holder[2] = (void *)sink;                /* +0x10 = inert sink object */
+ 			*(void **)((char *)ctl + 0x130) = holder;
+-			printf("SWEET NUB: installed descriptor holder %p at ctl+0x130 (target %p)\n",
+-			    holder, (void *)ctl);
++			printf("SWEET NUB: installed descriptor holder %p at ctl+0x130 (sink %p)\n",
++			    holder, (void *)sink);
+ 		} else {
+ 			printf("SWEET NUB: cannot allocate the descriptor holder\n");
+ 		}
