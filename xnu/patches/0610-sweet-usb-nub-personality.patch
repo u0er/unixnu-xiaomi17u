@@ -1,0 +1,35 @@
+From: CarPlay C0 lane (2026-11-21)
+Subject: 0510 sweet_nub: choose the controller personality by boot argument
+
+IOUSBDeviceFamily publishes four configurator personalities, and they differ only in which
+interfaces the DeviceDescription asks for: ncmBringup is AppleUSBNCMControl + AppleUSBNCMData,
+iBridgeBringup is AppleUSBMux + AppleUSBNCMControl + AppleUSBNCMData. CarPlay needs the mux
+variant, plain C0 verification needs the NCM variant, and rebuilding the kernel to switch between
+them costs a CI round and an image rebuild each time.
+
+0510 reads an integer boot argument sweet_nub_ibridge (same PE_parse_boot_argn pattern as the
+existing sweet_nub=1 gate) and publishes ConfigurationType accordingly, logging which one was
+used. Default stays ncmBringup, so the existing queue is unchanged; the next boot can A/B the
+iBridge personality with one bootarg on the same image.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -208,7 +208,17 @@
+ 
+ 	/* prepareDefaults overwrites ConfigurationType; set the matching value now and
+ 	 * publish, which is what starts personality matching (IOService.h:650). */
+-	ctl->setProperty("ConfigurationType", "ncmBringup");
++	/* Personality selection: the four IOUSBDeviceFamily personalities differ only in the
++	 * InterfaceAssociation/Interfaces sets, so this is the one knob that decides whether the
++	 * host sees plain NCM (AppleUSBNCMControl/Data) or the CarPlay-capable iBridge set
++	 * (AppleUSBMux + NCM). Making it a boot argument turns a personality change from a CI
++	 * round + image rebuild into a single bootarg, which is exactly what an A/B needs. */
++	int ibridge = 0;
++	PE_parse_boot_argn("sweet_nub_ibridge", &ibridge, sizeof(ibridge));
++	const char *personality = ibridge ? "iBridgeBringup" : "ncmBringup";
++	ctl->setProperty("ConfigurationType", personality);
++	printf("SWEET NUB: ConfigurationType=%s%s\n", personality,
++	    ibridge ? " (sweet_nub_ibridge=1)" : " (pass sweet_nub_ibridge=1 for iBridge)");
+ 	ctl->registerService();
+ 	printf("SWEET NUB: registered as ncmBringup; mux/configurator should now match\n");
+ }
