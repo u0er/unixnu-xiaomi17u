@@ -1,0 +1,55 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0523 sweet_nub: install the descriptor holder createUSBDevice dereferences
+
+0522's S3d boot got further than any before -- S0/S2/S3 all True, DeviceDescription published --
+and still died at the same place: "ctl+0x130 = 0" then data abort at 0xfffffff004cf1b54.
+
+Disassembling the helper (0xfffffff004cf1b40) shows why the NULL matters and what it wants:
+  if (x1 == NULL) return 0;
+  x0 = [holder + 0x10];              // an IORegistryEntry
+  x0->vtable[0xe8](x0, x1);          // setProperty-style
+  x0->vtable[0x90](x0);              // tail call
+So [ctl+0x130] must be a holder whose +0x10 points at a registry entry, not the entry itself.
+
+The only store to +0x130 in this prelink is at 0xfffffff004cf0614, inside a function
+(0xfffffff004cf05d8) that has no static caller and no data reference at all -- it is not the path
+this build takes; Apple's concrete controllers fill that field in their own init. Since neither
+AppleSynopsysOTGDevice nor AppleVirtIOUSBDeviceController is even registered here (both metas 0),
+0523 installs the holder itself: 0x20 zeroed bytes with +0x10 = the controller (an IORegistryEntry),
+and prints the pointer. This is a bring-up shim; if createUSBDevice now proceeds, the next failure
+line tells us what the holder really had to be.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -367,6 +367,31 @@
+ 		if (ifaces) ifaces->release();
+ 		if (attr) attr->release();
+ 		if (maxpower) maxpower->release();
++	}
++	/*
++	 * 0523: createUSBDevice expects [ctl+0x130] to be a small holder whose +0x10 is an
++	 * IORegistryEntry; it calls that target's vtable slot 29 (helper 0xfffffff004cf1b40:
++	 * `ldr x0,[x0,#0x10]` -> slot 0xe8 -> tail-call slot 0x90). On 0522 the holder was still
++	 * NULL after publishing DeviceDescription (`ctl+0x130 = 0`), because the only function in
++	 * the prelink that stores it (0xfffffff004cf05d8) has no static caller at all -- it is not
++	 * the path this build takes. Apple's concrete controllers populate it in their own init.
++	 *
++	 * So build the holder here: 0x20 zeroed bytes with +0x10 = the controller itself. The
++	 * controller is an IORegistryEntry, so the helper's setProperty/getProperty calls land on
++	 * it instead of NULL. This is a bring-up shim, not the real descriptor object; the probe
++	 * prints the pointer so the next boot shows whether createUSBDevice now gets past the
++	 * dereference and which line it reaches next.
++	 */
++	{
++		void **holder = (void **)OSObject::operator new(0x20);
++		if (holder != NULL) {
++			holder[2] = (void *)ctl;                 /* +0x10 */
++			*(void **)((char *)ctl + 0x130) = holder;
++			printf("SWEET NUB: installed descriptor holder %p at ctl+0x130 (target %p)\n",
++			    holder, (void *)ctl);
++		} else {
++			printf("SWEET NUB: cannot allocate the descriptor holder\n");
++		}
+ 	}
+ 	ctl->setProperty("ConfigurationType", personality);
+ 	printf("SWEET NUB: ConfigurationType=%s (sweet_nub=%d%s)\n", personality, run_start,
