@@ -446,9 +446,9 @@ static uint32_t vidc_smmu_bank;
 static ArmSmmu4KStreamState vidc_smmu_sstate;   /* owned routes, for teardown */
 /* Fault-capture state for the post-boot-release window. */
 /* Default 0 = bring-up at init.  Deferring to 9 s dodged the TOUCH 128 KiB
- * failure at 5.171 s but then our 3 MiB queue table made a later 1 MiB
- * kmem_alloc fail at 9.180 s, so the problem is what we KEEP, not when.
- * The teardown below frees the SMMU window as soon as the ladder ends. */
+ * failure at 5.171 s but then our own 1 MiB apps-smmu map failed at 9.180 s
+ * (io_submap already full), so the problem was what we KEEP, not when -- see
+ * vidc_probe() for why the register windows now live on kernel_map. */
 static int      vidc_defer_ms = 0;
 static bool     vc_smmu_faults_done;
 static unsigned vc_smmu_faults;
@@ -651,20 +651,20 @@ vidc_alloc_buffers(void)
 
 static vm_offset_t vidc_smmu_va;
 
-/* Release the apps-smmu window if it is still mapped.  Idempotent: the failure
- * paths of vidc_smmu_up() and its success path both call it, and so does the
- * ladder teardown.  This exists because the original code unmapped ONLY on
- * success, so every early return leaked 1 MiB of kernel_map -- the same kind of
- * permanent footprint that produced the 5.177 s kmem_alloc failure. */
+/* Bookkeeping only.  This USED to be the release path, and it never released
+ * anything: ml_io_unmap() on an ml_io_map() window panics ("Attempting to remove
+ * permanent VM map entry", restart type 4 at 0.207 s on 2026-11-21 23:36), so the
+ * 1 MiB stayed in the shared 8 MiB io_submap for the whole boot while this
+ * function printed that it had been given back.
+ *
+ * As of 2026-11-22 the window is made with ml_io_map_unmappable() (kernel_map,
+ * KMA_DATA), so the io_submap no longer pays for it at all.  The mapping still
+ * stays up: vidc_smmu_wait_faults() reads FSR/FAR through it after the ladder,
+ * and unmapping+remapping inside those polls would add a VM call to a path that
+ * has to stay allocation-free. */
 static void
 vidc_smmu_drop(void)
 {
-    /* NOTE: this used to call ml_io_unmap().  That is illegal for a window made
-     * by ml_io_map(): it is a PERMANENT VM map entry and removing it panics
-     * (`vm_map_delete: Attempting to remove permanent VM map entry`,
-     * restart type 4 at 0.207 s on 2026-11-21 23:36).  The window therefore
-     * stays mapped for the lifetime of the driver, exactly like every other
-     * pandora_* driver's register window. */
     vidc_smmu_drop_calls++;
 }
 
@@ -724,7 +724,8 @@ vidc_smmu_up(void)
         return -1;
     }
     if (!vidc_smmu_va) {
-        vidc_smmu_va = ml_io_map(VIDC_SMMU_PA, VIDC_SMMU_SIZE);
+        /* UNMAPPABLE, not ml_io_map: see the budget note at vidc_probe(). */
+        vidc_smmu_va = ml_io_map_unmappable(VIDC_SMMU_PA, VIDC_SMMU_SIZE, VM_WIMG_IO);
         if (!vidc_smmu_va) {
             printf("PANDORA VIDC: cannot map apps-smmu at %#x\n", VIDC_SMMU_PA);
             return -1;
@@ -955,13 +956,13 @@ vidc_smmu_up(void)
     vidc_smmu_bank = bank;
     vidc_smmu_sstate = sstate;
     vidc_smmu_on = true;
-    /* Give the 1 MiB of apps-smmu VA back NOW, not at the end of the ladder.
-     * Measured: with the teardown only at the end, the kernel died at 5.177 s
-     * inside HFI polling on someone else's 864 KiB kmem_alloc
-     * (`failed with 3 @vm_kern.c:178`), i.e. we were still holding ~5.5 MiB.
-     * The bank/ASID/CB programming lives in the SMMU hardware, so the mapping
-     * is dead weight the moment attach succeeds. */
-    printf("PANDORA VIDC: released %#x bytes of apps-smmu VA after attach\n",
+    /* The 1 MiB apps-smmu window is a kernel_map (KMA_DATA) mapping now, so it
+     * is NOT part of the shared 8 MiB io_submap any more and does not have to be
+     * released to keep other drivers alive.  It stays mapped because the fault
+     * summary reads its FSR/FAR after the ladder (vidc_smmu_wait_faults()); the
+     * old "released ... bytes" line here was a lie: vidc_smmu_drop() could not
+     * unmap a permanent entry, so the 1 MiB was in fact held for the whole boot. */
+    printf("PANDORA VIDC: apps-smmu window 0x%x on kernel_map (not io_submap)\n",
         VIDC_SMMU_SIZE);
     printf("PANDORA VIDC: apps-smmu bank %u asid %u cb %#x sctlr %08x/%08x "
            "tcr %08x ttbr0 %#llx pages %zu\n", bank, asid, cb_off, sctlr,
@@ -1132,10 +1133,35 @@ vidc_release_qtable(void)
 static int
 vidc_probe(void)
 {
+    /* WHY ml_io_map_unmappable() AND NOT ml_io_map() -- read before changing any
+     * window below, including the SMMU/GCC/VIDEOCC ones:
+     *
+     * ml_io_map() takes its VA from io_submap, a FIXED 8 MiB range
+     * (osfmk/arm/io_map.c: #define IO_MAP_SIZE (8ul << 20)) whose entries are
+     * KMA_PERMANENT: they are never released -- by any driver, for the whole
+     * boot.  Permanent occupants measured on nezha by 5 s: touch GCC 0x1F0000 +
+     * TLMM 0xD8000, GPU GPUCC/GMU/SMMU/cmd-db, UFS apps-SMMU 0x100000, keys,
+     * SPMI, serial.  Once that range is full the NEXT caller panics inside
+     * kmem_alloc and the machine dies: eight VIDC boots died at 5.167-5.170 s in
+     * kmem_alloc(..., 131072, 0x100021) failed with 3 @vm_kern.c:178, and the
+     * caller is touch's cmd-db map (pandora_touch.c pt_rpmh_vote_locked():
+     * rh_db = ml_io_map(PT_CMDDB_PA, PT_CMDDB_SIZE=0x20000)).  Flags 0x100021
+     * = KMA_NOFAIL | KMA_PAGEABLE | KMA_PERMANENT, and the only call site with
+     * that combination is osfmk/arm/io_map.c itself -- so it really is io_submap.
+     *
+     * OUR four windows are 0xF0000 + 0x100000 + 0x10000 + 0x1000 = 2.0 MiB, i.e.
+     * a quarter of the whole range, and before today they were permanent.  The
+     * "release the SMMU window after attach" idea could never work: a permanent
+     * entry cannot be unmapped, and trying panics (restart type 4 at 0.207 s,
+     * 2026-11-21 23:36) -- so the release print was lying and the footprint
+     * stayed.  Moving the windows to kernel_map removes our 2.0 MiB from the
+     * range entirely; the same VM_WIMG_IO attributes and the same hardware
+     * access are kept, matching pandora_adsp.c / pandora_amp*.c /
+     * pandora_camera.c, which map every register window this way. */
     if (!vidc_mmio_on) {
-        vidc_mmio = ml_io_map(VIDC_PA, VIDC_SIZE);
+        vidc_mmio = ml_io_map_unmappable(VIDC_PA, VIDC_SIZE, VM_WIMG_IO);
         if (!vidc_mmio) {
-            printf("PANDORA VIDC: ml_io_map(%08x) failed\n", VIDC_PA);
+            printf("PANDORA VIDC: ml_io_map_unmappable(%08x) failed\n", VIDC_PA);
             return -1;
         }
         vidc_mmio_on = true;
@@ -1362,9 +1388,9 @@ static int
 vidc_power_up(void)
 {
     if (!vidc_cc) {
-        vidc_cc = ml_io_map(VIDEOCC_PA, VIDEOCC_SIZE);
+        vidc_cc = ml_io_map_unmappable(VIDEOCC_PA, VIDEOCC_SIZE, VM_WIMG_IO);
         if (!vidc_cc) {
-            printf("PANDORA VIDC: ml_io_map(videocc) failed\n");
+            printf("PANDORA VIDC: ml_io_map_unmappable(videocc) failed\n");
             return -1;
         }
     }
@@ -1384,10 +1410,10 @@ vidc_power_up(void)
      * Upstream order is AXI, HW_FREERUN, HW, BSE_HW, VPP0, VPP1, APV. */
     /* AXI first, exactly like upstream's enable_hardware_clocks order. */
     if (!vidc_gcc) {
-        vidc_gcc = ml_io_map(GCC_PA + GCC_MAP_OFF, GCC_SIZE);
+        vidc_gcc = ml_io_map_unmappable(GCC_PA + GCC_MAP_OFF, GCC_SIZE, VM_WIMG_IO);
     }
     if (!vidc_gcc) {
-        printf("PANDORA VIDC: ml_io_map(GCC) failed; AXI clocks cannot be voted\n");
+        printf("PANDORA VIDC: ml_io_map_unmappable(GCC) failed; AXI clocks cannot be voted\n");
         failed++;
     } else {
         if (vidc_gcc_branch_on(GCC_VIDEO_AXI0_CLK - GCC_MAP_OFF, "video_axi0") != 0) failed++;
@@ -1447,11 +1473,13 @@ vidc_power_up(void)
             vidc_cc_rd(rcgs[i].off + 0x10));
     }
     /* Every reader of the GCC/videocc windows has now run (snapshot + RCG
-     * dump), so hand them back before the long tail starts.  The ordering is
-     * load-bearing: releasing first made the snapshot print zeros and hid the
-     * RCG configuration -- the very evidence this driver exists to produce. */
-    printf("PANDORA VIDC: gcc+videocc windows kept mapped (%#x) -- unmapping "
-           "ml_io_map entries panics\n", (unsigned)(GCC_SIZE + VIDEOCC_SIZE));
+     * dump).  The ordering is load-bearing: releasing first made the snapshot
+     * print zeros and hid the RCG configuration -- the very evidence this driver
+     * exists to produce.  Both windows are ml_io_map_unmappable() (kernel_map,
+     * KMA_DATA) as of 2026-11-22, so keeping them up costs the shared 8 MiB
+     * io_submap nothing; 0x11000 B is simply charged to kernel_map instead. */
+    printf("PANDORA VIDC: gcc+videocc windows kept mapped (%#x) on kernel_map; "
+           "no io_submap cost\n", (unsigned)(GCC_SIZE + VIDEOCC_SIZE));
     return failed ? -1 : 0;
 }
 
@@ -2055,12 +2083,15 @@ summary:
             vidc_rd(R_WRAPPER_EFUSE), vidc_rd(R_WRAPPER_CORE_PWR),
             vidc_rd(R_WRAPPER_CORE_CLK), vidc_rd(R_VCODEC_SS_IDLE));
 
-    /* Every register window taken by ml_io_map() is a PERMANENT VM map entry.
-     * Unmapping one panics ("Attempting to remove permanent VM map entry",
-     * restart type 4 at 0.207 s on 2026-11-21 23:36), so the windows stay mapped
-     * for the driver's lifetime -- same as every other pandora_* driver.  The
-     * earlier "release early to shrink the footprint" idea was simply illegal. */
-    printf("PANDORA VIDC: ladder done; MMA windows kept mapped (permanent entries)\n");
+    /* The four register windows are ml_io_map_unmappable() (kernel_map,
+     * KMA_DATA) since 2026-11-22, i.e. they never touch the shared 8 MiB
+     * io_submap (osfmk/arm/io_map.c: IO_MAP_SIZE) whose exhaustion was killing
+     * this boot at 5.167-5.170 s.  They stay mapped for the driver's lifetime:
+     * KMA_DATA entries CAN be unmapped, so a later client path may release them
+     * explicitly, but there is nothing left to starve. */
+    printf("PANDORA VIDC: ladder done; register windows on kernel_map "
+           "(0x%x bytes, no io_submap cost)\n",
+        (unsigned)(VIDC_SIZE + VIDC_SMMU_SIZE + VIDEOCC_SIZE + GCC_SIZE));
 }
 
 /* ------------------------------------------------------------------ */
@@ -2070,15 +2101,19 @@ static void
 vidc_thread(void *arg, wait_result_t wresult)
 {
     (void)arg; (void)wresult;
-    /* Delay the bring-up so its ~5 MiB of permanent kernel_map (3.06 MiB queue
-     * table + SFR + 16-page SMMU pool + the 2 MiB of MMIO windows) is not taken
-     * while the boot-time drivers are still allocating.  Measured on this board:
-     * with pandora_vidc=0 or =1 the kernel reaches the 135 s timer, but with
-     * =2 the TOUCH driver's 128 KiB pageable kmem_alloc fails at 5.171 s
-     * (`failed with 3 @vm_kern.c:178` -> restart type 4).  The GPU lane maps a
-     * 2 GiB pool, so the kernel_map margin is thin and our peak tips it over.
-     * pandora_vidc_defer_ms defaults to 9000: past the 5.2 s window, and the
-     * 2.5 s vendor ready-poll still ends well inside the 120 s image timer. */
+    /* Delay the bring-up so its kernel_map allocations (3.06 MiB queue table +
+     * SFR + 16-page SMMU pool) do not land while the boot-time drivers are still
+     * allocating.  Measured: with pandora_vidc=0 or =1 the kernel reaches the
+     * 135 s timer; with =2 and pandora_vidc_defer_ms=9000 the bring-up survives
+     * the 5.2 s window but then the driver's own 1 MiB apps-smmu map fails at
+     * 9.180 s (io_submap, which was full by then).
+     *
+     * The real fix is in vidc_probe(): the four register windows moved off the
+     * shared 8 MiB io_submap to kernel_map (ml_io_map_unmappable), so VIDC no
+     * longer contributes 2.0 MiB of permanent entries there and pandora_touch's
+     * 128 KiB cmd-db map at ~5.17 s is no longer the victim.  The default is
+     * therefore 0 (start at init, exactly as before), and the queue window is
+     * still released before the long tail unless pandora_vidc_hfi=1. */
     if (vidc_defer_ms > 0) delay(vidc_defer_ms * 1000);
     if (vidc_level >= 1) {
         if (vidc_level >= 2) vidc_bringup();
