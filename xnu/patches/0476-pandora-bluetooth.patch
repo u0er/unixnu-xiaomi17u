@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..99573ea7b7ec558956950f4d046861867a63636a
+index 0000000..35b9acbbbb91601c5292b9cd3500ac354e92179c
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4894 @@
+@@ -0,0 +1,4946 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4027,6 +4027,58 @@ index 0000000..99573ea7b7ec558956950f4d046861867a63636a
 + * 20.35), which makes any post-hoc reading of a log attribute the wrong revision. */
 +#define BT_PERI_VER "20.35"
 +
++/* Level 20.43: drain the line to silence, the way upstream qbt_geni does.
++ *
++ * Every timing constant this lane has tried (40 ms, then 200 ms) was a guess at
++ * how long the ROM keeps talking after a bulk stage. Upstream UniXNU/QcaBluetooth
++ * does not guess: qbt_geni drains until the line goes quiet. That is the right
++ * criterion here too - phase B's residual stream is what buried the 0x23 answer,
++ * and a fixed window either cuts early (ack lost) or waits needlessly.
++ *
++ * quiet_ms is the gap that counts as silence; max_ms bounds the total wait and
++ * keeps the whole sequence inside the 30 s image timer. Wake bytes are answered
++ * but do not count as traffic. */
++static unsigned
++bt_peri_drain_silence(unsigned quiet_ms, unsigned max_ms, const char *what)
++{
++	uint64_t start, last_rx, quiet_ns, max_ns;
++	unsigned bytes = 0;
++
++	/* Compare durations throughout: clock_interval_to_deadline() produces an
++	 * absolute deadline, and comparing a delta against it silently disables the
++	 * bound (the first version of this helper did exactly that). */
++	max_ns = (uint64_t)max_ms * NSEC_PER_MSEC;
++	quiet_ns = (uint64_t)quiet_ms * NSEC_PER_MSEC;
++	last_rx = mach_absolute_time();
++	start = last_rx;
++
++	while (mach_absolute_time() - start < max_ns) {
++		uint8_t b;
++
++		if (!(bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
++			if (mach_absolute_time() - last_rx >= quiet_ns) {
++				break;
++			}
++			bt_sleep(100);
++			continue;
++		}
++		b = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++		if (b == 0xfdu) {
++			const uint8_t ack = 0xfc;
++
++			(void)bt_uart_tx(&ack, 1, "PERI silence wake ACK FC");
++			last_rx = mach_absolute_time();
++			continue;
++		}
++		bytes++;
++		last_rx = mach_absolute_time();
++	}
++	printf("PANDORA BT: %s: silenced after %u byte(s) (quiet %u ms)\n",
++	    what, bytes, quiet_ms);
++	pandora_log_sync();
++	return bytes;
++}
++
 +/* Level 20.21: phase A at the trace's own cadence.
 + *
 + * The 4 ms/segment pacing 20.13 introduced was a guess made before the Android
@@ -4612,10 +4664,10 @@ index 0000000..99573ea7b7ec558956950f4d046861867a63636a
 +	 * the 0x23 command itself (20.3 ms after the frame). The old 1000 ms window
 +	 * delayed the next command by ~980 ms for no reason; 40 ms still catches
 +	 * that trailing Command Complete. */
-+	/* The trace puts 0x23 only 0.1 ms after B's own Command Complete, so a long
-+	 * blind drain here both wastes time and leaves the reader in its record-skip
-+	 * state. Draining is now the caller's job, and the wait for the 0x23 answer
-+	 * is done by bt_peri_vs_cmd() with the exact-prefix matcher. */
++	/* Drain to silence before asking for the board id: upstream qbt_geni uses
++	 * exactly this criterion, and the fixed windows tried earlier are why the
++	 * 0x23 answer kept being buried in phase B's residual stream. */
++	(void)bt_peri_drain_silence(4u, 200u, "PERI TME-L map B tail");
 +	/* Phase C (trace 11.209352 0x23, then 57 frames to 11.380534): the nv
 +	 * stage carries gngbtnv20.bin behind a 4-byte 04 22 4c 00 header. This
 +	 * is the only stage the ROM answers frame by frame, so it runs with the
