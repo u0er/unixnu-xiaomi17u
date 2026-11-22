@@ -1,0 +1,97 @@
+From: baseband lane
+Subject: 0538 pandora: three fixes a second reviewer found (one would have inverted the next boot)
+
+1. pandora_mpss.c, is_call_available: the verdict was BACKWARDS.
+
+   It printed "NOT available" for (a0 || a1), i.e. for exactly the answer that means available on this
+   device.  pas_is_supported(4) prints a0 0 a1 0x1 for an id that is supported, and upstream reads
+   res.result[0], which with the SMC results in x1/x2/x3 is a1 here.  The probe added in 0536 would
+   therefore have reported every working call -- PAS_INIT_IMAGE included -- as missing, which is the
+   precise false lead that probe exists to avoid.  Verdict is now (a0 == 0 && a1 != 0).
+
+2. pandora_pas.c, shm_bridge_create: the handle was taken from a2, not a1.
+
+   Upstream returns res.result[0] as the status and res.result[1] as the handle, and that is a1.
+   Measured here: a0 0 a1 0xd a2 0, so the old a2-first line happened to work -- but if a2 ever held
+   anything non-zero it would delete the wrong handle and leave the real TrustZone bridge live over a
+   page this file then frees.  a1 first, a2 only as a fallback.
+
+3. pandora_pas.c, pandora_pas_init_only: the probe path had none of the bounds the load path has.
+
+   ehdr_size and hash_size come straight out of the .mdt and were used unchecked here, while
+   pandora_pas_load() refuses the same values when they exceed the file.  hdr is a fixed 64 KiB
+   buffer, so an over-large p_filesz both reads past it and hands whatever lies there to TrustZone as
+   the metadata of a probe whose refusal is then treated as evidence about the id.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 87678e1..ef03810 100644
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -328,9 +328,16 @@ mp_probe_scm_calls(void)
+ 		uint64_t a0 = 0, a1 = 0;
+ 		pandora_scm_call(MP_SCM_FN(6, 1), MP_SCM_ARGS(1),
+ 		    ((uint64_t)calls[i].svc << 8) | calls[i].cmd, 0, &a0, &a1);
+-		printf("PANDORA MPSS: is_call_available(%#x, %#x) %-18s -> a0 %#llx %s\n",
+-		    calls[i].svc, calls[i].cmd, calls[i].what, a0,
+-		    (a0 || a1) ? "NOT available" : "available");
++		/*
++		 * The answer arrives in a1 on this device, not a0: `pas_is_supported(4)` prints
++		 * `a0 0 a1 0x1` for an id that is supported, and upstream reads `res.result[0]` -- which
++		 * with the SMC results in x1/x2/x3 is a1 here.  An earlier version of this line treated
++		 * (a0 || a1) as "not available", i.e. it would have reported every working call as
++		 * missing, which is the exact false lead this probe exists to avoid.
++		 */
++		printf("PANDORA MPSS: is_call_available(%#x, %#x) %-18s -> a0 %#llx a1 %#llx %s\n",
++		    calls[i].svc, calls[i].cmd, calls[i].what, a0, a1,
++		    (a0 == 0 && a1 != 0) ? "available" : "NOT available");
+ 	}
+ }
+ 
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index 50c52bd..ceb1dcc 100644
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -572,6 +572,23 @@ pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64
+ 	uint32_t ehdr_size = ph[0].p_filesz;
+ 	uint32_t hash_size = ph[hash].p_filesz;
+ 	uint64_t md_size = ((uint64_t)ehdr_size + hash_size + 0xfff) & ~0xfffull;
++	/*
++	 * The same bound the load path applies, applied here too.
++	 *
++	 * A second reader caught this: pandora_pas_load() refuses a header whose p_filesz is larger than
++	 * the file, but this probe path did not.  hdr is a fixed 64 KiB kalloc_data(), so an image whose
++	 * program header 0 claims more than that would be copied past the end of the source -- and, worse
++	 * for this file's purpose, whatever `Z_ZERO` did not leave behind would be handed to TrustZone as
++	 * the metadata of a probe whose answer is then read as "this id is refused".  A false lead is
++	 * more damaging here than a crash.
++	 */
++	if (ehdr_size == 0 || hash_size == 0 || ehdr_size > mdt_size || hash_size > mdt_size ||
++	    md_size > (4u << 20)) {
++		printf("PANDORA PAS: probe: %s: metadata sizes out of range (ehdr %u, hash %u, file "
++		    "%llu)\n", name, ehdr_size, hash_size, (unsigned long long)mdt_size);
++		err = EINVAL;
++		goto out;
++	}
+ 	vm_offset_t md = 0;
+ 	/*
+ 	 * Below 4 GiB on purpose.
+@@ -743,7 +760,18 @@ pas_bridge_create(uint64_t pa, uint64_t size)
+ 	if (a0 != 0) {
+ 		return 0;
+ 	}
+-	return a2 ? a2 : a1;
++	/*
++	 * Upstream's qcom_scm_shm_bridge_create() returns res.result[0] as the status and
++	 * res.result[1] as the handle.  The SMC results land in x1/x2/x3, so the handle is **a1**;
++	 * a2 is only meaningful if the call declares three results, and this one does not.
++	 *
++	 * An earlier version of this line preferred a2 and fell back to a1.  Measured on this phone
++	 * a2 is 0 and a1 carries the handle (`a0 0 a1 0xd a2 0`), so the fallback happened to work
++	 * -- but if a2 ever held anything non-zero, pas_bridge_delete() would delete the wrong handle
++	 * and leave the real bridge live over a page this file then frees: a TrustZone mapping over
++	 * reused memory.
++	 */
++	return a1 ? a1 : a2;
+ }
+ 
+ static void
