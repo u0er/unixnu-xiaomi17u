@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..716c8382d53644addba7ce5be45c2f1c91ecac9c
+index 0000000..99573ea7b7ec558956950f4d046861867a63636a
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4875 @@
+@@ -0,0 +1,4894 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4456,6 +4456,25 @@ index 0000000..716c8382d53644addba7ce5be45c2f1c91ecac9c
 +			break;
 +		}
 +		if (ev[0] == 0x04u && ev[1] == 0x0eu && got >= 8u && ev[7] == sub) {
++			if (tlen != 0u) {
++				/* The payload is what carries the evidence for 0x20
++				 * (oBTFW.GANGES in a 117-byte build-info answer). Without this
++				 * line the plan's criterion cannot be checked from the log at
++				 * all - tlen was captured and then never reported. */
++				bool has_tag = false;
++				unsigned lim = (tlen > 96u) ? 96u : tlen;
++
++				for (unsigned i = 0u; i + 5u <= tlen; i++) {
++					if (__builtin_memcmp(ev + 8u + i, "oBTFW", 5) == 0) {
++						has_tag = true;
++						break;
++					}
++				}
++				printf("PANDORA BT: %s: VS command %02x payload %u byte(s), oBTFW %s\n",
++				    what, sub, tlen, has_tag ? "present" : "absent");
++				bt_dump("VS payload head", ev + 8u, lim);
++				pandora_log_sync();
++			}
 +			if (ev[6] != 0x00u) {
 +				printf("PANDORA BT: %s: VS command %02x answered status %u\n",
 +				    what, sub, ev[6]);
