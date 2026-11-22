@@ -12,10 +12,10 @@ index d70963c..44db1dd 100644
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
 new file mode 100644
-index 0000000..85d6abd
+index 0000000..e630dcd
 --- /dev/null
 +++ b/bsd/dev/pandora_vidc.c
-@@ -0,0 +1,1932 @@
+@@ -0,0 +1,1993 @@
 +/*
 + * PANDORA VIDC: minimal clean-room Qualcomm Iris4 / VPU4 transport for UniXNU.
 + *
@@ -194,7 +194,8 @@ index 0000000..85d6abd
 + * `movk w21,#0xa,lsl#16`), so every `add w1,w21,#imm` below is 0xA0024+imm:
 + *   0xA0064 <- qtable DA   (orr w21,#0x40)   0xA0068 <- 0x300000 (add #0x44)
 + *   0xA0054 <- qtable DA   (add #0x30)       0xA0050 <- 1        (add #0x2c)
-+ *   0xA0060 <- SFR DA      (add #0x3c)                       [K 0x15a60-0x15b0c]
++ *   0xA0060 <- UC page DA  (add #0x3c; skipped when core[0x13e8]==0)
++ *                                                   [K 0x15af8-0x15b08]
 + * `0xA0048` (boot) and `0xA004C` (status) are likewise w21+0x24 and w21+0x28.
 + * A round where these were "corrected" to 0x40/0x44/0x30/0x2c/0x3c read back
 + * self-consistent but changed nothing, which is what a wrong-but-writable
@@ -203,7 +204,7 @@ index 0000000..85d6abd
 +#define R_CPU_QUEUE_TABLE_SIZE  (CPU_BASE_OFFS + 0x068u)  /* write 0x300000 */
 +#define R_CPU_QUEUE_TABLE_DA2   (CPU_BASE_OFFS + 0x054u)  /* qtable device addr */
 +#define R_CPU_QUEUE_TABLE_EN    (CPU_BASE_OFFS + 0x050u)  /* write 1 */
-+#define R_CPU_QUEUE_TABLE_ADDR2 (CPU_BASE_OFFS + 0x060u)  /* vendor writes sfr here too */
++#define R_CPU_QUEUE_TABLE_ADDR2 (CPU_BASE_OFFS + 0x060u)  /* UC descriptor page DA */
 +/* [M] iris_vpu_common.c iris_vpu_setup_ucregion_memory_map():
 + *     #define SFR_ADDR (CPU_CS_BASE_OFFS + 0x5C)
 + *     if (core->sfr_daddr) writel(sfr_daddr + core_arch, SFR_ADDR);
@@ -275,9 +276,20 @@ index 0000000..85d6abd
 + * can restore 1024 for the vendor-identical 0x300000 window when A/B testing.
 + * The initialisers below keep the geometry valid even if a probe touches it
 + * before pandora_vidc_init runs. */
-+#define VIDC_RING_KB_ACTIVE     256u
++/* Back to the vendor-identical geometry: 1 MiB per ring => window 0x300000,
++ * which is exactly the UC_REGION_SIZE the vendor publishes (0x300000).  The
++ * 256 KiB experiment existed only to dodge the 5.17 s kmem panic, and three
++ * kva-budget probes have since proven that panic is NOT ours (1 MiB was still
++ * allocatable right before the failure).  Publishing 0xC1000 instead of the
++ * vendor's 0x300000 was therefore an unnecessary deviation -- and the firmware's
++ * only host-visible description of the queue region is that number. */
++#define VIDC_RING_KB_ACTIVE     1024u
 +static uint32_t vidc_ring_bytes = (VIDC_RING_KB_ACTIVE << 10);
-+static uint32_t vidc_qtable_bytes = 0x1000u + 3u * (VIDC_RING_KB_ACTIVE << 10);
++/* Ring i starts at 0x1000 + i*ring and ends at (i+1)*ring, so the whole window
++ * is exactly NUMQ*ring -- 0x300000 for 1 MiB rings, matching the vendor's
++ * UC_REGION_SIZE byte for byte.  (0x1000 + NUMQ*ring would over-allocate 4 KiB
++ * and publish 0x301000, a value the vendor never writes.) */
++static uint32_t vidc_qtable_bytes = 3u * (VIDC_RING_KB_ACTIVE << 10);
 +#define VIDC_QTABLE_BYTES       vidc_qtable_bytes
 +/* Exactly the published window: header 456 B + three 1 MiB rings ends at
 + * 0x300000, so the old +64 KiB slack was pure permanent kernel_map waste. */
@@ -375,7 +387,7 @@ index 0000000..85d6abd
 +        kb = VIDC_RING_KB_DEFAULT;
 +    }
 +    vidc_ring_bytes = kb << 10;
-+    vidc_qtable_bytes = 0x1000u + IFACEQ_NUMQ * vidc_ring_bytes;
++    vidc_qtable_bytes = IFACEQ_NUMQ * vidc_ring_bytes;
 +    printf("PANDORA VIDC: queue geometry: %u KiB per ring, window %#x, q_size %#x words\n",
 +        kb, vidc_qtable_bytes, (vidc_ring_bytes - 0x1000u) / 4u);
 +}
@@ -384,6 +396,8 @@ index 0000000..85d6abd
 +static uint64_t vidc_qtable_pa;
 +static vm_offset_t vidc_sfr_va;
 +static uint64_t vidc_sfr_pa;
++static vm_offset_t vidc_uc_va;
++static uint64_t vidc_uc_pa;
 +
 +/* The VPU is an Xtensa core whose queue-table and start-address registers are
 + * 32-bit, but every wired page xnu hands out sits above 4 GiB (level-2b run:
@@ -405,6 +419,16 @@ index 0000000..85d6abd
 +#define VIDC_SMMU_SIZE          0x00100000u
 +#define VIDC_IOVA_BASE          0xFF000000ull /* < 0xffc00000 DMA limit */
 +#define VIDC_IOVA_SFR           0xFF400000ull /* its own 4 KiB page */
++/* The vendor's `cpu_queue_table_addr2` (0xA0060) is NOT the SFR: it is the
++ * separate 4 KiB "UC region" descriptor page that iris_vpu_common.c maps and
++ * zero-fills, then writes `page[0] = 1`.  __boot_firmware_iris4 loads its
++ * device address from core+0x13E8 and skips the write entirely when the field
++ * is zero [K 0x15af8-0x15b08; M iris_vpu_common.c iris_vpu_setup_ucregion_
++ * memory_map].  Publishing the SFR page there made the core look for its
++ * descriptor where the SFR size word lives.  Give it its own page just below
++ * the SFR IOVA; 0xA005C stays sfr_da + core_arch. */
++#define VIDC_UC_BYTES           0x00001000u
++#define VIDC_IOVA_UC            0xFF3FF000ull /* 4 KiB page under the SFR */
 +/* ArmSmmu4KBuild reported `pages 10` for our three ranges on the real
 + * hardware, so 16 pages leaves 60% headroom while keeping the permanent
 + * wired footprint small: at 64 pages the extra 192 KiB of wired memory
@@ -412,8 +436,8 @@ index 0000000..85d6abd
 + * KERN_NO_SPACE at 5.17 s on the first level-4 run). */
 +#define VIDC_SMMU_TABLE_PAGES   12u
 +/* Leaves actually mapped: carveout 8 MiB (2048) + qtable 0x310000 (784) +
-+ * SFR 4 KiB (1) = 2836, so the budget must exceed that or ArmSmmu4KBuild
-+ * refuses with ArmSmmu4KBudget. */
++ * UC 4 KiB (1) + SFR 4 KiB (1) = 2837, so the budget must exceed that or
++ * ArmSmmu4KBuild refuses with ArmSmmu4KBudget. */
 +#define VIDC_SMMU_LEAF_BUDGET   4096u
 +#define VIDC_SMMU_ACTLR         0x103u        /* DT qcom,actlr for these SIDs */
 +/* All four NON-SECURE video streams, from the DT contexts [V vidc-dt-audit]:
@@ -432,6 +456,7 @@ index 0000000..85d6abd
 +
 +static uint32_t vidc_qtable_iova;
 +static uint32_t vidc_sfr_iova;
++static uint32_t vidc_uc_iova;
 +static bool     vidc_smmu_on;
 +static unsigned vidc_smmu_drop_calls;   /* see vidc_smmu_drop() */
 +static uint32_t vidc_smmu_cb;      /* CB base offset inside apps-smmu */
@@ -565,9 +590,10 @@ index 0000000..85d6abd
 +    __asm__ volatile ("dmb oshld" ::: "memory");
 +}
 +
-+/* Allocate the HFI queue table and the SFR as physically contiguous wired
-+ * memory.  Filling them in needs their 32-bit device addresses, which come
-+ * from vidc_smmu_up(), so allocation and publication are separate stages. */
++/* Allocate the HFI queue table, the SFR and the UC descriptor page as
++ * physically contiguous wired memory.  Filling them in needs their 32-bit
++ * device addresses, which come from vidc_smmu_up(), so allocation and
++ * publication are separate stages. */
 +static int
 +vidc_alloc_buffers(void)
 +{
@@ -589,9 +615,18 @@ index 0000000..85d6abd
 +            return -1;
 +        }
 +    }
-+    printf("PANDORA VIDC: buffers qtable PA=%08llx (%#x) SFR PA=%08llx (%#x)\n",
++    if (!vidc_uc_va) {
++        vidc_uc_va = vidc_contig(VIDC_UC_BYTES, &vidc_uc_pa);
++        if (!vidc_uc_va) {
++            printf("PANDORA VIDC: no %#x contiguous bytes for UC page\n", VIDC_UC_BYTES);
++            return -1;
++        }
++    }
++    printf("PANDORA VIDC: buffers qtable PA=%08llx (%#x) SFR PA=%08llx (%#x) "
++           "UC PA=%08llx (%#x)\n",
 +        (unsigned long long)vidc_qtable_pa, VIDC_QTABLE_ALLOC,
-+        (unsigned long long)vidc_sfr_pa, VIDC_SFR_BYTES);
++        (unsigned long long)vidc_sfr_pa, VIDC_SFR_BYTES,
++        (unsigned long long)vidc_uc_pa, VIDC_UC_BYTES);
 +    if (vidc_qtable_pa >> 32)
 +        printf("PANDORA VIDC: qtable is above 4 GiB (%#llx); a 32-bit VPU cannot "
 +               "reach it, the apps-SMMU IOVA below is mandatory\n",
@@ -600,7 +635,7 @@ index 0000000..85d6abd
 +}
 +
 +/* ------------------------------------------------------------------ */
-+/* apps-SMMU: 32-bit IOVAs for the queue table and the SFR             */
++/* apps-SMMU: 32-bit IOVAs for the queue table, the UC page and the SFR */
 +/* ------------------------------------------------------------------ */
 +
 +static vm_offset_t vidc_smmu_va;
@@ -653,6 +688,12 @@ index 0000000..85d6abd
 +}
 +
 +static inline uint32_t
++vidc_uc_da(void)
++{
++    return vidc_smmu_on ? vidc_uc_iova : (uint32_t)vidc_uc_pa;
++}
++
++static inline uint32_t
 +vidc_ring_da(unsigned i)
 +{
 +    return vidc_qtable_da() + IFACEQ_RING_OFFS(i);
@@ -667,7 +708,7 @@ index 0000000..85d6abd
 +vidc_smmu_up(void)
 +{
 +    if (vidc_smmu_on) return 0;
-+    if (!vidc_qtable_va || !vidc_sfr_va) {
++    if (!vidc_qtable_va || !vidc_sfr_va || !vidc_uc_va) {
 +        printf("PANDORA VIDC: SMMU before buffers\n");
 +        return -1;
 +    }
@@ -816,7 +857,8 @@ index 0000000..85d6abd
 +    }
 +    const unsigned oas = widths[encoding] < 40 ? widths[encoding] : 40;
 +    if ((vidc_qtable_pa + VIDC_QTABLE_ALLOC) >> oas ||
-+        (vidc_sfr_pa + VIDC_SFR_BYTES) >> oas) {
++        (vidc_sfr_pa + VIDC_SFR_BYTES) >> oas ||
++        (vidc_uc_pa + VIDC_UC_BYTES) >> oas) {
 +        pandora_apps_smmu_unlock();
 +        vidc_smmu_drop();
 +        printf("PANDORA VIDC: buffers exceed the %u-bit output address space\n", oas);
@@ -827,7 +869,7 @@ index 0000000..85d6abd
 +    ArmSmmu4KResult tres;
 +    /* ArmSmmu4KBuild requires IOVA-sorted, disjoint ranges, so the ascending
 +     * order here is 0x9a600000 (identity-mapped carveout), 0xff000000 (queue
-+     * table) and 0xff400000 (SFR).
++     * table), 0xff3ff000 (UC descriptor page) and 0xff400000 (SFR).
 +     *
 +     * Why the carveout must be mapped: once these SIDs are routed into the
 +     * bank, EVERY VPU access is translated, including the ones the firmware
@@ -836,14 +878,16 @@ index 0000000..85d6abd
 +     * firmware computed (and PAS programmed) valid, the same way
 +     * pandora_dpu.c identity-maps the ABL's panel memory.  The carveout is
 +     * inside the non_secure_cb window and below the 0xffc00000 DMA limit. */
-+    ArmSmmu4KRange ranges[3];
++    ArmSmmu4KRange ranges[4];
 +    ranges[0] = (ArmSmmu4KRange){ VIDEO_REGION_PA, VIDEO_REGION_PA, VIDEO_REGION_SIZE,
 +        ArmSmmu4KRead | ArmSmmu4KWrite, 0, 2 };
 +    ranges[1] = (ArmSmmu4KRange){ VIDC_IOVA_BASE, vidc_qtable_pa, VIDC_QTABLE_ALLOC,
 +        ArmSmmu4KRead | ArmSmmu4KWrite, 0, 2 };
-+    ranges[2] = (ArmSmmu4KRange){ VIDC_IOVA_SFR, vidc_sfr_pa, VIDC_SFR_BYTES,
++    ranges[2] = (ArmSmmu4KRange){ VIDC_IOVA_UC, vidc_uc_pa, VIDC_UC_BYTES,
 +        ArmSmmu4KRead | ArmSmmu4KWrite, 0, 2 };
-+    ArmSmmu4KStatus st = ArmSmmu4KBuild(&tcfg, ranges, 3, (uint64_t *)tva,
++    ranges[3] = (ArmSmmu4KRange){ VIDC_IOVA_SFR, vidc_sfr_pa, VIDC_SFR_BYTES,
++        ArmSmmu4KRead | ArmSmmu4KWrite, 0, 2 };
++    ArmSmmu4KStatus st = ArmSmmu4KBuild(&tcfg, ranges, 4, (uint64_t *)tva,
 +        VIDC_SMMU_TABLE_PAGES, &tres);
 +    if (st != ArmSmmu4KSuccess) {
 +        pandora_apps_smmu_unlock();
@@ -895,6 +939,7 @@ index 0000000..85d6abd
 +
 +    vidc_qtable_iova = (uint32_t)VIDC_IOVA_BASE;
 +    vidc_sfr_iova = (uint32_t)VIDC_IOVA_SFR;
++    vidc_uc_iova = (uint32_t)VIDC_IOVA_UC;
 +    vidc_smmu_cb = cb_off;
 +    vidc_smmu_bank = bank;
 +    vidc_smmu_on = true;
@@ -910,9 +955,10 @@ index 0000000..85d6abd
 +           "tcr %08x ttbr0 %#llx pages %zu\n", bank, asid, cb_off, sctlr,
 +        prog.readback.sctlr, prog.readback.tcr, prog.readback.ttbr0,
 +        tres.table_pages);
-+    printf("PANDORA VIDC: IOVA qtable %08x (PA %08llx) SFR %08x (PA %08llx) "
-+           "sids %#x/%#x/%#x\n", vidc_qtable_iova,
-+        (unsigned long long)vidc_qtable_pa, vidc_sfr_iova,
++    printf("PANDORA VIDC: IOVA qtable %08x (PA %08llx) UC %08x (PA %08llx) "
++           "SFR %08x (PA %08llx) sids %#x/%#x/%#x\n", vidc_qtable_iova,
++        (unsigned long long)vidc_qtable_pa, vidc_uc_iova,
++        (unsigned long long)vidc_uc_pa, vidc_sfr_iova,
 +        (unsigned long long)vidc_sfr_pa, sids[0], sids[1], sids[2]);
 +    return 0;
 +}
@@ -921,14 +967,15 @@ index 0000000..85d6abd
 +static int
 +vidc_fill_queues(void)
 +{
-+    if (!vidc_qtable_va || !vidc_sfr_va) {
++    if (!vidc_qtable_va || !vidc_sfr_va || !vidc_uc_va) {
 +        printf("PANDORA VIDC: fill before alloc\n");
 +        return -1;
 +    }
-+    if (!vidc_smmu_on && ((vidc_qtable_pa | vidc_sfr_pa) >> 32)) {
++    if (!vidc_smmu_on && ((vidc_qtable_pa | vidc_sfr_pa | vidc_uc_pa) >> 32)) {
 +        printf("PANDORA VIDC: refusing to publish truncated 32-bit addresses "
-+               "(qtable %#llx SFR %#llx)\n",
-+            (unsigned long long)vidc_qtable_pa, (unsigned long long)vidc_sfr_pa);
++               "(qtable %#llx SFR %#llx UC %#llx)\n",
++            (unsigned long long)vidc_qtable_pa, (unsigned long long)vidc_sfr_pa,
++            (unsigned long long)vidc_uc_pa);
 +        return -1;
 +    }
 +
@@ -962,17 +1009,26 @@ index 0000000..85d6abd
 +        q->write_idx = 0;
 +    }
 +    *(volatile uint32_t *)vidc_sfr_va = VIDC_SFR_BYTES;   /* [M] first word = SFR size */
++    /* iris_vpu_common.c maps the UC region as its own 4 KiB page, zero-fills
++     * it and sets word 0 to 1; the core reads that page through 0xA0060.  All
++     * of the vendor's optional fields (page+0x2c..0x58) are zero on a fresh
++     * boot because their core-> fields are never written, so zeros are the
++     * honest content -- do not invent addresses here. */
++    memset((void *)vidc_uc_va, 0, VIDC_UC_BYTES);
++    ((volatile uint32_t *)vidc_uc_va)[0] = 1;
 +
 +    /* One clean for the header and every ring header the VPU will read. */
 +    vidc_sync_out(0, (unsigned)sizeof(*t));
 +    __asm__ volatile ("dmb oshst" ::: "memory");
 +    clean_dcache64((addr64_t)vidc_sfr_pa, (unsigned)VIDC_SFR_BYTES, TRUE);
++    clean_dcache64((addr64_t)vidc_uc_pa, (unsigned)VIDC_UC_BYTES, TRUE);
 +
 +    printf("PANDORA VIDC: qtable DA=%08x hdr=%u qhdr0=%u q_size=%u ring0=%08x\n",
 +        vidc_qtable_da(), t->size, t->qhdr0_offset,
 +        IFACEQ_QUEUE_WORDS, vidc_ring_da(0));
-+    printf("PANDORA VIDC: rings %08x/%08x/%08x SFR DA=%08x\n",
-+        vidc_ring_da(0), vidc_ring_da(1), vidc_ring_da(2), vidc_sfr_da());
++    printf("PANDORA VIDC: rings %08x/%08x/%08x SFR DA=%08x UC DA=%08x (word0=%u)\n",
++        vidc_ring_da(0), vidc_ring_da(1), vidc_ring_da(2), vidc_sfr_da(),
++        vidc_uc_da(), ((volatile uint32_t *)vidc_uc_va)[0]);
 +    return 0;
 +}
 +
@@ -1330,7 +1386,8 @@ index 0000000..85d6abd
 + *   0xA0068 <- 0x300000             (published window)
 + *   0xA0054 <- qtable PA            (second copy)
 + *   0xA0050 <- 1                    (enable)
-+ *   0xA0060 <- SFR PA               (vendor: core->+0x13E8, the SFR carveout)
++ *   0xA0060 <- UC page PA           (vendor: core->+0x13E8, the UC descriptor
++ *                                    page - NOT the SFR carveout)
 + *   0xA0024/0xA0028/0xA005C         (TZ content-protection span: the vendor
 + *                                    only writes these when it has a CP table
 + *                                    with a non-zero start, which we do not)
@@ -1346,7 +1403,7 @@ index 0000000..85d6abd
 +static int
 +vidc_publish_queues(void)
 +{
-+    if (!vidc_qtable_va || !vidc_sfr_va) {
++    if (!vidc_qtable_va || !vidc_sfr_va || !vidc_uc_va) {
 +        printf("PANDORA VIDC: publish before alloc\n");
 +        return -1;
 +    }
@@ -1359,15 +1416,19 @@ index 0000000..85d6abd
 +    vidc_wr(R_CPU_QUEUE_TABLE_SIZE, VIDC_QTABLE_BYTES);
 +    vidc_wr(R_CPU_QUEUE_TABLE_DA2, da);
 +    vidc_wr(R_CPU_QUEUE_TABLE_EN, 1);
-+    if (vidc_sfr_da()) {
-+        vidc_wr(R_CPU_QUEUE_TABLE_ADDR2, vidc_sfr_da());
++    if (vidc_sfr_da() && vidc_uc_da()) {
++        /* 0xA0060 is the UC descriptor page, not the SFR (see VIDC_IOVA_UC):
++         * the vendor writes core[0x13e8] there and only when it is non-zero
++         * [K 0x15af8-0x15b08], so publishing the SFR page put the descriptor
++         * where the SFR size word lives. */
++        vidc_wr(R_CPU_QUEUE_TABLE_ADDR2, vidc_uc_da());
 +        /* SFR_ADDR must carry sfr + core_arch (upstream), not the bare DA. */
 +        vidc_wr(R_CPU_SFR_ADDR, vidc_sfr_da() + VIDC_CORE_ARCH);
 +        vidc_wr(R_CPU_SCIACMDARG3, 1);
 +        printf("PANDORA VIDC: SCIACMDARG3 (0xA0058) = %08x\n", vidc_rd(R_CPU_SCIACMDARG3));
 +    }
-+    printf("PANDORA VIDC: published DA=%08x SFR=%08x (smmu %s) "
-+           "regs A0064/A0068/A0054/A0050/A0060\n", da, vidc_sfr_da(),
++    printf("PANDORA VIDC: published DA=%08x UC=%08x SFR=%08x (smmu %s) "
++           "regs A0064/A0068/A0054/A0050/A0060\n", da, vidc_uc_da(), vidc_sfr_da(),
 +        vidc_smmu_on ? "on" : "OFF, truncated physical address");
 +    printf("PANDORA VIDC: readback DA=%08x size=%08x DA2=%08x en=%08x sfr=%08x\n",
 +        vidc_rd(R_CPU_QUEUE_TABLE_DA), vidc_rd(R_CPU_QUEUE_TABLE_SIZE),
@@ -1381,7 +1442,7 @@ index 0000000..85d6abd
 +     * protected playback and own no CP table, so the vendor-equivalent action
 +     * is to write nothing -- not to invent a span for video_region.  Both
 +     * registers and 0xA005C are therefore left at their reset values. */
-+    printf("PANDORA VIDC: SFR published at 0xA005C=%08x (sfr+core_arch) and "
++    printf("PANDORA VIDC: SFR 0xA005C=%08x (sfr+core_arch) and UC page "
 +           "0xA0060=%08x; CP span 0xA0024/0xA0028 skipped (no TZ CP table)\n",
 +        vidc_rd(R_CPU_SFR_ADDR), vidc_rd(R_CPU_QUEUE_TABLE_ADDR2));
 +
