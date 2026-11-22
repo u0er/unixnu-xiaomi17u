@@ -1,0 +1,70 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 449a868..d0fe177 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1030,6 +1030,37 @@ pandora_scm_mem_protect_video_var(uint32_t cp_start, uint32_t cp_size,
+ 	return r.a0 ? (int)r.a0 : 0;
+ }
+ 
++/* qcom_scm_mem_protect_region_id(region_id, ptr): the vendor's video PIL
++ * programs the video DDR regions into TZ with this call after the PAS auth
++ * (hyp_log: pil_video_program_vars_ext_func region 0/1/5).  Vendor qcom-scm.ko
++ * builds svc=0x0c, cmd=0x10, arginfo=2, args={region_id, descriptor ptr}; the
++ * descriptor is a two-u64 {start, size} in physically contiguous memory that
++ * TZ reads, so the page is dcache-cleaned before the call.  This is a new,
++ * unverified-in-the-field interface: a bad pointer/arg would fault the secure
++ * world, hence it is the single variable of 0538. */
++int pandora_scm_mem_protect_region_id(uint32_t region_id, uint64_t start, uint64_t size);
++
++int
++pandora_scm_mem_protect_region_id(uint32_t region_id, uint64_t start, uint64_t size)
++{
++	struct scm_res r;
++	vm_offset_t buf = 0;
++	if (kmem_alloc_contig(kernel_map, &buf, PAGE_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("PANDORA ADSP: mem_protect_region_id(%u): no memory\n", region_id);
++		return ENOMEM;
++	}
++	((volatile uint64_t *)buf)[0] = start;
++	((volatile uint64_t *)buf)[1] = size;
++	const uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)buf));
++	flush_dcache64((addr64_t)pa, PAGE_SIZE, TRUE);
++	scm_smc(SCM_FN(0x0c, 0x10), SCM_ARGS(2), region_id, pa, 0, 0, &r);
++	printf("PANDORA ADSP: mem_protect_region_id(%u, %#llx, %#llx) -> a0 %#llx a1 %#llx\n",
++	    region_id, (unsigned long long)start, (unsigned long long)size, r.a0, r.a1);
++	kmem_free(kernel_map, buf, PAGE_SIZE);
++	return r.a0 ? (int)r.a0 : 0;
++}
++
+ int pandora_pas_load_auth_src(const char *file, unsigned pas, uint64_t mem_pa,
+     uint64_t mem_size, bool part);
+ 
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+index 11513c9..1386e9f 100644
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -1718,6 +1718,7 @@ extern int pandora_pas_load_auth_src(const char *file, unsigned pas, uint64_t me
+     uint64_t mem_size, bool part);
+ extern int pandora_scm_mem_protect_video_var(uint32_t cp_start, uint32_t cp_size,
+     uint32_t np_start, uint32_t np_size);
++extern int pandora_scm_mem_protect_region_id(uint32_t region_id, uint64_t start, uint64_t size);
+ 
+ #define VIDC_PAS_ID 9u
+ 
+@@ -1741,6 +1742,15 @@ vidc_auth_reset(void)
+          * (empty) protected range.  That SCM call is the only vendor step our
+          * path never made; see pandora_scm_mem_protect_video_var(). */
+         (void)pandora_scm_mem_protect_video_var(0, 0, 0, 0);
++        /* 0538 (single variable): the vendor's video PIL also programs the
++         * video DDR regions into TZ after the PAS auth, via
++         * qcom_scm_mem_protect_region_id (hyp_log:
++         * pil_video_program_vars_ext_func region 0/1/5 with the values below).
++         * Our port had never made this call; without it TZ's video memory map
++         * stays empty even though the firmware is authenticated. */
++        (void)pandora_scm_mem_protect_region_id(0, 0x0ull, 0x800000ull);
++        (void)pandora_scm_mem_protect_region_id(1, 0x1000000ull, 0x24800000ull);
++        (void)pandora_scm_mem_protect_region_id(5, 0x25800000ull, 0xda400000ull);
+     }
+     if (err != 0) {
+         printf("PANDORA VIDC: PAS load/auth failed for %s (err %d)\n", vidc_fw_name, err);
