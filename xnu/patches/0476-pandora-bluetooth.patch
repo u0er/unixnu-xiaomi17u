@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..d27e8242a851e255a7e6594ede0b071573321582
+index 0000000..b8964a6c9cbe439db9251ed7d5fb9fe51f7886b5
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4823 @@
+@@ -0,0 +1,4845 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4157,6 +4157,29 @@ index 0000000..d27e8242a851e255a7e6594ede0b071573321582
 +			if (got != NULL) {
 +				*got = sizeof(win);
 +			}
++			/* The event is 3 + plen bytes in total and only 8 were consumed.
++			 * Leaving the tail in the FIFO poisons the next reader: for 0x23 it
++			 * is 3 bytes, but the 0x20 build-info answer has plen = 117 and would
++			 * leave 111 bytes behind. Drain what belongs to this event. */
++			if (win[2] > 5u) {
++				unsigned rest = (unsigned)win[2] - 5u;
++				uint64_t tail_deadline;
++
++				clock_interval_to_deadline(50u, NSEC_PER_MSEC, &tail_deadline);
++				while (rest != 0u && mach_absolute_time() < tail_deadline) {
++					if (!(bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
++						bt_sleep(50);
++						continue;
++					}
++					(void)bt_rd(BT_W_SE, SE_RX_FIFO);
++					rest--;
++				}
++				if (rest != 0u) {
++					printf("PANDORA BT: %s: sub %02x event tail %u byte(s) left\n",
++					    what, sub, rest);
++					pandora_log_sync();
++				}
++			}
 +			if (dropped != 0u) {
 +				printf("PANDORA BT: %s: %u byte(s) before the sub %02x CC\n",
 +				    what, dropped, sub);
@@ -4375,7 +4398,6 @@ index 0000000..d27e8242a851e255a7e6594ede0b071573321582
 +	uint8_t request[5] = { 0x01, 0x00, 0xfc, 0x01, 0x00 };
 +	uint8_t ev[BT_PERI_EVT_MAX] = {0};
 +	unsigned got = 0;
-+	unsigned wakes = 0;
 +	int err;
 +
 +	request[4] = sub;
