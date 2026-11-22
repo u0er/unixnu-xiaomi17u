@@ -1,0 +1,34 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0527 sweet_nub: print each child's USBDeviceFunction tag in the 5 s sample
+
+0525 built the device tree (child[0] IOUSBDeviceConfigurator, child[1] IOUSBDeviceInterface,
+child[2] IOUSBDeviceInterface) but the sample only printed class names. The NCM/Mux personalities
+match IOUSBDeviceInterface on IOPropertyMatch {USBDeviceFunction: AppleUSBNCMControl|Data|Mux},
+so whether the clients can ever attach depends on that tag being present -- and on this build the
+only "USBDeviceFunction" string in the prelinked image is ours, i.e. Apple's createUSBDevice path
+does not obviously set it by that name. Printing it per child answers that offline question with
+one boot instead of guessing.
+
+Prepared while the volume gate has booting frozen; NOT dispatched until the gate clears.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -491,8 +491,16 @@
+ 		while (OSObject *obj = children_it->getNextObject()) {
+ 			IOService *child = OSDynamicCast(IOService, obj);
+ 			if (child != NULL) {
+-				printf("SWEET NUB: child[%d] %s\n", children,
+-				    child->getMetaClass()->getClassName());
++				/* 0527: the NCM/Mux personalities match IOUSBDeviceInterface children on
++				 * IOPropertyMatch {USBDeviceFunction: AppleUSBNCMControl|Data|Mux}. Print it
++				 * here too: if the configurator built the children but the tag is missing,
++				 * the clients can never attach and the next fix is in the description, not
++				 * in the endpoint virtuals. */
++				OSString *fn = OSDynamicCast(OSString,
++				    child->getProperty("USBDeviceFunction"));
++				printf("SWEET NUB: child[%d] %s fn=%s\n", children,
++				    child->getMetaClass()->getClassName(),
++				    fn != NULL ? fn->getCStringNoCopy() : "(none)");
+ 			} else {
+ 				printf("SWEET NUB: child[%d] (non-IOService)\n", children);
+ 			}
