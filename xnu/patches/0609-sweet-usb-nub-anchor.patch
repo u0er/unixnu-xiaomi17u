@@ -1,0 +1,132 @@
+From: CarPlay C0 lane (2026-11-21)
+Subject: 0509 sweet_nub: anchor the controller vtable on the instance, not on a link-time address
+
+0508 validated and copied the 232-slot IOUSBDeviceController vtable from the constant
+0xfffffff005e11210 and required each of the 18 pure slots to hold a kernel-range pointer.
+Before spending a boot on that, tools/carplay/check_nub_prelink.py mapped the prelinks
+through LC_SEGMENT_64 and compared them:
+
+  prelink                  vtable VA            slot 0         slot 86        pure target
+  0507+accessory (record)  0xfffffff005e11210  0xfffffff004cee5bc  0xfffffff004cef59c  0xfffffff0079eff24
+  0508-acckeys (S3 image)  same                 same           same           0xfffffff0079f0394
+  0508b-acckeys (rebuilt)  same                 same           same           0xfffffff0079f0394
+
+The kext-region pointers are therefore stable across kernel changes, while the pure-virtual
+target lives in __TEXT and moves with it. 0508's check only tested the range, so it tolerated
+that by luck: it was one prelink away from refusing a good image, and it could not distinguish
+"the vtable moved" from "the kernel moved".
+
+The object's first word is the vtable its constructor installed, and it is the table every
+later dispatch goes through. 0509 reads that pointer from the allocated instance, logs it
+against the constant, validates only layout-independent invariants (table in the kernel image,
+start slot in kernel text, all 18 pure slots identical) and copies from the live table. A moved
+constant is reported, never fatal -- so a prelink rebuild can no longer waste a boot.
+
+Verification: tools/carplay/check_nub_prelink.py reports constants_current=true for both
+0508-acckeys and 0508b-acckeys (start slot and pure target recorded); the patch applies cleanly
+to the file that 0508 creates.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * 0508 CarPlay C1: controller-nub probe / first instantiation.
++ * 0508/0509 CarPlay C1: controller-nub probe / first instantiation.
+  *
+  * Why this exists: our kernel does not carry Apple's device-side USB stack by
+  * default. It can be prelinked in (IOUSBDeviceFamily, AppleUSBDeviceMux,
+@@ -16,9 +16,11 @@
+  * (0x1000000). Verified on the 0507+accessory prelink:
+  *   IOUSBDeviceController instance vtable  0xfffffff005e11210
+  *     slot 0 0xfffffff004cee5bc, slot 86 (start) 0xfffffff004cef59c
+- *   the 18 pure slots all point at __cxa_pure_virtual (0xfffffff0079eff24)
+- * The vtable address is validated below before it is used, so a changed prelink
+- * layout fails loudly instead of calling random memory.
++ *   the 18 pure slots all point at __cxa_pure_virtual
++ * 0509 measured the 0508b prelink: the vtable VA and slots 0/86 are unchanged (they live in the
++ * appended kext region, whose base is stable), while the pure target moved with __TEXT
++ * (0xfffffff0079eff24 -> 0xfffffff0079f0394). So the probe now validates the table the instance
++ * actually carries and treats these constants as evidence to log, not as a refusal condition.
+  */
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOPlatformExpert.h>
+@@ -78,18 +80,33 @@
+ }
+ 
+ static bool
+-sweet_nub_vtable_ok(void)
+-{
+-	const uint64_t *vt = (const uint64_t *)SWEET_NUB_CTL_VTABLE;
+-	if ((uint64_t)vt < SWEET_NUB_KERNEL_BASE)
++sweet_nub_vtable_ok(void **vt, uint64_t *pure_target)
++{
++	/*
++	 * 0509: validate the table the OBJECT actually carries, and treat the compile-time
++	 * address as an observation, not as ground truth. Measured on the 0508b prelink:
++	 * the table VA and slot 0 / slot 86 survived a kernel change, but the 18 pure slots
++	 * moved 0xfffffff0079eff24 -> 0xfffffff0079f0394 with the kernel text (that address
++	 * lives in __TEXT, not in the appended kext region). Requiring equality with the old
++	 * pure address would therefore reject a perfectly good prelink.
++	 *
++	 * The layout-independent invariants are: the pointer is in the kernel image, the
++	 * start slot holds a kernel function, and the 18 pure slots all hold the SAME kernel
++	 * function (__cxa_pure_virtual). That is what this checks.
++	 */
++	if (vt == NULL || (uint64_t)vt < SWEET_NUB_KERNEL_BASE)
+ 		return false;
+-	if ((vt[SWEET_NUB_START_SLOT] & 0xfffffff000000000ULL) != SWEET_NUB_KERNEL_BASE)
++	if (((uint64_t)vt[SWEET_NUB_START_SLOT] & 0xfffffff000000000ULL) != SWEET_NUB_KERNEL_BASE)
+ 		return false;
+-	for (unsigned i = 0; i < sizeof(sweet_nub_pure_slots) / sizeof(sweet_nub_pure_slots[0]); i++) {
+-		uint64_t target = vt[sweet_nub_pure_slots[i]];
+-		if ((target & 0xfffffff000000000ULL) != SWEET_NUB_KERNEL_BASE)
++	uint64_t first = (uint64_t)vt[sweet_nub_pure_slots[0]];
++	if ((first & 0xfffffff000000000ULL) != SWEET_NUB_KERNEL_BASE)
++		return false;
++	for (unsigned i = 1; i < sizeof(sweet_nub_pure_slots) / sizeof(sweet_nub_pure_slots[0]); i++) {
++		if ((uint64_t)vt[sweet_nub_pure_slots[i]] != first)
+ 			return false;
+ 	}
++	if (pure_target)
++		*pure_target = first;
+ 	return true;
+ }
+ 
+@@ -148,15 +165,31 @@
+ 		return;
+ 	}
+ 
+-	if (!sweet_nub_vtable_ok()) {
++	/*
++	 * 0509: the object's first word IS the vtable the class constructor installed, and it is
++	 * the table every later dispatch goes through. Anchor on it; report whether the compile-time
++	 * constant still agrees, but never refuse just because it moved.
++	 */
++	void **live = *(void ***)ctl;
++	uint64_t pure_target = 0;
++	printf("SWEET NUB: instance vtable %p, constant %p (%s)\n", live,
++	    (void *)SWEET_NUB_CTL_VTABLE,
++	    live == (void **)SWEET_NUB_CTL_VTABLE ? "same" : "DIFFERENT -- live wins");
++	if (!sweet_nub_vtable_ok(live, &pure_target)) {
++		uint64_t start_va = (live && (uint64_t)live >= SWEET_NUB_KERNEL_BASE)
++		    ? (uint64_t)live[SWEET_NUB_START_SLOT] : 0;
++		printf("SWEET NUB: instance vtable %p fails the structural check "
++		    "(start slot 0x%llx, pure 0x%llx); refusing to start\n",
++		    live, (unsigned long long)start_va, (unsigned long long)pure_target);
+ 		ctl->release();
+-		printf("SWEET NUB: vtable at %p does not look like the 0507 prelink; refusing to start\n",
+-		    (void *)SWEET_NUB_CTL_VTABLE);
+-		return;
+-	}
++		return;
++	}
++	printf("SWEET NUB: vtable ok: start slot 0x%llx, pure 0x%llx\n",
++	    (unsigned long long)(uint64_t)live[SWEET_NUB_START_SLOT],
++	    (unsigned long long)pure_target);
+ 
+ 	for (unsigned i = 0; i < SWEET_NUB_CTL_SLOTS; i++)
+-		sweet_nub_vtable[i] = ((void **)SWEET_NUB_CTL_VTABLE)[i];
++		sweet_nub_vtable[i] = live[i];
+ 	for (unsigned i = 0; i < sizeof(sweet_nub_pure_slots) / sizeof(sweet_nub_pure_slots[0]); i++)
+ 		sweet_nub_vtable[sweet_nub_pure_slots[i]] = (void *)sweet_nub_stub0;
+ 	sweet_nub_vtable[187] = (void *)sweet_nub_stub_speed;
