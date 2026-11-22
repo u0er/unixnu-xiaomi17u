@@ -1,0 +1,88 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0524 sweet_nub: publish a complete DeviceDescription (device fields + 18-byte descriptor)
+
+0523 solved the NULL holder (ctl+0x130 was installed and printed) and createUSBDevice moved on,
+then died 19 ms later in OSData::initWithBytes -> memcpy with x2 = 0x079cc4a4, i.e. a ~127 MB
+length. The published description only carried ConfigurationDescriptors/Attributes/MaxPower/
+Interfaces; every device-level key createUSBDevice reads was absent.
+
+0524 adds the same set Apple's own descriptions use: DefaultConfiguration 0, deviceID,
+deviceClass/SubClass/Protocol, BcdUSBVersion 0x0200, manufacturerString/productString/
+serialNumber, and a real 18-byte USB device descriptor as OSData under "Description" (bcdUSB
+0x0200, idVendor 0x1209, idProduct 0x0001, iManufacturer/iProduct/iSerialNumber 1/2/3,
+bNumConfigurations 1). If the oversized length survives this, the missing key was not the cause
+and the next step is to find which field is being read as a length.
+
+Device evidence: outputs/data-a-live-nezha/device/private/logs/1795307450 (kernel.txt, after
+"installed descriptor holder ... at ctl+0x130").
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -25,6 +25,7 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOPlatformExpert.h>
+ #include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSData.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSKext.h>
+ #include <libkern/c++/OSMetaClass.h>
+@@ -356,8 +357,58 @@
+ 			config->setObject("Interfaces", ifaces);
+ 			configs->setObject(config);
+ 			desc->setObject("ConfigurationDescriptors", configs);
++			/*
++			 * 0524: 0523 got past the NULL holder and then died in
++			 * OSData::initWithBytes -> memcpy with x2 = 0x079cc4a4 (a ~127 MB length). The
++			 * minimal description had no device-level fields at all; this adds the same set
++			 * the Apple personalities/kexts use, including a real 18-byte device descriptor
++			 * under "Description" and an explicit DefaultConfiguration. If a length is still
++			 * wrong after this, the source is not the missing key but a field we are
++			 * mis-typing.
++			 */
++			OSNumber *default_config = OSNumber::withNumber(0ULL, 32);
++			OSNumber *device_id = OSNumber::withNumber(0x0001ULL, 32);
++			OSNumber *device_class = OSNumber::withNumber(0x00ULL, 32);
++			OSNumber *device_subclass = OSNumber::withNumber(0x00ULL, 32);
++			OSNumber *device_protocol = OSNumber::withNumber(0x00ULL, 32);
++			OSNumber *bcd_usb = OSNumber::withNumber(0x0200ULL, 16);
++			OSString *manufacturer = OSString::withCString("UniXNU");
++			OSString *product = OSString::withCString("iPhone");
++			OSString *serial = OSString::withCString("F2LXUNIXNU01");
++			static const unsigned char device_descriptor[18] = {
++				0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40,
++				0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 0x01, 0x02,
++				0x03, 0x01,
++			};
++			OSData *descriptor = OSData::withBytes(device_descriptor,
++			    sizeof(device_descriptor));
++			if (default_config && device_id && device_class && device_subclass &&
++			    device_protocol && bcd_usb && manufacturer && product && serial &&
++			    descriptor) {
++				desc->setObject("DefaultConfiguration", default_config);
++				desc->setObject("deviceID", device_id);
++				desc->setObject("deviceClass", device_class);
++				desc->setObject("deviceSubClass", device_subclass);
++				desc->setObject("deviceProtocol", device_protocol);
++				desc->setObject("BcdUSBVersion", bcd_usb);
++				desc->setObject("manufacturerString", manufacturer);
++				desc->setObject("productString", product);
++				desc->setObject("serialNumber", serial);
++				desc->setObject("Description", descriptor);
++			}
+ 			ctl->setProperty("DeviceDescription", desc);
+-			printf("SWEET NUB: published DeviceDescription (%u interfaces)\n", count);
++			printf("SWEET NUB: published DeviceDescription (%u interfaces, %s descriptor)\n",
++			    count, descriptor != NULL ? "18-byte" : "no");
++			if (default_config) default_config->release();
++			if (device_id) device_id->release();
++			if (device_class) device_class->release();
++			if (device_subclass) device_subclass->release();
++			if (device_protocol) device_protocol->release();
++			if (bcd_usb) bcd_usb->release();
++			if (manufacturer) manufacturer->release();
++			if (product) product->release();
++			if (serial) serial->release();
++			if (descriptor) descriptor->release();
+ 		} else {
+ 			printf("SWEET NUB: cannot allocate the DeviceDescription\n");
+ 		}
