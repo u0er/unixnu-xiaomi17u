@@ -1,6 +1,8 @@
 name: sign-shim
 on:
-  workflow_dispatch:
+  push:
+    paths:
+      - 'carplay/shim/**'
 jobs:
   sign:
     runs-on: macos-15-intel
