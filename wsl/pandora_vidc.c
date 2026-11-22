@@ -1550,18 +1550,18 @@ vidc_publish_queues(void)
            "0xA0060=%08x; CP span 0xA0024/0xA0028 skipped (no TZ CP table)\n",
         vidc_rd(R_CPU_SFR_ADDR), vidc_rd(R_CPU_QUEUE_TABLE_ADDR2));
 
-    /* Assert MSK_CORE_POWER_ON (BIT1) before releasing the core.  The register
-     * definition is explicit: CPU_CS_X2RPMH bit1 is the core power-on request
-     * (iris_vpu_register_defines.h:39-41) and the vendor clears it to 0 only
-     * after the handshake succeeds.  Every earlier ladder left it at 0, and the
-     * snapshot proved the consequence: bit1 read 0, the CPU block and the TZ
-     * wrapper stayed all-zero, and 0xA004C never reported ready -- TZ's
-     * auth_and_reset had released the reset, but the wrapper had never been
-     * asked to power the core. */
-    vidc_wr(R_CPU_X2RPMH, MSK_CORE_POWER_ON);
-    __asm__ volatile ("dsb sy" ::: "memory");
-    printf("PANDORA VIDC: core power-on request 0x%08x = %08x\n",
-        R_CPU_X2RPMH, vidc_rd(R_CPU_X2RPMH));
+    /* Do NOT touch CPU_CS_X2RPMH before releasing the core.  0533 change: the
+     * vendor's __boot_firmware_iris4 never writes w21+0x144 (0xA0168) before
+     * 0xA0048 -- the single site in the whole function is the success branch
+     * 0x15CD8, which writes 0 [K 0x15A44+0x308].  Our previous revision
+     * asserted MSK_CORE_POWER_ON (BIT1) unconditionally right before the boot
+     * control write, and the 17:22 boot then read back x2rpmh=00000002 while
+     * both 0xA004C and 0xC0010 stayed all-zero: the Xtensa never started.
+     * The vendor leaves this register at reset 0 until the handshake is done,
+     * so holding BIT1 across the release was the last pure increment we had
+     * over the vendor sequence.  Read it, never write it. */
+    printf("PANDORA VIDC: X2RPMH left at %08x (vendor writes it only on success/power-off)\n",
+        vidc_rd(R_CPU_X2RPMH));
     vc_smmu_faults = 0;
     vc_smmu_faults_done = false;
     /* Drop any fault latched during table build/attach so the capture below
