@@ -1,0 +1,107 @@
+From: baseband lane
+Subject: 0527 pandora_pas/adsp: read the THIRD result word -- the bridge handle lives there
+
+Evidence from logs/1795306044 (the first boot that ever switched the bridge on):
+
+  PANDORA PAS: shm_bridge_enable -> a0 0 (0) a1 0
+  PANDORA PAS: shm_bridge_create(0x8caf74000+0x1000) -> a0 0 (0) handle 0
+  PANDORA PAS: probe pas 4 init_image -> a0 0xffcffff6 (-3145738)     <- a NEW code, not 0xffcfffbb
+  PANDORA PAS: probe pas 24 init_image -> a0 0xffcfffbb               <- the old code, same boot
+
+So the create was accepted (a0 0) and the handle came back as zero, because this file only ever read
+two of the result registers.  Upstream's qcom_scm_shm_bridge_create() returns res.result[0] as the
+status and res.result[1] as the handle, and the SMC results land in x1/x2/x3 -- the handle is the
+third word, which none of this kernel's wrappers returned.
+
+adsp.c gains pandora_scm_call5_r3() (same lock, same retry, three results) and pas_bridge_create()
+now takes the handle from a2, falling back to a1 on platforms that pack it differently.  Both words
+are printed so the next log says exactly where it arrived.
+
+The other half of that log matters too: with SHM_BRIDGE_ENABLE switched on, plain buffers were
+refused with 0xffcffff6 instead of 0xffcfffbb -- two codes coexisting in one boot.  That is the same
+"a bridge changes the answer" observation freedreno reports on SM8845 ("passing an SHM bridge buffer
+gives a different error"), and it means the enable is a global switch that then requires a real
+bridge for the buffer.
+
+diff --git a/bsd/dev/pandora_adsp.c b/b/bsd/dev/pandora_adsp.c
+index 59f5848..f7e9763 100755
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -282,6 +282,37 @@ pandora_scm_call5(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint6
+ 	*a1 = r.a1;
+ }
+ 
++/*
++ * The form that also returns the third result word.
++ *
++ * qcom_scm_shm_bridge_create() hands its handle back in res.result[1]; with the SMC results landing
++ * in x1/x2/x3 that is the *third* register, and the wrappers above stop at two.  The 2026-11-22
++ * 08:0x boot (logs/1795306044) showed the consequence: `shm_bridge_create(...) -> a0 0 (0)
++ * handle 0` -- the call was accepted and the handle was simply never read -- and TZ, with the
++ * bridge feature switched on by SHM_BRIDGE_ENABLE, then refused plain buffers with a different
++ * code than before (0xffcffff6 instead of 0xffcfffbb).
++ */
++void pandora_scm_call5_r3(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4,
++    uint64_t x5, uint64_t *a0, uint64_t *a1, uint64_t *a2);
++
++void
++pandora_scm_call5_r3(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4,
++    uint64_t x5, uint64_t *a0, uint64_t *a1, uint64_t *a2)
++{
++	struct scm_res r;
++
++	scm_smc(fn, arginfo, x2, x3, x4, x5, &r);
++	if (a0) {
++		*a0 = r.a0;
++	}
++	if (a1) {
++		*a1 = r.a1;
++	}
++	if (a2) {
++		*a2 = r.a2;
++	}
++}
++
+ /*
+  * The seven-value form.
+  *
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index 6939297..424a72f 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -46,6 +46,8 @@ extern void pandora_scm_call5(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64
+ static void pas_enable_shm_bridge(void);
+ static uint64_t pas_bridge_create(uint64_t pa, uint64_t size);
+ static void pas_bridge_delete(uint64_t handle, unsigned pas);
++extern void pandora_scm_call5_r3(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4,
++    uint64_t x5, uint64_t *a0, uint64_t *a1, uint64_t *a2);
+ static void pas_release_meta(unsigned pas, vm_offset_t md, uint64_t size, uint64_t bridge);
+ 
+ /*
+@@ -598,11 +600,21 @@ pas_bridge_create(uint64_t pa, uint64_t size)
+ 	if (!pas_bridge_on) {
+ 		return 0;
+ 	}
+-	pandora_scm_call5(PAS_SCM_SHIM_CREATE, SCM_ARGS(4), pa | PAS_PERM_RW, pa | PAS_PERM_RW,
+-	    size | (1ull << PAS_NUM_VM_SHIFT), PAS_VMID_HLOS, &a0, &a1);
+-	printf("PANDORA PAS: shm_bridge_create(%#llx+%#llx) -> a0 %#llx (%d) handle %#llx\n", pa, size,
+-	    a0, (int)(int32_t)a0, a1);
+-	return (a0 || a1 == 0) ? 0 : a1;
++	uint64_t a2 = 0;
++
++	pandora_scm_call5_r3(PAS_SCM_SHIM_CREATE, SCM_ARGS(4), pa | PAS_PERM_RW, pa | PAS_PERM_RW,
++	    size | (1ull << PAS_NUM_VM_SHIFT), PAS_VMID_HLOS, &a0, &a1, &a2);
++	printf("PANDORA PAS: shm_bridge_create(%#llx+%#llx) -> a0 %#llx (%d) a1 %#llx a2 %#llx\n",
++	    pa, size, a0, (int)(int32_t)a0, a1, a2);
++	/*
++	 * Upstream's qcom_scm_shm_bridge_create() returns res.result[0] as the status and
++	 * res.result[1] as the handle; the results arrive in x1/x2/x3, so the handle is a2 here.
++	 * a1 is kept as a fallback because a platform may pack it differently.
++	 */
++	if (a0 != 0) {
++		return 0;
++	}
++	return a2 ? a2 : a1;
+ }
+ 
+ static void
