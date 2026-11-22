@@ -1,0 +1,130 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0513 sweet_nub: call createUSBDevice ourselves when no personality matched
+
+0512 samples the published controller five seconds after registerService. If it is still inactive
+there, the configuration personality did not match, and the S4/S5 gates would stay dark forever
+without saying why.
+
+But IOUSBDeviceConfigurator::start has no other job: it reads its own DeviceDescription property
+(the dictionary the personality carries) and calls createUSBDevice(provider, description) at a
+fixed address. So the fallback can do exactly that: with sweet_nub=3 (NCM) or 4 (NCM + mux) the
+probe builds the same dictionary from the values read out of __PRELINK_INFO (Attributes 224,
+MaxPower 0, Interfaces = the function names, vendorID/productID 0x1209/0x0001) and calls
+createUSBDevice itself, logging the IOReturn. Modes 1/2 keep the old behaviour.
+
+Address: createUSBDevice lives at stock 0xfffffff005cf54c0, i.e. our prelink 0xfffffff004cf54c0
+(stock minus SLIDE). Verified offline with tools/kdis.py on prelink-0511-acckeys: the function
+starts with `sub sp, sp, #0x150`, exactly as the stock listing in USBDEVICE_CONTROLLER_ABI §2.4.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * 0508/0509 CarPlay C1: controller-nub probe / first instantiation.
++ * 0508/0509/0510/0511/0512/0513 CarPlay C1: controller-nub probe and instantiation.
+  *
+  * Why this exists: our kernel does not carry Apple's device-side USB stack by
+  * default. It can be prelinked in (IOUSBDeviceFamily, AppleUSBDeviceMux,
+@@ -24,7 +24,11 @@
+  */
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOPlatformExpert.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSMetaClass.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
+ #include <libkern/c++/OSSymbol.h>
+ #include <libkern/c++/OSSharedPtr.h>
+ #include <libkern/c++/OSIterator.h>
+@@ -44,6 +48,10 @@
+ #define SWEET_NUB_START_SLOT   86
+ #define SWEET_NUB_KERNEL_BASE  0xfffffff000000000ULL
+ #define SWEET_NUB_CLASS        "IOUSBDeviceController"
++/* createUSBDevice in OUR prelink = stock 0xfffffff005cf54c0 minus SLIDE 0x1000000. Verified
++ * offline with tools/kdis.py on prelink-0511-acckeys: the function starts with
++ * `sub sp, sp, #0x150`, exactly like the stock listing in the ABI document. */
++#define SWEET_NUB_CREATE_USBDEVICE  0xfffffff004cf54c0ULL
+ 
+ /* The 18 slots that hold __cxa_pure_virtual in IOUSBDeviceController. */
+ static const unsigned sweet_nub_pure_slots[] = {
+@@ -214,10 +222,12 @@
+ 	 * personality, sweet_nub=2 is iBridgeBringup (AppleUSBMux + NCM). A separate boot argument
+ 	 * would not fit: the assembled cmdline is already 603 of the 607 usable bytes, so growing it
+ 	 * by a second flag makes mkpayload refuse the image. One integer, one knob, no length risk. */
+-	const char *personality = (run_start == 2) ? "iBridgeBringup" : "ncmBringup";
++	const char *personality = (run_start == 2 || run_start == 4) ? "iBridgeBringup" : "ncmBringup";
++	/* 0513: 3/4 arm the direct fallback (call createUSBDevice ourselves if nothing matched). */
++	const int direct_fallback = (run_start >= 3);
+ 	ctl->setProperty("ConfigurationType", personality);
+ 	printf("SWEET NUB: ConfigurationType=%s (sweet_nub=%d%s)\n", personality, run_start,
+-	    run_start == 2 ? "" : "; pass 2 for iBridge");
++	    direct_fallback ? ", direct fallback armed" : "; add 2 for iBridge, 3/4 to arm direct");
+ 	ctl->registerService();
+ 	printf("SWEET NUB: registered as %s; mux/configurator should now match\n", personality);
+ 
+@@ -245,6 +255,64 @@
+ 		}
+ 	}
+ 	printf("SWEET NUB: children %d\n", children);
++
++	/*
++	 * 0513: IOUSBDeviceConfigurator::start is nothing but getProperty("DeviceDescription") plus a
++	 * direct call to createUSBDevice(this = provider). If the published personality did not get
++	 * us that far (still inactive after five seconds), do its one job here with the same
++	 * dictionary the personality carries (contents read out of __PRELINK_INFO: Attributes 224,
++	 * MaxPower 0, Interfaces = the function names, and the NCM/Mux variant is selectable).
++	 */
++	if (!started_now && direct_fallback) {
++		OSDictionary *desc = OSDictionary::withCapacity(8);
++		OSArray *configs = OSArray::withCapacity(1);
++		OSDictionary *config = OSDictionary::withCapacity(4);
++		OSArray *ifaces = OSArray::withCapacity(3);
++		if (desc == NULL || configs == NULL || config == NULL || ifaces == NULL) {
++			printf("SWEET NUB: cannot allocate the direct description\n");
++		} else {
++			OSNumber *attributes = OSNumber::withNumber(224, 32);
++			OSNumber *maxpower = OSNumber::withNumber(0, 32);
++			OSNumber *vendor = OSNumber::withNumber(0x1209, 32);
++			OSNumber *product = OSNumber::withNumber(0x0001, 32);
++			OSString *fn_mux = OSString::withCString("AppleUSBMux");
++			OSString *fn_ctl = OSString::withCString("AppleUSBNCMControl");
++			OSString *fn_dat = OSString::withCString("AppleUSBNCMData");
++			if (attributes && maxpower && vendor && product && fn_ctl && fn_dat) {
++				config->setObject("Attributes", attributes);
++				config->setObject("MaxPower", maxpower);
++				if (run_start == 4 && fn_mux) {
++					ifaces->setObject(fn_mux);
++				}
++				ifaces->setObject(fn_ctl);
++				ifaces->setObject(fn_dat);
++				config->setObject("Interfaces", ifaces);
++				configs->setObject(config);
++				desc->setObject("ConfigurationDescriptors", configs);
++				desc->setObject("vendorID", vendor);
++				desc->setObject("productID", product);
++				uint32_t ir = ((uint32_t (*)(IOService *, OSDictionary *))
++				    SWEET_NUB_CREATE_USBDEVICE)(ctl, desc);
++				printf("SWEET NUB: direct createUSBDevice -> 0x%08x\n", ir);
++			} else {
++				printf("SWEET NUB: cannot allocate the description values\n");
++			}
++			if (attributes) attributes->release();
++			if (maxpower) maxpower->release();
++			if (vendor) vendor->release();
++			if (product) product->release();
++			if (fn_mux) fn_mux->release();
++			if (fn_ctl) fn_ctl->release();
++			if (fn_dat) fn_dat->release();
++		}
++		if (ifaces) ifaces->release();
++		if (config) config->release();
++		if (configs) configs->release();
++		if (desc) desc->release();
++	} else if (!started_now) {
++		printf("SWEET NUB: nothing matched; pass sweet_nub=3 (or 4) to call createUSBDevice "
++		    "from here\n");
++	}
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
