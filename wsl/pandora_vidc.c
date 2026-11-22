@@ -1457,9 +1457,12 @@ vidc_power_up(void)
     vidc_snap("after power");
     /* A branch reading CLK_OFF=0 only means the *gate* is open; if its RCG has no
      * root enabled or no source selected, the core still gets no clock and never
-     * executes.  RCG2 layout is CFG_RCGR @+0, CMD_RCGR @+4, M/N/D @+8/+0xC/+0x10
-     * [K clock_regs.txt:202-290 __clk_rcg2_configure]; base offsets come from the
-     * captured videocc-canoe.ko objects.  Read-only: this decides "gated" vs
+     * executes.  Corrected decoder (2026-11-23, vendor __clk_rcg2_configure
+     * 0x12cfc/0x12f0c): CMD_RCGR is at base+cmd_rcgr (the update command) and
+     * CFG_RCGR is at base+cmd_rcgr+4 (the src/pre_div/M/N/D fields); the
+     * previous revision printed the CMD register as "cfg", which made a
+     * configured RCG look unconfigured.  Base offsets come from the captured
+     * videocc-canoe.ko objects.  Read-only: this decides "gated" vs
      * "configured but core still idle" without another guess. */
     static const struct { const char *name; uint32_t off; } rcgs[] = {
         { "mvs0a", 0x8000u }, { "mvs0b", 0x8018u }, { "mvs0", 0x8030u },
@@ -1468,7 +1471,7 @@ vidc_power_up(void)
     for (unsigned i = 0; i < sizeof(rcgs) / sizeof(rcgs[0]); i++) {
         printf("PANDORA VIDC: rcg %-5s cfg=%08x cmd=%08x m/n/d=%08x/%08x/%08x\n",
             rcgs[i].name,
-            vidc_cc_rd(rcgs[i].off), vidc_cc_rd(rcgs[i].off + 4),
+            vidc_cc_rd(rcgs[i].off + 4), vidc_cc_rd(rcgs[i].off),
             vidc_cc_rd(rcgs[i].off + 8), vidc_cc_rd(rcgs[i].off + 0xC),
             vidc_cc_rd(rcgs[i].off + 0x10));
     }
@@ -1520,12 +1523,15 @@ vidc_publish_queues(void)
     vidc_wr(R_CPU_QUEUE_TABLE_SIZE, VIDC_QTABLE_BYTES);
     vidc_wr(R_CPU_QUEUE_TABLE_DA2, da);
     vidc_wr(R_CPU_QUEUE_TABLE_EN, 1);
-    if (vidc_sfr_da() && vidc_uc_da()) {
-        /* 0xA0060 is the UC descriptor page, not the SFR (see VIDC_IOVA_UC):
-         * the vendor writes core[0x13e8] there and only when it is non-zero
-         * [K 0x15af8-0x15b08], so publishing the SFR page put the descriptor
-         * where the SFR size word lives. */
-        vidc_wr(R_CPU_QUEUE_TABLE_ADDR2, vidc_uc_da());
+    if (vidc_sfr_da()) {
+        /* Round 27 single variable: the vendor writes 0xA0060 (the UC
+         * descriptor page, core[0x13e8]) only when that pointer is non-zero
+         * [K 0x15af8-0x15b08]; our port owns no such pointer, so the
+         * vendor-equivalent action is to leave 0xA0060 at reset instead of
+         * publishing the fabricated UC page that 0529 added.  The UC page
+         * itself stays allocated/zeroed but is no longer advertised here. */
+        printf("PANDORA VIDC: 0xA0060 left at %08x (vendor skips when core[0x13e8]==0)\n",
+            vidc_rd(R_CPU_QUEUE_TABLE_ADDR2));
         /* SFR_ADDR must carry sfr + core_arch (upstream), not the bare DA. */
         vidc_wr(R_CPU_SFR_ADDR, vidc_sfr_da() + VIDC_CORE_ARCH);
         /* Round 24 single variable: do NOT write SCIACMDARG3 (0xA0058).
