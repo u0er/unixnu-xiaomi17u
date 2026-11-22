@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+index d089181..3addc17 100644
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -1543,16 +1543,22 @@ vidc_publish_queues(void)
+         vidc_rd(R_CPU_QUEUE_TABLE_DA2), vidc_rd(R_CPU_QUEUE_TABLE_EN),
+         vidc_rd(R_CPU_QUEUE_TABLE_ADDR2));
+ 
+-    /* 0xA0024/0xA0028 carry the TrustZone content-protection span: the vendor
+-     * derives it from its CP resource table and only writes it when that table
+-     * reports a non-zero start (start != 0 is purely a guard; both registers
+-     * receive the SPAN) [K __boot_firmware_iris4 step 6-7].  We do not use
+-     * protected playback and own no CP table, so the vendor-equivalent action
+-     * is to write nothing -- not to invent a span for video_region.  Both
+-     * registers and 0xA005C are therefore left at their reset values. */
++    /* Round 26 single variable: 0xA0024/0xA0028 are the CP span the vendor
++     * derives from its device-region table -- a = min(size), b =
++     * max(start+size) - a [K 0x173d4 / 0x15b34].  Our port owns no res table,
++     * so the single video_region entry is staged directly:
++     * start = VIDEO_REGION_PA, size = VIDEO_REGION_SIZE -> a = 8 MiB,
++     * b = start.  The TZ SCM call in vidc_auth_reset is deliberately left
++     * unchanged (a separate variable).  Previous revisions skipped both
++     * writes because the vendor skips them when its table is empty; this
++     * round tests whether a non-zero span changes the firmware ACK. */
++    vidc_wr(R_CPU_CP_SPAN_A, VIDEO_REGION_SIZE);
++    vidc_wr(R_CPU_CP_SPAN_B, VIDEO_REGION_PA);
++    __asm__ volatile ("dsb sy" ::: "memory");
+     printf("PANDORA VIDC: SFR 0xA005C=%08x (sfr+core_arch) and UC page "
+-           "0xA0060=%08x; CP span 0xA0024/0xA0028 skipped (no TZ CP table)\n",
+-        vidc_rd(R_CPU_SFR_ADDR), vidc_rd(R_CPU_QUEUE_TABLE_ADDR2));
++           "0xA0060=%08x; CP span 0xA0024=%08x 0xA0028=%08x (video_region 8 MiB)\n",
++        vidc_rd(R_CPU_SFR_ADDR), vidc_rd(R_CPU_QUEUE_TABLE_ADDR2),
++        vidc_rd(R_CPU_CP_SPAN_A), vidc_rd(R_CPU_CP_SPAN_B));
+ 
+     /* Do NOT touch CPU_CS_X2RPMH before releasing the core.  0533 change: the
+      * vendor's __boot_firmware_iris4 never writes w21+0x144 (0xA0168) before
