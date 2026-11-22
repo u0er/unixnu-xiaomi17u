@@ -1,0 +1,201 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+index f7b0cbf..e7cca8a 100644
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -443,6 +443,7 @@ static bool     vidc_smmu_on;
+ static unsigned vidc_smmu_drop_calls;   /* see vidc_smmu_drop() */
+ static uint32_t vidc_smmu_cb;      /* CB base offset inside apps-smmu */
+ static uint32_t vidc_smmu_bank;
++static ArmSmmu4KStreamState vidc_smmu_sstate;   /* owned routes, for teardown */
+ /* Fault-capture state for the post-boot-release window. */
+ /* Default 0 = bring-up at init.  Deferring to 9 s dodged the TOUCH 128 KiB
+  * failure at 5.171 s but then our 3 MiB queue table made a later 1 MiB
+@@ -532,9 +533,30 @@ vidc_le32(const uint8_t *p)
+            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+ }
+ 
++/* Every queue-window access must stay inside OUR allocation.  This is not
++ * belt-and-braces: vidc_sync_in/out clean or flush cache lines at
++ * `vidc_qtable_pa + off`, so an offset past the window would discard another
++ * buffer's dirty lines -- including page-cache pages -- which is exactly the
++ * silent volume corruption we must never risk.  Ring offsets also derive from
++ * `start_addr`, a field the device writes, so they are untrusted. */
++static bool vidc_qt_off_bad_logged;
++static inline bool
++vidc_qt_off_ok(uint64_t off, unsigned len)
++{
++    if (off + len <= (uint64_t)vidc_qtable_bytes) return true;
++    if (!vidc_qt_off_bad_logged) {
++        vidc_qt_off_bad_logged = true;
++        printf("PANDORA VIDC: REFUSED queue-window access off=%#llx len=%u "
++               "(window %#x) -- it would touch memory outside our allocation\n",
++            (unsigned long long)off, len, vidc_qtable_bytes);
++    }
++    return false;
++}
++
+ static inline uint32_t
+ vidc_qt_rd(uint32_t off)
+ {
++    if (!vidc_qt_off_ok(off, 4)) return 0;
+     return vidc_ld32(vidc_qtable_va, off);
+ }
+ 
+@@ -554,6 +576,7 @@ vidc_ring_rd(uint32_t ring_off, uint32_t ring_end, uint32_t off)
+ static inline void
+ vidc_qt_wr(uint32_t off, uint32_t v)
+ {
++    if (!vidc_qt_off_ok(off, 4)) return;
+     vidc_st32(vidc_qtable_va, off, v);
+     __asm__ volatile ("dmb oshst" ::: "memory");
+ }
+@@ -562,6 +585,7 @@ vidc_qt_wr(uint32_t off, uint32_t v)
+ static inline void
+ vidc_sync_out(uint64_t off, unsigned len)
+ {
++    if (!vidc_qt_off_ok(off, len)) return;
+     __asm__ volatile ("dmb oshst" ::: "memory");
+     clean_dcache64((addr64_t)(vidc_qtable_pa + off), len, TRUE);
+     __asm__ volatile ("dmb oshst" ::: "memory");
+@@ -571,6 +595,7 @@ vidc_sync_out(uint64_t off, unsigned len)
+ static inline void
+ vidc_sync_in(uint64_t off, unsigned len)
+ {
++    if (!vidc_qt_off_ok(off, len)) return;
+     __asm__ volatile ("dmb oshld" ::: "memory");
+     flush_dcache64((addr64_t)(vidc_qtable_pa + off), len, TRUE);
+     __asm__ volatile ("dmb oshld" ::: "memory");
+@@ -620,31 +645,6 @@ vidc_alloc_buffers(void)
+     return 0;
+ }
+ 
+-/* Give the queue window back as soon as the ladder stops needing it.
+- *
+- * Measured on this board: the TOUCH driver's 128 KiB
+- * kmem_alloc(KMA_NOFAIL|KMA_KOBJECT|KMA_ZERO) fails at 5.168 s on every boot
+- * whose ladder still holds VIDC's buffers (`failed with 3 @vm_kern.c:178` ->
+- * restart type 4), while the probe-only level 1 never panics.  Publishing has
+- * already read 0xA004C and printed the verdict by this point, so dropping the
+- * 3 MiB qtable here restores the map to the level-1 shape before the touch
+- * window opens.  The SFR and UC pages stay (16 KiB + 4 KiB, and the SMMU
+- * context still points at them); the qtable IOVA is marked invalid so nothing
+- * in this build can publish or poll it again. */
+-static void
+-vidc_release_qtable(void)
+-{
+-    if (!vidc_qtable_va)
+-        return;
+-    printf("PANDORA VIDC: releasing qtable %#x bytes before the 5.17 s window\n",
+-        VIDC_QTABLE_ALLOC);
+-    kmem_free(kernel_map, vidc_qtable_va, VIDC_QTABLE_ALLOC);
+-    vidc_qtable_va = 0;
+-    vidc_qtable_pa = 0;
+-    vidc_qtable_iova = 0;
+-    vidc_smmu_on = false;
+-}
+-
+ /* ------------------------------------------------------------------ */
+ /* apps-SMMU: 32-bit IOVAs for the queue table, the UC page and the SFR */
+ /* ------------------------------------------------------------------ */
+@@ -953,6 +953,7 @@ vidc_smmu_up(void)
+     vidc_uc_iova = (uint32_t)VIDC_IOVA_UC;
+     vidc_smmu_cb = cb_off;
+     vidc_smmu_bank = bank;
++    vidc_smmu_sstate = sstate;
+     vidc_smmu_on = true;
+     /* Give the 1 MiB of apps-smmu VA back NOW, not at the end of the ladder.
+      * Measured: with the teardown only at the end, the kernel died at 5.177 s
+@@ -1068,6 +1069,62 @@ vidc_wr(uint32_t off, uint32_t v)
+     __asm__ volatile ("dmb oshst" ::: "memory");
+ }
+ 
++/* Give the queue window back as soon as the ladder stops needing it.
++ *
++ * Measured on this board: the TOUCH driver's 128 KiB
++ * kmem_alloc(KMA_NOFAIL|KMA_KOBJECT|KMA_ZERO) fails at 5.168 s on every boot
++ * whose ladder still holds VIDC's buffers (`failed with 3 @vm_kern.c:178` ->
++ * restart type 4), while the probe-only level 1 never panics.  Publishing has
++ * already read 0xA004C and printed the verdict by this point, so dropping the
++ * 3 MiB qtable here restores the map to the level-1 shape before the touch
++ * window opens.  The owned streams are moved to FAULT (abort, never bypass)
++ * before the free, so no DMA can reach the recycled pages; the SFR and UC
++ * pages stay allocated; the qtable IOVA is marked invalid so nothing in this
++ * build can publish it again. */
++static bool
++vidc_streams_fault(void)
++{
++    if (!vidc_smmu_on)
++        return true;                    /* nothing was routed */
++    if (!vidc_smmu_va)
++        return false;
++    ArmSmmu4KMmio mmio = { (volatile unsigned char *)vidc_smmu_va, VIDC_SMMU_SIZE };
++    ArmSmmu4KIo io;
++    ArmSmmu4KStreamResult res;
++    if (ArmSmmu4KBindMmio(&mmio, &io) != ArmSmmu4KSuccess)
++        return false;
++    pandora_apps_smmu_lock();
++    ArmSmmu4KStatus st = ArmSmmu4KFaultStreams(&io, &vidc_smmu_sstate, &res);
++    pandora_apps_smmu_unlock();
++    printf("PANDORA VIDC: SMMU streams -> FAULT: %s\n",
++        st == ArmSmmu4KSuccess ? "ok" : "refused, qtable kept");
++    return st == ArmSmmu4KSuccess;
++}
++
++static void
++vidc_release_qtable(void)
++{
++    if (!vidc_qtable_va)
++        return;
++    /* Stop the core and its translations BEFORE the pages go back to the map:
++     * a still-running VPU can DMA through 0xFF000000 into recycled pages, which
++     * panics minutes later (and that panic is what dirties the volume). */
++    vidc_wr(R_CPU_BOOT_CTRL, 0);              /* hold the VPU in reset */
++    __asm__ volatile ("dsb sy" ::: "memory");
++    delay(2000);                               /* delay() takes microseconds */
++    if (!vidc_streams_fault()) {
++        printf("PANDORA VIDC: qtable kept allocated (streams still active)\n");
++        return;
++    }
++    printf("PANDORA VIDC: releasing qtable %#x bytes before the 5.17 s window\n",
++        VIDC_QTABLE_ALLOC);
++    kmem_free(kernel_map, vidc_qtable_va, VIDC_QTABLE_ALLOC);
++    vidc_qtable_va = 0;
++    vidc_qtable_pa = 0;
++    vidc_qtable_iova = 0;
++    vidc_smmu_on = false;
++}
++
+ /* ------------------------------------------------------------------ */
+ /* Level 1: read-only identity probe.  Maps MMIO and prints the registers
+  * whose values establish the vpu4 variant.  No power or clock changes. */
+@@ -1763,15 +1820,25 @@ vidc_hfi_poll(void)
+     if (w == r) return 0;
+ 
+     uint32_t start = vidc_qt_rd(moff + offsetof(struct vidc_queue_header, start_addr));
+-    uint32_t ring_off = start - vidc_qtable_da();
+-    uint32_t q_off = ring_off + r * 4u;
+-    const uint32_t ring_end = ring_off + (uint32_t)IFACEQ_QUEUE_SIZE;
+-    if (q_off + 8u > VIDC_QTABLE_BYTES) {
+-        printf("PANDORA VIDC: msg queue index out of range (r=%u w=%u start=%08x)\n", r, w, start);
++    /* Validate against the *current* ring geometry before any pointer math:
++     * a corrupt ring header can otherwise wrap uint32 (start < DA, r*4 wraps)
++     * and turn the flush below into an out-of-bounds kernel read. */
++    bool bad = r >= IFACEQ_QUEUE_WORDS || w >= IFACEQ_QUEUE_WORDS ||
++        start < vidc_qtable_da();
++    uint32_t ring_off = bad ? 0u : start - vidc_qtable_da();
++    uint64_t q64 = (uint64_t)ring_off + (uint64_t)r * 4u;
++    if (!bad && (ring_off > VIDC_QTABLE_BYTES - (uint32_t)IFACEQ_QUEUE_SIZE ||
++                 q64 + 8u > (uint64_t)VIDC_QTABLE_BYTES))
++        bad = true;
++    if (bad) {
++        printf("PANDORA VIDC: msg queue header out of range (r=%u w=%u start=%08x q_size=%u)\n",
++            r, w, start, IFACEQ_QUEUE_WORDS);
+         vidc_qt_wr(moff + offsetof(struct vidc_queue_header, read_idx), w);
+         vidc_sync_out(moff, (unsigned)sizeof(struct vidc_queue_header));
+         return 2;
+     }
++    uint32_t q_off = (uint32_t)q64;
++    const uint32_t ring_end = ring_off + (uint32_t)IFACEQ_QUEUE_SIZE;
+     /* One packet is at most IFACEQ_CORE_PKT_SIZE, and it may wrap at the ring
+      * end, so invalidate the tail and (when wrapping) the head separately. */
+     uint32_t span = 20u + 128u;                  /* header + property head */
