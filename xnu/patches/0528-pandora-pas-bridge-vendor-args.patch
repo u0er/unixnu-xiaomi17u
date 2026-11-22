@@ -1,0 +1,55 @@
+From: baseband lane
+Subject: 0528 pandora_pas: build the SHM bridge arguments the way the vendor module does
+
+Until now the bridge arguments came from upstream qcom_tzmem.c.  This phone's own qcom-scm.ko turns
+out to be readable -- it lives in the vendor_boot ramdisk under the hyphenated name
+lib/modules/qcom-scm.ko, which is why searching the mounted module directories for "qcom_scm" never
+found it.  Disassembling it gives the arguments this platform actually uses:
+
+  qcom_tzmem_shm_bridge_create():
+      mov w2, wzr                        vmid = 0 for a plain create
+
+  qcom_tzmem_shm_bridge_create_with_vmid():
+      mov w8, #512                       (1 << QCOM_SHM_BRIDGE_NUM_VM_SHIFT)
+      orr x1, x20, #0x6                  paddr | PERM_RW
+      orr x2, x8, x21                    (1 << 9) | ((size + 4095) & ~0xfff)
+
+and qcom_scm_shm_bridge_create() itself packs svc 0xc / cmd 0x1e with arginfo 4 and owner SIP --
+exactly what this file does.
+
+Two differences with what this file passed:
+
+  * vmid: upstream passes QCOM_SCM_VMID_HLOS (3), the vendor passes 0.  That is now the default and
+    `pandora_pas_bridge_vmid=` overrides it, so one boot can compare both.
+  * size: the vendor rounds up to 4 KiB before OR-ing 1<<9; this file passed a size that happens to be
+    page-aligned already, so that part was equivalent, but it is now explicit.
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index 424a72f..c98d13f 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -602,8 +602,23 @@ pas_bridge_create(uint64_t pa, uint64_t size)
+ 	}
+ 	uint64_t a2 = 0;
+ 
++	/*
++	 * The four arguments, taken from the vendor's own qcom-scm.ko rather than from upstream:
++	 *
++	 *   qcom_tzmem_shm_bridge_create():        mov w2, wzr    -> vmid 0 for a plain create
++	 *   qcom_tzmem_shm_bridge_create_with_vmid():
++	 *     mov w8, #512                                     -> (1 << SHM_BRIDGE_NUM_VM_SHIFT)
++	 *     orr x1, x20, #0x6                                -> paddr | PERM_RW
++	 *     orr x2, x8, x21                                  -> (1 << 9) | round_up(size, 4 KiB)
++	 *
++	 * This file passed PAS_VMID_HLOS (3) where the vendor passes 0, and an unrounded size.
++	 * `pandora_pas_bridge_vmid=` overrides the vmid so both can be compared in one boot.
++	 */
++	unsigned vmid = 0;
++	(void)PE_parse_boot_argn("pandora_pas_bridge_vmid", &vmid, sizeof(vmid));
++	uint64_t rounded = ((uint64_t)size + 0xfff) & ~0xfffull;
+ 	pandora_scm_call5_r3(PAS_SCM_SHIM_CREATE, SCM_ARGS(4), pa | PAS_PERM_RW, pa | PAS_PERM_RW,
+-	    size | (1ull << PAS_NUM_VM_SHIFT), PAS_VMID_HLOS, &a0, &a1, &a2);
++	    rounded | (1ull << PAS_NUM_VM_SHIFT), vmid, &a0, &a1, &a2);
+ 	printf("PANDORA PAS: shm_bridge_create(%#llx+%#llx) -> a0 %#llx (%d) a1 %#llx a2 %#llx\n",
+ 	    pa, size, a0, (int)(int32_t)a0, a1, a2);
+ 	/*
