@@ -1,0 +1,80 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0528 sweet_nub: never dereference ctl+0x110/0x120, and ignore a duplicate start
+
+Two hardening changes after the 5-pass review:
+
+1. The 0519 diagnostic dereferenced [ctl+0x110] as an object pointer. 0525 proved that field can
+   hold a packed value (0x5ac00000000...), and the boot died at 15.195 s. 0526 added a
+   "looks like a kernel address" check -- but a value can satisfy that and still be unmapped, so
+   the probe would still fault. 0528 prints the raw field and never dereferences it: the tag
+   census belongs to a later stage where those objects really exist.
+
+2. sweet_nub_start had no duplicate guard: a second call would spawn a second probe thread, and
+   both would rewrite the vtable globals and the same object fields. 0528 adds a start flag.
+
+Prepared during the code review; not dispatched until the volume gate story is closed.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -83,6 +83,10 @@
+ extern "C" void sweet_nub_start(void);
+ 
+ static int sweet_nub_wait;
++/* 0528: best-effort duplicate-start guard. The gadget start calls sweet_nub_start once, but a
++ * second call would spawn a second probe thread and both would rewrite the vtable globals and the
++ * same object fields. A plain flag is enough: the call site is single-threaded. */
++static int sweet_nub_armed;
+ 
+ extern "C" uint64_t sweet_nub_stub0(void *, ...);
+ extern "C" uint64_t sweet_nub_stub1(void *, ...);
+@@ -154,6 +158,11 @@
+ extern "C" void
+ sweet_nub_start(void)
+ {
++	if (sweet_nub_armed) {
++		printf("SWEET NUB: probe already armed; ignoring duplicate start\n");
++		return;
++	}
++	sweet_nub_armed = 1;
+ 	thread_t thread;
+ 	if (kernel_thread_start(sweet_nub_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+@@ -518,27 +527,18 @@
+ 	 * The pointers may legitimately be NULL in the direct-create path -- that is information,
+ 	 * so print them unconditionally and only dereference a pointer that looks like text.
+ 	 */
++	/*
++	 * 0528: print the two channel fields raw, and never dereference them.
++	 *
++	 * 0525 crashed here (data abort at 0xfffffff0079ef73c) because ctl+0x110 held a packed
++	 * value, 0x5ac00000000..., that the probe treated as an object pointer. 0526 added a
++	 * "looks like a kernel address" check, but a value can look like one and still be
++	 * unmapped -- the probe has no business dereferencing a field it does not own. The tag
++	 * census has to wait until C1's channel objects actually exist.
++	 */
+ 	for (unsigned off = 0x110; off <= 0x120; off += 0x10) {
+-		void *obj = *(void **)((char *)ctl + off);
+-		uint64_t raw = (uint64_t)obj;
+-		printf("SWEET NUB: ctl+0x%x = %p", off, obj);
+-		/*
+-		 * 0526: on the 0525 boot this loop crashed the kernel at 15.195 s, right after the 5 s
+-		 * sample had already shown child[0] IOUSBDeviceConfigurator and two IOUSBDeviceInterface
+-		 * children. ctl+0x110 held 0x5ac00000000..., i.e. a packed value, not a pointer -- the
+-		 * old code dereferenced it unconditionally. Only follow values that could actually be a
+-		 * kernel object address, and say so when the field is something else: the 18-slot / tag
+-		 * census can then be read from the log instead of from a panic.
+-		 */
+-		if (raw >= SWEET_NUB_KERNEL_BASE && (raw & 7) == 0) {
+-			void **vt = *(void ***)obj;
+-			if (vt != NULL && (uint64_t)vt >= SWEET_NUB_KERNEL_BASE) {
+-				printf(", vtable %p, slot29 %p", vt, vt[29]);
+-			}
+-		} else if (raw != 0) {
+-			printf(", not a pointer");
+-		}
+-		printf("\n");
++		printf("SWEET NUB: ctl+0x%x = %p (raw, not dereferenced)\n", off,
++		    *(void **)((char *)ctl + off));
+ 	}
+ 
+ 	/*
