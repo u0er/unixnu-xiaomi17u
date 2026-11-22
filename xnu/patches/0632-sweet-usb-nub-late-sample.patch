@@ -1,0 +1,30 @@
+From: CarPlay C0 lane (2026-11-23)
+Subject: 0632 sweet_nub: second late sample of the channel fields (raw, never dereferenced)
+
+The 5 s sample runs before Apple's NCM data client starts (it attaches around 30 s), so the raw
+ctl+0x110/0x120 values we print there are the pre-client state (25 s boot showed the packed
+0x5ac00000000). Add one 20 s tsleep after the fallback branch and print started/children plus the
+two fields raw again, so C1's endpoint-dispatch step can see whether those fields become real
+objects once the data client is up. No dereference is added (0528's rule).
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -652,6 +652,19 @@
+ 		printf("SWEET NUB: nothing matched; pass sweet_nub=3 (or 4) to call createUSBDevice "
+ 		    "from here\n");
+ 	}
++
++	/*
++	 * 0632: second sample, after Apple's NCM data client has had time to start (~30 s). The two
++	 * channel fields are printed raw again -- still no dereference -- so the next C1 step learns
++	 * whether they are packed values or real objects by then. Costs one tsleep.
++	 */
++	(void)tsleep(&sweet_nub_wait, PZERO, "sweetnub3", 20 * hz);
++	printf("SWEET NUB: late sample: started %d, children %d\n",
++	    ctl->isInactive() ? 0 : 1, children);
++	for (unsigned off = 0x110; off <= 0x120; off += 0x10) {
++		printf("SWEET NUB: late ctl+0x%x = %p (raw, not dereferenced)\n", off,
++		    *(void **)((char *)ctl + off));
++	}
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
