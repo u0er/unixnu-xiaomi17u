@@ -1,0 +1,87 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0522 sweet_nub: publish DeviceDescription so the controller builds its own copy
+
+0520's S3d boot finally reached "Apple start -> 1" and "registered as ncmBringup", then died 0 ms
+later inside createUSBDevice with a data abort at pc 0xfffffff004cf1b54 (far=0x10, x0=NULL).
+
+Tracing the NULL back: createUSBDevice loads x24 = [controller+0x130] and passes it as the first
+argument of the setProperty-style helper at 0xfffffff004cf1b40. +0x130 is filled by the function
+at 0xfffffff004cf05d8, which reads the controller's OWN "DeviceDescription" property, casts it to
+an OSDictionary, converts it and stores the result at +0x130. The probe never published that
+property, so the builder stored NULL and createUSBDevice dereferenced it.
+
+0522 publishes the same dictionary the stock personalities carry (Attributes 224, MaxPower 0,
+Interfaces = the two NCM functions, or Mux + both for iBridge) right before registerService, and
+prints [ctl+0x130] after registration so the next boot shows whether the builder ran.
+
+Device evidence: outputs/data-a-live-nezha/device/private/logs/1795301518 (kernel.txt, after the
+"registered as ncmBringup" line).
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -318,11 +318,65 @@
+ 	const char *personality = (run_start == 2 || run_start == 4) ? "iBridgeBringup" : "ncmBringup";
+ 	/* 0513: 3/4 arm the direct fallback (call createUSBDevice ourselves if nothing matched). */
+ 	const int direct_fallback = (run_start >= 3);
++	/*
++	 * 0522: the controller builds its OWN internal description object from a
++	 * "DeviceDescription" property it reads itself. The builder is the function at
++	 * 0xfffffff004cf05d8 in the 0520 prelink: getProperty("DeviceDescription") -> cast to
++	 * OSDictionary -> helper -> store at this+0x130. With no such property +0x130 stays NULL,
++	 * and the configurator's createUSBDevice then passes that NULL as the first argument of a
++	 * setProperty-style helper -> data abort at 0xfffffff004cf1b54, far=0x10 (observed at
++	 * 10.197 s on the 0520 S3d boot, right after `registered as ncmBringup`).
++	 *
++	 * The stock personalities in __PRELINK_INFO carry exactly this dictionary, so publish the
++	 * matching one here, before registerService starts matching. iBridge needs the Mux entry;
++	 * ncmBringup is the two NCM functions.
++	 */
++	{
++		static const char *iface_ncm[] = {"AppleUSBNCMControl", "AppleUSBNCMData"};
++		static const char *iface_ibridge[] = {"AppleUSBMux", "AppleUSBNCMControl",
++		    "AppleUSBNCMData"};
++		const char *const *names = (run_start == 2 || run_start == 4) ? iface_ibridge : iface_ncm;
++		unsigned count = (run_start == 2 || run_start == 4) ? 3 : 2;
++		OSDictionary *desc = OSDictionary::withCapacity(1);
++		OSArray *configs = OSArray::withCapacity(1);
++		OSDictionary *config = OSDictionary::withCapacity(3);
++		OSArray *ifaces = OSArray::withCapacity(count);
++		OSNumber *attr = OSNumber::withNumber(224ULL, 32);
++		OSNumber *maxpower = OSNumber::withNumber(0ULL, 32);
++		if (desc && configs && config && ifaces && attr && maxpower) {
++			for (unsigned i = 0; i < count; i++) {
++				OSString *s = OSString::withCString(names[i]);
++				if (s != NULL) {
++					ifaces->setObject(s);
++					s->release();
++				}
++			}
++			config->setObject("Attributes", attr);
++			config->setObject("MaxPower", maxpower);
++			config->setObject("Interfaces", ifaces);
++			configs->setObject(config);
++			desc->setObject("ConfigurationDescriptors", configs);
++			ctl->setProperty("DeviceDescription", desc);
++			printf("SWEET NUB: published DeviceDescription (%u interfaces)\n", count);
++		} else {
++			printf("SWEET NUB: cannot allocate the DeviceDescription\n");
++		}
++		if (desc) desc->release();
++		if (configs) configs->release();
++		if (config) config->release();
++		if (ifaces) ifaces->release();
++		if (attr) attr->release();
++		if (maxpower) maxpower->release();
++	}
+ 	ctl->setProperty("ConfigurationType", personality);
+ 	printf("SWEET NUB: ConfigurationType=%s (sweet_nub=%d%s)\n", personality, run_start,
+ 	    direct_fallback ? ", direct fallback armed" : "; add 2 for iBridge, 3/4 to arm direct");
+ 	ctl->registerService();
+ 	printf("SWEET NUB: registered as %s; mux/configurator should now match\n", personality);
++	/* 0522: +0x130 is what the DeviceDescription builder fills; a zero here means the builder
++	 * did not run (or ran before the property existed), and createUSBDevice will deref NULL. */
++	printf("SWEET NUB: ctl+0x130 = %p (internal description)\n",
++	    *(void **)((char *)ctl + 0x130));
+ 
+ 	/*
+ 	 * 0512: device-side evidence for S4/S5. Apple's configurator may stay silent unless a debug
