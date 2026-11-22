@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..b8964a6c9cbe439db9251ed7d5fb9fe51f7886b5
+index 0000000..5007c80905545a80026c77db81d14396781139d6
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4845 @@
+@@ -0,0 +1,4862 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4115,10 +4115,17 @@ index 0000000..b8964a6c9cbe439db9251ed7d5fb9fe51f7886b5
 + * This matcher cannot fall into that state: it looks only for the fixed prefix
 + * 04 0e <len> 01 00 fc 00 <sub> and drops everything else. */
 +static int
-+bt_peri_wait_cc_sub(uint8_t sub, unsigned window_ms, uint8_t *ev, unsigned *got,
-+    const char *what)
++bt_peri_wait_cc_sub(uint8_t sub, unsigned window_ms, uint8_t *ev, unsigned cap,
++    unsigned *got, const char *what)
 +{
 +	uint8_t win[8] = {0};
++
++	/* A HCI event is at most 258 bytes, but the caller's buffer is its own
++	 * business: refuse rather than write eight bytes into something small. */
++	if (ev == NULL || cap < sizeof(win)) {
++		printf("PANDORA BT: %s: ev buffer too small (%u < 8)\n", what, cap);
++		return EINVAL;
++	}
 +	unsigned filled = 0, dropped = 0;
 +	uint64_t deadline;
 +
@@ -4167,11 +4174,21 @@ index 0000000..b8964a6c9cbe439db9251ed7d5fb9fe51f7886b5
 +
 +				clock_interval_to_deadline(50u, NSEC_PER_MSEC, &tail_deadline);
 +				while (rest != 0u && mach_absolute_time() < tail_deadline) {
++					uint8_t tb;
++
 +					if (!(bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
 +						bt_sleep(50);
 +						continue;
 +					}
-+					(void)bt_rd(BT_W_SE, SE_RX_FIFO);
++					tb = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++					if (tb == 0xfdu) {
++						/* A wake byte is not payload: still answer it, or the
++						 * ROM waits for the ack while we drain its event. */
++						const uint8_t ack = 0xfc;
++
++						(void)bt_uart_tx(&ack, 1, "PERI tail wake ACK FC");
++						continue;
++					}
 +					rest--;
 +				}
 +				if (rest != 0u) {
@@ -4421,7 +4438,7 @@ index 0000000..b8964a6c9cbe439db9251ed7d5fb9fe51f7886b5
 +		 * enters its 34 00 ff record state on the bytes preceding the answer
 +		 * and then swallows the whole event (measured: 147 bytes dropped,
 +		 * record state 4, 0x23 reported unanswered). */
-+		err = bt_peri_wait_cc_sub(sub, w, ev, &got, what);
++		err = bt_peri_wait_cc_sub(sub, w, ev, sizeof(ev), &got, what);
 +		if (err) {
 +			break;
 +		}
