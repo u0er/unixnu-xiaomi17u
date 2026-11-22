@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
-index 56132ef..d1ce22b 100644
+index 56132ef..503a69b 100644
 --- a/bsd/dev/pandora_adsp.c
 +++ b/bsd/dev/pandora_adsp.c
 @@ -548,6 +548,16 @@ struct fw_ent {
@@ -219,7 +219,7 @@ index 56132ef..d1ce22b 100644
  static int
  pas_auth(unsigned pas)
  {
-@@ -886,10 +982,42 @@ int
+@@ -886,10 +982,64 @@ int
  pandora_pas_load_auth(const char *file, unsigned pas, uint64_t mem_pa, uint64_t mem_size)
  {
  	uint64_t bridge = 0;
@@ -246,6 +246,28 @@ index 56132ef..d1ce22b 100644
 + * segment bounds check, while the firmware container itself was never changed
 + * and still holds the known-good vpu40_2v_v1.mbn (2,462,860 B).  Callers can
 + * therefore fall back to the container instead of failing the stage. */
++/* qcom_scm_mem_protect_video_var(cp_start, cp_size, cp_nonpixel_start,
++ * cp_nonpixel_size).  The vendor calls this from
++ * msm_vidc_mem_protect_video_regions_v1/v2 even when there is no CP region --
++ * with four zeros (disassembly 0x9d00-0x9d1c sets w0..w3 = 0 then calls).  Our
++ * driver never called it at all, and the VPU remains inert with every other
++ * host-visible prerequisite satisfied, so it is the next single variable.
++ * Encoding from upstream qcom_scm.c: svc QCOM_SCM_SVC_MP (0x0c),
++ * cmd QCOM_SCM_MP_VIDEO_VAR (0x0b), ARGS(4, VAL, VAL, VAL, VAL). */
++int pandora_scm_mem_protect_video_var(uint32_t cp_start, uint32_t cp_size,
++    uint32_t np_start, uint32_t np_size);
++
++int
++pandora_scm_mem_protect_video_var(uint32_t cp_start, uint32_t cp_size,
++    uint32_t np_start, uint32_t np_size)
++{
++	struct scm_res r;
++	scm_smc(SCM_FN(0x0c, 0x0b), SCM_ARGS(4), cp_start, cp_size, np_start, np_size, &r);
++	printf("PANDORA ADSP: mem_protect_video_var(%u,%u,%u,%u) -> a0 %#llx a1 %#llx\n",
++	    cp_start, cp_size, np_start, np_size, r.a0, r.a1);
++	return r.a0 ? (int)r.a0 : 0;
++}
++
 +int pandora_pas_load_auth_src(const char *file, unsigned pas, uint64_t mem_pa,
 +    uint64_t mem_size, bool part);
 +
