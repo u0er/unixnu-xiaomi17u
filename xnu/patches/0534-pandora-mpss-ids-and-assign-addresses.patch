@@ -1,0 +1,78 @@
+From: baseband lane
+Subject: 0534 pandora_mpss: cross the modem's images with the ADSP's ids, and log the assign addresses
+
+Two questions that one boot can now answer.
+
+1. The cross probe only ever compared {modem_dtb, modem} against {4, 38}, so it could not tell
+   whether the refusal is about the ID or about the IMAGE.  It now also sends those images as pas 13
+   and pas 36 -- the ids the secure world accepts for the ADSP on this very phone -- and the plan is
+   to try the ADSP's own zap as pas 4 in the same spirit.  Either answer ends the guessing:
+     * modem blob accepted as 13 -> the id is what is refused;
+     * still refused      -> TrustZone is judging the image against the id, so the blob pair is wrong.
+
+2. The assign now prints every address that went into the call (the page's physical address, the
+   sources, the destinations, the argument tail).  The 2026-11-23 03:1x boot ran the upstream-shaped
+   assign and still got 0xffffffffffffffff, which an SMC64 uses for "call not accepted at all".  The
+   one thing the code cannot verify before the call is what pmap_find_phys() returned for the page;
+   printing it says whether that is the problem or the descriptor still is.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 7c58eea..d4d4173 100755
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -104,6 +104,7 @@ extern void pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_
+ #define MP_PAS            4u             /* canoe_mpss_resource, decoded from qcom_q6v5_pas.ko */
+ #define MP_PAS_DTB        0x26u          /* 38 */
+ #define MP_PAS_CONTROL    13u            /* the ADSP's zap id: known-good for INIT_IMAGE */
++#define MP_PAS_ADSP1      36u            /* the ADSP's second id, also accepted in every boot so far */
+ static unsigned mp_pas = MP_PAS, mp_pas_dtb = MP_PAS_DTB;
+ #define MP_IPA_FW_PA      0x99580000ull  /* ipa_fw_region@99580000: 0x10000 */
+ #define MP_IPA_FW_SIZE    0x10000ull
+@@ -349,8 +350,18 @@ mp_assign_region(uint64_t region_pa, uint64_t region_size)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	pandora_scm_call5(PANDORA_SCM_MP_ASSIGN, PANDORA_SCM_ASSIGN_ARGUMENTS, pa, 16, pa + 64,
+ 	    pa + 240, &a0, &a1);
+-	printf("PANDORA MPSS: assign %#llx+%#llx to MSS -> a0 %#llx a1 %#llx %s\n", region_pa,
+-	    region_size, a0, a1, (a0 || a1) ? "REFUSED" : "ok");
++	/*
++	 * Print every address that went into the call, not just the answer.
++	 *
++	 * The 2026-11-23 03:1x boot ran the upstream-shaped call and still got
++	 * 0xffffffffffffffff, which for an SMC64 means the secure world did not accept the call at
++	 * all.  With the page's physical address in the log the next run can say whether that is
++	 * because pmap_find_phys() returned something unusable (the one thing the code cannot check
++	 * before the call) or because the descriptor itself is still wrong.
++	 */
++	printf("PANDORA MPSS: assign %#llx+%#llx to MSS (page %#llx src %#llx dest %#llx more %#llx) "
++	    "-> a0 %#llx a1 %#llx %s\n", region_pa, region_size, pa, pa + 64, pa + 128, pa + 240,
++	    a0, a1, (a0 || a1) ? "REFUSED" : "ok");
+ 	kmem_free(kernel_map, (vm_offset_t)page, PAGE_SIZE);
+ 	return (a0 == 0 && a1 == 0);
+ }
+@@ -993,12 +1004,24 @@ static void
+ mp_probe_cross(void)
+ {
+ 	static const char *const images[] = { "modem_dtb", "modem" };
+-	static const unsigned ids[] = { MP_PAS, MP_PAS_DTB };
++	/*
++	 * Not just the modem's own ids.  Two questions are worth one boot each way:
++	 *
++	 *   - is the refusal about the ID?  Then the modem's blob paired with an id the secure world
++	 *     already accepts for other images (13, 36 -- the ADSP's) should be taken;
++	 *   - or is it about the IMAGE?  Then the ADSP's own zap, which TrustZone accepts as pas 13,
++	 *     should be refused when sent as pas 4.
++	 *
++	 * Whichever way it comes out, the answer stops the guessing: until now every cross was inside
++	 * {4, 38} and so could not separate the two.
++	 */
++	static const unsigned ids[] = { MP_PAS, MP_PAS_DTB, MP_PAS_CONTROL, MP_PAS_ADSP1 };
+ 
+ 	if (!mp_option("pandora_mpss_pas_probe2")) {
+ 		return;
+ 	}
+-	printf("PANDORA MPSS: crossing 2 images with 2 PAS ids, each with its own metadata\n");
++	printf("PANDORA MPSS: crossing 2 images with %u PAS ids (4, 38, 13, 36), each with its own metadata\n",
++	    (unsigned)(sizeof(ids) / sizeof(ids[0])));
+ 	for (unsigned i = 0; i < sizeof(images) / sizeof(images[0]); i++) {
+ 		for (unsigned j = 0; j < sizeof(ids) / sizeof(ids[0]); j++) {
+ 			uint64_t answer = 0;
