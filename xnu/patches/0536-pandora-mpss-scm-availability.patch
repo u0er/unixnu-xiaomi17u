@@ -1,0 +1,77 @@
+From: baseband lane
+Subject: 0536 pandora_mpss: ask the secure world which of these SCM calls it implements
+
+Every refusal this stage has collected arrives as a bare error code, and one of them -- the assign's
+0xffffffffffffffff -- is exactly what an SMC64 returns for "this command does not exist here".  There
+is a call that answers the question directly: is_call_available, svc 6 cmd 1, one argument svc<<8|cmd,
+the answer in a0.
+
+The probe asks about the nine calls this ladder depends on:
+
+  PAS_INIT_IMAGE (2,1)  PAS_MEM_SETUP (2,2)  PAS_AUTH_AND_RESET (2,5)
+  PAS_SHUTDOWN  (2,6)   PAS_IS_SUPPORTED (2,7)
+  MP_ASSIGN (0xc,0x16)  SHM_BRIDGE_ENABLE (0xc,0x1c)  DELETE (0xc,0x1d)  CREATE (0xc,0x1e)
+
+If MP_ASSIGN comes back unavailable, the assign can never work on this platform and 0530's rewrite
+is moot -- the vendor's own start would be calling something TrustZone does not expose, which is
+worth knowing.  If INIT_IMAGE comes back unavailable the whole ladder has the wrong idea of this
+device.  Either way one boot stops the guessing, gated behind the existing pandora_mpss_pas_probe.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index d4d4173..2bdca6f 100644
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -295,6 +295,45 @@ mp_option(const char *name)
+  * -- and TrustZone answered 0xffffffffffffffff, which is the SMC's own rejection of a malformed
+  * descriptor rather than a judgement about the memory.
+  */
++/*
++ * Ask the secure world which of the calls this stage uses it actually implements.
++ *
++ * `qcom_scm_is_call_available` is svc 6 cmd 1 with one argument, svc<<8|cmd, and the answer in a0.
++ * Every refusal so far arrives as a bare error code, and one of them -- the assign's
++ * 0xffffffffffffffff -- would look exactly like "this command does not exist here".  One boot that
++ * asks settles it, and it costs nine SMC calls.
++ */
++static void
++mp_probe_scm_calls(void)
++{
++	static const struct {
++		const char *what;
++		unsigned svc, cmd;
++	} calls[] = {
++		{ "PAS_INIT_IMAGE",       2, 1 },
++		{ "PAS_MEM_SETUP",        2, 2 },
++		{ "PAS_AUTH_AND_RESET",   2, 5 },
++		{ "PAS_SHUTDOWN",         2, 6 },
++		{ "PAS_IS_SUPPORTED",     2, 7 },
++		{ "MP_ASSIGN",            0xc, 0x16 },
++		{ "SHM_BRIDGE_ENABLE",    0xc, 0x1c },
++		{ "SHM_BRIDGE_DELETE",    0xc, 0x1d },
++		{ "SHM_BRIDGE_CREATE",    0xc, 0x1e },
++	};
++
++	if (!mp_option("pandora_mpss_pas_probe")) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
++		uint64_t a0 = 0, a1 = 0;
++		pandora_scm_call(MP_SCM_FN(6, 1), MP_SCM_ARGS(1),
++		    ((uint64_t)calls[i].svc << 8) | calls[i].cmd, 0, &a0, &a1);
++		printf("PANDORA MPSS: is_call_available(%#x, %#x) %-18s -> a0 %#llx %s\n",
++		    calls[i].svc, calls[i].cmd, calls[i].what, a0,
++		    (a0 || a1) ? "NOT available" : "available");
++	}
++}
++
+ static bool
+ mp_assign_region(uint64_t region_pa, uint64_t region_size)
+ {
+@@ -1067,6 +1106,7 @@ static bool
+ step_dtb(void)
+ {
+ 	mp_shutdown_first();
++	mp_probe_scm_calls();
+ 	mp_probe_pas_ids();
+ 	mp_probe_cross();
+ 	if (!mp_assign_dsm()) {
