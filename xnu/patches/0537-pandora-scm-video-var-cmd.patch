@@ -1,0 +1,28 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 503a69b..449a868 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1010,8 +1010,12 @@ pandora_pas_load_auth(const char *file, unsigned pas, uint64_t mem_pa, uint64_t
+  * with four zeros (disassembly 0x9d00-0x9d1c sets w0..w3 = 0 then calls).  Our
+  * driver never called it at all, and the VPU remains inert with every other
+  * host-visible prerequisite satisfied, so it is the next single variable.
+- * Encoding from upstream qcom_scm.c: svc QCOM_SCM_SVC_MP (0x0c),
+- * cmd QCOM_SCM_MP_VIDEO_VAR (0x0b), ARGS(4, VAL, VAL, VAL, VAL). */
++ * Encoding: the vendor's own qcom_scm module (first-stage vendor_boot ramdisk,
++ * qcom-scm.ko, symbol qcom_scm_mem_protect_video_var at .text+0x3374) builds
++ * the SCM descriptor as svc = 0x0c, cmd = 0x08, arginfo = 4, args =
++ * {cp_start, cp_size, np_start, np_size}.  The earlier value 0x0b was copied
++ * from upstream qcom_scm.h but this vendor kernel uses 0x08, so TrustZone
++ * answered 0xffffffffffffffff (illegal command) on every boot. */
+ int pandora_scm_mem_protect_video_var(uint32_t cp_start, uint32_t cp_size,
+     uint32_t np_start, uint32_t np_size);
+ 
+@@ -1020,7 +1024,7 @@ pandora_scm_mem_protect_video_var(uint32_t cp_start, uint32_t cp_size,
+     uint32_t np_start, uint32_t np_size)
+ {
+ 	struct scm_res r;
+-	scm_smc(SCM_FN(0x0c, 0x0b), SCM_ARGS(4), cp_start, cp_size, np_start, np_size, &r);
++	scm_smc(SCM_FN(0x0c, 0x08), SCM_ARGS(4), cp_start, cp_size, np_start, np_size, &r);
+ 	printf("PANDORA ADSP: mem_protect_video_var(%u,%u,%u,%u) -> a0 %#llx a1 %#llx\n",
+ 	    cp_start, cp_size, np_start, np_size, r.a0, r.a1);
+ 	return r.a0 ? (int)r.a0 : 0;
