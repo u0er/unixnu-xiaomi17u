@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..35b9acbbbb91601c5292b9cd3500ac354e92179c
+index 0000000..91e421bd33b3424a5806355889c98c4d58ab3fb6
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4946 @@
+@@ -0,0 +1,4960 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -1039,12 +1039,26 @@ index 0000000..35b9acbbbb91601c5292b9cd3500ac354e92179c
 +static int
 +bt_uart_stop(void)
 +{
-+	uint32_t active = bt_rd(BT_W_SE, SE_STATUS);
-+	if (active & GENI_STATUS_M_ACTIVE) {
-+		bt_wr(BT_W_SE, SE_M_CMD_CTRL, GENI_CMD_ABORT);
++	/* Upstream qbt_geni_quiesce cancels RX only after TX drains, and that order
++	 * matters: aborting TX mid-frame puts half a frame on the wire, which the ROM
++	 * can glue onto whatever follows - one source of the stray bytes this lane
++	 * keeps finding between stages. So give TX 20 ms to finish on its own before
++	 * touching either sequencer. */
++	for (unsigned drained = 0; drained < 20000u; drained += 100u) {
++		if (!(bt_rd(BT_W_SE, SE_STATUS) & GENI_STATUS_M_ACTIVE)) {
++			break;
++		}
++		bt_sleep(100);
 +	}
-+	if (active & GENI_STATUS_S_ACTIVE) {
-+		bt_wr(BT_W_SE, SE_S_CMD_CTRL, GENI_CMD_ABORT);
++	{
++		uint32_t active = bt_rd(BT_W_SE, SE_STATUS);
++
++		if (active & GENI_STATUS_M_ACTIVE) {
++			bt_wr(BT_W_SE, SE_M_CMD_CTRL, GENI_CMD_ABORT);
++		}
++		if (active & GENI_STATUS_S_ACTIVE) {
++			bt_wr(BT_W_SE, SE_S_CMD_CTRL, GENI_CMD_ABORT);
++		}
 +	}
 +	for (unsigned waited = 0; waited < 5000; waited++) {
 +		if (!(bt_rd(BT_W_SE, SE_STATUS) & (GENI_STATUS_M_ACTIVE | GENI_STATUS_S_ACTIVE))) {
