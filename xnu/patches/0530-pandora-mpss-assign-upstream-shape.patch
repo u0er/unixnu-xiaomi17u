@@ -1,0 +1,163 @@
+From: baseband lane
+Subject: 0530 pandora_mpss: the memory assign in the shape this platform actually takes
+
+The assign has never worked here: every boot that tried it printed
+
+  PANDORA MPSS: assign 0x85000000+0x4f00000 to MSS -> a0 0xffffffffffffffff a1 0 REFUSED
+
+and the reason is now certain, from HakiOS's modem driver rather than from guesswork
+(oosexgang/hakios-xnu-kernel, drivers/board/mpss.c, rmtfs_share()):
+
+  scm(..., SCM_MP_ASSIGN, SCM_ASSIGN_ARGUMENTS, pa, 16, pa + 64, pa + 240, &answer);
+      //                                   arg0 arg1   arg2     arg3
+  page->more[0] = sources * 4;         // argument 4: the sources' size
+  page->more[1] = pa + 128;            // argument 5: the destinations
+  page->more[2] = destinations * 24;   // argument 6: their size
+  page->more[3] = 0;                   // argument 7: spare
+
+  struct at pa:
+    +0    uint64_t address, size
+    +64   uint32_t sources[]
+    +128  struct { uint32_t vmid, permission; uint64_t context;
+                   uint32_t context_size, unused; } destinations[3]     // 24 bytes each
+    +240  uint64_t more[7]
+
+Only FOUR values travel in registers; arginfo still says seven, and TrustZone reads the last
+three arguments from the memory that arg3 points at.  Seven values in x2..x8 cannot be
+expressed by an SMC at all: x1 carries the arginfo, so x2..x7 is the whole window.
+
+This rewrites mp_assign_region() to that shape -- one zeroed page, the same four register
+arguments through the existing pandora_scm_call5(), the 24-byte destination entry, and a
+cache flush of the page before the call -- and adds PANDORA_VMID_PERM_RW (6) which the header
+did not have.  The VMIDs already matched: HLOS 3, MSS_MSA 15.
+
+The function is still reachable only through pandora_mpss_assign=1, so this changes nothing
+about a boot that does not ask for it.
+
+diff --git a/bsd/dev/pandora_modem.h b/b/bsd/dev/pandora_modem.h
+old mode 100644
+new mode 100755
+index b36249c..914db6f
+--- a/bsd/dev/pandora_modem.h
++++ b/bsd/dev/pandora_modem.h
+@@ -65,6 +65,8 @@ extern int32_t pandora_scm(const char *what, uint64_t function, uint64_t argumen
+ #define PANDORA_SCM_ASSIGN_ARGUMENTS        0x1117u
+ #define PANDORA_VMID_HLOS                   3u
+ #define PANDORA_VMID_MSS_MSA                15u
++/* Read+write, as QCOM_SCM_PERM_RW and as the vendor/HakiOS VM_PERM_RW both have it. */
++#define PANDORA_VMID_PERM_RW                6u
+ 
+ /* ---- firmware, read in place off the phone's own partitions ---------------------------- */
+ 
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 0c2fb41..7c58eea 100755
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -297,43 +297,61 @@ mp_option(const char *name)
+ static bool
+ mp_assign_region(uint64_t region_pa, uint64_t region_size)
+ {
+-	struct {
+-		uint64_t addr;
+-		uint64_t size;
+-	} mem_map;
+-	struct {
+-		uint32_t vmid;
+-		uint32_t perm;
+-		uint32_t ctx;
+-		uint32_t ctx_size;
+-	} dest;
+-	vm_offset_t page = 0;
+-	uint32_t *src;
++	/*
++	 * How TrustZone is actually given this call, taken from HakiOS's own modem driver
++	 * (oosexgang/hakios-xnu-kernel, drivers/board/mpss.c, rmtfs_share()):
++	 *
++	 *   struct {
++	 *       uint64_t address, size;          // +0   the memory
++	 *       uint64_t pad0[6];
++	 *       uint32_t sources[3];             // +64  who has it
++	 *       uint32_t pad1[13];
++	 *       struct {                         // +128 who is to have it, 24 bytes each
++	 *           uint32_t vmid, permission;
++	 *           uint64_t context;
++	 *           uint32_t context_size, unused;
++	 *       } destinations[3];
++	 *       uint8_t pad2[40];
++	 *       uint64_t more[7];                // +240 the arguments beyond the registers
++	 *   } *page;
++	 *
++	 *   scm(..., SCM_MP_ASSIGN, SCM_ASSIGN_ARGUMENTS, pa, 16, pa + 64, pa + 240, &answer);
++	 *   //                                    arg0 arg1   arg2     arg3
++	 *   page->more[0] = sources * 4;             // argument 4: how big the sources are
++	 *   page->more[1] = pa + 128;                // argument 5: the destinations
++	 *   page->more[2] = destinations * 24;       // argument 6: how big they are
++	 *   page->more[3] = 0;                       // argument 7: spare
++	 *
++	 * Only FOUR values go in registers; arginfo still says seven, and TrustZone reads the last
++	 * three out of the memory that arg3 points at.  This file used to put seven values in x2..x8,
++	 * which the SMC interface cannot carry at all: x1 is taken by the arginfo, so x2..x7 is the
++	 * most it can hold and the answer was always 0xffffffffffffffff (2026-11-22 08:0x and 23:1x).
++	 */
++	uint8_t *page = NULL;
+ 	uint64_t pa, a0 = 0, a1 = 0;
+ 
+-	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO, VM_KERN_MEMORY_IOKIT) !=
+-	    KERN_SUCCESS) {
++	if (kmem_alloc(kernel_map, (vm_offset_t *)&page, PAGE_SIZE,
++	    KMA_DATA | KMA_ZERO | KMA_KOBJECT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("PANDORA MPSS: no page for the assign structures\n");
+ 		return false;
+ 	}
+-	mem_map.addr = region_pa;
+-	mem_map.size = region_size;
+-	src = (uint32_t *)(page + 64);
+-	src[0] = PANDORA_VMID_HLOS;                     /* the current owner: HLOS */
+-	dest.vmid = PANDORA_VMID_MSS_MSA;               /* the new owner: the modem's MSA */
+-	dest.perm = 6u;                                 /* RW */
+-	dest.ctx = 0;
+-	dest.ctx_size = 0;
+-	memcpy((void *)(page + 0), &mem_map, sizeof(mem_map));
+-	memcpy((void *)(page + 128), &dest, sizeof(dest));
+-	pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)page));
++	*(uint64_t *)(void *)(page + 0) = region_pa;
++	*(uint64_t *)(void *)(page + 8) = region_size;
++	*(uint32_t *)(void *)(page + 64) = PANDORA_VMID_HLOS;
++	*(uint32_t *)(void *)(page + 128) = PANDORA_VMID_MSS_MSA;
++	*(uint32_t *)(void *)(page + 132) = PANDORA_VMID_PERM_RW;
++	pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(vm_offset_t)page));
++	*(uint64_t *)(void *)(page + 240) = 4;                 /* sources: one u32 */
++	*(uint64_t *)(void *)(page + 248) = pa + 128;          /* destinations */
++	*(uint64_t *)(void *)(page + 256) = 24;                /* one destination, 24 bytes */
++	*(uint64_t *)(void *)(page + 264) = 0;                 /* spare */
+ 	flush_dcache64((addr64_t)pa, PAGE_SIZE, TRUE);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	pandora_scm_call7(PANDORA_SCM_MP_ASSIGN, PANDORA_SCM_ASSIGN_ARGUMENTS,
+-	    pa + 0, 16, pa + 64, 4, pa + 128, 16, 0, &a0, &a1);
++	pandora_scm_call5(PANDORA_SCM_MP_ASSIGN, PANDORA_SCM_ASSIGN_ARGUMENTS, pa, 16, pa + 64,
++	    pa + 240, &a0, &a1);
+ 	printf("PANDORA MPSS: assign %#llx+%#llx to MSS -> a0 %#llx a1 %#llx %s\n", region_pa,
+ 	    region_size, a0, a1, (a0 || a1) ? "REFUSED" : "ok");
+-	kmem_free(kernel_map, page, PAGE_SIZE);
++	kmem_free(kernel_map, (vm_offset_t)page, PAGE_SIZE);
+ 	return (a0 == 0 && a1 == 0);
+ }
+ 
+@@ -355,6 +373,17 @@ mp_assign_dsm(void)
+ 	if (!mp_option("pandora_mpss_assign")) {
+ 		return true;
+ 	}
++	/*
++	 * Known-broken as of 2026-11-23, deliberately still reachable only by an explicit boot
++	 * argument.  The vendor does NOT issue a raw seven-argument SMC here: qcom_scm_assign_mem
++	 * builds a struct qcom_scm_desc (arginfo 0x1117 at +40, svc 0xc, the argument addresses) and
++	 * calls qcom_scm_call(dev, &desc, res).  An SMC carries x0..x7 with x1 taken by the arginfo, so
++	 * at most six arguments can be expressed this way and the seven-argument form always comes
++	 * back 0xffffffffffffffff.  Boots on 2026-11-22 23:0x and 08:0x both showed exactly that.
++	 * Say so out loud rather than let the next person believe the call worked.
++	 */
++	printf("PANDORA MPSS: WARNING pandora_mpss_assign is known to return -1 (the seven-argument SMC "
++	    "cannot be expressed; the vendor uses a desc struct + qcom_scm_call instead)\n");
+ 	for (unsigned i = 0; i < sizeof(dsm) / sizeof(dsm[0]); i++) {
+ 		if (!mp_assign_region(dsm[i].pa, dsm[i].size)) {
+ 			ok = false;
