@@ -1,0 +1,53 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0529 sweet_nub: fill the device-object field the shutdown walk dereferences
+
+The 22:53 RW control boot is the first one that survived to the 150 s watchdog. It ended in a
+kernel data abort inside the kext (pc 0xfffffff004ce83e8, `ldr w8,[x0,#0xc]!`, far=0xc) called
+from 0xfffffff004cf46a0 right after `ldr x0,[x0,#0x1b8]`. ctl+0x1b8 is the device object Apple's
+own DeviceDescription builder stores there (0xfffffff004cf0628: str x0,[x19,#0x1b8]); that
+builder is unreachable in this prelink, so the field was NULL and the shutdown walk crashed --
+restart type 4, i.e. every probe boot would dirty the volume again.
+
+0529 puts the same inert sink the descriptor holder uses into ctl+0x1b8, sized 0x200 so the
+shutdown function's reads at +0xc and +0x8c see zeroed memory and its virtual calls land on the
+return-0 stub. The printed line now shows both pointers.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -63,6 +63,13 @@
+ static void *sweet_nub_vtable[SWEET_NUB_CTL_SLOTS];
+ 
+ /*
++ * 0529: the shutdown walk dereferences ctl+0x1b8 (the device object Apple's unreachable
++ * DeviceDescription builder stores at 0xfffffff004cf0628) and passes it to a function that
++ * reads +0xc/+0x8c and switches on them. On the first boot that reached the 150 s watchdog
++ * this was NULL and the kernel took a data abort (far=0xc, restart type 4), dirtying the
++ * volume on every probe boot. Fill it with the same inert sink, sized 0x200 so those offsets
++ * are zeroed memory and its virtual calls land on the return-0 stub.
++ *
+  * 0525: createUSBDevice's helper calls holder->target->vtable[29] with only (target, value),
+  * but the controller's slot 29 is IORegistryEntry::setProperty(key, bytes, len) -- it takes the
+  * length from x3, which the helper never sets. That is exactly the 127 MB memcpy seen on 0523:
+@@ -461,7 +468,8 @@
+ 	 */
+ 	{
+ 		void **holder = (void **)OSObject::operator new(0x20);
+-		void **sink = (void **)OSObject::operator new(0x10);
++		/* 0529: 0x200 bytes, not 0x10 -- the shutdown path reads sink+0xc and sink+0x8c. */
++		void **sink = (void **)OSObject::operator new(0x200);
+ 		if (holder != NULL && sink != NULL) {
+ 			for (unsigned i = 0; i < 256; i++) {
+ 				sweet_sink_vtable[i] = (void *)sweet_sink_zero;
+@@ -469,8 +477,10 @@
+ 			sink[0] = (void *)sweet_sink_vtable;
+ 			holder[2] = (void *)sink;                /* +0x10 = inert sink object */
+ 			*(void **)((char *)ctl + 0x130) = holder;
+-			printf("SWEET NUB: installed descriptor holder %p at ctl+0x130 (sink %p)\n",
+-			    holder, (void *)sink);
++			/* 0529: the device object Apple would have built; shutdown dereferences it. */
++			*(void **)((char *)ctl + 0x1b8) = sink;
++			printf("SWEET NUB: installed descriptor holder %p at ctl+0x130 (sink %p), "
++			    "ctl+0x1b8 = %p\n", holder, (void *)sink, (void *)sink);
+ 		} else {
+ 			printf("SWEET NUB: cannot allocate the descriptor holder\n");
+ 		}
