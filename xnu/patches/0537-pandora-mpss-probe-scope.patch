@@ -1,0 +1,97 @@
+From: baseband lane
+Subject: 0537 pandora_mpss: stop pointing INIT_IMAGE at other subsystems' ids
+
+Three of this file's lists hand TrustZone an INIT_IMAGE carrying THIS image's metadata, and all three
+had grown to include ids belonging to subsystems this kernel does not load:
+
+  mp_probe_pas_ids   {4, 38, 24, 28, 34, 15, 33, 63, 0}   -> {4, 38}
+  mp_probe_cross     {4, 38, 13, 36}   (0534 widened it)  -> {4, 38}
+  mp_shutdown_first  {4, 38, 13}                          -> {4, 38}
+
+That was not harmless.  TrustZone ACCEPTS INIT_IMAGE for pas 13 -- the ADSP's own id, and rings from
+before the ADSP driver was switched off show `pas 13 init_image -> a0 0`.  So this kernel was setting
+up a PIL state for a subsystem it never loads, on every boot with the probes on.  On the same volume,
+minutes apart on 2026-11-23, another lane's image reached DESKTOP_OK while this lane's boot produced
+LOGO_LOOP with hfs_mark_inconsistent 0, restart type 1 and no panic -- i.e. the volume and the kernel
+were fine and the graphics stack still crash-looped.  A wrong PIL state for the ADSP is the best
+explanation available, and it is this file's doing.
+
+The first list's question ("which id does TrustZone know") stays answered by the PAS_IS_SUPPORTED
+probe, which only queries and changes nothing -- that one keeps all ids.  The second list's question
+("is the refusal about the id or the image") is answered: pas 13 is accepted, so it is not the id.
+The third list's "control" shut a live subsystem down and returned the same b8 for every id.
+
+A subsystem this kernel does not own is not a control group.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 2bdca6f..87678e1 100644
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -993,7 +993,20 @@ int pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, ui
+ static void
+ mp_probe_pas_ids(void)
+ {
+-	static const unsigned ids[] = {4, 0x26, 0x18, 0x1c, 0x22, 0x0f, 0x21, 0x3f, 0};
++	/*
++	 * Only the modem's own ids go through INIT_IMAGE here.
++	 *
++	 * This list used to be nine ids wide -- 15 (the IPA), 24, 28, 33, 34, 36 (the ADSP), 63 and 0 --
++	 * because the question at the time was "which id does TrustZone know".  That question is
++	 * answered and stays answered by the PAS_IS_SUPPORTED probe below, which only queries.  What
++	 * this loop does is different: it hands TrustZone an INIT_IMAGE carrying THIS image's metadata
++	 * under an id belonging to some other subsystem -- and for pas 13 (the ADSP) TrustZone accepts
++	 * it (`pas 13 init_image -> a0 0` appears in rings from before the ADSP driver was switched
++	 * off).  That is a live PIL state for a subsystem this kernel is not loading, and the best
++	 * explanation for this lane's boots producing LOGO_LOOP while another lane's image reaches
++	 * DESKTOP_OK on the same volume minutes earlier.
++	 */
++	static const unsigned ids[] = {4, 0x26};
+ 	if (!mp_option("pandora_mpss_pas_probe")) {
+ 		return;
+ 	}
+@@ -1054,13 +1067,20 @@ mp_probe_cross(void)
+ 	 * Whichever way it comes out, the answer stops the guessing: until now every cross was inside
+ 	 * {4, 38} and so could not separate the two.
+ 	 */
+-	static const unsigned ids[] = { MP_PAS, MP_PAS_DTB, MP_PAS_CONTROL, MP_PAS_ADSP1 };
++	/*
++	 * The modem's own ids only, for the same reason as the probe above: 0534 widened this to pas
++	 * 13 and 36 to separate "the id is refused" from "the image is refused", and that question is
++	 * worth asking once, not on every boot -- the answer in hand is that pas 13 is ACCEPTED, i.e.
++	 * the id is not the refusal.  Sending the modem's metadata under the ADSP's id again would
++	 * keep touching a subsystem this kernel does not load.
++	 */
++	static const unsigned ids[] = { MP_PAS, MP_PAS_DTB };
+ 
+ 	if (!mp_option("pandora_mpss_pas_probe2")) {
+ 		return;
+ 	}
+-	printf("PANDORA MPSS: crossing 2 images with %u PAS ids (4, 38, 13, 36), each with its own metadata\n",
+-	    (unsigned)(sizeof(ids) / sizeof(ids[0])));
++	printf("PANDORA MPSS: crossing %u images with %u modem PAS ids, each with its own metadata\n",
++	    (unsigned)(sizeof(images) / sizeof(images[0])), (unsigned)(sizeof(ids) / sizeof(ids[0])));
+ 	for (unsigned i = 0; i < sizeof(images) / sizeof(images[0]); i++) {
+ 		for (unsigned j = 0; j < sizeof(ids) / sizeof(ids[0]); j++) {
+ 			uint64_t answer = 0;
+@@ -1087,12 +1107,16 @@ static void
+ mp_shutdown_first(void)
+ {
+ 	/*
+-	 * The third id is a CONTROL, not a target: the ADSP's 13 is accepted by INIT_IMAGE in the same
+-	 * boot this runs in (logs/1795302306 and 1795302772 show `pas 13 init_image -> a0 0`), so its
+-	 * answer to PAS_SHUTDOWN says whether 0xffcfffb8 means "this id may not be touched" or merely
+-	 * "that peripheral is not running".
++	 * The modem's own two ids, and nothing else.
++	 *
++	 * This list carried the ADSP's 13 as a "control": TrustZone accepts INIT_IMAGE for 13 in the
++	 * same boot (logs/1795302306 and 1795302772 show `pas 13 init_image -> a0 0`), so its answer to
++	 * PAS_SHUTDOWN was meant to say whether 0xffcfffb8 means "this id may not be touched" or
++	 * "that peripheral is not running".  The answer came back: b8 for every id, so the control
++	 * taught nothing -- while actually SHUTTING THE ADSP DOWN is not a neutral act.  A subsystem
++	 * this kernel does not own is not a control group.
+ 	 */
+-	static const unsigned ids[] = { MP_PAS, MP_PAS_DTB, MP_PAS_CONTROL };
++	static const unsigned ids[] = { MP_PAS, MP_PAS_DTB };
+ 
+ 	if (!mp_option("pandora_mpss_shutdown_first")) {
+ 		return;
