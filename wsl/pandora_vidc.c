@@ -1528,8 +1528,12 @@ vidc_publish_queues(void)
         vidc_wr(R_CPU_QUEUE_TABLE_ADDR2, vidc_uc_da());
         /* SFR_ADDR must carry sfr + core_arch (upstream), not the bare DA. */
         vidc_wr(R_CPU_SFR_ADDR, vidc_sfr_da() + VIDC_CORE_ARCH);
-        vidc_wr(R_CPU_SCIACMDARG3, 1);
-        printf("PANDORA VIDC: SCIACMDARG3 (0xA0058) = %08x\n", vidc_rd(R_CPU_SCIACMDARG3));
+        /* Round 24 single variable: do NOT write SCIACMDARG3 (0xA0058).
+         * The vendor patch v7 writes 1 here, but publish has TIMEOUTed
+         * 6/6 boots with that bit set; leave the reset value to test
+         * whether the write itself keeps the firmware ACK (0xA004C)
+         * from appearing.  Nothing else changes this round. */
+        printf("PANDORA VIDC: SCIACMDARG3 (0xA0058) left at %08x\n", vidc_rd(R_CPU_SCIACMDARG3));
     }
     printf("PANDORA VIDC: published DA=%08x UC=%08x SFR=%08x (smmu %s) "
            "regs A0064/A0068/A0054/A0050/A0060\n", da, vidc_uc_da(), vidc_sfr_da(),
