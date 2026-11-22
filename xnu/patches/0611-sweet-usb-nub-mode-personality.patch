@@ -1,0 +1,42 @@
+From: CarPlay C0 lane (2026-11-21)
+Subject: 0511 sweet_nub: the mode value selects the personality (no second boot argument)
+
+0510 added sweet_nub_ibridge as a second boot argument. That does not fit: the assembled cmdline
+of the S3 image is already 603 of the 607 usable bytes, and mkpayload refuses the image once the
+line grows ("boot arguments exceed 607 bytes") -- measured while building the iBridge image.
+
+So the personality rides on the existing integer: sweet_nub=1 keeps the default ncmBringup,
+sweet_nub=2 selects iBridgeBringup (AppleUSBMux + AppleUSBNCMControl + AppleUSBNCMData). Same one
+character, no length change, no extra knob. The registration line now prints the personality it
+actually published instead of a hardcoded name, and the log checker accepts either value.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -208,19 +208,16 @@
+ 
+ 	/* prepareDefaults overwrites ConfigurationType; set the matching value now and
+ 	 * publish, which is what starts personality matching (IOService.h:650). */
+-	/* Personality selection: the four IOUSBDeviceFamily personalities differ only in the
+-	 * InterfaceAssociation/Interfaces sets, so this is the one knob that decides whether the
+-	 * host sees plain NCM (AppleUSBNCMControl/Data) or the CarPlay-capable iBridge set
+-	 * (AppleUSBMux + NCM). Making it a boot argument turns a personality change from a CI
+-	 * round + image rebuild into a single bootarg, which is exactly what an A/B needs. */
+-	int ibridge = 0;
+-	PE_parse_boot_argn("sweet_nub_ibridge", &ibridge, sizeof(ibridge));
+-	const char *personality = ibridge ? "iBridgeBringup" : "ncmBringup";
++	/* 0511: the mode argument doubles as the personality selector -- sweet_nub=1 is the NCM
++	 * personality, sweet_nub=2 is iBridgeBringup (AppleUSBMux + NCM). A separate boot argument
++	 * would not fit: the assembled cmdline is already 603 of the 607 usable bytes, so growing it
++	 * by a second flag makes mkpayload refuse the image. One integer, one knob, no length risk. */
++	const char *personality = (run_start == 2) ? "iBridgeBringup" : "ncmBringup";
+ 	ctl->setProperty("ConfigurationType", personality);
+-	printf("SWEET NUB: ConfigurationType=%s%s\n", personality,
+-	    ibridge ? " (sweet_nub_ibridge=1)" : " (pass sweet_nub_ibridge=1 for iBridge)");
++	printf("SWEET NUB: ConfigurationType=%s (sweet_nub=%d%s)\n", personality, run_start,
++	    run_start == 2 ? "" : "; pass 2 for iBridge");
+ 	ctl->registerService();
+-	printf("SWEET NUB: registered as ncmBringup; mux/configurator should now match\n");
++	printf("SWEET NUB: registered as %s; mux/configurator should now match\n", personality);
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
