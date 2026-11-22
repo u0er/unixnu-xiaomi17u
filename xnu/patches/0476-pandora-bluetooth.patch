@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..91e421bd33b3424a5806355889c98c4d58ab3fb6
+index 0000000..4f86d073a1aa5462795915e075cde1deee7864ab
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4960 @@
+@@ -0,0 +1,4970 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4305,6 +4305,8 @@ index 0000000..91e421bd33b3424a5806355889c98c4d58ab3fb6
 +{
 +	static const uint8_t want[8] = { 0x04, 0x0e, 0x05, 0x01, 0x00, 0xfc, 0x00, 0x1e };
 +	uint8_t win[8] = {0};
++	uint8_t head[48] = {0};  /* first bytes seen, for identification on timeout */
++	unsigned head_n = 0;
 +	unsigned filled = 0;
 +	uint64_t total = 0;      /* every byte read, for an exact drop count */
 +	uint64_t deadline;
@@ -4325,6 +4327,13 @@ index 0000000..91e421bd33b3424a5806355889c98c4d58ab3fb6
 +			continue;
 +		}
 +		total++;
++		if (head_n < sizeof(head)) {
++			/* Keeping the leading bytes is the difference between "the ack
++			 * never came" and knowing what did arrive - the 1,024-byte stream
++			 * this lane keeps seeing could not be identified because only a
++			 * count was logged. */
++			head[head_n++] = b;
++		}
 +		if (filled < sizeof(win)) {
 +			win[filled++] = b;
 +		} else {
@@ -4352,6 +4361,7 @@ index 0000000..91e421bd33b3424a5806355889c98c4d58ab3fb6
 +	if (total != 0u) {
 +		printf("PANDORA BT: %s: window closed after %llu byte(s) without a CC\n",
 +		    what, (unsigned long long)total);
++		bt_dump("PERI CC8 window head", head, head_n);
 +		pandora_log_sync();
 +	}
 +	return ETIMEDOUT;
