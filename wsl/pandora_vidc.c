@@ -1578,6 +1578,8 @@ extern int pandora_pas_load_auth(const char *file, unsigned pas,
     uint64_t mem_pa, uint64_t mem_size);
 extern int pandora_pas_load_auth_src(const char *file, unsigned pas, uint64_t mem_pa,
     uint64_t mem_size, bool part);
+extern int pandora_scm_mem_protect_video_var(uint32_t cp_start, uint32_t cp_size,
+    uint32_t np_start, uint32_t np_size);
 
 #define VIDC_PAS_ID 9u
 
@@ -1595,6 +1597,12 @@ vidc_auth_reset(void)
                "firmware container\n", err);
         err = pandora_pas_load_auth_src(vidc_fw_name, VIDC_PAS_ID,
             VIDEO_REGION_PA, VIDEO_REGION_SIZE, true);
+    }
+    if (err == 0) {
+        /* Vendor parity: even with no CP region the video driver tells TZ the
+         * (empty) protected range.  That SCM call is the only vendor step our
+         * path never made; see pandora_scm_mem_protect_video_var(). */
+        (void)pandora_scm_mem_protect_video_var(0, 0, 0, 0);
     }
     if (err != 0) {
         printf("PANDORA VIDC: PAS load/auth failed for %s (err %d)\n", vidc_fw_name, err);
