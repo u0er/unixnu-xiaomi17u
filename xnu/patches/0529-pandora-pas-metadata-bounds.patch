@@ -1,0 +1,57 @@
+From: baseband lane
+Subject: 0529 pandora_pas: bound the metadata sizes the .mdt header asks for
+
+Static review of pandora_pas_load found that ehdr_size (phdrs[0].p_filesz) and hash_size
+(phdrs[hash].p_filesz) were used without ever being compared with the file that was read:
+
+  uint32_t ehdr_size = ph[0].p_filesz;
+  uint32_t hash_size = ph[hash].p_filesz;
+  uint64_t md_size   = ((uint64_t)ehdr_size + hash_size + 0xfff) & ~0xfffull;
+  ...
+  memcpy((void *)md, hdr, ehdr_size);
+
+A truncated or hostile .mdt could therefore ask this code to
+
+  * copy ehdr_size bytes out of a buffer that only holds mdt_size -- a read past the end of a kmem
+    allocation, whose next page need not be mapped; and
+  * allocate up to 4 GiB for the metadata from a size that came out of the file.  On this phone the
+    low 4 GiB are entirely carved out, so that allocation is exactly the shape that already cost one
+    window on 2026-11-22 06:30 (see 0517/0524).
+
+Neither can happen with the phone's own files: modem_dtb.mdt is 148+3896 == 4044 and modem.mdt is
+948+6304 == 7252, both exactly the file size.  The new check therefore only refuses input that was
+already inconsistent:
+
+    ehdr_size == 0 || hash_size == 0 || ehdr_size > mdt_size || hash_size > mdt_size
+        || md_size > 4 MiB   ->  EINVAL with a message that prints all three numbers
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index c98d13f..2d045a8 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -233,6 +233,25 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 	uint32_t ehdr_size = ph[0].p_filesz;
+ 	uint32_t hash_size = ph[hash].p_filesz;
+ 	uint64_t md_size = ((uint64_t)ehdr_size + hash_size + 0xfff) & ~0xfffull;
++	/*
++	 * Bound both sizes against the file we actually read.
++	 *
++	 * p_filesz comes straight out of the .mdt and nothing had compared it with mdt_size, so a
++	 * truncated or hostile header could ask this code to
++	 *   - copy ehdr_size bytes out of a buffer that only holds mdt_size (a read past the
++	 *     allocation, whose end is a page boundary), and
++	 *   - allocate up to 4 GiB for the metadata (kmem_alloc_contig on a size derived from the
++	 *     file), which on a phone with the low 4 GiB full is a good way to hang the boot.
++	 * Neither can happen for the phone's own files -- both are 148+3896 and 948+6304 == the file
++	 * size exactly -- so this only refuses input that was already wrong.
++	 */
++	if (ehdr_size == 0 || hash_size == 0 || ehdr_size > mdt_size || hash_size > mdt_size ||
++	    md_size > (4u << 20)) {
++		printf("PANDORA PAS: %s: metadata sizes out of range (ehdr %u, hash %u, file %llu)\n",
++		    name, ehdr_size, hash_size, (unsigned long long)mdt_size);
++		err = EINVAL;
++		goto out;
++	}
+ 	printf("PANDORA PAS: %s: pas %u, %u segments, hash %u (%u bytes), load %#llx-%#llx%s, carveout %#llx+%#llx\n",
+ 	    name, pas, phnum, hash, hash_size, min, max, reloc ? " relocatable" : "", mem_pa, mem_size);
+ 	if (max - min > mem_size) {
