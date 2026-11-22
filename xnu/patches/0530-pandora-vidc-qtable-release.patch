@@ -1,0 +1,82 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+index ac9162e..f7b0cbf 100644
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -472,13 +472,17 @@ vidc_verdict(const char *stage, int ok)
+ }
+ 
+ /* Physically contiguous, zeroed, wired pages (same pattern as pandora_gpu.c
+- * gpu_contig).  Returns the cached VA and the physical base. */
++ * gpu_contig).  Returns the cached VA and the physical base.
++ *
++ * Deliberately NOT KMA_PERMANENT: the ladder releases the queue window again
++ * before the 5.17 s touch allocation (vidc_release_qtable), and a permanent VM
++ * map entry cannot be removed. */
+ static vm_offset_t
+ vidc_contig(uint64_t bytes, uint64_t *pa)
+ {
+     vm_offset_t va = 0;
+     if (kmem_alloc_contig(kernel_map, &va, (vm_size_t)bytes, PAGE_MASK, 0, 0,
+-        KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++        KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+         return 0;
+     }
+     *pa = (uint64_t)ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va));
+@@ -616,6 +620,31 @@ vidc_alloc_buffers(void)
+     return 0;
+ }
+ 
++/* Give the queue window back as soon as the ladder stops needing it.
++ *
++ * Measured on this board: the TOUCH driver's 128 KiB
++ * kmem_alloc(KMA_NOFAIL|KMA_KOBJECT|KMA_ZERO) fails at 5.168 s on every boot
++ * whose ladder still holds VIDC's buffers (`failed with 3 @vm_kern.c:178` ->
++ * restart type 4), while the probe-only level 1 never panics.  Publishing has
++ * already read 0xA004C and printed the verdict by this point, so dropping the
++ * 3 MiB qtable here restores the map to the level-1 shape before the touch
++ * window opens.  The SFR and UC pages stay (16 KiB + 4 KiB, and the SMMU
++ * context still points at them); the qtable IOVA is marked invalid so nothing
++ * in this build can publish or poll it again. */
++static void
++vidc_release_qtable(void)
++{
++    if (!vidc_qtable_va)
++        return;
++    printf("PANDORA VIDC: releasing qtable %#x bytes before the 5.17 s window\n",
++        VIDC_QTABLE_ALLOC);
++    kmem_free(kernel_map, vidc_qtable_va, VIDC_QTABLE_ALLOC);
++    vidc_qtable_va = 0;
++    vidc_qtable_pa = 0;
++    vidc_qtable_iova = 0;
++    vidc_smmu_on = false;
++}
++
+ /* ------------------------------------------------------------------ */
+ /* apps-SMMU: 32-bit IOVAs for the queue table, the UC page and the SFR */
+ /* ------------------------------------------------------------------ */
+@@ -1929,9 +1958,22 @@ vidc_bringup(void)
+     vidc_verdict("publish", rc);
+     if (rc == 0) vidc_pass_mask |= VIDC_STAGE_PUBLISH;
+ 
+-    rc = vidc_hfi_init();               /* HFI_CMD_INIT + version packet */
+-    vidc_verdict("hfi", rc);
+-    if (rc == 0) vidc_pass_mask |= VIDC_STAGE_HFI;
++    /* HFI is opt-in in this build.  The default path releases the 3 MiB queue
++     * table before the 5.17 s touch allocation and stops at publish; HFI would
++     * poll from ~3.3 s to 5.17 s while holding that window and re-trigger the
++     * panic.  pandora_vidc_hfi=1 keeps the queues and runs the handshake for a
++     * later map-budget experiment. */
++    int hfi_on = 0;
++    (void)PE_parse_boot_argn("pandora_vidc_hfi", &hfi_on, sizeof(hfi_on));
++    if (hfi_on) {
++        rc = vidc_hfi_init();           /* HFI_CMD_INIT + version packet */
++        vidc_verdict("hfi", rc);
++        if (rc == 0) vidc_pass_mask |= VIDC_STAGE_HFI;
++    } else {
++        vidc_release_qtable();
++        printf("PANDORA VIDC: STAGE hfi      = SKIP (window released before 5.17 s; "
++               "pandora_vidc_hfi=1 opts in)\n");
++    }
+ 
+ summary:
+     printf("PANDORA VIDC: SUMMARY mask=%03x/%03x probe=%u power=%u alloc=%u smmu=%u "
