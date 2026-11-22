@@ -1,0 +1,39 @@
+diff --git a/bsd/kern/tty.c b/b/bsd/kern/tty.c
+index e6f410a..d2503ec 100644
+--- a/bsd/kern/tty.c
++++ b/bsd/kern/tty.c
+@@ -278,6 +278,22 @@ tty_lock(struct tty *tp)
+ 	lck_mtx_lock(&tp->t_lock);
+ }
+ 
++/*
++ * 0630: restore tty_trylock for kexts built against older kernels.
++ *
++ * The reference kernelcache's USB kexts carry a relocation against _tty_trylock, and this base
++ * dropped the function together with its export, so prelink binding fails ("Kernel target
++ * 0xfffffff00761087c has 0 native address candidates: ['_tty_trylock']"). A never-acquired
++ * trylock is the safe shim: callers then take their blocking tty_lock() fallback instead of
++ * assuming they already hold the lock.
++ */
++boolean_t
++tty_trylock(struct tty *tp)
++{
++	(void)tp;
++	return FALSE;
++}
++
+ 
+ /*
+  * tty_unlock
+diff --git a/config/Private.exports b/b/config/Private.exports
+index 95550c9..7fc5aab 100644
+--- a/config/Private.exports
++++ b/config/Private.exports
+@@ -925,6 +925,7 @@ _ttspeedtab
+ _ttwakeup
+ _ttwwakeup
+ _tty_lock
++_tty_trylock
+ _tty_unlock
+ _ttyclose
+ _ttyflush
