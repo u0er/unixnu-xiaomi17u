@@ -1,0 +1,79 @@
+From: baseband lane
+Subject: 0531 pandora_pas: read the image back out of the carveout before TrustZone sees it
+
+HakiOS's step_image() writes the modem's segments and then reads every one of them back
+("read them back ... %llu words or bytes differ"), and only hands the image to TrustZone when
+nothing differs.  This loader wrote them and went straight on to MEM_SETUP and AUTH_AND_RESET.
+
+The cost of not checking is specific to this stage: a carveout mapping that silently refused the
+writes would reach TrustZone as a corrupt image, and TrustZone's answer would look like an id or a
+permission problem -- which is what this stage has been chasing.  A read-back turns that into
+
+  PANDORA PAS: modem.mdt: read back 70254592 bytes, 0 differ
+
+and, when something is wrong, into an EIO that stops the load before the call, with the difference
+count in the log.
+
+The comparison needs each segment's bytes a second time, so one buffer sized to the largest segment
+is allocated for the pass (about 11 MiB on this phone) and freed afterwards.  If it cannot be
+allocated the message says the image is unverified rather than pretending it passed.
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index 2d045a8..477ba70 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -379,6 +379,54 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 		total += ph[i].p_filesz;
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
++	/*
++	 * Read every segment back, as HakiOS's step_image() does ("read them back ... %llu words or
++	 * bytes differ" before it hands the image to TrustZone).  A carveout mapping that silently
++	 * refused the writes would otherwise reach MEM_SETUP and AUTH_AND_RESET as a corrupt image:
++	 * TrustZone would answer with a rejection that looks like an id or a permission problem,
++	 * which is exactly the kind of false lead this stage has already cost days to.
++	 *
++	 * The comparison needs the segment's bytes a second time, so one buffer of the largest
++	 * segment is allocated for the pass; the phone's own largest segment is about 11 MiB.
++	 */
++	if (!err) {
++		uint64_t differ = 0, checked = 0, biggest = 0;
++		vm_offset_t tmp = 0;
++		for (unsigned i = 0; i < phnum; i++) {
++			if (mdt_loadable(&ph[i]) && ph[i].p_filesz > biggest) {
++				biggest = ph[i].p_filesz;
++			}
++		}
++		if (biggest && kmem_alloc(kernel_map, &tmp, (vm_size_t)biggest, KMA_DATA | KMA_ZERO,
++		    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
++			for (unsigned i = 0; i < phnum && !err; i++) {
++				if (!mdt_loadable(&ph[i]) || ph[i].p_filesz == 0) {
++					continue;
++				}
++				uint64_t off = (uint64_t)ph[i].p_paddr - reloc_base;
++				if (mdt_segment(prefix, base, mdt, &ph[i], i, (void *)tmp)) {
++					err = EIO;
++					break;
++				}
++				const uint8_t *at = (const uint8_t *)(mem + off);
++				const uint8_t *was = (const uint8_t *)tmp;
++				for (uint32_t k = 0; k < ph[i].p_filesz; k++) {
++					if (at[k] != was[k]) {
++						differ++;
++					}
++				}
++				checked += ph[i].p_filesz;
++			}
++			kmem_free(kernel_map, tmp, (vm_size_t)biggest);
++			printf("PANDORA PAS: %s: read back %llu bytes, %llu differ%s\n", name,
++			    checked, differ, differ ? " -- the image is NOT in place" : "");
++			if (differ) {
++				err = EIO;
++			}
++		} else {
++			printf("PANDORA PAS: %s: no buffer for the read-back, the image is unverified\n", name);
++		}
++	}
+ 	/*
+ 	 * The carveout mapping stays.
+ 	 *
