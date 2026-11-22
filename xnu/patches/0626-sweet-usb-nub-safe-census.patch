@@ -1,0 +1,46 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0526 sweet_nub: only dereference ctl+0x110/0x120 when the value looks like a pointer
+
+0525 is the first boot that built the device tree: after "registered as ncmBringup" the probe's
+5 s sample printed child[0] IOUSBDeviceConfigurator, child[1] IOUSBDeviceInterface,
+child[2] IOUSBDeviceInterface, children 3 -- the configurator matched and createUSBDevice made both
+NCM interfaces. S0/S2/S3/S4/S5 were all True.
+
+Then the probe killed itself: the 0519 diagnostic printed "ctl+0x110 = 0x5ac00000000..." and
+dereferenced it as an object pointer, so the kernel took a data abort at 15.195 s (pc
+0xfffffff0079ef73c). ctl+0x110 legitimately holds a packed value at this point, not a pointer.
+
+0526 only dereferences values that could be a kernel object address (>= 0xfffffff000000000 and
+8-byte aligned) and prints ", not a pointer" otherwise, so the census stays readable without taking
+the machine down.
+
+Device evidence: outputs/data-a-live-nezha/device/private/logs/1795313400 (the crash follows the
+children 3 line, 1 ms after ctl+0x110 was printed).
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -512,12 +512,23 @@
+ 	 */
+ 	for (unsigned off = 0x110; off <= 0x120; off += 0x10) {
+ 		void *obj = *(void **)((char *)ctl + off);
++		uint64_t raw = (uint64_t)obj;
+ 		printf("SWEET NUB: ctl+0x%x = %p", off, obj);
+-		if (obj != NULL) {
++		/*
++		 * 0526: on the 0525 boot this loop crashed the kernel at 15.195 s, right after the 5 s
++		 * sample had already shown child[0] IOUSBDeviceConfigurator and two IOUSBDeviceInterface
++		 * children. ctl+0x110 held 0x5ac00000000..., i.e. a packed value, not a pointer -- the
++		 * old code dereferenced it unconditionally. Only follow values that could actually be a
++		 * kernel object address, and say so when the field is something else: the 18-slot / tag
++		 * census can then be read from the log instead of from a panic.
++		 */
++		if (raw >= SWEET_NUB_KERNEL_BASE && (raw & 7) == 0) {
+ 			void **vt = *(void ***)obj;
+ 			if (vt != NULL && (uint64_t)vt >= SWEET_NUB_KERNEL_BASE) {
+ 				printf(", vtable %p, slot29 %p", vt, vt[29]);
+ 			}
++		} else if (raw != 0) {
++			printf(", not a pointer");
+ 		}
+ 		printf("\n");
+ 	}
