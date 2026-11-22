@@ -1,0 +1,74 @@
+From: CarPlay C0 lane (2026-11-22)
+Subject: 0521 sweet_nub: never release the manually built controller instance
+
+0520 fixed the metaclass accounting and still died at 10.192 s, one line after "manual ->":
+  Break 0x0001 instruction exception from kernel. Panic (by design) at pc 0xfffffff004cee5c0
+That PC is vtable slot 1 of the published controller vtable, and disassembling the 0520 prelink
+shows slots 0 and 1 are literally `brk #1` while slot 2 is getMetaClass -- the two Itanium
+destructor slots are traps. OSObject::free() ends with `delete this`, so releasing a manually
+built instance dispatches the deleting destructor into that trap. Apple's own instances never
+take that path (kext objects are not individually freed), which is why the table can carry the
+trap at all.
+
+0521 therefore never releases the manual instance: one 504-byte object leaks per boot, and the
+retain() stays (the object must look owned while init/attach/start run). It also prints the
+three vtable slots so the next boot proves the layout, and notes the reason in the source.
+
+--- a/libkern/c++/sweet_nub.cpp
++++ b/libkern/c++/sweet_nub.cpp
+@@ -178,6 +178,7 @@
+ 		printf("SWEET NUB: class not registered yet; S2 skipped\n");
+ 		return;
+ 	}
++	bool manual_ctl = false;
+ 	IOService *ctl = (IOService *)mc->alloc();
+ 	printf("SWEET NUB: alloc -> %p, classSize %u, own class %s\n", ctl, mc->getClassSize(),
+ 	    ctl != NULL ? ctl->getMetaClass()->getClassName() : "-");
+@@ -225,6 +226,20 @@
+ 			if (mem != NULL) {
+ 				*(void ***)mem = (void **)SWEET_NUB_CTL_VTABLE;
+ 				ctl = (IOService *)mem;
++				manual_ctl = true;
++				/*
++				 * 0521: the published prelink vtable has `brk #1` in slots 0 and 1 -- the two
++				 * Itanium destructor slots -- while slot 2 is getMetaClass. This is Apple's
++				 * "kext instances are never deleted" layout: OSObject::free() ends in
++				 * `delete this`, which dispatches the deleting destructor in slot 1 and would
++				 * land on that trap. The 0520 boot died exactly there, one line after the
++				 * manual print, when the S2-only path released the object. So a manually built
++				 * instance is never released by this probe: one 504-byte object leaks per boot,
++				 * which is cheaper than a panic. Print the slots so the next boot proves it.
++				 */
++				printf("SWEET NUB: manual vtable slots: 0=%p 1=%p 2=%p\n",
++				    (void *)((void **)mem)[0], (void *)((void **)mem)[1],
++				    (void *)((void **)mem)[2]);
+ 				ctl->retain();
+ 				/*
+ 				 * 0520: the class's generated constructor does two things: sets the object's
+@@ -248,7 +263,7 @@
+ 	int run_start = 0;
+ 	PE_parse_boot_argn("sweet_nub", &run_start, sizeof(run_start));
+ 	if (run_start == 0) {
+-		ctl->release();
++		if (!manual_ctl) ctl->release();
+ 		printf("SWEET NUB: S2 done (pass sweet_nub=1 to run Apple's start)\n");
+ 		return;
+ 	}
+@@ -269,7 +284,7 @@
+ 		printf("SWEET NUB: instance vtable %p fails the structural check "
+ 		    "(start slot 0x%llx, pure 0x%llx); refusing to start\n",
+ 		    live, (unsigned long long)start_va, (unsigned long long)pure_target);
+-		ctl->release();
++		if (!manual_ctl) ctl->release();
+ 		return;
+ 	}
+ 	printf("SWEET NUB: vtable ok: start slot 0x%llx, pure 0x%llx\n",
+@@ -287,7 +302,7 @@
+ 	printf("SWEET NUB: provider %p; init/attach\n", provider);
+ 	if (!ctl->init() || !ctl->attach(provider)) {
+ 		printf("SWEET NUB: init/attach failed\n");
+-		ctl->release();
++		if (!manual_ctl) ctl->release();
+ 		return;
+ 	}
+ 
