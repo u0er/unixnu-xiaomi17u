@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..caa7e2214762d36e10e479aa0b542e73f344a1b2
+index 0000000..d27e8242a851e255a7e6594ede0b071573321582
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4747 @@
+@@ -0,0 +1,4823 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4103,6 +4103,75 @@ index 0000000..caa7e2214762d36e10e479aa0b542e73f344a1b2
 +	return 0;
 +}
 +
++/* Level 20.38: wait for one specific VS Command Complete by exact prefix.
++ *
++ * The Android trace answers 0x23 with an 11-byte event
++ *   04 0e 08 01 00 fc 00 23 02 00 00
++ * 0.34 ms after the command. Our generic reader entered its 34 00 ff record-skip
++ * state on the bytes that arrive just before it and swallowed the whole event
++ * (real log: "window closed with 147 byte(s) dropped, record state 4"), so the
++ * command looked unanswered.
++ *
++ * This matcher cannot fall into that state: it looks only for the fixed prefix
++ * 04 0e <len> 01 00 fc 00 <sub> and drops everything else. */
++static int
++bt_peri_wait_cc_sub(uint8_t sub, unsigned window_ms, uint8_t *ev, unsigned *got,
++    const char *what)
++{
++	uint8_t win[8] = {0};
++	unsigned filled = 0, dropped = 0;
++	uint64_t deadline;
++
++	clock_interval_to_deadline(window_ms, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		uint8_t b;
++
++		if (!(bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
++			bt_sleep(100);
++			continue;
++		}
++		b = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++		if (b == 0xfdu) {
++			const uint8_t ack = 0xfc;
++
++			(void)bt_uart_tx(&ack, 1, "PERI sub wake ACK FC");
++			continue;
++		}
++		if (filled < sizeof(win)) {
++			win[filled++] = b;
++		} else {
++			for (unsigned i = 1; i < sizeof(win); i++) {
++				win[i - 1u] = win[i];
++			}
++			win[sizeof(win) - 1u] = b;
++		}
++		if (filled < sizeof(win)) {
++			continue;
++		}
++		if (win[0] == 0x04u && win[1] == 0x0eu && win[3] == 0x01u &&
++		    win[4] == 0x00u && win[5] == 0xfcu && win[6] == 0x00u &&
++		    win[7] == sub) {
++			for (unsigned i = 0; i < sizeof(win); i++) {
++				ev[i] = win[i];
++			}
++			if (got != NULL) {
++				*got = sizeof(win);
++			}
++			if (dropped != 0u) {
++				printf("PANDORA BT: %s: %u byte(s) before the sub %02x CC\n",
++				    what, dropped, sub);
++				pandora_log_sync();
++			}
++			return 0;
++		}
++		dropped++;
++	}
++	printf("PANDORA BT: %s: no sub %02x CC within %u ms (%u byte(s) dropped)\n",
++	    what, sub, window_ms, dropped);
++	pandora_log_sync();
++	return ETIMEDOUT;
++}
++
 +/* Level 20.30: match the phase-C Command Complete by exact byte pattern.
 + *
 + * The generic event parser is the wrong tool here. Phase C must return exactly
@@ -4326,7 +4395,11 @@ index 0000000..caa7e2214762d36e10e479aa0b542e73f344a1b2
 +	err = ETIMEDOUT;
 +	for (unsigned tries = 0; tries < 4u; tries++) {
 +		unsigned w = (tries == 0u) ? window_ms : 50u;
-+		err = bt_peri_cc_read(w, ev, sizeof(ev), &got, &wakes, what, true);
++		/* Exact-prefix matcher instead of the generic reader: the generic one
++		 * enters its 34 00 ff record state on the bytes preceding the answer
++		 * and then swallows the whole event (measured: 147 bytes dropped,
++		 * record state 4, 0x23 reported unanswered). */
++		err = bt_peri_wait_cc_sub(sub, w, ev, &got, what);
 +		if (err) {
 +			break;
 +		}
@@ -4468,7 +4541,10 @@ index 0000000..caa7e2214762d36e10e479aa0b542e73f344a1b2
 +	 * the 0x23 command itself (20.3 ms after the frame). The old 1000 ms window
 +	 * delayed the next command by ~980 ms for no reason; 40 ms still catches
 +	 * that trailing Command Complete. */
-+	bt_peri_bulk_drain(40u, "PERI TME-L map B");
++	/* The trace puts 0x23 only 0.1 ms after B's own Command Complete, so a long
++	 * blind drain here both wastes time and leaves the reader in its record-skip
++	 * state. Draining is now the caller's job, and the wait for the 0x23 answer
++	 * is done by bt_peri_vs_cmd() with the exact-prefix matcher. */
 +	/* Phase C (trace 11.209352 0x23, then 57 frames to 11.380534): the nv
 +	 * stage carries gngbtnv20.bin behind a 4-byte 04 22 4c 00 header. This
 +	 * is the only stage the ROM answers frame by frame, so it runs with the
