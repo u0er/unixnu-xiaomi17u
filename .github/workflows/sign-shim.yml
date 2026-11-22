@@ -1,0 +1,20 @@
+name: sign-shim
+on:
+  workflow_dispatch:
+jobs:
+  sign:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ad-hoc sign the statusbar shim
+        run: |
+          mkdir -p out
+          cp carplay/shim/NezhaStatusBar.unsigned out/NezhaStatusBar
+          codesign -f -s - out/NezhaStatusBar
+          codesign -dvvv out/NezhaStatusBar 2> out/codesign.txt || true
+          cat out/codesign.txt
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-shim
+          path: out/
