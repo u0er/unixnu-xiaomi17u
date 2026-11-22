@@ -1,0 +1,30 @@
+From: baseband lane
+Subject: 0532 pandora_pas: the read-back must also check the zeroed padding
+
+0531 compares each segment's file bytes against what ended up in the carveout.  The bytes after them,
+up to p_memsz, are zeroed by the same loop and are just as much part of the image the secure world
+checks: if that write did not land, the image's interior is not what its segments claim while every
+file byte still matches.
+
+So the same pass now also requires the padding to read back as zero, and the printed byte count
+covers the padding too.  On this phone's two images the padding is small, so the cast is negligible.
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index 477ba70..b66cdc2 100755
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -416,6 +416,14 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 					}
+ 				}
+ 				checked += ph[i].p_filesz;
++				/* The padding was zeroed above; if that write did not land, the secure
++				 * world gets an image whose interior is not what the segment claims. */
++				for (uint32_t k = ph[i].p_filesz; k < ph[i].p_memsz; k++) {
++					if (at[k]) {
++						differ++;
++					}
++				}
++				checked += ph[i].p_memsz - ph[i].p_filesz;
+ 			}
+ 			kmem_free(kernel_map, tmp, (vm_size_t)biggest);
+ 			printf("PANDORA PAS: %s: read back %llu bytes, %llu differ%s\n", name,
