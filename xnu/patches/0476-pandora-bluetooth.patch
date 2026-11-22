@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..5007c80905545a80026c77db81d14396781139d6
+index 0000000..716c8382d53644addba7ce5be45c2f1c91ecac9c
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4862 @@
+@@ -0,0 +1,4875 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4116,7 +4116,8 @@ index 0000000..5007c80905545a80026c77db81d14396781139d6
 + * 04 0e <len> 01 00 fc 00 <sub> and drops everything else. */
 +static int
 +bt_peri_wait_cc_sub(uint8_t sub, unsigned window_ms, uint8_t *ev, unsigned cap,
-+    unsigned *got, const char *what)
++    unsigned *got, uint8_t *tail, unsigned tail_cap, unsigned *tail_len,
++    const char *what)
 +{
 +	uint8_t win[8] = {0};
 +
@@ -4168,6 +4169,9 @@ index 0000000..5007c80905545a80026c77db81d14396781139d6
 +			 * Leaving the tail in the FIFO poisons the next reader: for 0x23 it
 +			 * is 3 bytes, but the 0x20 build-info answer has plen = 117 and would
 +			 * leave 111 bytes behind. Drain what belongs to this event. */
++			if (tail_len != NULL) {
++				*tail_len = 0;
++			}
 +			if (win[2] > 5u) {
 +				unsigned rest = (unsigned)win[2] - 5u;
 +				uint64_t tail_deadline;
@@ -4188,6 +4192,13 @@ index 0000000..5007c80905545a80026c77db81d14396781139d6
 +
 +						(void)bt_uart_tx(&ack, 1, "PERI tail wake ACK FC");
 +						continue;
++					}
++					/* Keep the payload when the caller asked for it: the
++					 * 0x20 build-info answer carries oBTFW.GANGES in these
++					 * bytes, so discarding them would throw away evidence. */
++					if (tail != NULL && tail_len != NULL &&
++					    *tail_len < tail_cap) {
++						tail[(*tail_len)++] = tb;
 +					}
 +					rest--;
 +				}
@@ -4415,6 +4426,7 @@ index 0000000..5007c80905545a80026c77db81d14396781139d6
 +	uint8_t request[5] = { 0x01, 0x00, 0xfc, 0x01, 0x00 };
 +	uint8_t ev[BT_PERI_EVT_MAX] = {0};
 +	unsigned got = 0;
++	unsigned tlen = 0;
 +	int err;
 +
 +	request[4] = sub;
@@ -4438,7 +4450,8 @@ index 0000000..5007c80905545a80026c77db81d14396781139d6
 +		 * enters its 34 00 ff record state on the bytes preceding the answer
 +		 * and then swallows the whole event (measured: 147 bytes dropped,
 +		 * record state 4, 0x23 reported unanswered). */
-+		err = bt_peri_wait_cc_sub(sub, w, ev, sizeof(ev), &got, what);
++		err = bt_peri_wait_cc_sub(sub, w, ev, sizeof(ev), &got,
++			ev + 8u, sizeof(ev) - 8u, &tlen, what);
 +		if (err) {
 +			break;
 +		}
