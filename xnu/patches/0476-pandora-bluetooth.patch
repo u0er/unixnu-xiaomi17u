@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..e3204fd5ef860d09f8a62a16579715c8ee20fa02
+index 0000000..ef8e8afd50b69bc7a1917553dbad6399e425f77b
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,5006 @@
+@@ -0,0 +1,5027 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4728,6 +4728,27 @@ index 0000000..e3204fd5ef860d09f8a62a16579715c8ee20fa02
 +	 * exactly this criterion, and the fixed windows tried earlier are why the
 +	 * 0x23 answer kept being buried in phase B's residual stream. */
 +	(void)bt_peri_drain_silence(4u, 200u, "PERI TME-L map B tail");
++
++	/* Level 20.48: probe liveness before asking for the board id.
++	 *
++	 * Two boots in a row (19:5x and 20:52) measured the same thing after phase B:
++	 * 165,005 bytes of unstructed RX (drain head 5b 59 1d ee ...), 7,715 more bytes
++	 * inside the 0x23 window, six ROM diagnostic dumps and no BID answer. CTS reads
++	 * idle low on this board, so flow control is not an option and pacing or a
++	 * re-sync is. Before redesigning phase B, settle what state the ROM is in:
++	 * ask something it has already answered today (0x19 at 0.44 s). A reply means
++	 * the ROM lives and only the BID path is broken; silence means phase B knocked
++	 * it over and the fix belongs in how phase B transmits. */
++	{
++		uint8_t lev[BT_PERI_EVT_MAX];
++		unsigned lgot = 0;
++		int lerr = bt_peri_vs_cmd(0x19u, 400u, "PERI post-B liveness probe (0x19)");
++
++		(void)lev; (void)lgot;
++		printf("PANDORA BT: post-B liveness: 0x19 %s (error %d)\n",
++		    lerr == 0 ? "answered" : "silent", lerr);
++		pandora_log_sync();
++	}
 +	/* Phase C (trace 11.209352 0x23, then 57 frames to 11.380534): the nv
 +	 * stage carries gngbtnv20.bin behind a 4-byte 04 22 4c 00 header. This
 +	 * is the only stage the ROM answers frame by frame, so it runs with the
