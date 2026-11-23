@@ -1,0 +1,75 @@
+From: baseband lane
+Subject: 0539 pandora_mpss: an attach mode that loads nothing
+
+The lane's task book (UniXNU_Baseband_X85_SM8850_Lane_Handoff_2026-11-23.md) is explicit about the
+first milestone -- section 10: "in the premise of not restarting, not reflashing and not modifying
+the X85/MPSS firmware, UniXNU can observe the modem subsystem that is already running, build the
+AP<->Modem IPC, discover QRTR services and complete read-only QMI DMS/NAS queries" -- and section 5
+Phase 1 forbids reloading firmware, while 7.1 forbids triggering modem crash/SSR as an early tool.
+
+This file's steps 4..8 are exactly that reload path: INIT_IMAGE for the modem DTB and the main image,
+MEM_SETUP, the segment copy into mpss_region, the SMP2P handshake that starts what was copied, and
+AUTH_AND_RESET.  `pandora_mpss_attach=1` now skips those five and keeps the six that observe and talk:
+the SMEM survey, the firmware identity, the mailbox, the GLINK queues, our side of the link, QRTR.
+
+Attach mode makes the boot-arg visible in the ring ("ATTACH (steps 4-8 skipped...)") so a log cannot be
+mistaken for a load attempt.  The skipped steps still print, so the sequence in the log is complete.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index ef03810..432e4fc 100644
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -1647,12 +1647,32 @@ mp_steps_over(uint32_t done)
+ 	lck_mtx_unlock(&mp_lock);
+ }
+ 
++/*
++ * Attach instead of load.
++ *
++ * The lane's task book (UniXNU_Baseband_X85_SM8850_Lane_Handoff_2026-11-23.md, section 5 Phase 1 and
++ * section 10) draws the line this file crossed: the first milestone is to observe a modem that is
++ * ALREADY RUNNING -- "in the premise of not restarting, not reflashing and not modifying the X85/MPSS
++ * firmware" -- and to build the AP<->modem IPC and QRTR discovery on top of that.  Section 7.1
++ * forbids triggering modem crash/SSR as an early debugging tool, which is what PAS_SHUTDOWN was.
++ *
++ * So steps 4..8 (INIT_IMAGE, MEM_SETUP, the segment copy, the SMP2P handshake that starts what we
++ * copied, and AUTH_AND_RESET) are exactly the reload path and are skipped in attach mode.  What is
++ * kept is what observes and what talks: the SMEM survey, the firmware identity, the mailbox, then
++ * the GLINK queues, our side of the link, and QRTR.
++ */
++static bool mp_attach;
++
+ static void
+ mp_run_steps(void)
+ {
+ 	uint32_t done = 0;
+ 	for (uint32_t s = 1; s <= mp_last_step; s++) {
+ 		pandora_step = s;
++		if (mp_attach && s >= 4 && s <= 8) {
++			printf("PANDORA MPSS: step %u skipped (attach mode: no firmware is loaded or reset)\n", s);
++			continue;
++		}
+ 		if (!mp_steps[s - 1]()) {
+ 			printf("PANDORA MPSS: step %u FAILED; the steps after it are not attempted\n", s);
+ 			break;
+@@ -1755,6 +1775,10 @@ pandora_mpss_init(void)
+ 	(void)PE_parse_boot_argn("pandora_mpss_pas", &mp_pas, sizeof(mp_pas));
+ 	(void)PE_parse_boot_argn("pandora_mpss_pas_dtb", &mp_pas_dtb, sizeof(mp_pas_dtb));
+ 	bool whole = PE_parse_boot_argn("pandora_mpss", &on, sizeof(on)) && on == 1;
++	{
++		uint32_t attach = 0;
++		mp_attach = PE_parse_boot_argn("pandora_mpss_attach", &attach, sizeof(attach)) && attach == 1;
++	}
+ 	/*
+ 	 * Say which way this went, always.
+ 	 *
+@@ -1768,7 +1792,8 @@ pandora_mpss_init(void)
+ 		    "not 1); no modem work will be done this boot\n");
+ 		return;
+ 	}
+-	printf("PANDORA MPSS: asked for step %u%s\n", mp_last_step, whole ? " (whole stack)" : "");
++	printf("PANDORA MPSS: asked for step %u%s%s\n", mp_last_step, whole ? " (whole stack)" : "",
++	    mp_attach ? " ATTACH (steps 4-8 skipped: nothing is loaded or reset)" : "");
+ 	if (mp_map_windows()) {
+ 		return;
+ 	}
