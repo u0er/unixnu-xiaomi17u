@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..ee9436e02fc9266606b517c936c1f63b463e612b
+index 0000000..9cff27b66d324d52cf3ab92252a1f96fcc6530bb
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,5075 @@
+@@ -0,0 +1,5087 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4884,8 +4884,20 @@ index 0000000..ee9436e02fc9266606b517c936c1f63b463e612b
 +	if (err) {
 +		return err;
 +	}
++	/* Level 20.50: pace the ram patch the same way the NVM is paced.
++	 *
++	 * This driver already inserts BT_PERI_NVM_PACE_US between NVM segments - the
++	 * author knew full speed is risky - yet the ram patch went out at pace 0u.
++	 * That patch is the 1,374-frame bulk write after which two boots measured
++	 * 165 KB of unstructured RX, six ROM diagnostic dumps and a board-id request
++	 * that never got an answer. 1,374 x 1.5 ms costs 2.06 s; the level budget
++	 * moves from 23.18 s to 25.2 s and the image timer is 30 s, so it fits.
++	 *
++	 * CTS is not an option here: this board reads IOS 0x1, so CTS idles low and
++	 * hardware flow control cannot back-pressure us. The gap between segments is
++	 * the only throttle available. */
 +	err = bt_peri_tlv_download(pandora_peri_fw_mbn, sizeof(pandora_peri_fw_mbn),
-+	    "PERI ram patch", 0u, 1000u);
++	    "PERI ram patch", BT_PERI_NVM_PACE_US, 1000u);
 +	if (err) {
 +		return err;
 +	}
