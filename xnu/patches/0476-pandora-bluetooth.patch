@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..ef8e8afd50b69bc7a1917553dbad6399e425f77b
+index 0000000..ee9436e02fc9266606b517c936c1f63b463e612b
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,5027 @@
+@@ -0,0 +1,5075 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4129,6 +4129,53 @@ index 0000000..ef8e8afd50b69bc7a1917553dbad6399e425f77b
 +	return bytes;
 +}
 +
++/* Level 20.49: listen for the ROM's own frame at several rates.
++ *
++ * Phase B ends and the line then carries ~165 KB of unstructured bytes at a
++ * steady rate, with no loopback (routing loopback reads 0) and no CTS on this
++ * board (IOS 0x1). A patch that reconfigures its UART would produce exactly
++ * that: sampled at the wrong divisor, every frame becomes noise. QCA downloads
++ * do change rate mid-sequence (EDL_SET_BAUDRATE, and upstream's qbt_boot takes
++ * a baud argument), so this probe listens on each candidate and reports whether
++ * the 04 0e event prefix appears there. Reader is raw on purpose: the point is
++ * to detect framing, not to parse. */
++static void
++bt_peri_baud_probe(void)
++{
++	static const unsigned cand[] = { 4000000u, 3200000u, 3000000u, 2000000u,
++	    1500000u, 921600u };
++
++	for (unsigned k = 0; k < sizeof(cand) / sizeof(cand[0]); k++) {
++		uint8_t buf[64] = {0};
++		unsigned n = 0, pairs = 0;
++		uint64_t dl;
++
++		if (bt_uart_init(cand[k], false) != 0) {
++			printf("PANDORA BT: baud probe %u: init failed\n", cand[k]);
++			pandora_log_sync();
++			continue;
++		}
++		clock_interval_to_deadline(120u, NSEC_PER_MSEC, &dl);
++		while (mach_absolute_time() < dl && n < sizeof(buf)) {
++			if (!(bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
++				bt_sleep(100);
++				continue;
++			}
++			buf[n] = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++			if (n >= 1u && buf[n - 1u] == 0x04u && buf[n] == 0x0eu) {
++				pairs++;
++			}
++			n++;
++		}
++		printf("PANDORA BT: baud probe %u: %u byte(s)/120 ms, 04 0e %u, head %02x %02x %02x %02x\n",
++		    cand[k], n, pairs, buf[0], buf[1], buf[2], buf[3]);
++		pandora_log_sync();
++	}
++	(void)bt_uart_init(4000000u, false);
++	printf("PANDORA BT: baud probe done; back to 4000000\n");
++	pandora_log_sync();
++}
++
 +/* Level 20.21: phase A at the trace's own cadence.
 + *
 + * The 4 ms/segment pacing 20.13 introduced was a guess made before the Android
@@ -4728,6 +4775,7 @@ index 0000000..ef8e8afd50b69bc7a1917553dbad6399e425f77b
 +	 * exactly this criterion, and the fixed windows tried earlier are why the
 +	 * 0x23 answer kept being buried in phase B's residual stream. */
 +	(void)bt_peri_drain_silence(4u, 200u, "PERI TME-L map B tail");
++	bt_peri_baud_probe();
 +
 +	/* Level 20.48: probe liveness before asking for the board id.
 +	 *
