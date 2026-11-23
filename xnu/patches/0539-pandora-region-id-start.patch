@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 9595c98..d16aece 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1044,17 +1044,10 @@ int
+ pandora_scm_mem_protect_region_id(uint32_t region_id, uint64_t start, uint64_t size)
+ {
+ 	struct scm_res r;
+-	vm_offset_t buf = 0;
+-	if (kmem_alloc_contig(kernel_map, &buf, PAGE_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("PANDORA ADSP: mem_protect_region_id(%u): no memory\n", region_id);
+-		return ENOMEM;
+-	}
+-	((volatile uint64_t *)buf)[0] = start;
+-	((volatile uint64_t *)buf)[1] = size;
+-	const uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)buf));
+-	flush_dcache64((addr64_t)pa, PAGE_SIZE, TRUE);
+-	scm_smc(SCM_FN(0x0c, 0x10), SCM_ARGS(2), region_id, pa, 0, 0, &r);
++	/* 0539: vendor arginfo=2 means two plain VALs, not a descriptor pointer;
++	 * 0538's phys form was answered -1 by TZ.  Pass the region's start value
++	 * and let TZ validate it against its own region table. */
++	scm_smc(SCM_FN(0x0c, 0x10), SCM_ARGS(2), region_id, start, 0, 0, &r);
+ 	printf("PANDORA ADSP: mem_protect_region_id(%u, %#llx, %#llx) -> a0 %#llx a1 %#llx\n",
+ 	    region_id, (unsigned long long)start, (unsigned long long)size, r.a0, r.a1);
+ 	return r.a0 ? (int)r.a0 : 0;
