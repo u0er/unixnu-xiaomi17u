@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..4f86d073a1aa5462795915e075cde1deee7864ab
+index 0000000..e3204fd5ef860d09f8a62a16579715c8ee20fa02
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,4970 @@
+@@ -0,0 +1,5006 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -1139,7 +1139,31 @@ index 0000000..4f86d073a1aa5462795915e075cde1deee7864ab
 +	bt_wr(BT_W_SE, SE_TX_PARITY, 0);
 +	bt_wr(BT_W_SE, SE_RX_PARITY, 0);
 +	bt_wr(BT_W_SE, SE_RX_STALE, 0xf);
-+	bt_wr(BT_W_SE, SE_TX_TRANS_CFG, bt_rd(BT_W_SE, SE_TX_TRANS_CFG) | (1u << 1)); /* mask external CTS */
++	/* Level 20.47: do not ignore hardware flow control blindly.
++	 *
++	 * The engine was configured to mask external CTS, so it kept transmitting
++	 * whether or not the ROM was ready. The 2026-11-23 19:5x trial measured the
++	 * consequence: 164,974 bytes of residual stream after phase B, 7,672 more
++	 * inside a 500 ms window, "PERI CC8 window head" full of noise-looking bytes
++	 * and five ROM diagnostic dumps - a receiver overflowing, not a silent ROM.
++	 *
++	 * Reading the idle CTS level first keeps this safe: if the pad never
++	 * asserts, honouring CTS would stall every frame for a second times 1,374.
++	 * So: honour flow control only when the line actually offers it. */
++	{
++		uint32_t cfg = bt_rd(BT_W_SE, SE_TX_TRANS_CFG);
++		uint32_t ios = bt_rd(BT_W_SE, SE_IOS);
++		bool cts_idle_high = ((ios >> 1) & 1u) != 0u;
++
++		if (cts_idle_high) {
++			bt_wr(BT_W_SE, SE_TX_TRANS_CFG, cfg & ~(1u << 1));
++			printf("PANDORA BT: CTS idle high (IOS %#x) -> honouring flow control\n", ios);
++		} else {
++			bt_wr(BT_W_SE, SE_TX_TRANS_CFG, cfg | (1u << 1));
++			printf("PANDORA BT: CTS idle low (IOS %#x) -> masking it, as before\n", ios);
++		}
++		pandora_log_sync();
++	}
 +	/* CTS_MASK belongs to TX_TRANS_CFG only. Android's observed RX value
 +	 * is zero and its module never sets RX bit1. Isolate removal of the
 +	 * historical write in level 9; preserve the measured older levels. */
@@ -4057,6 +4081,8 @@ index 0000000..4f86d073a1aa5462795915e075cde1deee7864ab
 +{
 +	uint64_t start, last_rx, quiet_ns, max_ns;
 +	unsigned bytes = 0;
++	uint8_t head[48] = {0};
++	unsigned head_n = 0;
 +
 +	/* Compare durations throughout: clock_interval_to_deadline() produces an
 +	 * absolute deadline, and comparing a delta against it silently disables the
@@ -4085,10 +4111,20 @@ index 0000000..4f86d073a1aa5462795915e075cde1deee7864ab
 +			continue;
 +		}
 +		bytes++;
++		if (head_n < sizeof(head)) {
++			/* What the drain is throwing away decides whether the line carries
++			 * our own frames, records, events, or noise. A count alone cannot
++			 * tell those apart - 165 KB of unknown bytes is exactly the kind of
++			 * thing that hid the 0x23 answer for two days. */
++			head[head_n++] = b;
++		}
 +		last_rx = mach_absolute_time();
 +	}
 +	printf("PANDORA BT: %s: silenced after %u byte(s) (quiet %u ms)\n",
 +	    what, bytes, quiet_ms);
++	if (head_n != 0u) {
++		bt_dump("PERI drain head", head, head_n);
++	}
 +	pandora_log_sync();
 +	return bytes;
 +}
