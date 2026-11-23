@@ -1,0 +1,12 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1054,7 +1054,7 @@
+ 	((volatile uint64_t *)buf)[1] = size;
+ 	const uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)buf));
+ 	flush_dcache64((addr64_t)pa, PAGE_SIZE, TRUE);
+-	scm_smc(SCM_FN(0x0c, 0x10), SCM_ARGS(2), region_id, pa, 0, 0, &r);
++	scm_smc(SCM_FN(0x0c, 0x10), SCM_ARGS(2), region_id, start, 0, 0, &r);
+ 	printf("PANDORA ADSP: mem_protect_region_id(%u, %#llx, %#llx) -> a0 %#llx a1 %#llx\n",
+ 	    region_id, (unsigned long long)start, (unsigned long long)size, r.a0, r.a1);
+ 	kmem_free(kernel_map, buf, PAGE_SIZE);
