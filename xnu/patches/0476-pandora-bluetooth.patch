@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..9cff27b66d324d52cf3ab92252a1f96fcc6530bb
+index 0000000..23d7fef8cba5eb23429620a01494dccc36be124f
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,5087 @@
+@@ -0,0 +1,5096 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -1996,6 +1996,12 @@ index 0000000..9cff27b66d324d52cf3ab92252a1f96fcc6530bb
 + * segments ~1.0-1.5 ms apart. Level 19.1 matches that with 1.5 ms and gives
 + * the last ACK 3 s for erase/commit latency; the ram patch stays unpaced. */
 +#define BT_PERI_NVM_PACE_US 1500u
++/* Level 20.51: map A is the stage that precedes the ROM's dump. Measured on
++ * v2049: "map A: 284 frames sent" at 1.657 s, and the first
++ * 34 00 ff fc f0 04 record sits in map A's own bulk answer at 1.674 s, while
++ * map B does not even start until 2.206 s. So the dump is triggered by the
++ * 284-frame TLV stage, not by the 333 KB bulk. 284 x 1.5 ms costs 0.43 s. */
++#define BT_PERI_TLV_PACE_US 1500u
 +#define BT_PERI_NVM_LAST_ACK_MS 3000u
 +/* Level 20.3/20.4: observation window after the TME-L map download. The ROM's
 + * 63-byte status-2 event arrived ~185 ms into the phase in both earlier runs,
@@ -4224,6 +4230,9 @@ index 0000000..9cff27b66d324d52cf3ab92252a1f96fcc6530bb
 +			frame[8u + i] = fw[sent + i];
 +		}
 +		err = bt_uart_tx_long(frame, len + 8u, what);
++		if (err == 0 && bt_level >= 20) {
++			bt_sleep(BT_PERI_TLV_PACE_US);
++		}
 +		if (err) {
 +			bt_tx_long_quiet = false;
 +			printf("PANDORA BT: %s: frame %u/%u failed (error %d) after %u bytes\n",
