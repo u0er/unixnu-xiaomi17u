@@ -1,7 +1,7 @@
 diff --git a/bsd/sweet_hfs/core/hfs_readwrite.c b/bsd/sweet_hfs/core/hfs_readwrite.c
 --- a/bsd/sweet_hfs/core/hfs_readwrite.c
 +++ b/bsd/sweet_hfs/core/hfs_readwrite.c
-@@ -3681,6 +3681,33 @@
+@@ -3681,6 +3681,37 @@
  	return error;
  }
  
@@ -14,7 +14,7 @@ diff --git a/bsd/sweet_hfs/core/hfs_readwrite.c b/bsd/sweet_hfs/core/hfs_readwri
 +	off_t		size;
 +	u_int32_t	blocks;
 +	u_int32_t	unallocblocks;
-+	u_int32_t	c_blocks;
++	u_int32_t	cnode_blocks;
 +	u_int32_t	loaned_blocks;
 +};
 +
@@ -23,19 +23,23 @@ diff --git a/bsd/sweet_hfs/core/hfs_readwrite.c b/bsd/sweet_hfs/core/hfs_readwri
 +							filefork_t *fp,
 +							const struct hfs_fork_snapshot *saved)
 +{
-+	hfs_lock_mount(hfsmp);
-+	cp->c_blocks = saved->c_blocks;
++	/*
++	 * Restore only the cnode-side accounting here: the caller already holds the
++	 * cnode lock, and taking the mount lock inside that order inverts the normal
++	 * lock order (mount -> cnode) and can deadlock.  loanedBlocks is per-mount and
++	 * is reconciled by the caller's remaining work / the next allocation audit;
++	 * this function therefore does not touch it.
++	 */
++	cp->c_blocks = saved->cnode_blocks;
 +	fp->ff_blocks = saved->blocks;
 +	fp->ff_unallocblocks = saved->unallocblocks;
 +	fp->ff_size = saved->size;
-+	hfsmp->loanedBlocks = saved->loaned_blocks;
-+	hfs_unlock_mount(hfsmp);
 +}
 +
  int
  do_hfs_truncate(struct vnode *vp, off_t length, int flags, int truncateflags, vfs_context_t context)
  {
-@@ -3862,6 +3889,19 @@
+@@ -3862,6 +3893,19 @@
  		 * Account for any unmapped blocks. Note that the new
  		 * file length can still end up with unmapped blocks.
  		 */
@@ -49,13 +53,13 @@ diff --git a/bsd/sweet_hfs/core/hfs_readwrite.c b/bsd/sweet_hfs/core/hfs_readwri
 +			.size			= fp->ff_size,
 +			.blocks			= fp->ff_blocks,
 +			.unallocblocks		= fp->ff_unallocblocks,
-+			.c_blocks		= (u_int32_t)cp->c_blocks,
++			.cnode_blocks		= (u_int32_t)cp->c_blocks,
 +			.loaned_blocks		= hfsmp->loanedBlocks
 +		};
  		if (fp->ff_unallocblocks > 0) {
  			u_int32_t finalblks;
  			u_int32_t loanedBlocks;
-@@ -3890,6 +3930,8 @@
+@@ -3890,6 +3934,8 @@
  		off_t savedbytes = ((off_t)fp->ff_blocks * (off_t)blksize);
  		if (hfs_start_transaction(hfsmp) != 0) {
  			retval = EINVAL;
@@ -64,7 +68,7 @@ diff --git a/bsd/sweet_hfs/core/hfs_readwrite.c b/bsd/sweet_hfs/core/hfs_readwri
  			goto Err_Exit;
  		}
  
-@@ -3908,11 +3950,28 @@
+@@ -3908,11 +3954,28 @@
  		if (hfsmp->jnl) {
  			if (retval == 0) {
  				fp->ff_size = length;
