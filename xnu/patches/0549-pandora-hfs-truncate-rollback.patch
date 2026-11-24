@@ -11,9 +11,9 @@ diff --git a/bsd/sweet_hfs/core/hfs_readwrite.c b/bsd/sweet_hfs/core/hfs_readwri
 + * have published these values via hfs_update()/cat_update() yet.
 + */
 +struct hfs_fork_snapshot {
-+	off_t		ff_size;
-+	u_int32_t	ff_blocks;
-+	u_int32_t	ff_unallocblocks;
++	off_t		size;
++	u_int32_t	blocks;
++	u_int32_t	unallocblocks;
 +	u_int32_t	c_blocks;
 +	u_int32_t	loaned_blocks;
 +};
@@ -25,9 +25,9 @@ diff --git a/bsd/sweet_hfs/core/hfs_readwrite.c b/bsd/sweet_hfs/core/hfs_readwri
 +{
 +	hfs_lock_mount(hfsmp);
 +	cp->c_blocks = saved->c_blocks;
-+	fp->ff_blocks = saved->ff_blocks;
-+	fp->ff_unallocblocks = saved->ff_unallocblocks;
-+	fp->ff_size = saved->ff_size;
++	fp->ff_blocks = saved->blocks;
++	fp->ff_unallocblocks = saved->unallocblocks;
++	fp->ff_size = saved->size;
 +	hfsmp->loanedBlocks = saved->loaned_blocks;
 +	hfs_unlock_mount(hfsmp);
 +}
@@ -46,9 +46,9 @@ diff --git a/bsd/sweet_hfs/core/hfs_readwrite.c b/bsd/sweet_hfs/core/hfs_readwri
 +		 * logicalSize > 0 and totalBlocks == 0.
 +		 */
 +		struct hfs_fork_snapshot saved = {
-+			.ff_size		= fp->ff_size,
-+			.ff_blocks		= fp->ff_blocks,
-+			.ff_unallocblocks	= fp->ff_unallocblocks,
++			.size			= fp->ff_size,
++			.blocks			= fp->ff_blocks,
++			.unallocblocks		= fp->ff_unallocblocks,
 +			.c_blocks		= (u_int32_t)cp->c_blocks,
 +			.loaned_blocks		= hfsmp->loanedBlocks
 +		};

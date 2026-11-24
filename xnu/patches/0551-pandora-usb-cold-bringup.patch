@@ -18,12 +18,12 @@ diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
  #define PU_PWR_ON     (1u << 31)
  
 +/* Cold bring-up (pandora_usb=3). BCR/GDSCR bits are the GCC ones the read-only probe already
-+ * names; GUCTL1 is DWC3 0xc130 seen from the 0xc000 the mapping starts at; QSCRATCH sits at
++ * names; GUCTL1 is DWC3 0xc11c seen from the 0xc000 the mapping starts at; QSCRATCH sits at
 + * map + 0x800, as the probe's 0x808/0x810/0x830 reads show. */
 +#define PU_GCC_BCR      0x000u          /* BCR, USB3_PRIM block reset: bit 0 */
 +#define PU_BCR_RESET    (1u << 0)
 +#define PU_CLK_EN       (1u << 0)       /* CBCR branch enable; PU_CLK_OFF is the halt status */
-+#define PU_GUCTL1       0x130u          /* DWC3 GUCTL1 */
++#define PU_GUCTL1       0x11Cu          /* DWC3 GUCTL1 */
 +#define PU_GUCTL1_RESUME_OPMODE_HS_HOST (1u << 10)  /* snps,resume-hs-terminations */
 +#define PU_QSCR_HS_PHY_CTRL 0x810u      /* QSCRATCH HS_PHY_CTRL */
 +#define PU_QSCR_SS_PHY_CTRL 0x830u      /* QSCRATCH SS_PHY_CTRL */
@@ -34,7 +34,7 @@ diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
  static const struct {
  	uint32_t off;
  	const char *name;
-@@ -65,6 +84,192 @@
+@@ -65,6 +84,193 @@
  	const uint32_t v = *(volatile uint32_t *)(base + off);
  	__asm__ volatile("dmb oshld" ::: "memory");
  	return v;
@@ -211,12 +211,13 @@ diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
 +		return false;
 +	}
 +	bool done = pu_resume_hs_terminations(d);
-+	if (done) {
-+		struct pu_vbus_state saved = { 0, 0, false };
-+		if (!pu_vbus_override(q, &saved)) {
-+			pu_vbus_restore(q, &saved);
-+			done = false;
-+		}
++	struct pu_vbus_state saved = { 0, 0, false };
++	/* VBUS override is independent of GUCTL1: upstream writes it regardless of the
++	 * resume-termination quirk, and coupling the two makes a single register failure
++	 * hide the device-role VBUS setup. */
++	if (!pu_vbus_override(q, &saved)) {
++		pu_vbus_restore(q, &saved);
++		done = false;
 +	}
 +	ml_io_unmap(d, 0x1000);
 +	ml_io_unmap(q, 0x1000);
@@ -227,7 +228,7 @@ diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
  }
  
  static void
-@@ -161,6 +366,16 @@
+@@ -161,6 +367,16 @@
  	if (cpu_number() != master_cpu) {
  		printf("PANDORA USB: serial not started: not on the boot CPU\n");
  		return;
