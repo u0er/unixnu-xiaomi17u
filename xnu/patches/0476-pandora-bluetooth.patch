@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..10dae30482929fe28dc11c76ab61a0e57c6c3ac5
+index 0000000..d779e4ebfee2e55e654db7f5a3519becad3b1414
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,5122 @@
+@@ -0,0 +1,5150 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4135,8 +4135,15 @@ index 0000000..10dae30482929fe28dc11c76ab61a0e57c6c3ac5
 +		}
 +		last_rx = mach_absolute_time();
 +	}
-+	printf("PANDORA BT: %s: silenced after %u byte(s) (quiet %u ms)\n",
-+	    what, bytes, quiet_ms);
++	if (bytes == 0u) {
++		/* Nothing ever arrived: the wait was first_ns (200 ms), not quiet_ms.
++		 * Printing "quiet 4 ms" here has already caused two misreadings today. */
++		printf("PANDORA BT: %s: no traffic within %u ms (first-byte wait)\n",
++		    what, 200u);
++	} else {
++		printf("PANDORA BT: %s: silenced after %u byte(s) (quiet %u ms)\n",
++		    what, bytes, quiet_ms);
++	}
 +	if (head_n != 0u) {
 +		bt_dump("PERI drain head", head, head_n);
 +	}
@@ -4583,6 +4590,27 @@ index 0000000..10dae30482929fe28dc11c76ab61a0e57c6c3ac5
 +		}
 +	}
 +	bt_tx_long_quiet = false;
++	/* Level 20.56: the bulk path must consume its own final Command Complete.
++	 *
++	 * Only the per-frame path (phase C) waits for a CC, so the 1,374-frame bulk
++	 * stage reported "0 Command Complete(s)". btqca states the last segment is
++	 * always acknowledged, and the v2050 log shows the cost of ignoring it: the
++	 * next command reported "no sub 19 CC within 500 ms (7965 byte(s) dropped)",
++	 * i.e. B's trailing CC was eaten by the following window.
++	 *
++	 * Wait once, bounded, and say so in the log. */
++	if (!per_frame_cc && sent != 0u) {
++		uint8_t lcc[BT_PERI_EVT_MAX];
++		int cerr = bt_peri_wait_cc8(500u, lcc, what);
++
++		if (cerr == 0) {
++			last_sub = lcc[7];
++			ccs++;
++		}
++		printf("PANDORA BT: %s: final Command Complete %s (error %d)\n",
++		    what, cerr == 0 ? "received" : "missing", cerr);
++		pandora_log_sync();
++	}
 +	printf("PANDORA BT: %s: %u frames sent (%u bytes), %u Command Complete(s), last sub %02x, %u wake(s), %u byte(s) flushed\n",
 +	    what, seg, sent, ccs, last_sub, wakes, flushed);
 +	printf("PANDORA BT: %s: %u TX command(s), %llu byte(s) on the wire, no per-frame log\n",
