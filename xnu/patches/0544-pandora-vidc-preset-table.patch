@@ -1,0 +1,68 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -1594,6 +1594,44 @@
+     printf("PANDORA VIDC: boot released (spare0=%08x boot=%08x stat=%08x)\n",
+         vidc_rd(R_WRAPPER_SPARE_0), vidc_rd(R_CPU_BOOT_CTRL),
+         vidc_rd(R_CPU_QUEUE_TABLE_STAT));
++
++    /* 0544 single variable: the vendor's __power_on_iris4 tail calls
++     * __set_registers at 0x16338 -- *after* __boot_firmware_iris4 has released
++     * the core (0x15be4, 0xA0048 <- 1) and *before* __interrupt_init_iris4
++     * (0x16340) and its publish op.  That platform table ("canoe" @0x1b008,
++     * cf. alor @0x1a648 / chora @0x1bab8) is 15 rows wide and every row has
++     * mask 0xffffffff, so every row is a plain write.  Our port has only ever
++     * written 0xB0088, which is row 0 of that same table [K
++     * __power_off_iris4_hardware 0x1659c].  Copy the canoe rows in vendor
++     * order, so this round changes exactly one thing: the twelve 0x13xxx
++     * rows plus 0xA013C that this port has never written. */
++    {
++        static const struct { uint32_t off; uint32_t val; } canoe[] = {
++            { 0xB0088u, 0x00000000u },   /* WRAPPER_CORE_CLK, row 0 */
++            { 0x13030u, 0x33332211u },
++            { 0x13034u, 0x44444444u },
++            { 0x13038u, 0x00001001u },
++            { 0x13040u, 0x00000000u },
++            { 0x13048u, 0x0000ffffu },
++            { 0x13430u, 0x33332211u },
++            { 0x13434u, 0x44444444u },
++            { 0x13438u, 0x00001001u },
++            { 0x13440u, 0x00000000u },
++            { 0x13448u, 0x0000ffffu },
++            { 0x13830u, 0x33332211u },
++            { 0x13834u, 0x44444444u },
++            { 0x13838u, 0x00001010u },
++            { 0xA013Cu, 0x00000099u },   /* never read back by the vendor */
++        };
++        const unsigned n = (unsigned)(sizeof(canoe) / sizeof(canoe[0]));
++        for (unsigned i = 0; i < n; i++)
++            vidc_wr(canoe[i].off, canoe[i].val);
++        __asm__ volatile ("dsb sy" ::: "memory");
++        printf("PANDORA VIDC: canoe preset %u rows applied: 13030=%08x "
++               "13430=%08x 13830=%08x A013C=%08x\n", n,
++            vidc_rd(0x13030u), vidc_rd(0x13430u), vidc_rd(0x13830u),
++            vidc_rd(0xA013Cu));
++    }
+     vidc_snap("after boot");
+ 
+     /* Vendor gate [K __prepare_pc_iris4 0x15e64-0x1602c]: proceed only when
+@@ -1684,6 +1722,19 @@
+      * snapshot also tells us whether the VPU actually touched memory at all:
+      * an SMMU context fault (CB_FSR != 0) would mean the firmware started but
+      * its accesses were mistranslated, a completely different fix. */
++    /* 0544 readback: the preset rows are the only host writes this round adds,
++     * so on a timeout they must be shown to have landed.  0x13xxx had no other
++     * writer in the whole vendor binary and 0xA013C is never read back there,
++     * which is exactly why they are dumped here. */
++    printf("PANDORA VIDC: preset 13030=%08x 13034=%08x 13038=%08x 13040=%08x "
++           "13048=%08x 13430=%08x\n",
++        vidc_rd(0x13030u), vidc_rd(0x13034u), vidc_rd(0x13038u),
++        vidc_rd(0x13040u), vidc_rd(0x13048u), vidc_rd(0x13430u));
++    printf("PANDORA VIDC: preset 13434=%08x 13438=%08x 13440=%08x 13448=%08x "
++           "13830=%08x 13834=%08x 13838=%08x A013C=%08x\n",
++        vidc_rd(0x13434u), vidc_rd(0x13438u), vidc_rd(0x13440u),
++        vidc_rd(0x13448u), vidc_rd(0x13830u), vidc_rd(0x13834u),
++        vidc_rd(0x13838u), vidc_rd(0xA013Cu));
+     printf("PANDORA VIDC: core clk=%08x pwr=%08x boot=%08x a2h=%08x x2rpmh=%08x\n",
+         vidc_rd(R_WRAPPER_CORE_CLK), vidc_rd(R_WRAPPER_CORE_PWR),
+         vidc_rd(R_CPU_BOOT_CTRL), vidc_rd(R_CPU_A2HSOFTINTCLR),
