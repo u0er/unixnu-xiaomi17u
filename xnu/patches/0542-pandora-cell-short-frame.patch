@@ -1,0 +1,32 @@
+From: baseband lane
+Subject: 0542 pandora_cell: cell_inject refuses a frame shorter than an Ethernet header
+
+cell_inject() builds an mbuf from a received frame and then calls
+mbuf_adj(packet, CELL_ETHER_HEADER) to strip the header.  Nothing checked that the frame was that
+long.  On the transmit side (the ARP and DHCP answers this file assembles) it always is; on the
+receive side the frame comes from the modem and its length is whatever the modem sent.
+
+mbuf_adj returns an error for a packet shorter than the adjustment, but that return was dropped, so
+the data pointer moved anyway and ifnet_input was handed a packet whose length no longer matched its
+data.  A two-line guard at the top rejects the short frame instead.
+
+diff --git a/bsd/dev/pandora_cell.c b/b/bsd/dev/pandora_cell.c
+index a294cfb..a57af1c 100644
+--- a/bsd/dev/pandora_cell.c
++++ b/bsd/dev/pandora_cell.c
+@@ -480,6 +480,15 @@ cell_inject(const uint8_t *frame, size_t length)
+ 	if (cell_interface == NULL) {
+ 		return;
+ 	}
++	/*
++	 * Shorter than an Ethernet header cannot happen on the paths this file builds (the ARP and DHCP
++	 * answers), but it can on the receive path if the modem hands something odd, and mbuf_adj() below
++	 * would then take the packet's data pointer past its own length.  mbuf_adj returns an error rather
++	 * than panicking, but the error was being dropped and the data pointer still moved.
++	 */
++	if (length < CELL_ETHER_HEADER) {
++		return;
++	}
+ 	if (mbuf_getpacket(MBUF_DONTWAIT, &packet) != 0) {
+ 		return;
+ 	}
