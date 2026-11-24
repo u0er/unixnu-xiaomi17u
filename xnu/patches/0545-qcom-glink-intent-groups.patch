@@ -1,0 +1,194 @@
+From: baseband lane
+Subject: 0545 qcom/QcomGlink + pandora_mpss: advertise the intents the device tree asks for
+
+The modem's IPCRTR edge says, in the live device tree:
+
+  qcom,modem_qrtr { qcom,glink-channels = "IPCRTR";
+                    qcom,intents = <0x800 0x5  0x2000 0x3  0x4400 0x2>; };
+
+three groups, ten buffers.  This lane advertised one group of five 17408-byte buffers, so every 2 KiB
+message the modem sent consumed a whole intent and five of them used the channel up.  It cannot be
+proven from a ring yet because the modem is not running, but the profile is in the device tree and
+ours does not match it.
+
+Each local intent slot now carries its own size and its own offset into storage, so a channel may
+advertise several groups.  qcom_glink_channel() keeps its signature and fills the slots exactly as
+it used to (size, k*size), so the ADSP's channels behave byte for byte as before.  The new
+qcom_glink_channel_intents() takes the groups as written in the DT, and only the modem's call site
+uses it -- storage 0x800*5 + 0x2000*3 + 0x4400*2 = 69,632 bytes, ten slots.
+
+The two receive paths that matter follow the slot rather than the channel: advertise() puts the
+slot's size in the INTENT message, and handle_data() bounds the bytes against the slot's size and
+writes at the slot's offset.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 96929fc..7552b12 100644
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -1537,7 +1537,13 @@ step_link(void)
+ 	 * here once the version is agreed -- before that the DSP would not understand it.
+ 	 */
+ 	if (!mp_qrtr_channel && mp_gl.version_agreed) {
+-		uint32_t bytes = MP_GL_INTENT_SIZE * MP_GL_INTENT_COUNT;
++		/*
++		 * The DT's profile for the modem's IPCRTR edge: qcom,intents = <0x800 5 0x2000 3 0x4400 2>.
++		 * Five small buffers matter: with one 17408-byte group every 2 KiB message from the modem
++		 * consumed a whole intent and five of them exhausted the supply.
++		 */
++		static const QcomGlinkIntentGroup groups[] = {{0x800u, 5u}, {0x2000u, 3u}, {0x4400u, 2u}};
++		const uint32_t bytes = 0x800u * 5u + 0x2000u * 3u + 0x4400u * 2u;
+ 
+ 		if (mp_gl_storage == NULL) {
+ 			mp_gl_storage = kalloc_data(bytes, Z_WAITOK | Z_ZERO);
+@@ -1547,10 +1553,10 @@ step_link(void)
+ 			return false;
+ 		}
+ 		static const QcomGlinkClient client = {mp_qrtr_state, mp_qrtr_receive};
+-		mp_qrtr_channel = qcom_glink_channel(&mp_gl, MP_GL_CHANNEL, MP_GL_INTENT_SIZE, MP_GL_INTENT_COUNT,
+-		    mp_gl_storage, &client, NULL, 1);
+-		printf("PANDORA MPSS: channel %s %s (%u intents of %u bytes)\n", MP_GL_CHANNEL,
+-		    mp_qrtr_channel != NULL ? "opened" : "NOT OPENED", MP_GL_INTENT_COUNT, MP_GL_INTENT_SIZE);
++		mp_qrtr_channel = qcom_glink_channel_intents(&mp_gl, MP_GL_CHANNEL, groups,
++		    sizeof(groups) / sizeof(groups[0]), mp_gl_storage, &client, NULL, 1);
++		printf("PANDORA MPSS: channel %s %s (%u intents: %u+%u+%u bytes)\n", MP_GL_CHANNEL,
++		    mp_qrtr_channel != NULL ? "opened" : "NOT OPENED", 10u, 0x800u, 0x2000u, 0x4400u);
+ 		if (mp_qrtr_channel == NULL) {
+ 			return false;
+ 		}
+diff --git a/bsd/dev/qcom/QcomGlink.c b/b/bsd/dev/qcom/QcomGlink.c
+index fee7b1f..25342c5 100644
+--- a/bsd/dev/qcom/QcomGlink.c
++++ b/bsd/dev/qcom/QcomGlink.c
+@@ -101,10 +101,9 @@ void qcom_glink_set_rx(QcomGlink *g, volatile uint8_t *data, uint32_t length)
+     g->rx.length = length;
+ }
+ 
+-QcomGlinkChannel *qcom_glink_channel(QcomGlink *g, const char *name, uint32_t intent_size, uint32_t intent_count, uint8_t *storage,
+-                                     const QcomGlinkClient *client, void *context, int open_now)
++static QcomGlinkChannel *register_channel(QcomGlink *g, const char *name, uint8_t *storage, const QcomGlinkClient *client,
++                                          void *context, int open_now)
+ {
+-    if (!name || !client || intent_count > QCOM_GLINK_MAX_LOCAL_INTENTS || (intent_count && (!storage || !intent_size))) return 0;
+     for (unsigned i = 0; i < QCOM_GLINK_MAX_CHANNELS; ++i) {
+         QcomGlinkChannel *c = &g->channel[i];
+         if (c->used) continue;
+@@ -116,8 +115,6 @@ QcomGlinkChannel *qcom_glink_channel(QcomGlink *g, const char *name, uint32_t in
+         c->client = *client;
+         c->context = context;
+         c->storage = storage;
+-        c->intent_size = intent_size;
+-        c->intent_count = intent_count;
+         c->initiator = open_now != 0;
+         c->open_sent = open_now ? 0 : 2;  /* 2: wait for the remote's OPEN before sending ours */
+         return c;
+@@ -125,6 +122,48 @@ QcomGlinkChannel *qcom_glink_channel(QcomGlink *g, const char *name, uint32_t in
+     return 0;
+ }
+ 
++QcomGlinkChannel *qcom_glink_channel(QcomGlink *g, const char *name, uint32_t intent_size, uint32_t intent_count, uint8_t *storage,
++                                     const QcomGlinkClient *client, void *context, int open_now)
++{
++    if (!name || !client || intent_count > QCOM_GLINK_MAX_LOCAL_INTENTS || (intent_count && (!storage || !intent_size))) return 0;
++    QcomGlinkChannel *c = register_channel(g, name, storage, client, context, open_now);
++    if (!c) return 0;
++    c->intent_size = intent_size;
++    c->intent_count = intent_count;
++    for (unsigned k = 0; k < intent_count; ++k) {
++        c->local[k].size = intent_size;
++        c->local[k].offset = k * intent_size;
++    }
++    return c;
++}
++
++QcomGlinkChannel *qcom_glink_channel_intents(QcomGlink *g, const char *name, const QcomGlinkIntentGroup *groups, unsigned count,
++                                             uint8_t *storage, const QcomGlinkClient *client, void *context, int open_now)
++{
++    if (!name || !client || !groups || !count || !storage) return 0;
++    unsigned slots = 0;
++    for (unsigned i = 0; i < count; ++i) {
++        if (!groups[i].size || !groups[i].count) return 0;
++        slots += groups[i].count;
++        if (slots > QCOM_GLINK_MAX_LOCAL_INTENTS) return 0;
++    }
++    QcomGlinkChannel *c = register_channel(g, name, storage, client, context, open_now);
++    if (!c) return 0;
++    unsigned slot = 0;
++    uint32_t offset = 0;
++    for (unsigned i = 0; i < count; ++i) {
++        for (uint32_t k = 0; k < groups[i].count; ++k) {
++            c->local[slot].size = groups[i].size;
++            c->local[slot].offset = offset;
++            offset += groups[i].size;
++            slot++;
++        }
++    }
++    c->intent_count = slot;
++    c->intent_size = groups[0].size;  /* the log line's figure; the per-slot sizes are what count */
++    return c;
++}
++
+ static QcomGlinkChannel *by_lcid(QcomGlink *g, uint32_t lcid)
+ {
+     for (unsigned i = 0; i < QCOM_GLINK_MAX_CHANNELS; ++i)
+@@ -155,7 +194,7 @@ static int advertise(QcomGlink *g, QcomGlinkChannel *c, unsigned index)
+     uint8_t m[16];
+     m[0] = QCOM_GLINK_INTENT; m[1] = 0; m[2] = (uint8_t)c->lcid; m[3] = (uint8_t)(c->lcid >> 8);
+     put32(m + 4, 1);
+-    put32(m + 8, c->intent_size);
++    put32(m + 8, c->local[index].size);
+     put32(m + 12, index + 1);
+     const int rc = tx(g, m, 16, 0, 0);
+     if (!rc) {c->local[index].advertised = 1; c->local[index].fill = 0;}
+@@ -210,16 +249,17 @@ static int handle_data(QcomGlink *g, uint16_t cmd, uint32_t rcid, uint32_t liid,
+         g->dropped++;
+     } else {
+         uint32_t fill = cmd == QCOM_GLINK_TX_DATA ? 0 : c->local[index].fill;
+-        if ((uint64_t)fill + chunk + left > c->intent_size) {
++        if ((uint64_t)fill + chunk + left > c->local[index].size) {
+             g->dropped++;
+             fill = 0;
+         } else {
+-            rx_peek(&g->rx, 16, c->storage + (size_t)index * c->intent_size + fill, chunk);
++            uint8_t *slot = c->storage + c->local[index].offset;
++            rx_peek(&g->rx, 16, slot + fill, chunk);
+             fill += chunk;
+             if (!left) {
+                 c->local[index].busy = 1;
+                 g->rx_data++;
+-                if (c->client.receive) c->client.receive(c->context, c, c->storage + (size_t)index * c->intent_size, fill);
++                if (c->client.receive) c->client.receive(c->context, c, slot, fill);
+                 c->local[index].busy = 0;
+                 fill = 0;
+                 /* The intent is ours again once the remote knows it is done; with reuse it stays advertised. */
+diff --git a/bsd/dev/qcom/QcomGlink.h b/b/bsd/dev/qcom/QcomGlink.h
+index 1fb845c..c543197 100644
+--- a/bsd/dev/qcom/QcomGlink.h
++++ b/bsd/dev/qcom/QcomGlink.h
+@@ -56,8 +56,11 @@ struct QcomGlinkChannel {
+     void *context;
+     /* Our receive intents: count buffers of size bytes in storage (count * size). */
+     uint8_t *storage;
+-    uint32_t intent_size, intent_count;
+-    struct {uint32_t fill; uint8_t advertised, busy;} local[QCOM_GLINK_MAX_LOCAL_INTENTS];
++    uint32_t intent_size, intent_count;   /* the single group the old entry point makes; kept for the log */
++    /* Every local slot carries its own size and its own offset into storage, so a channel may advertise
++     * several groups (the DT's qcom,intents = <0x800 0x5 0x2000 0x3 0x4400 0x2> is three of them). The old
++     * entry point fills these with k*intent_size / intent_size, which is exactly what it used to do. */
++    struct {uint32_t fill, size, offset; uint8_t advertised, busy;} local[QCOM_GLINK_MAX_LOCAL_INTENTS];
+     /* The remote's intents we may send into. */
+     struct {uint32_t id, size; uint8_t valid, busy;} remote[QCOM_GLINK_MAX_REMOTE_INTENTS];
+ };
+@@ -84,6 +87,13 @@ void qcom_glink_set_rx(QcomGlink *g, volatile uint8_t *data, uint32_t length);
+  * otherwise we answer when the remote opens it. */
+ QcomGlinkChannel *qcom_glink_channel(QcomGlink *g, const char *name, uint32_t intent_size, uint32_t intent_count, uint8_t *storage,
+                                      const QcomGlinkClient *client, void *context, int open_now);
++/* One group of receive intents, as the device tree writes them: qcom,intents = <size count>. */
++typedef struct {uint32_t size, count;} QcomGlinkIntentGroup;
++/* Registers a channel advertising SEVERAL groups of receive intents (the modem's IPCRTR edge wants
++ * <0x800 5, 0x2000 3, 0x4400 2>, i.e. small buffers for small messages as well as large ones). The slots
++ * are laid out in the order the groups are given, each group's buffers one after another in storage. */
++QcomGlinkChannel *qcom_glink_channel_intents(QcomGlink *g, const char *name, const QcomGlinkIntentGroup *groups, unsigned count,
++                                             uint8_t *storage, const QcomGlinkClient *client, void *context, int open_now);
+ /* Sends VERSION (once) and any channel OPEN that is due, then handles every complete message in the receive FIFO. Returns the number of
+  * messages handled or QcomGlinkCorrupt. Rings the remote when anything was written. */
+ int qcom_glink_poll(QcomGlink *g);
