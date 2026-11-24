@@ -36,21 +36,54 @@ diff --git a/bsd/sweet_hfs/core/hfs_vnops.c b/bsd/sweet_hfs/core/hfs_vnops.c
  
  	// Update from_cp
  	if ((error = cat_update(hfsmp, &from_cp->c_desc, &from_cp->c_attr, 
-@@ -6184,6 +6193,13 @@
+@@ -6183,6 +6192,46 @@
+ 	return (0);
  }
  
- /*
-+ * P0-b: set once we have reported a fork invariant violation.  A poisoned
-+ * volume hits the getattr sanity check hundreds of times per boot; one
-+ * report (with the fileID) plus one hfs_mark_inconsistent() is enough.
-+ */
-+static boolean_t hfs_fork_invariant_reported = FALSE;
-+
 +/*
++ * P0-b: report each distinct (mount, fileID) fork invariant violation once.
++ * A poisoned volume can hit the getattr sanity check hundreds of times per
++ * boot, for many different files; a single latch hid every file after the
++ * first hit.  The ring is deliberately lock-free: a lost update only costs
++ * one duplicate report, and the volume is already marked inconsistent by
++ * then.  The mount pointer keeps a remount from suppressing reports.
++ */
++#define HFS_FORK_INVARIANT_HISTORY 16U
++
++struct hfs_fork_invariant_report {
++	struct hfsmount *hfsmp;
++	uint32_t fileid;
++};
++
++static struct hfs_fork_invariant_report
++    hfs_fork_invariant_reports[HFS_FORK_INVARIANT_HISTORY];
++static unsigned int hfs_fork_invariant_report_next;
++
++static boolean_t
++hfs_fork_invariant_reported(struct hfsmount *hfsmp, uint32_t fileid)
++{
++	unsigned int i;
++
++	for (i = 0; i < HFS_FORK_INVARIANT_HISTORY; i++) {
++		if (hfs_fork_invariant_reports[i].hfsmp == hfsmp &&
++		    hfs_fork_invariant_reports[i].fileid == fileid)
++			return TRUE;
++	}
++
++	i = hfs_fork_invariant_report_next;
++	hfs_fork_invariant_report_next = (i + 1) % HFS_FORK_INVARIANT_HISTORY;
++	hfs_fork_invariant_reports[i].hfsmp = hfsmp;
++	hfs_fork_invariant_reports[i].fileid = fileid;
++	return FALSE;
++}
++
++/* Forks without a usable cnode/vnode: report once, never mark the volume. */
++static boolean_t hfs_fork_invariant_unidentified_reported = FALSE;
++
+ /*
   * Prepares a fork for cat_update by making sure ff_size and ff_blocks
   * are no bigger than the valid data on disk thus reducing the chance
-  * of exposing uninitialised data in the event of a non clean unmount.
-@@ -6194,7 +6210,8 @@
+@@ -6194,7 +6243,8 @@
  hfs_prepare_fork_for_update(filefork_t *ff,
  							const struct cat_fork *cf,
  							struct cat_fork *cf_buf,
@@ -60,7 +93,7 @@ diff --git a/bsd/sweet_hfs/core/hfs_vnops.c b/bsd/sweet_hfs/core/hfs_vnops.c
  {
  	if (!ff)
  		return NULL;
-@@ -6210,6 +6227,32 @@
+@@ -6210,6 +6260,53 @@
  	if (!TAILQ_EMPTY(&ff->ff_invalidranges))
  		max_size = TAILQ_FIRST(&ff->ff_invalidranges)->rl_start;
  
@@ -75,16 +108,37 @@ diff --git a/bsd/sweet_hfs/core/hfs_vnops.c b/bsd/sweet_hfs/core/hfs_vnops.c
 +	 */
 +	if (block_size != 0 && !ff->ff_unallocblocks
 +		&& howmany((uint64_t)ff->ff_size, block_size) > (uint64_t)ff->ff_blocks) {
-+		struct hfsmount *hfsmp = ff->ff_cp ? FCBTOVCB(ff) : NULL;
++		struct cnode *cp = ff->ff_cp;
++		struct vnode *vp = cp ? cp->c_vp : NULL;
++		struct mount *mp = vp ? vnode_mount(vp) : NULL;
++		struct hfsmount *hfsmp = mp ? VFSTOHFS(mp) : NULL;
 +
-+		if (hfsmp && !hfs_fork_invariant_reported) {
-+			hfs_fork_invariant_reported = TRUE;
-+			printf("hfs: fork invariant violated for fileID %llu: "
++		if (cp && vp && hfsmp) {
++			/*
++			 * Report each distinct (mount, fileID) once, but do not
++			 * call hfs_mark_inconsistent() again once the volume bit
++			 * is set: the bit is the per-mount latch and the call
++			 * would only repeat the volume-level message.  This keeps
++			 * a poisoned volume from hiding later files (the old
++			 * static latch) and from logging one copy per hit.
++			 */
++			if (!hfs_fork_invariant_reported(hfsmp, cp->c_fileid)) {
++				printf("hfs: fork invariant violated for fileID %llu: "
++					   "size %lld, %u block(s) allocated, 0 loaned; "
++					   "refusing catalog update\n",
++					   (unsigned long long)cp->c_fileid,
++					   (long long)ff->ff_size, ff->ff_blocks);
++			}
++			if ((hfsmp->vcbAtrb & kHFSVolumeInconsistentMask) == 0)
++				hfs_mark_inconsistent(hfsmp, HFS_INCONSISTENCY_DETECTED);
++		} else if (!hfs_fork_invariant_unidentified_reported) {
++			hfs_fork_invariant_unidentified_reported = TRUE;
++			printf("hfs: fork invariant violated for fork %p: "
 +				   "size %lld, %u block(s) allocated, 0 loaned; "
-+				   "refusing catalog update\n",
-+				   (unsigned long long)FTOC(ff)->c_fileid,
++				   "refusing catalog update (no usable cnode/vnode/mount; "
++				   "volume not marked)\n",
++				   (void *)ff,
 +				   (long long)ff->ff_size, ff->ff_blocks);
-+			hfs_mark_inconsistent(hfsmp, HFS_INCONSISTENCY_DETECTED);
 +		}
 +		if (errorp)
 +			*errorp = EIO;
@@ -93,7 +147,7 @@ diff --git a/bsd/sweet_hfs/core/hfs_vnops.c b/bsd/sweet_hfs/core/hfs_vnops.c
  	if (!ff->ff_unallocblocks && ff->ff_size <= max_size)
  		return cf; // Nothing to do
  
-@@ -6344,8 +6387,18 @@
+@@ -6344,8 +6441,18 @@
       * Modify the values passed to cat_update based on whether or not
       * the file has invalid ranges or borrowed blocks.
       */
