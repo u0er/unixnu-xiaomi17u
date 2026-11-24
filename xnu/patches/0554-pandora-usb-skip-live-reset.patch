@@ -1,0 +1,33 @@
+--- a/bsd/dev/pandora_usb.c
++++ b/bsd/dev/pandora_usb.c
+@@ -239,9 +239,27 @@
+ 		printf("PANDORA USB: bring-up: GCC not mapped\n");
+ 		return false;
+ 	}
+-	ok = pu_reset_pulse(g);
+-	if (ok) {
+-		ok = pu_clocks_on(g);
++	/* 0554: the hand-over state can already be live (clocks on, reset released).
++	 * Pulsing BCR then would reset a controller that sweet_usb has already
++	 * initialised (0.180 s) and nothing re-initialises it afterwards.  Only
++	 * reset when the controller is actually held or unclocked. */
++	bcr = pu_rd(g, 0x000);
++	gdscr = pu_rd(g, 0x004);
++	bool running = !(bcr & PU_BCR_RESET) && (gdscr & PU_PWR_ON);
++	for (unsigned i = 0; i < 5 && running; i++) {
++		if (pu_rd(g, pu_clk[i].off) & PU_CLK_OFF) {
++			running = false;
++		}
++	}
++	if (running) {
++		printf("PANDORA USB: bring-up: controller already on (BCR %08x GDSCR %08x); skipping BCR pulse\n",
++		    bcr, gdscr);
++		ok = true;
++	} else {
++		ok = pu_reset_pulse(g);
++		if (ok) {
++			ok = pu_clocks_on(g);
++		}
+ 	}
+ 	bcr = pu_rd(g, 0x000);
+ 	gdscr = pu_rd(g, 0x004);
