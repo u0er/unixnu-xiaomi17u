@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..23d7fef8cba5eb23429620a01494dccc36be124f
+index 0000000..d984bc91ddf2712175ddc3fd2e7990cc8bb72346
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,5096 @@
+@@ -0,0 +1,5103 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4784,7 +4784,13 @@ index 0000000..23d7fef8cba5eb23429620a01494dccc36be124f
 +	 * exactly this criterion, and the fixed windows tried earlier are why the
 +	 * 0x23 answer kept being buried in phase B's residual stream. */
 +	(void)bt_peri_drain_silence(4u, 200u, "PERI TME-L map B tail");
-+	bt_peri_baud_probe();
++	/* Level 20.52: ask about liveness BEFORE the baud probe.
++	 *
++	 * The probe reconfigures the SE six times and discards whatever arrives
++	 * during 720 ms. Running it first therefore contaminates the very verdict
++	 * the liveness check is supposed to produce: "0x19 silent" would be
++	 * indistinguishable from "0x19 answered but the probe ate it". Order matters
++	 * more than the 0.7 s saved by doing otherwise. */
 +
 +	/* Level 20.48: probe liveness before asking for the board id.
 +	 *
@@ -4806,6 +4812,7 @@ index 0000000..23d7fef8cba5eb23429620a01494dccc36be124f
 +		    lerr == 0 ? "answered" : "silent", lerr);
 +		pandora_log_sync();
 +	}
++	bt_peri_baud_probe();
 +	/* Phase C (trace 11.209352 0x23, then 57 frames to 11.380534): the nv
 +	 * stage carries gngbtnv20.bin behind a 4-byte 04 22 4c 00 header. This
 +	 * is the only stage the ROM answers frame by frame, so it runs with the
