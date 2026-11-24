@@ -34,7 +34,7 @@ diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
  static const struct {
  	uint32_t off;
  	const char *name;
-@@ -65,6 +84,193 @@
+@@ -65,6 +84,206 @@
  	const uint32_t v = *(volatile uint32_t *)(base + off);
  	__asm__ volatile("dmb oshld" ::: "memory");
  	return v;
@@ -53,10 +53,11 @@ diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
 +pu_reset_pulse(vm_offset_t g)
 +{
 +	const uint32_t bcr = pu_rd(g, PU_GCC_BCR);
++	unsigned n;
 +	pu_wr(g, PU_GCC_BCR, bcr | PU_BCR_RESET);
 +	delay(10);
 +	pu_wr(g, PU_GCC_BCR, bcr & ~PU_BCR_RESET);
-+	for (unsigned n = 0; n < 1000; n++) {
++	for (n = 0; n < 1000; n++) {
 +		if (!(pu_rd(g, PU_GCC_BCR) & PU_BCR_RESET)) {
 +			printf("PANDORA USB: BCR reset pulse: released after %u us (BCR %08x -> %08x)\n",
 +			    n * 10, bcr, pu_rd(g, PU_GCC_BCR));
@@ -75,21 +76,24 @@ diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
 +pu_clocks_on(vm_offset_t g)
 +{
 +	bool ok = true;
-+	for (unsigned i = 0; i < 5; i++) {
-+		const uint32_t before = pu_rd(g, pu_clk[i].off);
++	bool on;
++	unsigned i, n;
++	uint32_t before, after;
++	for (i = 0; i < 5; i++) {
++		before = pu_rd(g, pu_clk[i].off);
 +		if (!(before & PU_CLK_OFF)) {
 +			continue;
 +		}
 +		pu_wr(g, pu_clk[i].off, before | PU_CLK_EN);
-+		bool on = false;
-+		for (unsigned n = 0; n < 1000; n++) {
++		on = false;
++		for (n = 0; n < 1000; n++) {
 +			if (!(pu_rd(g, pu_clk[i].off) & PU_CLK_OFF)) {
 +				on = true;
 +				break;
 +			}
 +			delay(10);
 +		}
-+		const uint32_t after = pu_rd(g, pu_clk[i].off);
++		after = pu_rd(g, pu_clk[i].off);
 +		if (!on) {
 +			printf("PANDORA USB: clock %s stays off (CBCR %08x -> %08x); bring-up incomplete\n",
 +			    pu_clk[i].name, before, after);
@@ -109,12 +113,13 @@ diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
 +{
 +	const uint32_t before = pu_rd(d, PU_GUCTL1);
 +	const uint32_t want = before | PU_GUCTL1_RESUME_OPMODE_HS_HOST;
++	uint32_t after;
 +	if (want == before) {
 +		printf("PANDORA USB: GUCTL1 %08x already has RESUME_OPMODE_HS_HOST (bit 10)\n", before);
 +		return true;
 +	}
 +	pu_wr(d, PU_GUCTL1, want);
-+	const uint32_t after = pu_rd(d, PU_GUCTL1);
++	after = pu_rd(d, PU_GUCTL1);
 +	if (after & PU_GUCTL1_RESUME_OPMODE_HS_HOST) {
 +		printf("PANDORA USB: GUCTL1 %08x -> %08x (bit 10 RESUME_OPMODE_HS_HOST)\n", before, after);
 +		return true;
@@ -138,15 +143,16 @@ diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
 +{
 +	const uint32_t hs = pu_rd(q, PU_QSCR_HS_PHY_CTRL);
 +	const uint32_t ss = pu_rd(q, PU_QSCR_SS_PHY_CTRL);
++	uint32_t hs_new, ss_new, hs_after, ss_after;
 +	saved->hs = hs;
 +	saved->ss = ss;
 +	saved->valid = true;
-+	const uint32_t hs_new = hs | PU_HS_UTMI_OTG_VBUS_VALID | PU_HS_SW_SESSVLD_SEL;
-+	const uint32_t ss_new = ss | PU_SS_LANE0_PWR_PRESENT;
++	hs_new = hs | PU_HS_UTMI_OTG_VBUS_VALID | PU_HS_SW_SESSVLD_SEL;
++	ss_new = ss | PU_SS_LANE0_PWR_PRESENT;
 +	pu_wr(q, PU_QSCR_HS_PHY_CTRL, hs_new);
 +	pu_wr(q, PU_QSCR_SS_PHY_CTRL, ss_new);
-+	const uint32_t hs_after = pu_rd(q, PU_QSCR_HS_PHY_CTRL);
-+	const uint32_t ss_after = pu_rd(q, PU_QSCR_SS_PHY_CTRL);
++	hs_after = pu_rd(q, PU_QSCR_HS_PHY_CTRL);
++	ss_after = pu_rd(q, PU_QSCR_SS_PHY_CTRL);
 +	printf("PANDORA USB: VBUS override device role: HS_PHY_CTRL %08x -> %08x, "
 +	    "SS_PHY_CTRL %08x -> %08x\n", hs, hs_after, ss, ss_after);
 +	if ((hs_after & (PU_HS_UTMI_OTG_VBUS_VALID | PU_HS_SW_SESSVLD_SEL)) !=
@@ -178,16 +184,21 @@ diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
 +static bool
 +pu_bringup(void)
 +{
-+	vm_offset_t g = ml_io_map_unmappable(PU_GCC_PA, 0x1000, VM_WIMG_IO);
++	vm_offset_t g, d, q;
++	uint32_t bcr, gdscr;
++	bool ok, done;
++	struct pu_vbus_state saved;
++	g = ml_io_map_unmappable(PU_GCC_PA, 0x1000, VM_WIMG_IO);
 +	if (!g) {
 +		printf("PANDORA USB: bring-up: GCC not mapped\n");
 +		return false;
 +	}
-+	bool ok = pu_reset_pulse(g);
++	ok = pu_reset_pulse(g);
 +	if (ok) {
 +		ok = pu_clocks_on(g);
 +	}
-+	const uint32_t bcr = pu_rd(g, 0x000), gdscr = pu_rd(g, 0x004);
++	bcr = pu_rd(g, 0x000);
++	gdscr = pu_rd(g, 0x004);
 +	printf("PANDORA USB: bring-up: BCR %08x GDSCR %08x CFG_GDSCR %08x\n",
 +	    bcr, gdscr, pu_rd(g, 0x008));
 +	ml_io_unmap(g, 0x1000);
@@ -198,8 +209,8 @@ diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
 +		printf("PANDORA USB: bring-up: power domain still off; controller registers not written\n");
 +		return false;
 +	}
-+	vm_offset_t d = ml_io_map_unmappable(PU_DWC3_PA, 0x1000, VM_WIMG_IO);
-+	vm_offset_t q = ml_io_map_unmappable(PU_QSCR_PA, 0x1000, VM_WIMG_IO);
++	d = ml_io_map_unmappable(PU_DWC3_PA, 0x1000, VM_WIMG_IO);
++	q = ml_io_map_unmappable(PU_QSCR_PA, 0x1000, VM_WIMG_IO);
 +	if (!d || !q) {
 +		printf("PANDORA USB: bring-up: DWC3 or QSCRATCH not mapped\n");
 +		if (d) {
@@ -210,8 +221,10 @@ diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
 +		}
 +		return false;
 +	}
-+	bool done = pu_resume_hs_terminations(d);
-+	struct pu_vbus_state saved = { 0, 0, false };
++	done = pu_resume_hs_terminations(d);
++	saved.hs = 0;
++	saved.ss = 0;
++	saved.valid = false;
 +	/* VBUS override is independent of GUCTL1: upstream writes it regardless of the
 +	 * resume-termination quirk, and coupling the two makes a single register failure
 +	 * hide the device-role VBUS setup. */
@@ -228,7 +241,47 @@ diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
  }
  
  static void
-@@ -161,6 +367,16 @@
+@@ -83,26 +302,32 @@
+ static void
+ pu_probe(void)
+ {
+-	vm_offset_t g = ml_io_map_unmappable(PU_GCC_PA, 0x1000, VM_WIMG_IO);
++	vm_offset_t g, d, q;
++	uint32_t cbcr[5];
++	uint32_t bcr, gdscr, cfg;
++	bool on;
++	unsigned i;
++	g = ml_io_map_unmappable(PU_GCC_PA, 0x1000, VM_WIMG_IO);
+ 	if (!g) {
+ 		printf("PANDORA USB: GCC not mapped\n");
+ 		return;
+ 	}
+-	uint32_t cbcr[5];
+-	for (unsigned i = 0; i < 5; i++) {
++	for (i = 0; i < 5; i++) {
+ 		cbcr[i] = pu_rd(g, pu_clk[i].off);
+ 	}
+-	const uint32_t bcr = pu_rd(g, 0x000), gdscr = pu_rd(g, 0x004), cfg = pu_rd(g, 0x008);
++	bcr = pu_rd(g, 0x000);
++	gdscr = pu_rd(g, 0x004);
++	cfg = pu_rd(g, 0x008);
+ 	ml_io_unmap(g, 0x1000);
+ 	printf("PANDORA USB: clocks core %08x iface %08x aggr %08x utmi %08x sleep %08x; BCR %08x GDSCR %08x CFG_GDSCR %08x\n",
+ 	    cbcr[0], cbcr[1], cbcr[2], cbcr[3], cbcr[4], bcr, gdscr, cfg);
+-	const bool on = !(cbcr[0] & PU_CLK_OFF) && !(cbcr[1] & PU_CLK_OFF) && (gdscr & PU_PWR_ON) && !(bcr & 1u);
++	on = !(cbcr[0] & PU_CLK_OFF) && !(cbcr[1] & PU_CLK_OFF) && (gdscr & PU_PWR_ON) && !(bcr & 1u);
+ 	if (!on) {
+ 		printf("PANDORA USB: core or iface clock off, power domain off or reset held: the controller is not read\n");
+ 		return;
+ 	}
+-	vm_offset_t d = ml_io_map_unmappable(PU_DWC3_PA, 0x1000, VM_WIMG_IO);
+-	vm_offset_t q = ml_io_map_unmappable(PU_QSCR_PA, 0x1000, VM_WIMG_IO);
++	d = ml_io_map_unmappable(PU_DWC3_PA, 0x1000, VM_WIMG_IO);
++	q = ml_io_map_unmappable(PU_QSCR_PA, 0x1000, VM_WIMG_IO);
+ 	if (!d || !q) {
+ 		printf("PANDORA USB: DWC3 not mapped\n");
+ 		return;
+@@ -161,6 +386,16 @@
  	if (cpu_number() != master_cpu) {
  		printf("PANDORA USB: serial not started: not on the boot CPU\n");
  		return;
