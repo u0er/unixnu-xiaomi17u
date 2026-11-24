@@ -1,0 +1,23 @@
+From: baseband lane
+Subject: 0546 pandora_mpss: the attach line says which steps it actually skips
+
+0539 printed "ATTACH (steps 4-8 skipped: nothing is loaded or reset)" and skipped 4..8.  0543 changed
+the skip set to {4,5,6,8} so that step 7 -- the SMP2P/GLINK announcement, which loads nothing -- runs,
+but the line kept the old wording.  A ring from a boot with 0543 and later would therefore say it
+skipped step 7 when it did not, and this log is the only place that says what was and was not done.
+
+The line now reads "ATTACH (steps 4-6 and 8 skipped: nothing is loaded or reset; step 7 announces us)".
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 7552b12..1a052ed 100644
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -1872,7 +1872,7 @@ pandora_mpss_init(void)
+ 		return;
+ 	}
+ 	printf("PANDORA MPSS: asked for step %u%s%s\n", mp_last_step, whole ? " (whole stack)" : "",
+-	    mp_attach ? " ATTACH (steps 4-8 skipped: nothing is loaded or reset)" : "");
++	    mp_attach ? " ATTACH (steps 4-6 and 8 skipped: nothing is loaded or reset; step 7 announces us)" : "");
+ 	if (mp_map_windows()) {
+ 		return;
+ 	}
