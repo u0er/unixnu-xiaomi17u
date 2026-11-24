@@ -1,0 +1,12 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -280,7 +280,7 @@
+ #define IFACEQ_QUEUE_SIZE       (vidc_ring_bytes - 0x001000u)   /* rings stay disjoint */
+ #define IFACEQ_QUEUE_WORDS      (IFACEQ_QUEUE_SIZE / 4u)
+ 
+-#define VIDC_SFR_BYTES          0x00004000u   /* [M] SFR_SIZE = 4 KiB */
++#define VIDC_SFR_BYTES          0x00001000u   /* [M] SFR_SIZE = 4 KiB (vendor maps 4 KiB, word0 = 0x1000) */
+ 
+ /* Generic packet header: u32 size, u32 pkt_type (little endian). */
+ struct vidc_pkt_hdr {
