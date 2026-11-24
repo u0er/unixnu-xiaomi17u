@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..d47f83c5bcae02ac153265b4e639de568aaf7719
+index 0000000..43c2f28228053d11e4fcaed5740b78b101ab7fe5
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,5159 @@
+@@ -0,0 +1,5166 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4688,8 +4688,15 @@ index 0000000..d47f83c5bcae02ac153265b4e639de568aaf7719
 +			if (ev[6] != 0x00u) {
 +				printf("PANDORA BT: %s: VS command %02x answered status %u\n",
 +				    what, sub, ev[6]);
-+				pandora_log_sync();
++			} else {
++				/* Level 20.59: success used to be silent, so "map B open got its
++				 * sub 19 CC" - a pre-registered criterion for the next run - had no
++				 * line to grep. A criterion that cannot be observed is not a
++				 * criterion; this lane has lost hours to exactly that pattern. */
++				printf("PANDORA BT: %s: VS command %02x answered (status 0, %u byte(s))\n",
++				    what, sub, got);
 +			}
++			pandora_log_sync();
 +			err = 0;
 +			break;
 +		}
