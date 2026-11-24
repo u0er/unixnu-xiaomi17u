@@ -1,0 +1,247 @@
+diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
+--- a/bsd/dev/pandora_usb.c
++++ b/bsd/dev/pandora_usb.c
+@@ -11,6 +11,11 @@
+  * reset the rest goes out from the resetting CPU (pandora_usb_final).
+  * pandora_usb=1, read only: the state the bootloader leaves the primary USB controller in when
+  * it hands over, which decides what the serial console has to bring up itself.
++ * pandora_usb=3 adds the cold bring-up the hand-over path lacks -- the reset pulse, the five
++ * clocks, GUCTL1[10] (snps,resume-hs-terminations) and the device role's VBUS override, i.e.
++ * what dwc3_qcom_probe, dwc3_core_init and dwc3_qcom_vbus_override_enable bring on for SM8850
++ * -- before the serial console. Every step that fails only logs and falls back to the
++ * hand-over state; the module is still let in.
+  * - GCC (gcc-kaanapali.c): the five clocks of the live DT's ssusb@a600000 (core = usb30_prim_master
+  *   0x39018, iface = cfg_noc_usb3_prim_axi 0x39090, bus_aggr = aggre_usb3_prim_axi 0x39094, utmi =
+  *   usb30_prim_mock_utmi 0x3902c, sleep = usb30_prim_sleep 0x39028; CLK_OFF bit 31, enable bit 0),
+@@ -54,6 +59,20 @@
+ #define PU_CLK_OFF    (1u << 31)
+ #define PU_PWR_ON     (1u << 31)
+ 
++/* Cold bring-up (pandora_usb=3). BCR/GDSCR bits are the GCC ones the read-only probe already
++ * names; GUCTL1 is DWC3 0xc11c seen from the 0xc000 the mapping starts at; QSCRATCH sits at
++ * map + 0x800, as the probe's 0x808/0x810/0x830 reads show. */
++#define PU_GCC_BCR      0x000u          /* BCR, USB3_PRIM block reset: bit 0 */
++#define PU_BCR_RESET    (1u << 0)
++#define PU_CLK_EN       (1u << 0)       /* CBCR branch enable; PU_CLK_OFF is the halt status */
++#define PU_GUCTL1       0x11Cu          /* DWC3 GUCTL1 */
++#define PU_GUCTL1_RESUME_OPMODE_HS_HOST (1u << 10)  /* snps,resume-hs-terminations */
++#define PU_QSCR_HS_PHY_CTRL 0x810u      /* QSCRATCH HS_PHY_CTRL */
++#define PU_QSCR_SS_PHY_CTRL 0x830u      /* QSCRATCH SS_PHY_CTRL */
++#define PU_HS_UTMI_OTG_VBUS_VALID (1u << 20)  /* device role: VBUS valid */
++#define PU_HS_SW_SESSVLD_SEL      (1u << 28)  /* device role: session valid select */
++#define PU_SS_LANE0_PWR_PRESENT   (1u << 24)  /* device role: lane 0 power present */
++
+ static const struct {
+ 	uint32_t off;
+ 	const char *name;
+@@ -65,6 +84,193 @@
+ 	const uint32_t v = *(volatile uint32_t *)(base + off);
+ 	__asm__ volatile("dmb oshld" ::: "memory");
+ 	return v;
++}
++
++static void
++pu_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile("dmb oshst" ::: "memory");
++}
++
++/* a) Reset pulse, dwc3_qcom_probe's reset array: assert, usleep_range(10, 1000), release, then
++ * wait up to 10 ms for the block to leave reset. The bit is left released on every path. */
++static bool
++pu_reset_pulse(vm_offset_t g)
++{
++	const uint32_t bcr = pu_rd(g, PU_GCC_BCR);
++	pu_wr(g, PU_GCC_BCR, bcr | PU_BCR_RESET);
++	delay(10);
++	pu_wr(g, PU_GCC_BCR, bcr & ~PU_BCR_RESET);
++	for (unsigned n = 0; n < 1000; n++) {
++		if (!(pu_rd(g, PU_GCC_BCR) & PU_BCR_RESET)) {
++			printf("PANDORA USB: BCR reset pulse: released after %u us (BCR %08x -> %08x)\n",
++			    n * 10, bcr, pu_rd(g, PU_GCC_BCR));
++			return true;
++		}
++		delay(10);
++	}
++	printf("PANDORA USB: BCR reset pulse: bit stays asserted (%08x); clocks left untouched\n",
++	    pu_rd(g, PU_GCC_BCR));
++	return false;
++}
++
++/* b) Clock enable, clk_bulk_prepare_enable's five branches (the same table the probe reads).
++ * A branch that will not come on is logged and makes the bring-up incomplete; no panic. */
++static bool
++pu_clocks_on(vm_offset_t g)
++{
++	bool ok = true;
++	for (unsigned i = 0; i < 5; i++) {
++		const uint32_t before = pu_rd(g, pu_clk[i].off);
++		if (!(before & PU_CLK_OFF)) {
++			continue;
++		}
++		pu_wr(g, pu_clk[i].off, before | PU_CLK_EN);
++		bool on = false;
++		for (unsigned n = 0; n < 1000; n++) {
++			if (!(pu_rd(g, pu_clk[i].off) & PU_CLK_OFF)) {
++				on = true;
++				break;
++			}
++			delay(10);
++		}
++		const uint32_t after = pu_rd(g, pu_clk[i].off);
++		if (!on) {
++			printf("PANDORA USB: clock %s stays off (CBCR %08x -> %08x); bring-up incomplete\n",
++			    pu_clk[i].name, before, after);
++			ok = false;
++		} else {
++			printf("PANDORA USB: clock %s on (CBCR %08x -> %08x)\n", pu_clk[i].name, before, after);
++		}
++	}
++	return ok;
++}
++
++/* d) GUCTL1[10], snps,resume-hs-terminations (needed once the port resumes in host mode; the
++ * M31 eUSB2 does not do it for us). RMW with pu_rd/pu_wr's dmb oshld/oshst as the barriers;
++ * the read-back is the proof. Puts the old value back if the bit does not stick. */
++static bool
++pu_resume_hs_terminations(vm_offset_t d)
++{
++	const uint32_t before = pu_rd(d, PU_GUCTL1);
++	const uint32_t want = before | PU_GUCTL1_RESUME_OPMODE_HS_HOST;
++	if (want == before) {
++		printf("PANDORA USB: GUCTL1 %08x already has RESUME_OPMODE_HS_HOST (bit 10)\n", before);
++		return true;
++	}
++	pu_wr(d, PU_GUCTL1, want);
++	const uint32_t after = pu_rd(d, PU_GUCTL1);
++	if (after & PU_GUCTL1_RESUME_OPMODE_HS_HOST) {
++		printf("PANDORA USB: GUCTL1 %08x -> %08x (bit 10 RESUME_OPMODE_HS_HOST)\n", before, after);
++		return true;
++	}
++	pu_wr(d, PU_GUCTL1, before);
++	printf("PANDORA USB: GUCTL1 bit 10 did not stick (%08x -> %08x); wrote %08x back\n",
++	    before, after, before);
++	return false;
++}
++
++struct pu_vbus_state {
++	uint32_t hs, ss;
++	bool valid;
++};
++
++/* c) VBUS override, device role, dwc3_qcom_vbus_override_enable's QSCRATCH writes with the
++ * values the survey lists: HS UTMI_OTG_VBUS_VALID|SW_SESSVLD_SEL, SS LANE0_PWR_PRESENT. The
++ * values found are kept so a failure can put them back. */
++static bool
++pu_vbus_override(vm_offset_t q, struct pu_vbus_state *saved)
++{
++	const uint32_t hs = pu_rd(q, PU_QSCR_HS_PHY_CTRL);
++	const uint32_t ss = pu_rd(q, PU_QSCR_SS_PHY_CTRL);
++	saved->hs = hs;
++	saved->ss = ss;
++	saved->valid = true;
++	const uint32_t hs_new = hs | PU_HS_UTMI_OTG_VBUS_VALID | PU_HS_SW_SESSVLD_SEL;
++	const uint32_t ss_new = ss | PU_SS_LANE0_PWR_PRESENT;
++	pu_wr(q, PU_QSCR_HS_PHY_CTRL, hs_new);
++	pu_wr(q, PU_QSCR_SS_PHY_CTRL, ss_new);
++	const uint32_t hs_after = pu_rd(q, PU_QSCR_HS_PHY_CTRL);
++	const uint32_t ss_after = pu_rd(q, PU_QSCR_SS_PHY_CTRL);
++	printf("PANDORA USB: VBUS override device role: HS_PHY_CTRL %08x -> %08x, "
++	    "SS_PHY_CTRL %08x -> %08x\n", hs, hs_after, ss, ss_after);
++	if ((hs_after & (PU_HS_UTMI_OTG_VBUS_VALID | PU_HS_SW_SESSVLD_SEL)) !=
++	    (PU_HS_UTMI_OTG_VBUS_VALID | PU_HS_SW_SESSVLD_SEL) ||
++	    !(ss_after & PU_SS_LANE0_PWR_PRESENT)) {
++		printf("PANDORA USB: VBUS override did not stick\n");
++		return false;
++	}
++	return true;
++}
++
++static void
++pu_vbus_restore(vm_offset_t q, const struct pu_vbus_state *saved)
++{
++	if (!saved->valid) {
++		return;
++	}
++	pu_wr(q, PU_QSCR_HS_PHY_CTRL, saved->hs);
++	pu_wr(q, PU_QSCR_SS_PHY_CTRL, saved->ss);
++	printf("PANDORA USB: VBUS override rolled back: HS_PHY_CTRL %08x, SS_PHY_CTRL %08x\n",
++	    saved->hs, saved->ss);
++}
++
++/*
++ * Cold bring-up, opt-in with pandora_usb=3: reset pulse -> clocks -> power domain -> GUCTL1
++ * -> device-role VBUS override. Every failure is a log line and a return; the module still
++ * gets the controller as found, and nothing panics.
++ */
++static bool
++pu_bringup(void)
++{
++	vm_offset_t g = ml_io_map_unmappable(PU_GCC_PA, 0x1000, VM_WIMG_IO);
++	if (!g) {
++		printf("PANDORA USB: bring-up: GCC not mapped\n");
++		return false;
++	}
++	bool ok = pu_reset_pulse(g);
++	if (ok) {
++		ok = pu_clocks_on(g);
++	}
++	const uint32_t bcr = pu_rd(g, 0x000), gdscr = pu_rd(g, 0x004);
++	printf("PANDORA USB: bring-up: BCR %08x GDSCR %08x CFG_GDSCR %08x\n",
++	    bcr, gdscr, pu_rd(g, 0x008));
++	ml_io_unmap(g, 0x1000);
++	if (!ok) {
++		return false;
++	}
++	if (!(gdscr & PU_PWR_ON)) {
++		printf("PANDORA USB: bring-up: power domain still off; controller registers not written\n");
++		return false;
++	}
++	vm_offset_t d = ml_io_map_unmappable(PU_DWC3_PA, 0x1000, VM_WIMG_IO);
++	vm_offset_t q = ml_io_map_unmappable(PU_QSCR_PA, 0x1000, VM_WIMG_IO);
++	if (!d || !q) {
++		printf("PANDORA USB: bring-up: DWC3 or QSCRATCH not mapped\n");
++		if (d) {
++			ml_io_unmap(d, 0x1000);
++		}
++		if (q) {
++			ml_io_unmap(q, 0x1000);
++		}
++		return false;
++	}
++	bool done = pu_resume_hs_terminations(d);
++	struct pu_vbus_state saved = { 0, 0, false };
++	/* VBUS override is independent of GUCTL1: upstream writes it regardless of the
++	 * resume-termination quirk, and coupling the two makes a single register failure
++	 * hide the device-role VBUS setup. */
++	if (!pu_vbus_override(q, &saved)) {
++		pu_vbus_restore(q, &saved);
++		done = false;
++	}
++	ml_io_unmap(d, 0x1000);
++	ml_io_unmap(q, 0x1000);
++	if (!done) {
++		printf("PANDORA USB: bring-up incomplete; the module gets the controller as found\n");
++	}
++	return done;
+ }
+ 
+ static void
+@@ -161,6 +367,16 @@
+ 	if (cpu_number() != master_cpu) {
+ 		printf("PANDORA USB: serial not started: not on the boot CPU\n");
+ 		return;
++	}
++	if (pu_level >= 3) {
++		printf("PANDORA USB: cold bring-up (pandora_usb=3); state as handed over:\n");
++		pu_probe();
++		if (pu_bringup()) {
++			printf("PANDORA USB: cold bring-up complete; state now:\n");
++		} else {
++			printf("PANDORA USB: cold bring-up incomplete; state now:\n");
++		}
++		pu_probe();
+ 	}
+ 	/* the module masks interrupts while it works; its windows are mapped first, here */
+ 	if (!qcom_usb_debug_map()) {

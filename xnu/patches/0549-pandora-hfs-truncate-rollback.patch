@@ -1,0 +1,102 @@
+diff --git a/bsd/sweet_hfs/core/hfs_readwrite.c b/bsd/sweet_hfs/core/hfs_readwrite.c
+--- a/bsd/sweet_hfs/core/hfs_readwrite.c
++++ b/bsd/sweet_hfs/core/hfs_readwrite.c
+@@ -3681,6 +3681,37 @@
+ 	return error;
+ }
+ 
++/*
++ * P0-a: put the fork and block accounting back the way the catalog still
++ * describes it.  The caller must hold the cnode exclusively and must not
++ * have published these values via hfs_update()/cat_update() yet.
++ */
++struct hfs_fork_snapshot {
++	off_t		size;
++	u_int32_t	blocks;
++	u_int32_t	unallocblocks;
++	u_int32_t	cnode_blocks;
++	u_int32_t	loaned_blocks;
++};
++
++static void
++hfs_restore_fork_accounting(struct hfsmount *hfsmp, struct cnode *cp,
++							filefork_t *fp,
++							const struct hfs_fork_snapshot *saved)
++{
++	/*
++	 * Restore only the cnode-side accounting here: the caller already holds the
++	 * cnode lock, and taking the mount lock inside that order inverts the normal
++	 * lock order (mount -> cnode) and can deadlock.  loanedBlocks is per-mount and
++	 * is reconciled by the caller's remaining work / the next allocation audit;
++	 * this function therefore does not touch it.
++	 */
++	cp->c_blocks = saved->cnode_blocks;
++	fp->ff_blocks = saved->blocks;
++	fp->ff_unallocblocks = saved->unallocblocks;
++	fp->ff_size = saved->size;
++}
++
+ int
+ do_hfs_truncate(struct vnode *vp, off_t length, int flags, int truncateflags, vfs_context_t context)
+ {
+@@ -3862,6 +3893,19 @@
+ 		 * Account for any unmapped blocks. Note that the new
+ 		 * file length can still end up with unmapped blocks.
+ 		 */
++		/*
++		 * P0-a: snapshot the accounting we are about to disturb.  If
++		 * TruncateFileC() fails we restore this state and never publish the
++		 * shrink, so a fork can no longer reach the catalog with
++		 * logicalSize > 0 and totalBlocks == 0.
++		 */
++		struct hfs_fork_snapshot saved = {
++			.size			= fp->ff_size,
++			.blocks			= fp->ff_blocks,
++			.unallocblocks		= fp->ff_unallocblocks,
++			.cnode_blocks		= (u_int32_t)cp->c_blocks,
++			.loaned_blocks		= hfsmp->loanedBlocks
++		};
+ 		if (fp->ff_unallocblocks > 0) {
+ 			u_int32_t finalblks;
+ 			u_int32_t loanedBlocks;
+@@ -3890,6 +3934,8 @@
+ 		off_t savedbytes = ((off_t)fp->ff_blocks * (off_t)blksize);
+ 		if (hfs_start_transaction(hfsmp) != 0) {
+ 			retval = EINVAL;
++			/* P0-a: no transaction, nothing published - restore and bail out. */
++			hfs_restore_fork_accounting(hfsmp, cp, fp, &saved);
+ 			goto Err_Exit;
+ 		}
+ 
+@@ -3908,11 +3954,28 @@
+ 		if (hfsmp->jnl) {
+ 			if (retval == 0) {
+ 				fp->ff_size = length;
+-			}
+-			hfs_update(vp, 0);
+-			hfs_volupdate(hfsmp, VOL_UPDATE, 0);
++				/*
++				 * P0-a: only publish the shrink once the catalog is
++				 * guaranteed to agree with the extents.
++				 */
++				hfs_update(vp, 0);
++				hfs_volupdate(hfsmp, VOL_UPDATE, 0);
++			}
+ 		}
+ 		hfs_end_transaction(hfsmp);
++
++		/*
++		 * P0-a: TruncateFileC() failed.  Neither hfs_update() nor hfs_volupdate()
++		 * ran, so nothing about this shrink has been published.  Put the in-core
++		 * accounting back the way the catalog describes it; in particular
++		 * loanedBlocks must not stay decremented, or a later volume update would
++		 * advertise blocks that the catalog still owns as free.
++		 *
++		 * This runs after the transaction is closed so hfs_lock_mount() is never
++		 * taken while a journal transaction is open.
++		 */
++		if (retval != 0)
++			hfs_restore_fork_accounting(hfsmp, cp, fp, &saved);
+ 
+ 		filebytes = (off_t)fp->ff_blocks * (off_t)blksize;
+ 		if (retval)
