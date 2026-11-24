@@ -1,0 +1,2827 @@
+--- a/bsd/dev/pandora_camera.c
++++ b/bsd/dev/pandora_camera.c
+@@ -186,6 +186,11 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++/* v100: deferred camera probe needs Mach thread_call (same pattern as fuxi_adreno.c). */
++#define MACH_KERNEL_PRIVATE 1
++#include <kern/thread_call.h>
++#undef MACH_KERNEL_PRIVATE
++#include <kern/kern_types.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/vm_kern.h>
+@@ -215,7 +220,13 @@
+  * (CAMERA_L2_CAMCC_P0 閹?2 / TPG_IMPL 閹?.3). tpg2 pairs with CSID MUX_SEL=3. */
+ #define PC_TPG2_PA    0x093ff000u
+ #define PC_CSID0_PA   0x09253000u
++/* CSID2 (qcom,csid2@9273000). The live Android HAL binds the wide sensor
++ * (nezha_ofilm_ovx10500u_wide_ii) to CSIPHY0 as a 3-lane CPHY device and
++ * reports conn_csid_idx=2, so the D-PHY csiphy4/CSID0 pair used by w79..w83
++ * is not the path this sensor streams on. */
++#define PC_CSID2_PA   0x09273000u
+ #define PC_VFE0_PA    0x09151000u
++#define PC_VFE2_PA    0x09191000u
+ /* GCC camera AXI bridge page (GCC base 0x100000 + 0x26000). Single sub-page map,
+  * never unmapped (pandora_usb/sweet_ufs precedent); hf=0x26014 sf=0x26028, both
+  * BRANCH_HALT_SKIP. VFE register access froze without these (direction C); they
+@@ -232,7 +243,7 @@
+ #define PC_CAM_SID         0x1c00u
+ #define PC_CAM_IOVA        0x00100000ull
+ #define PC_CAM_IOVA_LIMIT  0xfff00000ull
+-#define PC_CAM_FRAME_BYTES 0x00060000u   /* 640x480 RAW10 = 384000 B, page-rounded */
++#define PC_CAM_FRAME_BYTES 0x01000000u   /* v42: 4096x2304 RAW10 = 11,796,480 B */
+ #define PC_CAM_TABLE_BYTES 0x00010000u   /* 3-level native-4K pool for one frame */
+ #define PC_PRIORITY   92               /* as pandora_touch */
+ #define PC_BIT(n)     (1u << (n))
+@@ -271,6 +282,7 @@
+ #define PC_CCI_SDA_CTL_0(m)           (0x104u + 0x100u * (m))
+ /* Queue word counters, needed by w0/w1/w3 status dumps. */
+ #define PC_CCI_Qn_EXEC_WORD_CNT(m, q) (0x300u + 0x200u * (m) + 0x100u * (q))
++#define PC_CCI_I2C_Mm_Qn_CUR_CMD(m, q) (0x308u + 0x200u * (m) + 0x100u * (q))
+ #define PC_CCI_Qn_CUR_WORD_CNT(m, q)  (0x304u + 0x200u * (m) + 0x100u * (q))
+ #define PC_CCI_Qn_CUR_CMD(m, q)       (0x308u + 0x200u * (m) + 0x100u * (q))
+ #define PC_CCI_Qn_REPORT_STATUS(m, q) (0x30cu + 0x200u * (m) + 0x100u * (q))
+@@ -1125,6 +1137,16 @@
+ 
+ /* Wait for a CCI IRQ status bit (bounded poll). Returns 0 on success. */
+ static uint32_t pc_cci_last_irq;	/* last IRQ_STATUS seen by any wait (diag) */
++/* v93: the burst path waits for REPORT only. Count NACK/timeout so a replay
++ * that silently loses register writes can be told apart from one that does
++ * not. Reset before each wide-table replay and printed after it. */
++static uint32_t pc_cci_burst_report, pc_cci_burst_nack, pc_cci_burst_timeout;
++/* v95: `0xFFFF` entries are the sensor's data-port writes (a 0x3288 page/bank
++ * select precedes each 929-word run). They MUST be replayed: every historical
++ * build that skipped them (applied=6944 skipped=7432, 22 boot logs) produced
++ * zero CPHY activity, while full replay (14376) produced frames in 44/57 boot
++ * logs. The counter below now records how many payload words were *sent*. */
++static uint32_t pc_cci_payload_sent;
+ static int
+ pc_cci_wait_irq(vm_offset_t cci, uint32_t mask)
+ {
+@@ -1375,6 +1397,8 @@
+ /* pandora_adsp.c exports pandora_rpmh_resource(name, offset, value).
+  * offset 0 = voltage mV, offset 4 = enable, offset 8 = mode. */
+ extern int pandora_rpmh_resource(const char *, uint32_t, uint32_t);
++extern bool pandora_log_sync(void);
++static void pc_csiphy_mark(const char *);
+ 
+ /* TLMM GPIO write (replicates pt_gpio in pandora_touch.c exactly).
+  * n = pin, func = 0 for GPIO, pull = 0/1/2, ma = drive in mA, out = 0/1/-1. */
+@@ -1810,6 +1834,88 @@
+ 	if (ret != 0) {
+ 		printf("PANDORA CAMERA: cci_write M%u IRQ timeout status=%#x\n",
+ 		    master, pc_rd(cci, PC_CCI_IRQ_STATUS_0));
++		return ret;
++	}
++	return 0;
++}
++
++/* v32 burst-queue replay: one CCI queue per ~1000-byte payload chunk, matching
++ * the vendor camera_io_dev_write segmentation (5x1000B segments; the observed
++ * ~24 ms/segment is pure I2C bus time at the tuned clock, not an artificial
++ * delay). pc_sensor_apply_tbl's per-register path costs 1.18 ms/write (engine
++ * reset + timing + IRQ poll per register) vs the vendor's ~8 us/write — the
++ * register stream reached the sensor ~150x slower than Android. The burst
++ * queue keeps the vendor's pacing: every register write is one queue word
++ * (same packing as pc_cci_write_reg), the whole chunk executes at I2C speed,
++ * and one REPORT closes it. Q0 holds 1024 words; 333 entries x (2+1) bytes
++ * = 999 payload bytes fits with the command words to spare. */
++static int
++pc_cci_write_burst(vm_offset_t cci, unsigned master, uint8_t slave,
++    const struct pc_init_reg *t, unsigned start, unsigned end, int setup)
++{
++	uint32_t cur, words = 0;
++	int ret;
++
++	if (setup) {
++		pc_cci_reset_engine();
++		pc_cci_refresh_timing(1);	/* 37.5 MHz, verified talking to sensors */
++	}
++	pc_wr(cci, PC_CCI_IRQ_CLEAR_0, 0xffffffffu);
++	pc_wr(cci, PC_CCI_IRQ_GLOBAL_CLEAR_CMD, 1u);
++
++	pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 0),
++	    PC_CCI_I2C_SET_PARAM | ((uint32_t)slave & 0x7fu) << 4);
++	words++;
++	for (unsigned i = start; i < end; i++) {
++		unsigned db = t[i].width ? t[i].width : 1u;
++		if (t[i].reg == 0xffffu) {
++			pc_cci_payload_sent++;
++		}
++		if (db >= 2u) {
++			pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 0),
++			    pc_cci_load_word(PC_CCI_I2C_WRITE | (4u << 4),
++			        (uint32_t)(t[i].reg >> 8) & 0xffu,
++			        (uint32_t)t[i].reg & 0xffu,
++			        (uint32_t)(t[i].val >> 8) & 0xffu));
++			pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 0),
++			    (uint32_t)t[i].val & 0xffu);
++			words += 2;
++		} else {
++			pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 0),
++			    pc_cci_load_word(PC_CCI_I2C_WRITE | (3u << 4),
++			        (uint32_t)(t[i].reg >> 8) & 0xffu,
++			        (uint32_t)t[i].reg & 0xffu,
++			        (uint32_t)t[i].val & 0xffu));
++			words++;
++		}
++	}
++	pc_wr(cci, PC_CCI_Qn_LOAD_DATA(master, 0),
++	    PC_CCI_I2C_REPORT | PC_CCI_I2C_REPORT_IRQ_EN);
++	words++;
++
++	cur = pc_rd(cci, PC_CCI_Qn_CUR_WORD_CNT(master, 0));
++	if (cur == 0 || cur != words) {
++		printf("PANDORA CAMERA: cci_burst M%u queue word mismatch "
++		    "cur=%u want=%u\n", master, cur, words);
++		return EINVAL;
++	}
++	pc_wr(cci, PC_CCI_Qn_EXEC_WORD_CNT(master, 0), cur);
++	pc_wr(cci, PC_CCI_QUEUE_START, 1u << (master * 2u + 0u));
++	ret = pc_cci_wait_irq(cci, 1u << (4u + master * 12u));
++	if (ret == 0) {
++		pc_cci_burst_report++;
++		if (pc_cci_last_irq & (1u << (27u + master * 2u)))
++			pc_cci_burst_nack++;
++	} else {
++		pc_cci_burst_timeout++;
++	}
++	if (ret != 0) {
++		printf("PANDORA CAMERA: cci_burst M%u IRQ timeout status=%#x "
++		    "cur_cmd=%#x cur_words=%#x report=%#x\n", master,
++		    pc_rd(cci, PC_CCI_IRQ_STATUS_0),
++		    pc_rd(cci, PC_CCI_I2C_Mm_Qn_CUR_CMD(master, 0)),
++		    pc_rd(cci, PC_CCI_Qn_CUR_WORD_CNT(master, 0)),
++		    pc_rd(cci, PC_CCI_Qn_REPORT_STATUS(master, 0)));
+ 		return ret;
+ 	}
+ 	return 0;
+@@ -3344,21 +3450,38 @@
+ 	pc_gpio_set(113, 0, 0, 2, 1);   /* tele vana/vdig */
+ 	pc_sleep(1);
+ 
+-	/* MCLK 19.2 MHz from XO (DT clock-rates 0x124f800), Android running values */
++	/* MCLK 19.2 MHz from XO (DT clock-rates 0x124f800). Vendor sequence per
++	 * cambistmclkcc-canoe.ko + clk-qcom.ko disassembly: CFG=0x00100001
++	 * (src=0 bi_tcxo, pre_div=1, vendor flag bit20), CMD UPDATE pulse (bit0,
++	 * self-clearing; bit31 is status, not a writable root bit), then CBCR
++	 * BIT(0) enable followed by the CLK_OFF (bit31) poll clk_branch2 uses
++	 * when halt_check==1. Per-branch readback gives the first on-device
++	 * proof that these branches actually toggle. */
+ 	{
+ 		static const uint32_t mclk_cmd[] = { 0x4000u, 0x4038u, 0x4054u, 0x4070u };
+ 		static const uint32_t mclk_cbcr[] = { 0x4018u, 0x4050u, 0x406cu, 0x4088u };
+ 		for (unsigned mi = 0; mi < 4; mi++) {
++			uint32_t cbcr = 0u;
+ 			pc_wr(pc_bdistm, mclk_cmd[mi] + 4, 0x00100001u);
+ 			pc_wr(pc_bdistm, mclk_cmd[mi],
+-			    (pc_rd(pc_bdistm, mclk_cmd[mi]) & ~0x80000000u) | 0x1u);
++			    pc_rd(pc_bdistm, mclk_cmd[mi]) | PC_CMD_UPDATE);
+ 			for (unsigned pi = 0; pi < 50; pi++) {
+-				if (!(pc_rd(pc_bdistm, mclk_cmd[mi]) & 0x1u))
++				if (!(pc_rd(pc_bdistm, mclk_cmd[mi]) & PC_CMD_UPDATE))
+ 					break;
+ 				pc_sleep(1);
+ 			}
+ 			pc_wr(pc_bdistm, mclk_cbcr[mi],
+-			    pc_rd(pc_bdistm, mclk_cbcr[mi]) | 0x1u);
++			    pc_rd(pc_bdistm, mclk_cbcr[mi]) | PC_CBCR_ENABLE);
++			for (unsigned pi = 0; pi < 200; pi++) {
++				cbcr = pc_rd(pc_bdistm, mclk_cbcr[mi]);
++				if (!(cbcr & PC_CBCR_CLK_OFF))
++					break;
++				pc_sleep(1);
++			}
++			printf("PANDORA CAMERA: MCLK%u on cmd=%#x cfg=%#x cbcr=%#x%s\n",
++			    mi, pc_rd(pc_bdistm, mclk_cmd[mi]),
++			    pc_rd(pc_bdistm, mclk_cmd[mi] + 4), cbcr,
++			    (cbcr & PC_CBCR_CLK_OFF) ? " (CLK_OFF stuck)" : "");
+ 		}
+ 	}
+ 	pc_sleep(1);
+@@ -3405,45 +3528,282 @@
+ 	return (unsigned)(clk37 > 0);
+ }
+ 
++/* v30 experiment (ownership facts closed 2026-11-19/20, see
++ * android-cambist-mclk-20261119/FINDINGS.md): the RCG table is authoritative
++ * from cambistmclkcc-canoe.ko (mclkN cmd @0x4000+0x1C*N, branch @+0x18,
++ * plain clk_rcg2_ops + clk_branch2_ops, HW_CLK_CTRL root), so the MCLK
++ * stop path now mirrors the vendor clk_branch2 sequence instead of the
++ * earlier speculative RCG ROOT_OFF writes. The sensor-side rail ownership
++ * (wide/tele only, MX untouched, BOB1 voltage-only) still follows the
++ * provider trace and remains the part to validate on device.
++ *
++ * Draft intent: cycle the wide+tele resources enabled by pc_sensor_power_up(). The
++ * provider-probe trace shows wide shutdown as reset -> VIO/AVDD GPIO -> MCLK0
++ * -> AFVDD/BOB2, and tele shutdown as MCLK3 -> reset -> tele-only rails/GPIO.
++ * L5M_E1 and B2B_E0 are shared, so release them once after both resets. BOB1
++ * is voltage-voted but not disabled in the trace. Tracefs uses global GPIOs;
++ * pc_gpio_set() takes TLMM-local pins (global - 512): 619/628/625 -> 107/116/113.
++ */
++static int
++pc_sensor_power_down_probe_pair(void)
++{
++	static const uint32_t mclk_cmd[] = { 0x4000u, 0x4038u, 0x4054u, 0x4070u };
++	static const uint32_t mclk_cbcr[] = { 0x4018u, 0x4050u, 0x406cu, 0x4088u };
++	int first_error = 0;
++
++	if (pc_level >= 3u)
++		return EBUSY;
++	if (!pc_tlmm || !pc_bdistm)
++		return ENXIO;
++
++	pc_csiphy_mark("v30 probe-cycle down: assert wide+tele reset");
++	pc_gpio_set(106, 0, 0, 2, 0);
++	pc_gpio_set(105, 0, 0, 2, 0);
++	if ((pc_rd(pc_tlmm, PC_GPIO(106) + 4) & 0x2u) ||
++	    (pc_rd(pc_tlmm, PC_GPIO(105) + 4) & 0x2u)) {
++		printf("PANDORA CAMERA: v30 reset assertion readback failed\n");
++		(void)pandora_log_sync();
++		return EIO;
++	}
++	pc_sleep(1);
++
++	/* Wide shutdown trace drops shared VIO and the AVDD/DVDD GPIO first. */
++	int err = pandora_rpmh_resource("L5M_E1", 4, 0);
++	if (err) {
++		printf("PANDORA CAMERA: v30 L5M_E1 disable failed=%d\n", err);
++		if (!first_error) first_error = err;
++	}
++	pc_gpio_set(107, 0, 0, 2, 0);
++
++	/* Stop the four MCLK branches with the vendor clk_branch2 sequence:
++	 * clear CBCR BIT(0), then poll the CLK_OFF status bit (BIT(31), same
++	 * register, halt_check==1 semantics) with the vendor-scale timeout
++	 * (~200 x 5 ms). The RCGs use plain clk_rcg2_ops whose disable never
++	 * touches the CMD register — no park, no writable root bit — so the
++	 * previous ROOT_OFF writes are removed (mclk_cmd is kept only for the
++	 * final state printout). */
++	for (unsigned mi = 0; mi < 4; mi++) {
++		uint32_t cbcr = pc_rd(pc_bdistm, mclk_cbcr[mi]);
++		pc_wr(pc_bdistm, mclk_cbcr[mi], cbcr & ~PC_CBCR_ENABLE);
++		unsigned poll;
++		for (poll = 0; poll < 200; poll++) {
++			cbcr = pc_rd(pc_bdistm, mclk_cbcr[mi]);
++			if (cbcr & PC_CBCR_CLK_OFF)
++				break;
++			pc_sleep(1);
++		}
++		if (poll == 200) {
++			printf("PANDORA CAMERA: v30 MCLK%u halt timeout cbcr=%#x\n",
++			    mi, cbcr);
++			if (!first_error) first_error = ETIMEDOUT;
++		}
++	}
++	printf("PANDORA CAMERA: v30 MCLK stopped cmd0=%#x cbcr=%#x/%#x/%#x/%#x\n",
++	    pc_rd(pc_bdistm, mclk_cmd[0]), pc_rd(pc_bdistm, mclk_cbcr[0]),
++	    pc_rd(pc_bdistm, mclk_cbcr[1]), pc_rd(pc_bdistm, mclk_cbcr[2]),
++	    pc_rd(pc_bdistm, mclk_cbcr[3]));
++	if (first_error) {
++		printf("PANDORA CAMERA: v30 stopped before rail shutdown; MCLK error=%d\n",
++		    first_error);
++		(void)pandora_log_sync();
++		return first_error;
++	}
++
++	/* Tele's dedicated rails are released after its MCLK is stopped. */
++	err = pandora_rpmh_resource("L5N_E1", 4, 0);
++	if (err) {
++		printf("PANDORA CAMERA: v30 L5N_E1 disable failed=%d\n", err);
++		if (!first_error) first_error = err;
++	}
++	err = pandora_rpmh_resource("L3N_E1", 4, 0);
++	if (err) {
++		printf("PANDORA CAMERA: v30 L3N_E1 disable failed=%d\n", err);
++		if (!first_error) first_error = err;
++	}
++	pc_gpio_set(113, 0, 0, 2, 0);
++
++	/* AFVDD GPIO628 and shared BOB2 are the final wide power-down steps. */
++	pc_gpio_set(116, 0, 0, 2, 0);
++	err = pandora_rpmh_resource("B2B_E0", 4, 0);
++	if (err) {
++		printf("PANDORA CAMERA: v30 B2B_E0 disable failed=%d\n", err);
++		if (!first_error) first_error = err;
++	}
++	printf("PANDORA CAMERA: v30 probe-cycle down result=%d reset=%#x/%#x "
++	    "wide_gpio=%#x/%#x mclk0=%#x mclk3=%#x\n", first_error,
++	    pc_rd(pc_tlmm, PC_GPIO(106)), pc_rd(pc_tlmm, PC_GPIO(105)),
++	    pc_rd(pc_tlmm, PC_GPIO(107)), pc_rd(pc_tlmm, PC_GPIO(116)),
++	    pc_rd(pc_bdistm, mclk_cbcr[0]), pc_rd(pc_bdistm, mclk_cbcr[3]));
++	(void)pandora_log_sync();
++	return first_error;
++}
++
+ /* Replay an Android-dumped init table through the real driver write path.
+- * width 0 in an entry means "use the sensor family default". Each entry is a
+- * full transaction with per-transaction reset+timing. Opt-in only: called from
+- * pc_sensor_init when the pandora_camera_apply boot arg is set.
+- * UNVERIFIED on-device: a wrong data width can lock a sensor until a power
+- * cycle. Default widths: wide 8-bit, tele/ultra 16-bit (from the trace's value
++ * width 0 in an entry means "use the sensor family default". Entries are
++ * delivered through burst queues (one CCI queue per ~1000-byte payload chunk)
++ * so the stream reaches the sensor at the vendor's I2C-bus-bound pace. Opt-in
++ * only: called from pc_sensor_init when the pandora_camera_apply boot arg is
++ * set. Default widths: wide 8-bit, tele/ultra 16-bit (from the trace's value
+  * distribution; per-register width is inferred, not authoritative). */
+ static int
+ pc_sensor_apply_tbl(const struct pc_init_reg *t, unsigned n, unsigned master,
+     uint8_t slave, unsigned def_width, unsigned cap, const char *name)
+ {
+ 	unsigned applied = 0, fails = 0, skipped = 0;
+-	for (unsigned i = 0; i < n; i++) {
+-		/* reg 0xFFFF is a trace artifact (52% of the wide dump), not a
+-		 * real register; writing it NACKs and pollutes the fail count. */
+-		if (t[i].reg == 0xffffu) {
+-			skipped++;
+-			continue;
+-		}
+-		if (cap && (applied + fails) >= cap) {
++	/* v33: burst-queue pacing with a bounded chunk (28 entries ~= 30 queue
++	 * words) plus per-register fallback so the table still lands if the
++	 * big-burst IRQ timeout recurs (v32: 335-word queues load fine —
++	 * CUR_WORD_CNT readback matched — but EXEC silently never fires,
++	 * status=0; the per-register 4-word queue always executes). The
++	 * fallback keeps the sensor configured while the diagnostic fields
++	 * (CUR_CMD / CUR_WORD_CNT / REPORT_STATUS on timeout) bound where the
++	 * engine stops. */
++	(void)def_width;
++	(void)skipped;
++	unsigned i = 0;
++	while (i < n) {
++		if (cap && applied >= cap) {
+ 			break;
+ 		}
+-		unsigned w = t[i].width ? t[i].width : def_width;
+-		int ret = pc_cci_write_reg(pc_cci[0], master, slave,
+-		    t[i].reg, t[i].val, w);
++		unsigned chunk_end = i + 28u;
++		if (chunk_end > n) {
++			chunk_end = n;
++		}
++		if (cap && chunk_end > i + (cap - applied)) {
++			chunk_end = i + (cap - applied);
++		}
++		int ret = pc_cci_write_burst(pc_cci[0], master, slave,
++		    t, i, chunk_end, 1);
+ 		if (ret != 0) {
+-			fails++;
+-			if (fails <= 8)
+-				printf("PANDORA CAMERA: apply %s[%u] reg=0x%04x FAIL ret=%d\n",
+-				    name, i, t[i].reg, ret);
++			/* per-register fallback: same entries, proven path */
++			for (unsigned j = i; j < chunk_end; j++) {
++				unsigned w = t[j].width ? t[j].width : def_width;
++				int r2 = pc_cci_write_reg(pc_cci[0], master, slave,
++				    t[j].reg, t[j].val, w);
++				if (r2 != 0) {
++					fails++;
++				} else {
++					applied++;
++				}
++			}
+ 		} else {
+-			applied++;
+-			if (applied <= 4)
+-				printf("PANDORA CAMERA: apply %s[%u] reg=0x%04x val=0x%04x OK\n",
+-				    name, i, t[i].reg, t[i].val);
+-		}
+-	}
+-	printf("PANDORA CAMERA: apply %s done applied=%u fails=%u skipped=%u cap=%u\n",
+-	    name, applied, fails, skipped, cap);
++			applied += chunk_end - i;
++		}
++		i = chunk_end;
++	}
++	printf("PANDORA CAMERA: apply %s done applied=%u fails=%u cap=%u\n",
++	    name, applied, fails, cap);
++	return fails ? EIO : 0;
++}
++
++/* v34: vendor packet-accurate replay of the wide table.
++ *
++ * Evidence (cci_burst_trace.txt, wide session 2558.143..2558.339, 14376
++ * writes): the stream is 16 back-to-back packets. Each packet's trace gap
++ * equals its own bus time at ~9.5 us/write — so the "~63 ms inter-burst
++ * pause" recorded in FINDINGS 9 was a burst-index misread (burst[4] occupies
++ * that window; there is no idle gap). Only four gaps exceed the bus-time
++ * model and carry real settles: ~24 ms after the power-up packet, and
++ * ~5/15/6 ms around the AE + stream-on group. The 0xFFFF blocks are real
++ * 929-byte data-port writes (a 0x3288 bank-select write precedes each), not
++ * delay pseudo-entries — they stay in the stream untouched.
++ *
++ * Single variable vs v33: engine setup (reset + timing) runs ONCE per packet
++ * instead of once per 28-entry chunk, the vendor's packet boundaries are
++ * kept, and only the real settles above are re-inserted. */
++struct pc_apply_packet { unsigned end; unsigned dwell_ms; };
++
++static const struct pc_apply_packet pc_wide_pkts[] = {
++	{ 1692u, 24u },		/* power-up packet + OVX power settle */
++	{ 2621u, 0u },		/* LUT bank 0x20 */
++	{ 3552u, 0u },		/* LUT bank 0x30/0x31 */
++	{ 7121u, 2u },		/* PLL/timing block */
++	{ 8561u, 3u },		/* 0x6400 data-port block (1440 words) */
++	{ 9492u, 0u },		/* LUT bank 0x10 */
++	{ 9589u, 0u },		/* 97-entry tail */
++	{ 9692u, 5u },		/* mode-switch pre-delay */
++	{ 9705u, 15u },		/* AE settle before stream-on */
++	{ 9720u, 6u },		/* stream-on packet post-settle */
++	{ 10651u, 0u },		/* LUT bank 0x11 (stream already on) */
++	{ 11582u, 0u },		/* LUT bank 0x12 */
++	{ 12513u, 0u },		/* LUT bank 0x13 */
++	{ 13444u, 0u },		/* LUT bank 0x14 */
++	{ 14375u, 0u },		/* LUT bank 0x14 tail */
++	{ 14376u, 0u },		/* final single write */
++};
++
++static int
++pc_sensor_apply_wide_v34(const char *name, unsigned cap)
++{
++	unsigned applied = 0, fails = 0, pkt = 0, i = 0;
++	unsigned npk = (unsigned)(sizeof(pc_wide_pkts) /
++	    sizeof(pc_wide_pkts[0]));
++
++	pc_cci_burst_report = pc_cci_burst_nack = pc_cci_burst_timeout = 0;
++	pc_cci_payload_sent = 0;
++
++	while (i < pc_wide_tbl_n && pkt < npk) {
++		unsigned end = pc_wide_pkts[pkt].end;
++		unsigned first = 1;
++
++		if (end > pc_wide_tbl_n) {
++			end = pc_wide_tbl_n;
++		}
++		if (cap && applied >= cap) {
++			break;
++		}
++		printf("PANDORA CAMERA: v34 pkt %u [%u,%u) dwell=%ums\n",
++		    pkt, i, end, pc_wide_pkts[pkt].dwell_ms);
++		while (i < end) {
++			unsigned chunk_end = i + 28u;
++			int ret;
++
++			if (chunk_end > end) {
++				chunk_end = end;
++			}
++			if (cap && chunk_end > i + (cap - applied)) {
++				chunk_end = i + (cap - applied);
++			}
++			ret = pc_cci_write_burst(pc_cci[0], 1, 0x10u,
++			    pc_wide_tbl, i, chunk_end, first);
++			first = 0;
++			if (ret != 0) {
++				/* per-register fallback; it resets per write, so the
++				 * next burst chunk must redo the engine setup. */
++				for (unsigned j = i; j < chunk_end; j++) {
++					unsigned w = pc_wide_tbl[j].width ?
++					    pc_wide_tbl[j].width : 1u;
++					int r2;
++					r2 = pc_cci_write_reg(pc_cci[0], 1, 0x10u,
++					    pc_wide_tbl[j].reg, pc_wide_tbl[j].val, w);
++					if (r2 != 0) {
++						fails++;
++					} else {
++						applied++;
++					}
++				}
++				first = 1;
++			} else {
++				applied += chunk_end - i;
++			}
++			i = chunk_end;
++			if (cap && applied >= cap) {
++				break;
++			}
++		}
++		printf("PANDORA CAMERA: v93 pkt %u bursts report=%u nack=%u "
++		    "timeout=%u\n", pkt, pc_cci_burst_report,
++		    pc_cci_burst_nack, pc_cci_burst_timeout);
++		(void)pandora_log_sync();
++		if (pc_wide_pkts[pkt].dwell_ms) {
++			pc_sleep(pc_wide_pkts[pkt].dwell_ms);
++		}
++		pkt++;
++	}
++	printf("PANDORA CAMERA: apply %s done applied=%u fails=%u "
++	    "cap=%u packets=%u v93_nack=%u v93_timeout=%u v95_payload_sent=%u\n",
++	    name, applied, fails, cap, pkt, pc_cci_burst_nack,
++	    pc_cci_burst_timeout, pc_cci_payload_sent);
+ 	return fails ? EIO : 0;
+ }
+ 
+@@ -3486,7 +3846,7 @@
+ 			/* apply==1 -> full replay; apply>1 -> first N valid entries
+ 			 * (quick write-path verification, single variable). */
+ 			unsigned cap = (apply > 1u) ? apply : 0u;
+-			pc_sensor_apply_tbl(pc_wide_tbl, pc_wide_tbl_n, 1, 0x10u, 1, cap, "wide");
++			pc_sensor_apply_wide_v34("wide", cap);
+ 			pc_sensor_apply_tbl(pc_tele_tbl, pc_tele_tbl_n, 0, 0x2du, 2, cap, "tele");
+ 		}
+ 	}
+@@ -3494,9 +3854,15 @@
+ 	/* self-check via the DRIVER read path: read each sensor's chip-id
+ 	 * register (wide ovx10500 @ 0x300a, tele s5khpe @ 0x0000). */
+ 	ret = pc_cci_read_reg16_timed(pc_cci[0], 1, 0x10u, 0x300au, &id);
+-	printf("PANDORA CAMERA: driver self-check wide chip_id=%#x ret=%d\n", id, ret);
++	if (ret)
++		printf("PANDORA CAMERA: driver self-check wide read failed ret=%d\n", ret);
++	else
++		printf("PANDORA CAMERA: driver self-check wide chip_id=%#x ret=0\n", id);
+ 	ret = pc_cci_read_reg16_timed(pc_cci[0], 0, 0x2du, 0x0000u, &id);
+-	printf("PANDORA CAMERA: driver self-check tele chip_id=%#x ret=%d\n", id, ret);
++	if (ret)
++		printf("PANDORA CAMERA: driver self-check tele read failed ret=%d\n", ret);
++	else
++		printf("PANDORA CAMERA: driver self-check tele chip_id=%#x ret=0\n", id);
+ }
+ 
+ /* ---------------------------------------------------------------------------
+@@ -3531,7 +3897,19 @@
+ /* S6 RCGs: cmd_rcgr, SRC_SEL, hid (=2*div-1). 閹?2.3. */
+ struct pc_tpg_rcg { uint32_t cmd; unsigned sel; unsigned hid; const char *name; };
+ static const struct pc_tpg_rcg pc_tpg_rcgs[] = {
+-	{ 0x21064u, 1u, 5u,  "cphy_rx" },       /* PLL0_MAIN/3   = 400 MHz */
++	/* v59: Android clk_summary on this device reads
++	 *   cam_cc_cphy_rx_clk_src 266666667
++	 *   cam_cc_csiphy0_clk     266666667
++	 *   cam_cc_csid_csiphy_rx_clk 266666667
++	 *   cam_cc_csi0phytimer_clk_src 400000000
++	 * but every probe through v58 programmed cphy_rx as PLL0_MAIN/3 = 400 MHz.
++	 * The PHY's bit-clock side was therefore 1.5x too fast while the CSID
++	 * wrapper ran at 266.67, which is exactly the kind of mismatch that
++	 * yields SOT/trio blips and corrupted CPHY headers instead of packets.
++	 * PLL0_MAIN/4.5 = 266.7 MHz needs hid=8 (div=(hid+1)/2=4.5), the same
++	 * 0x00100108 value the timer experiment already used. csid stays at
++	 * 400 MHz; only its PHY-side parent is corrected. */
++	{ 0x21064u, 1u, 8u,  "cphy_rx" },       /* PLL0_MAIN/4.5 = 266.7 MHz */
+ 	{ 0x212a4u, 1u, 5u,  "csid" },          /* PLL0_MAIN/3   = 400 MHz */
+ 	{ 0x21018u, 6u, 1u,  "tfe_0" },         /* PLL3_EVEN/1   = 360.28 MHz */
+ 	{ 0x212ccu, 1u, 4u,  "camnoc_rt_axi" }, /* PLL0_MAIN/2.5 = 480 MHz */
+@@ -3544,7 +3922,6 @@
+  * stale log. pandora_log_sync() (sweet_ufs.c) forces a thread-safe flush, so
+  * printing + syncing before each step keeps the last completed step on disk
+  * even if the next step freezes the kernel. */
+-extern bool pandora_log_sync(void);
+ static void
+ pc_tpg_mark(const char *msg)
+ {
+@@ -3881,6 +4258,102 @@
+ 	return 0;
+ }
+ 
++/* CSID 1080 RDI aperture (upstream camss-csid-1080.c). CFG0 lives at
++ * 0x5480 + 0x200*rdi and CTRL at 0x5488 + 0x200*rdi; CTRL bit0 is
++ * START_CMD (1 start, 0 stop). This generation has no
++ * HALT/RESUME_AT_FRAME_BOUNDARY state machine, so the gen2 control bits
++ * must never be reused here. 0x3080 is not a second RDI instance.
++ */
++#define PC_RDI_CFG0(rdi)     (0x5480u + 0x200u * (rdi))
++#define PC_RDI_CTRL(rdi)     (0x5488u + 0x200u * (rdi))
++#define PC_RDI_CFG1(rdi)     (PC_RDI_CFG0(rdi) + 0x14u)
++#define PC_RDI_CTRL_START    PC_BIT(0)
++
++/* TPG is its own aperture (tpg0/1/2 @0x093fd000/0x093fe000/0x093ff000),
++ * not a CSID+0x600 window. TEST_EN = CTRL_CMD(0x1F4) bit4 is the only
++ * frame source on this generation. */
++#define PC_TPG0_PA           0x093fd000u
++#define PC_TPG1_PA           0x093fe000u
++#define PC_TPG_CTRL          0x0064u
++#define PC_TPG_CTRL_CMD      0x01f4u
++#define PC_TPG_CMD_HW_RESET  PC_BIT(0)
++#define PC_TPG_CMD_TEST_EN   PC_BIT(4)
++#define PC_TPG_CTRL_4LANE_1VC 0x30u
++
++/* RX_CFG0 TPG route (camss-csid-1080 __csid_configure_rx): bit27 enables
++ * the TPG mux and bits 29:28 select the TPG instance. */
++#define PC_RX_CFG0_TPG_EN    PC_BIT(27)
++#define PC_RX_CFG0_TPG_SEL(n) ((uint32_t)(n) << 28)
++
++/* RDIN wrapper IRQ (0x224 + 0x10*n). RUP_DONE acknowledges a register
++ * update; it is not a frame completion and must never gate a capture. */
++#define PC_RDIN_IRQ(n)       (0x224u + 0x10u * (n))
++#define PC_RDIN_RUP_DONE     PC_BIT(23)
++#define PC_RDIN_INPUT_SOF    PC_BIT(12)
++#define PC_RDIN_INPUT_EOF    PC_BIT(9)
++
++/* Frame markers. Everything the offline verdict reads lives inside the
++ * 4 KiB head window, so a capture that carries only the head is judgeable:
++ * [0,16) head sentinel 0xA5, [0x10,0x50) canary, [0xFC0,0x1000) tail
++ * sentinel 0x5A. The whole frame is 0xA5 plus those markers, so a
++ * full-frame dump can cross-check the true tail.
++ */
++#define PC_SENT_BYTES        16u
++#define PC_CANARY_OFF        0x010u
++#define PC_CANARY_BYTES      64u
++#define PC_CANARY_BASE       0xc0u
++#define PC_SENT_TAIL_OFF     0xfc0u
++#define PC_PROBE_WINDOW      0x1000u
++#define PC_SENT_HEAD_VAL     0xa5u
++#define PC_SENT_TAIL_VAL     0x5au
++
++static void
++pc_frame_prefill(void)
++{
++	volatile uint8_t *fb = (volatile uint8_t *)pc_frame_va;
++
++	if (!pc_frame_va)
++		return;
++	for (unsigned i = 0; i < PC_CAM_FRAME_BYTES; i++)
++		fb[i] = PC_SENT_HEAD_VAL;
++	for (unsigned i = 0; i < PC_CANARY_BYTES; i++)
++		fb[PC_CANARY_OFF + i] = (uint8_t)(PC_CANARY_BASE + (i & 0x3fu));
++	for (unsigned i = 0; i < PC_SENT_BYTES; i++)
++		fb[PC_SENT_TAIL_OFF + i] = PC_SENT_TAIL_VAL;
++	clean_dcache64(pc_frame_pa, PC_CAM_FRAME_BYTES, TRUE);
++	printf("PANDORA TPG: prefill head=0x%02x canary=%u@%#x tail=0x%02x@%#x "
++	    "window=%#x frame=%#x\n", PC_SENT_HEAD_VAL, PC_CANARY_BYTES,
++	    PC_CANARY_OFF, PC_SENT_TAIL_VAL, PC_SENT_TAIL_OFF, PC_PROBE_WINDOW,
++	    PC_CAM_FRAME_BYTES);
++	(void)pandora_log_sync();
++}
++
++/* Read-only TPG route evidence: bit27 and bits 29:28 show whether the CSID
++ * RX is parked on a TPG or still bound to the PHY. */
++static void
++pc_rx_cfg0_report(vm_offset_t csid, const char *tag)
++{
++	uint32_t v = pc_rd(csid, 0x880u);
++
++	printf("PANDORA TPG: RX_CFG0[%s]=%#x tpg_en=%u tpg_sel=%u phy_sel=%u "
++	    "lane_assign=%#x lane_cnt=%u\n", tag, v, (v >> 27) & 1u,
++	    (v >> 28) & 3u, (v >> 20) & 1u, (v >> 4) & 0xffffu, (v & 3u) + 1u);
++	(void)pandora_log_sync();
++}
++
++/* Read-only RDIN IRQ evidence. RUP_DONE proves the register update landed
++ * and says nothing about a frame; SOF/EOF are input-side boundary events. */
++static void
++pc_rdi_irq_report(vm_offset_t csid, const char *tag)
++{
++	uint32_t v = pc_rd(csid, PC_RDIN_IRQ(0));
++
++	printf("PANDORA TPG: RDIN_IRQ[%s]=%#x rup_done=%u sof=%u eof=%u\n",
++	    tag, v, (v & PC_RDIN_RUP_DONE) ? 1u : 0u,
++	    (v & PC_RDIN_INPUT_SOF) ? 1u : 0u,
++	    (v & PC_RDIN_INPUT_EOF) ? 1u : 0u);
++	(void)pandora_log_sync();
++}
+ /* Increment 2a: drive the TPG->CSID RDI0 path far enough to observe frame
+  * events at the CSID, without VFE yet (VFE DMA is increment 2b). Spec:
+  * CAMERA_L2_TPG_IMPL_2026-11-12.md 閹? (TPG v2.4.0), 閹? (CSID 1080 reset/RX/RDI),
+@@ -3891,16 +4364,10 @@
+ static void
+ pc_tpg_stream_2a(vm_offset_t tpg2, vm_offset_t csid0, vm_offset_t vfe0)
+ {
+-	/* P6 diagnostic: pre-fill the DMA buffer with a known pattern so the
+-	 * post-stream readback can tell "DMA wrote here" from a stale cache. */
+-	if (pc_frame_va) {
+-		volatile uint32_t *fb = (volatile uint32_t *)pc_frame_va;
+-		for (unsigned i = 0; i < PC_CAM_FRAME_BYTES / 4; i++) fb[i] = 0xa5a5a5a5u;
+-		clean_dcache64(pc_frame_pa, PC_CAM_FRAME_BYTES, TRUE);
+-		printf("PANDORA TPG: P6 prefill 0xa5a5a5a5 done frame_pa=%#llx\n",
+-		    (unsigned long long)pc_frame_pa);
+-		(void)pandora_log_sync();
+-	}
++	/* P6 diagnostic: dual sentinel + canary prefill. Every marker the
++	 * offline verdict reads lives inside the 4 KiB head window, so a
++	 * capture that only carries the head can still be judged. */
++	pc_frame_prefill();
+ 
+ 	/* ---- P2: CSID reset (閹?.1), bounded poll of INFO_RST_DONE ---- */
+ 	pc_tpg_mark("P2: CSID reset begin");
+@@ -3925,9 +4392,13 @@
+ 		return;
+ 	}
+ 
+-	/* ---- P3: TPG v2.4.0 config (閹?), 640x480 RAW10 / 4 lane ---- */
++	/* ---- P3: TPG v2.4.0 config (gen1 regs), separate aperture ---- */
+ 	pc_tpg_mark("P3: TPG config begin");
+-	pc_wr(tpg2, 0x1f4, 0x1u);         /* CTRL_CMD: HW_RESET (v2.4.0 reset) */
++	printf("PANDORA TPG: P3 TPG apertures tpg0=%#x tpg1=%#x tpg2=%#x rx_sel=%u\n",
++	    PC_TPG0_PA, PC_TPG1_PA, PC_TPG2_PA,
++	    (pc_rd(csid0, 0x880u) >> 28) & 3u);
++	(void)pandora_log_sync();
++	pc_wr(tpg2, PC_TPG_CTRL_CMD, PC_TPG_CMD_HW_RESET);  /* HW_RESET */
+ 	pc_sleep(1);
+ 	pc_wr(tpg2, 0x68, 0x0u);          /* VC_0_CFG0: 0 = continuous frames */
+ 	pc_wr(tpg2, 0x6c, 0x12345678u);   /* VC_0_LSFR_SEED */
+@@ -3937,11 +4408,11 @@
+ 	pc_wr(tpg2, 0x7c, 0x028001e0u);   /* DT_0_CFG_0: W=640 H=480 */
+ 	pc_wr(tpg2, 0x80, 0x2bu);         /* DT_0_CFG_1: DATA_TYPE=RAW10 */
+ 	pc_wr(tpg2, 0x84, 0x20000be8u);   /* DT_0_CFG_2: payload mode 8 */
+-	pc_wr(tpg2, 0x64, 0x30u);         /* CTRL: 4 lane, 1 VC (no TEST_EN) */
++	pc_wr(tpg2, PC_TPG_CTRL, PC_TPG_CTRL_4LANE_1VC); /* 4 lane, 1 VC */
+ 	pc_tpg_mark("P3: TPG configured (TEST_EN deferred until RX/RDI/VFE ready)");
+ 	pc_sleep(2);
+-	printf("PANDORA TPG: P3 TPG configured ctrl=%#x ctrl_cmd=%#x hw_status=%#x\n",
+-	    pc_rd(tpg2, 0x64), pc_rd(tpg2, 0x1f4), pc_rd(tpg2, 0x4));
++	printf("PANDORA TPG: P3 TPG ctrl=%#x ctrl_cmd=%#x hw_status=%#x\n",
++	    pc_rd(tpg2, PC_TPG_CTRL), pc_rd(tpg2, PC_TPG_CTRL_CMD), pc_rd(tpg2, 0x4));
+ 	(void)pandora_log_sync();
+ 	pc_sleep(5);
+ 	printf("PANDORA TPG: P3 TPG cfg vc0=%#x dt0_cfg0=%#x dt0_cfg1=%#x dt0_cfg2=%#x hbi=%#x vbi=%#x bars=%#x hw_status=%#x\n",
+@@ -3949,37 +4420,26 @@
+ 	    pc_rd(tpg2, 0x70), pc_rd(tpg2, 0x74), pc_rd(tpg2, 0x78), pc_rd(tpg2, 0x4));
+ 	(void)pandora_log_sync();
+ 
+-	/* ---- P4: CSID RX mux + RDI0 (閹?.2/閹?.3), adaptive RDI page ---- */
++	/* ---- P4: CSID RX mux + RDI0 (CSID 1080 semantics, one aperture) ---- */
+ 	pc_tpg_mark("P4: CSID RX/RDI begin");
+-	pc_wr(csid0, 0x880, 0x38032103u); /* RX_CFG0: tpg2 mux_en+sel=3, lane_assign=0x3210<<4, 4 lane */
+-	pc_wr(csid0, 0x884, 0x1u);        /* RX_CFG1: ECC_CORRECTION_EN */
+-	/* RDI_CFG0 writes intermittently read back 0 (2a/2b) yet latched in the
+-	 * probe trial: a race against CSID reset settling, not an offset error.
+-	 * Readback-verify-retry up to 50 ms, probing non-lite 0x5480 then lite
+-	 * 0x3080 each pass; keep whichever latches. */
+-	uint32_t rb_nl = 0, rb_l = 0;
+-	uint32_t rdi_base = 0x5480;
+-	bool rdi_lite = false;
+-	unsigned latch_tries = 0;
+-	for (unsigned try = 0; try < 50; try++) {
+-		pc_wr(csid0, 0x5480, 0x002bf160u);
+-		rb_nl = pc_rd(csid0, 0x5480);
+-		if (rb_nl == 0x002bf160u) { rdi_base = 0x5480; rdi_lite = false; latch_tries = try + 1; break; }
+-		pc_wr(csid0, 0x3080, 0x002bf160u);
+-		rb_l = pc_rd(csid0, 0x3080);
+-		if (rb_l == 0x002bf160u) { rdi_base = 0x3080; rdi_lite = true; latch_tries = try + 1; break; }
+-		pc_sleep(1);
+-	}
+-	printf("PANDORA TPG: P4 RDI latch tries=%u nonlite@0x5480=%#x lite@0x3080=%#x -> base=%#x lite=%u\n",
+-	    latch_tries, rb_nl, rb_l, rdi_base, (unsigned)rdi_lite);
+-	(void)pandora_log_sync();
+-	pc_wr(csid0, rdi_base, 0x002bf160u);         /* RDI_CFG0: payload-only RAW10 VC0 */
+-	pc_wr(csid0, rdi_base + 0x14, 0x8000u);      /* RDI_CFG1: PACKING_FORMAT_MIPI */
+-	if (!rdi_lite)
+-		pc_wr(csid0, 0x5498, 0x9u);                /* RDI_PIX_STORE_CFG0: non-lite only */
+-	pc_wr(csid0, rdi_base + 0x8, 0x0u);          /* RDI_CTRL: 0 before enable */
+-	uint32_t rdi_cfg0 = pc_rd(csid0, rdi_base);
+-	pc_wr(csid0, rdi_base, rdi_cfg0 | 0x80000000u); /* RDI_CFG0 EN */
++	pc_wr(csid0, 0x880, PC_RX_CFG0_TPG_EN | PC_RX_CFG0_TPG_SEL(3) |
++	    (0x3210u << 4) | 0x3u);     /* RX_CFG0: TPG2 mux, lane_assign, 4 lane */
++	pc_wr(csid0, 0x884, 0x1u);      /* ECC correction (Android default) */
++	pc_rx_cfg0_report(csid0, "P4");
++	/* One canonical RDI0 aperture. 0x3080 is not a second instance on this
++	 * generation: the old lite probe only raced the reset for up to 50 ms. */
++	pc_wr(csid0, PC_RDI_CFG0(0), 0x002bf160u);   /* RDI_CFG0: RAW10 VC0 */
++	if (pc_rd(csid0, PC_RDI_CFG0(0)) != 0x002bf160u) {
++		printf("PANDORA TPG: P4 RDI_CFG0 latch FAILED rb=%#x\n",
++		    pc_rd(csid0, PC_RDI_CFG0(0)));
++		(void)pandora_log_sync();
++		return;
++	}
++	pc_wr(csid0, PC_RDI_CFG1(0), 0x8000u);      /* PACKING_FORMAT_MIPI */
++	pc_wr(csid0, 0x5498, 0x9u);                 /* PIX_STORE: MIN_HBI 4 | EN */
++	pc_wr(csid0, PC_RDI_CTRL(0), 0x0u);         /* START_CMD: 0 = stop */
++	pc_wr(csid0, PC_RDI_CFG0(0),
++	    pc_rd(csid0, PC_RDI_CFG0(0)) | 0x80000000u); /* CFG0 EN */
+ 	/* CAMSS_INIT_BUF_COUNT=2 address updates, each committed via RUP_SET */
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		pc_wr(csid0, 0x118, 0x100u);  /* AUP_CMD: RDI0 */
+@@ -3987,11 +4447,13 @@
+ 	}
+ 	pc_wr(csid0, 0x114, 0x100u);      /* RUP_CMD: RDI0 reg update */
+ 	pc_wr(csid0, 0x11c, 0x1u);        /* RUP_AUP_CMD: RUP_SET */
+-	pc_tpg_mark("P4: about to start RDI0 (RDI_CTRL START_CMD)");
+-	pc_wr(csid0, rdi_base + 0x8, 0x1u);          /* RDI_CTRL: START_CMD */
++	pc_tpg_mark("P4: about to start RDI0 (RDI_CTRL bit0 START_CMD=1)");
++	pc_wr(csid0, PC_RDI_CTRL(0), PC_RDI_CTRL_START);
+ 	pc_sleep(2);
+-	printf("PANDORA TPG: P4 RDI0 started rdi_cfg0=%#x rdi_ctrl=%#x rx_cfg0=%#x rx_irq=%#x\n",
+-	    pc_rd(csid0, rdi_base), pc_rd(csid0, rdi_base + 0x8), pc_rd(csid0, 0x880), pc_rd(csid0, 0x1b0));
++	printf("PANDORA TPG: P4 RDI0 started cfg0=%#x ctrl=%#x rx_cfg0=%#x rx_irq=%#x\n",
++	    pc_rd(csid0, PC_RDI_CFG0(0)), pc_rd(csid0, PC_RDI_CTRL(0)),
++	    pc_rd(csid0, 0x880), pc_rd(csid0, 0x1b0));
++	pc_rdi_irq_report(csid0, "P4");
+ 	(void)pandora_log_sync();
+ 
+ 	/* ---- P5: VFE0 write-master wm=0x17 (閹?), DMA dest = SMMU IOVA ----
+@@ -4030,52 +4492,71 @@
+ 	    pc_rd(tpg2, 0x64), pc_rd(tpg2, 0x1f4), pc_rd(tpg2, 0x4));
+ 	(void)pandora_log_sync();
+ 
+-	/* ---- Observe: bounded poll of BUF_DONE / RX / RDI-wrapper IRQ ---- */
+-	pc_tpg_mark("P5: polling CSID BUF_DONE/RX/RDI IRQ for frame events");
++	/* ---- Observe: CSID BUF_DONE only. VFE on 1080 has no frame-done
++	 * IRQ (vfe_isr() is a nop and vfe_halt() is empty), so nothing here
++	 * may wait on a VFE completion event. RUP_DONE is observed only. */
++	pc_tpg_mark("P5: polling CSID BUF_DONE (the only frame completion)");
+ 	uint32_t buf_done = 0, rx_irq = 0, rdi_irq = 0;
+-	unsigned frames = 0;
++	unsigned frames = 0, last_vc0 = 0;
+ 	for (unsigned i = 0; i < 200; i++) {
+ 		buf_done = pc_rd(csid0, 0x1a0);   /* BUF_DONE_IRQ_STATUS */
+-		rx_irq = pc_rd(csid0, 0x1b0);     /* CSI2_RX_IRQ_STATUS */
+-		rdi_irq = pc_rd(csid0, 0x224);    /* CSI2_RDIN_IRQ_STATUS(0): SOF/EOF/RUP */
+-		if (buf_done & 0x10000u) {        /* VC0 buffer done */
++		unsigned vc0 = (buf_done & 0x10000u) ? 1u : 0u;
++		if (vc0 && !last_vc0) {
+ 			frames++;
+ 			pc_wr(csid0, 0x1a8, 0x10000u); /* clear VC0 */
+ 		}
++		last_vc0 = vc0;
++		rx_irq |= pc_rd(csid0, 0x1b0);     /* CSI2_RX_IRQ_STATUS */
++		rdi_irq |= pc_rd(csid0, 0x224);    /* RDIN wrapper: RUP/SOF/EOF */
+ 		pc_sleep(1);
+ 	}
+-	printf("PANDORA TPG: P5 RESULT frames=%u buf_done=%#x rx_irq=%#x rdi_irq=%#x top_irq=%#x\n",
+-	    frames, buf_done, rx_irq, rdi_irq, pc_rd(csid0, 0x180));
++	printf("PANDORA TPG: P5 RESULT frames=%u buf_done=%#x rup_done=%u rx_irq=%#x rdi_irq=%#x top_irq=%#x\n",
++	    frames, buf_done, (rdi_irq & PC_RDIN_RUP_DONE) ? 1u : 0u, rx_irq,
++	    rdi_irq, pc_rd(csid0, 0x180));
+ 	(void)pandora_log_sync();
+-	pc_tpg_mark(frames ? "P5: CSID observed TPG frame events (PASS)"
+-	                   : "P5: NO CSID frame events (FAIL - check rdi_irq/mux)");
+-	/* P6 judge: dump the first words of the SMMU frame buffer (color bars?).
+-	 * pc_frame_va is the kernel VA of the same pages the VFE DMAs to. */
++	pc_tpg_mark(frames ? "P5: CSID observed BUF_DONE frame completions (PASS)"
++	                   : "P5: NO BUF_DONE frame completion (FAIL - TPG TEST_EN/RX mux)");
++	/* P6 judge: read back the 4 KiB head window (cache-invalidated) and
++	 * print exactly what the offline verdict consumes: both sentinels,
++	 * the canary and an FNV-1a hash over the window between them. */
+ 	if (pc_frame_va) {
++		volatile uint8_t *fb = (volatile uint8_t *)pc_frame_va;
++		unsigned head_ok = 1, tail_ok = 1, canary_ok = 1, n_a5 = 0;
++		uint32_t hash = 2166136261u;
++
+ 		pc_dcache_invalidate(pc_frame_va, PC_CAM_FRAME_BYTES);
+-		volatile uint32_t *fb = (volatile uint32_t *)pc_frame_va;
+-		printf("PANDORA TPG: P6 frame[0..7]=%#x %#x %#x %#x %#x %#x %#x %#x\n",
+-		    fb[0], fb[1], fb[2], fb[3], fb[4], fb[5], fb[6], fb[7]);
+-		unsigned n_a5 = 0, n_ff = 0, n_00 = 0, n_other = 0, first_idx = 0;
+-		uint32_t first_other = 0;
+-		for (unsigned i = 0; i < PC_CAM_FRAME_BYTES / 4; i++) {
+-			uint32_t w = fb[i];
+-			if (w == 0xa5a5a5a5u) n_a5++;
+-			else if (w == 0xffffffffu) n_ff++;
+-			else if (w == 0u) n_00++;
+-			else { if (!n_other) { first_other = w; first_idx = i; } n_other++; }
+-		}
+-		printf("PANDORA TPG: P6 scan a5=%u ff=%u zero=%u other=%u first_other[%u]=%#x\n",
+-		    n_a5, n_ff, n_00, n_other, first_idx, first_other);
++		for (unsigned i = 0; i < PC_SENT_BYTES; i++) {
++			if (fb[i] != PC_SENT_HEAD_VAL)
++				head_ok = 0;
++			if (fb[PC_SENT_TAIL_OFF + i] != PC_SENT_TAIL_VAL)
++				tail_ok = 0;
++		}
++		for (unsigned i = 0; i < PC_CANARY_BYTES; i++) {
++			if (fb[PC_CANARY_OFF + i] !=
++			    (uint8_t)(PC_CANARY_BASE + (i & 0x3fu)))
++				canary_ok = 0;
++		}
++		for (unsigned i = 0; i < PC_CAM_FRAME_BYTES / 4u; i++) {
++			if (((volatile uint32_t *)pc_frame_va)[i] == 0xa5a5a5a5u)
++				n_a5++;
++		}
++		for (unsigned i = PC_CANARY_OFF + PC_CANARY_BYTES;
++		    i < PC_SENT_TAIL_OFF; i++)
++			hash = (hash ^ fb[i]) * 16777619u;
++		printf("PANDORA TPG: P6 window head=%s canary=%s tail=%s a5w=%u "
++		    "hash=%#x frame_va=%#llx\n", head_ok ? "ok" : "BAD",
++		    canary_ok ? "ok" : "BAD", tail_ok ? "ok" : "BAD", n_a5,
++		    hash, (unsigned long long)pc_frame_va);
+ 		(void)pandora_log_sync();
+ 	}
+ 
+-	/* Graceful stop before the caller's power-down: halt RDI0 then reset
+-	 * the TPG so no block is streaming when clocks/GDSCs are pulled. */
++	/* Graceful stop before the caller's power-down: drop RDI0 with the
++	 * 1080 start/stop bit, then reset the TPG so no block streams while
++	 * clocks/GDSCs are pulled. There is no halt/step bit to clear. */
+ 	pc_tpg_mark("P5: stopping VFE WM + RDI0 + TPG before teardown");
+-	pc_wr(vfe0, 0x2c00, 0x0u);        /* VFE WM_CFG: disable */
+-	pc_wr(csid0, rdi_base + 0x8, 0x0u); /* RDI_CTRL: stop */
+-	pc_wr(tpg2, 0x1f4, 0x1u);         /* TPG CTRL_CMD: HW_RESET = stream off */
++	pc_wr(vfe0, 0x2c00, 0x0u);              /* VFE WM_CFG: disable */
++	pc_wr(csid0, PC_RDI_CTRL(0), 0x0u);     /* START_CMD: 0 = stop */
++	pc_wr(tpg2, PC_TPG_CTRL_CMD, PC_TPG_CMD_HW_RESET); /* TPG stream off */
+ 	pc_sleep(1);
+ }
+ 
+@@ -4098,6 +4579,15 @@
+ #define PC_CPHY_CMN        0x1000u          /* common_regs_offset */
+ #define PC_CPHY_CTRL(n)    (PC_CPHY_CMN + 4u * (n))
+ #define PC_CPHY_STATUS(n)  (0x10b0u + 4u * (n))
++/* CSIPHY 2.4.0 interleaves DPHY and CPHY lane-enable bits. The wide
++ * sensor uses DPHY data positions 0/2/4/6 and clock position 7, as defined
++ * by vendor cam_csiphy_dev.h; a contiguous five-bit mask is incorrect. */
++#define PC_CSIPHY_V240_LANE_EN       0x1014u
++#define PC_CSIPHY_V240_DPHY4_MASK    ((1u << 0) | (1u << 2) | (1u << 4) | \
++                                    (1u << 6) | (1u << 7))
++#define PC_CSIPHY_V240_IRQ_STATUS(n) (0x1138u + 4u * (n))
++#define PC_CSIPHY_V240_IRQ_COUNT     11u
++#define PC_CSIPHY_V240_CLK_EN_SEL    (1u << 2)
+ #define PC_CSIPHY0_CLK_CBCR    0x2001cu     /* csiphy0_clk branch */
+ #define PC_CSI0PHYTIMER_CBCR   0x20018u     /* csi0phytimer_clk branch */
+ #define PC_CSI0PHYTIMER_RCG    0x20000u     /* csi0phytimer_clk_src RCG */
+@@ -4149,14 +4639,22 @@
+  * ------------------------------------------------------------------------- */
+ #define PC_SLICEB_SLAVE    0x10u
+ #define PC_SLICEB_MASTER   1u
+-#define PC_RDIN_IRQ(n)     (0x224u + 0x10u * (n))
+-#define PC_RDIN_RUP_DONE   PC_BIT(23)
+-#define PC_RDIN_INPUT_SOF  PC_BIT(12)
+-#define PC_RDIN_INPUT_EOF  PC_BIT(9)
++/* PC_RDIN_* moved to the shared camera block above: the TPG stream and the
++ * real-sensor slice read the same RDIN wrapper IRQ. */
+ 
+ /* One 8-bit sensor register read through the verified timed read path. The
+  * helper returns the data byte in *ret's value; errors are reported by the
+  * helper itself and surface as ret != 0. */
++static uint16_t
++pc_sliceb_rd16(uint16_t reg, int *ret)
++{
++	uint16_t v = 0;
++
++	*ret = pc_cci_read_reg16_timed(pc_cci[0], PC_SLICEB_MASTER,
++	    PC_SLICEB_SLAVE, reg, &v);
++	return v;
++}
++
+ static uint8_t
+ pc_sliceb_rd8(uint16_t reg, int *ret)
+ {
+@@ -4176,6 +4674,29 @@
+ 	printf("PANDORA SLICEB: sensor 0x0100 stream %s ret=%d\n",
+ 	    on ? "on" : "off", ret);
+ 	(void)pandora_log_sync();
++}
++
++/* One CSID-1080 reset strobe (v24 camss-csid-1080.c csid_reset(): TOP_IRQ_CLEAR
++ * /TOP_IRQ_MASK = INFO_RST_DONE|BUF_DONE, BUF_DONE clear/mask, IRQ_CMD clear,
++ * RST_CFG = RST_LOCATION|RST_MODE, RST_CMD = SELECT_HW_RST|SELECT_IRQ_RST, then
++ * INFO_RST_DONE in TOP_IRQ_STATUS). Shared by the arm path and the failure
++ * discriminator so both instances run bit-identical code. */
++static unsigned
++pc_csid_reset_once(vm_offset_t csid)
++{
++	pc_wr(csid, 0x188, 0x9u);        /* TOP_IRQ_CLEAR: RST_DONE|BUF_DONE */
++	pc_wr(csid, 0x184, 0x9u);        /* TOP_IRQ_MASK */
++	pc_wr(csid, 0x1a8, 0x10000u);    /* BUF_DONE_IRQ_CLEAR: VC0 */
++	pc_wr(csid, 0x1a4, 0x10000u);    /* BUF_DONE_IRQ_MASK: VC0 */
++	pc_wr(csid, 0x110, 0x1u);        /* IRQ_CMD: clear */
++	pc_wr(csid, 0x108, 0x11u);       /* RST_CFG */
++	pc_wr(csid, 0x10c, 0x5u);        /* RST_CMD: HW_RST|IRQ_RST */
++	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
++		if (pc_rd(csid, 0x180) & 0x1u)
++			return 1;
++		pc_sleep(1);
++	}
++	return 0;
+ }
+ 
+ /* Arm CSID for one RX mux candidate: reset, RX_CFG0/1, RDI0 (payload-only,
+@@ -4187,88 +4708,133 @@
+ static uint32_t
+ pc_sliceb_arm(vm_offset_t csid0, uint32_t rx_cfg0)
+ {
+-	uint32_t rdi_base = 0x5480u;
+-	bool rdi_lite = false;
+-	unsigned rst_done = 0;
+-
+-	pc_wr(csid0, 0x188, 0x9u);        /* TOP_IRQ_CLEAR: RST_DONE|BUF_DONE */
+-	pc_wr(csid0, 0x184, 0x9u);        /* TOP_IRQ_MASK */
+-	pc_wr(csid0, 0x1a8, 0x10000u);    /* BUF_DONE_IRQ_CLEAR: VC0 */
+-	pc_wr(csid0, 0x1a4, 0x10000u);    /* BUF_DONE_IRQ_MASK: VC0 */
+-	pc_wr(csid0, 0x110, 0x1u);        /* IRQ_CMD: clear */
+-	pc_wr(csid0, 0x108, 0x11u);       /* RST_CFG */
+-	pc_wr(csid0, 0x10c, 0x5u);        /* RST_CMD: HW_RST|IRQ_RST */
+-	for (unsigned i = 0; i < PC_POLL_STEPS; i++) {
+-		if (pc_rd(csid0, 0x180) & 0x1u) { rst_done = 1; break; }
+-		pc_sleep(1);
+-	}
++	uint32_t rdi_base = PC_RDI_CFG0(0);
++	unsigned rst_done = pc_csid_reset_once(csid0);
++
+ 	printf("PANDORA SLICEB: CSID reset rst_done=%u top_irq=%#x\n",
+ 	    rst_done, pc_rd(csid0, 0x180));
+ 	(void)pandora_log_sync();
+-	if (!rst_done)
++	if (!rst_done) {
++		/* Discriminator: the identical sequence ACKs on CSID0 in the proven
++		 * TPG runs (log-cam-p6diag-w41: rst_done=1 top_irq=0x1). If the
++		 * failure follows the instance, the sequence is right and the block
++		 * (power/CPAS routing) is the suspect; if every instance fails, the
++		 * environment (clocks/GDSC) is. */
++		static const struct { uint32_t pa; const char *name; } others[2] = {
++			{ 0x09263000u, "csid1" }, { 0x09253000u, "csid0" } };
++
++		for (unsigned i = 0; i < 2; i++) {
++			vm_offset_t b = ml_io_map_unmappable(others[i].pa, 0x5e80u,
++			    VM_WIMG_IO);
++
++			if (!b) {
++				printf("PANDORA SLICEB: %s map failed\n", others[i].name);
++				continue;
++			}
++			printf("PANDORA SLICEB: %s id=%#x rst_done=%u top_irq=%#x\n",
++			    others[i].name, pc_rd(b, 0x0), pc_csid_reset_once(b),
++			    pc_rd(b, 0x180u));
++		}
++		(void)pandora_log_sync();
+ 		return 0;
+-
+-	pc_wr(csid0, 0x880, rx_cfg0);     /* RX_CFG0: real csiphy input mux */
+-	pc_wr(csid0, 0x884, 0x1u);        /* RX_CFG1: ECC_CORRECTION_EN */
+-
+-	/* RDI0 latch probe across non-lite 0x5480 / lite 0x3080 (same race the
+-	 * proven TPG path documents); payload value is resolution independent. */
++	}
++
++	pc_wr(csid0, 0x880, rx_cfg0);     /* v86: keep bit24 CPHY; lane count lives in RX_CFG1 */
++	pc_wr(csid0, 0x884, 0x1u);       /* v87: v86 0x2A killed SOF/EOF; back to v84 baseline */
++
++	/* v58: Android overrides the CSID error policy. Its dmesg prints
++	 *   part_fatal_err_mask 0x27fff000, fatal_err_mask 0x00000000
++	 * so CPHY header/ECC errors are counted but never abort the path.
++	 * cam_ife_csid_980_irq_reg_set gives the register trio
++	 *   status 0x138, set 0x13c, mask 0x134
++	 * and the vendor override helper mutates exactly the 0x134/0x13c
++	 * software masks. The reset/default policy otherwise makes a single
++	 * CPHY header CRC fatal, which is consistent with rx=0x10007077 and
++	 * pkt=0 never advancing despite a locked PHY. Keep all policy bits
++	 * non-fatal and mask the RX error IRQ line; SOF/EOF are read from the
++	 * separate RDIN wrapper at 0x224. */
++	pc_wr(csid0, 0x134u, 0x00000000u);   /* fatal error mask: none */
++	pc_wr(csid0, 0x13cu, 0x27fff000u);   /* part-fatal: Android value */
++	pc_wr(csid0, 0x1b4u, 0xffffffffu);   /* RX error IRQ mask (poll only) */
++
++	/* CSID 1080: one canonical RDI0 aperture (CFG0 0x5480 / CTRL 0x5488).
++	 * The former 0x3080 "lite" probe is not a second instance on this
++	 * generation; it only delayed the arm by up to 50 ms. */
+ 	for (unsigned try = 0; try < 50; try++) {
+-		pc_wr(csid0, 0x5480, 0x002bf160u);
+-		if (pc_rd(csid0, 0x5480) == 0x002bf160u) {
+-			rdi_base = 0x5480u; rdi_lite = false; break;
+-		}
+-		pc_wr(csid0, 0x3080, 0x002bf160u);
+-		if (pc_rd(csid0, 0x3080) == 0x002bf160u) {
+-			rdi_base = 0x3080u; rdi_lite = true; break;
+-		}
++		pc_wr(csid0, PC_RDI_CFG0(0), 0x002bf160u);
++		if (pc_rd(csid0, PC_RDI_CFG0(0)) == 0x002bf160u)
++			break;
+ 		pc_sleep(1);
+ 	}
+-	pc_wr(csid0, rdi_base, 0x002bf160u);              /* RDI_CFG0: RAW10 VC0 */
+-	pc_wr(csid0, rdi_base + 0x14, 0x8000u);           /* RDI_CFG1: MIPI packing */
+-	if (!rdi_lite)
+-		pc_wr(csid0, 0x5498, 0x9u);               /* PIX_STORE (non-lite) */
+-	pc_wr(csid0, rdi_base + 0x8, 0x0u);               /* RDI_CTRL: 0 */
+-	pc_wr(csid0, rdi_base, pc_rd(csid0, rdi_base) | 0x80000000u); /* EN */
+-	for (unsigned i = 0; i < 2; i++) {
++	pc_wr(csid0, PC_RDI_CFG0(0), 0x002bf160u);           /* RAW10 VC0 */
++	/* v45: mainline camss-csid-gen3 writes PACKING_FORMAT_MIPI | PIX_STORE
++	 * and drop/crop enables. The proven TPG path tolerated 0x8000 alone,
++	 * but a real sensor needs PIX_STORE to commit payload; keep this run
++	 * single-variable: 0x8000 only (v82 result kept). */
++	pc_wr(csid0, PC_RDI_CFG1(0), 0x8000u);               /* PACKING_FORMAT_MIPI */
++	pc_wr(csid0, 0x5498, 0x9u);                          /* PIX_STORE: MIN_HBI|EN */
++	pc_wr(csid0, PC_RDI_CTRL(0), 0x0u);                  /* START_CMD: 0 = stop */
++	pc_wr(csid0, PC_RDI_CFG0(0),
++	    pc_rd(csid0, PC_RDI_CFG0(0)) | 0x80000000u);     /* CFG0 EN */
++	for (unsigned i = 0; i < 4; i++) {   /* v82: CSID1080 CAMSS_INIT_BUF_COUNT=4 AUP */
+ 		pc_wr(csid0, 0x118, 0x100u);   /* AUP_CMD: RDI0 */
+ 		pc_wr(csid0, 0x11c, 0x1u);     /* RUP_AUP_CMD: RUP_SET */
+ 	}
+ 	pc_wr(csid0, 0x114, 0x100u);       /* RUP_CMD: RDI0 */
+ 	pc_wr(csid0, 0x11c, 0x1u);         /* RUP_AUP_CMD: RUP_SET */
+-	pc_wr(csid0, rdi_base + 0x8, 0x1u);               /* RDI_CTRL: RESUME */
++	pc_wr(csid0, PC_RDI_CTRL(0), PC_RDI_CTRL_START);     /* START_CMD: 1 = start */
+ 	pc_sleep(2);
+-	printf("PANDORA SLICEB: RDI0 armed rx_cfg0=%#x cfg0=%#x ctrl=%#x base=%#x\n",
+-	    rx_cfg0, pc_rd(csid0, rdi_base), pc_rd(csid0, rdi_base + 0x8), rdi_base);
++	printf("PANDORA SLICEB: RDI0 armed rx_cfg0=%#x rb=%#x/%#x cfg0=%#x "
++	    "ctrl=%#x\n", rx_cfg0, pc_rd(csid0, 0x880u), pc_rd(csid0, 0x884u),
++	    pc_rd(csid0, PC_RDI_CFG0(0)), pc_rd(csid0, PC_RDI_CTRL(0)));
++	pc_rx_cfg0_report(csid0, "sliceb-arm");
++	pc_rdi_irq_report(csid0, "sliceb-arm");
+ 	(void)pandora_log_sync();
+-	return rdi_base;
+-}
+-
+-/* Watch the input-side frame boundary for iters ms. SOF/EOF live in the RDIN
+- * wrapper IRQ (@0x224) and do not need a capture buffer, so a positive result
+- * proves real MIPI data reached CSID without any VFE DMA. */
++	return PC_RDI_CFG0(0);
++}
++
++/* Poll the input-side state for iters ms. CSID 1080 completion evidence is
++ * BUF_DONE (VC0) only: VFE has no frame-done IRQ on this generation and
++ * SOF/EOF are input-side boundary events, not frame completion. BUF_DONE is
++ * cleared after every rising edge so the caller sees a count, not a level. */
+ static uint32_t
+ pc_sliceb_poll(vm_offset_t csid0, unsigned iters, uint32_t *rx_out,
+     uint32_t *buf_out)
+ {
+ 	uint32_t seen_rdi = 0, seen_rx = 0, seen_buf = 0;
++	unsigned frames = 0, last_vc0 = 0;
+ 
+ 	for (unsigned i = 0; i < iters; i++) {
++		uint32_t buf = pc_rd(csid0, 0x1a0);
++		unsigned vc0 = (buf & 0x10000u) ? 1u : 0u;
++
++		if (vc0) {
++			seen_buf |= buf;
++			if (!last_vc0) {
++				frames++;
++				pc_wr(csid0, 0x1a8, 0x10000u); /* clear VC0 */
++			}
++		}
++		last_vc0 = vc0;
+ 		seen_rdi |= pc_rd(csid0, PC_RDIN_IRQ(0));
+ 		seen_rx |= pc_rd(csid0, 0x1b0);
+-		seen_buf |= pc_rd(csid0, 0x1a0);
+ 		pc_sleep(1);
+ 	}
++	if (buf_out)
++		*buf_out = seen_buf;
+ 	if (rx_out)
+ 		*rx_out = seen_rx;
+-	if (buf_out)
+-		*buf_out = seen_buf;
++	printf("PANDORA SLICEB: poll frames=%u buf=%#x rdin=%#x rx=%#x rup=%u\n",
++	    frames, seen_buf, seen_rdi, seen_rx,
++	    (seen_rdi & PC_RDIN_RUP_DONE) ? 1u : 0u);
++	(void)pandora_log_sync();
+ 	return seen_rdi;
+ }
+ 
+ /* Diagnostic mode (pandora_csiphy=4): locate the dead stage when no SOF/EOF
+  * appears. Read-only probes inside already powered domains:
+- *   - BDISTMCLKCC MCLK branch: RCG CMD bit31 (root off) + CBCR bit31 (clk off)
++ *   - BDISTMCLKCC MCLK branch: RCG CMD bit31 (root status, hw-driven) +
++ *     CBCR bit0 (enable) / bit31 (CLK_OFF status)
+  *   - sensor 0x0100/0x0300/0x0301/0x0304/0x0305/0x3208 before the table, after
+  *     the table, and after stream-on (does the replay actually change it?)
+  *   - CSIPHY common CTRL/STATUS + lane0 state
+@@ -4513,7 +5079,6 @@
+ 	static const unsigned cand[] = { 12u, 17u, 20u, 23u, 26u, 29u, 32u };
+ 	vm_offset_t csid0;
+ 	uint32_t seen_rdi;
+-	int ret = 0;
+ 
+ 	pc_csiphy_mark("stest start: map sensor bus + CSID");
+ 	csid0 = ml_io_map_unmappable(PC_CSID0_PA, 0x5e80u, VM_WIMG_IO);
+@@ -4922,6 +5487,39 @@
+ 	(void)pandora_log_sync();
+ 	pc_sliceb_stream_on(0);
+ 	pc_csiphy_mark("ctest done (sensor left in standby)");
++}
++
++/* Read-only CSIPHY 2.4.0 observations, before stream-on and while streaming.
++ * Vendor csiphy_v2_4_0 places interrupt status at 0x1138, not 0x102c:
++ * 0x102c..0x1054 are interrupt configuration registers. Do not clear status
++ * here or change IRQ masks; this probe polls CSID and owns no PHY IRQ handler.
++ * Raw PHY bits are evidence for comparison, not proof of a valid CSI packet. */
++static void
++pc_sliceb_p4_phy_status(vm_offset_t phy4, const char *phase)
++{
++	uint32_t irq[PC_CSIPHY_V240_IRQ_COUNT];
++
++	for (unsigned n = 0; n < PC_CSIPHY_V240_IRQ_COUNT; n++)
++		irq[n] = pc_rd(phy4, PC_CSIPHY_V240_IRQ_STATUS(n));
++	printf("PANDORA SLICEB: p4test v240 %s lane_en=%#x irq_mask0=%#x "
++	    "refgen1184=%#x\n", phase,
++	    pc_rd(phy4, PC_CSIPHY_V240_LANE_EN), pc_rd(phy4, 0x102cu),
++	    pc_rd(phy4, 0x1184u));
++	printf("PANDORA SLICEB: p4test v240 %s reset1000=%#x "
++	    "common1084=%#x common108c=%#x\n", phase,
++	    pc_rd(phy4, 0x1000u), pc_rd(phy4, 0x1084u), pc_rd(phy4, 0x108cu));
++	printf("PANDORA SLICEB: p4test v240 %s irq 1138=%#x 113c=%#x "
++	    "1140=%#x 1144=%#x 1148=%#x 114c=%#x 1150=%#x 1154=%#x "
++	    "1158=%#x 115c=%#x 1160=%#x\n", phase,
++	    irq[0], irq[1], irq[2], irq[3], irq[4], irq[5], irq[6], irq[7],
++	    irq[8], irq[9], irq[10]);
++	/* status_regs_2_4_0: DPHY status0=0xc0; lane stride=0x400;
++	 * the primary DPHY clock lane has its own window at 0xe00. */
++	printf("PANDORA SLICEB: p4test v240 %s dphy_status0 "
++	    "00c0=%#x 04c0=%#x 08c0=%#x 0cc0=%#x 0ec0=%#x\n", phase,
++	    pc_rd(phy4, 0x00c0u), pc_rd(phy4, 0x04c0u),
++	    pc_rd(phy4, 0x08c0u), pc_rd(phy4, 0x0cc0u), pc_rd(phy4, 0x0ec0u));
++	(void)pandora_log_sync();
+ }
+ 
+ /* csiphy4 probe (pandora_csiphy=14). Android vendor logs (user opened the main
+@@ -5036,40 +5634,33 @@
+ 
+ 	settle = pc_csiphy_settle(PC_WIDE_LINK_FREQ, PC_CPHY_TIMER_RATE);
+ 	pc_csiphy_mark("p4test: csiphy4 reset + lanes_enable");
++	/* Vendor v2.4.0 keeps reset asserted during configuration and releases
++	 * a non-combo DPHY with 0x1000=2 after lane setup. Its table's third
++	 * field (0x14/0x0a) is a delay in microseconds, not a register mask. */
+ 	pc_wr(phy4, PC_CPHY_CTRL(0), 1u);
+-	pc_sleep(8);
+-	pc_wr(phy4, PC_CPHY_CTRL(0), 0u);
+-	pc_sleep(1);
+-	/* vendor csiphy_lane_en_reg_2_4_0: 0x1014 is the LANE ENABLE register,
+-	 * not a control register. mainline writes (1 << (lanes+1)) - 1, i.e.
+-	 * 0x1F for four data lanes plus the clock lane. We had been writing the
+-	 * x1e80100 ctrl5 value 0xD5 here, which enables the wrong lane bits. */
+-	pc_wr(phy4, PC_CPHY_CTRL(5), 0x1Fu);
++	delay(20);
++	pc_wr(phy4, 0x1084u, 0u);
++	pc_wr(phy4, 0x108cu, 0u);
++	delay(1);
++	pc_wr(phy4, PC_CSIPHY_V240_LANE_EN, PC_CSIPHY_V240_DPHY4_MASK);
+ 	pc_wr(phy4, PC_CPHY_CTRL(6), 1u);
+-	pc_wr(phy4, PC_CPHY_CTRL(7), 2u);
+-	pc_wr(phy4, PC_CPHY_CTRL(0), 0u);
+-	/* The lane table is per-lane, but the old loop wrote every entry to
+-	 * lane0's window four times and never programmed the clock lane at
+-	 * 0x0E00 - so the PHY had no clock-lane init at all, which matches the
+-	 * mute STATUS registers even with everything else "correct". */
+-	static const uint32_t pc_lane_off[4] = { 0x000u, 0x400u, 0x800u, 0xC00u };
+-	for (unsigned l = 0; l < 4u; l++) {
+-		for (unsigned i = 0; i < PC_CSIPHY_LANE_REGS_N; i++) {
+-			const struct pc_csiphy_lane_reg *r =
+-			    &pc_csiphy_lane_regs_x1e80100[i];
+-			if (r->type == 2 || r->addr >= 0x1000u)
+-				continue;
+-			uint32_t val = (r->type == 1) ? (settle & 0xffu) : r->val;
+-			pc_wr(phy4, pc_lane_off[l] + r->addr, val);
+-			if (r->delay_us)
+-				delay(r->delay_us);
+-		}
+-	}
+-	/* vendor csiphy_lane_en_reg_2_4_0: 0x1014 is the LANE ENABLE register,
+-	 * not a control register. mainline writes (1 << (lanes+1)) - 1, i.e.
+-	 * 0x1F for four data lanes plus the clock lane. We had been writing the
+-	 * x1e80100 ctrl5 value 0xD5 here, which enables the wrong lane bits. */
+-	pc_wr(phy4, PC_CPHY_CTRL(5), 0x1Fu);
++	pc_wr(phy4, PC_CPHY_CTRL(7), 0x7au);
++	/* This mainline table already contains PHY-relative addresses for all
++	 * four data lanes and the clock lane at 0xe00. Adding a lane stride to
++	 * the entire table rebases later lanes into the 0x1000 common block
++	 * (for example 0xc00 + 0x400 writes the PHY reset register). Apply it
++	 * once, excluding common entries which this v2.4.0 probe sets itself. */
++	for (unsigned i = 0; i < PC_CSIPHY_LANE_REGS_N; i++) {
++		const struct pc_csiphy_lane_reg *r =
++		    &pc_csiphy_lane_regs_x1e80100[i];
++		if (r->type == 2 || r->addr >= 0x1000u)
++			continue;
++		uint32_t val = (r->type == 1) ? (settle & 0xffu) : r->val;
++		pc_wr(phy4, r->addr, val);
++		if (r->delay_us)
++			delay(r->delay_us);
++	}
++	pc_wr(phy4, PC_CSIPHY_V240_LANE_EN, PC_CSIPHY_V240_DPHY4_MASK);
+ 	pc_wr(phy4, PC_CPHY_CTRL(6), 1u);
+ 	pc_wr(phy4, PC_CPHY_CTRL(7), 0x7Au);
+ 	printf("PANDORA SLICEB: p4test after lanes CTRL5=%#x CTRL6=%#x CTRL7=%#x"
+@@ -5077,24 +5668,23 @@
+ 	    pc_rd(phy4, PC_CPHY_CTRL(6)), pc_rd(phy4, PC_CPHY_CTRL(7)),
+ 	    pc_rd(phy4, 0x0014u), pc_rd(phy4, 0x001Cu));
+ 
+-	/* vendor cam_csiphy_2_4_0_hwreg.h csiphy_2ph_v2_4_0_clk_ln_reg[] */
+-	pc_wr(phy4, 0x0E00u + 0x0028u, 0x00u);
++	/* The vendor clock table's 0x28 row is typed SEC_CLK_LN_SETTINGS:
++	 * cam_csiphy_program_dphy_clk_lane substitutes CLK_EN_SEL for the
++	 * primary clock lane. Its literal reg_data=0 is not the written value. */
++	pc_wr(phy4, 0x0E00u + 0x0028u, PC_CSIPHY_V240_CLK_EN_SEL);
+ 	pc_wr(phy4, 0x0E00u + 0x0000u, 0x80u);
+ 	pc_wr(phy4, 0x0E00u + 0x000Cu, 0xFFu);
+ 	pc_wr(phy4, 0x0E00u + 0x0038u, 0x1Fu);
+-	printf("PANDORA SLICEB: p4test clk lane ctrl0=%#x ctrlC=%#x ctrl38=%#x "
++	printf("PANDORA SLICEB: p4test clk lane ctrl0=%#x ctrlC=%#x ctrl38=%#x ctrl28=%#x "
+ 	    "ln3_ctrl0=%#x\n", pc_rd(phy4, 0x0E00u),
+ 	    pc_rd(phy4, 0x0E00u + 0x0Cu), pc_rd(phy4, 0x0E00u + 0x38u),
++	    pc_rd(phy4, 0x0E00u + 0x28u),
+ 	    pc_rd(phy4, 0xC00u));
+-	printf("PANDORA SLICEB: p4test irq 102c=%#x 1030=%#x 1034=%#x 1038=%#x "
+-	    "103c=%#x 1040=%#x 1044=%#x 1048=%#x 104c=%#x 1050=%#x\n",
+-	    pc_rd(phy4, 0x102Cu), pc_rd(phy4, 0x1030u), pc_rd(phy4, 0x1034u),
+-	    pc_rd(phy4, 0x1038u), pc_rd(phy4, 0x103Cu), pc_rd(phy4, 0x1040u),
+-	    pc_rd(phy4, 0x1044u), pc_rd(phy4, 0x1048u), pc_rd(phy4, 0x104Cu),
+-	    pc_rd(phy4, 0x1050u));
+ 	(void)pandora_log_sync();
+ 	for (unsigned n = 11; n <= 21; n++)
+ 		pc_wr(phy4, PC_CPHY_CTRL(n), 0u);
++	pc_wr(phy4, PC_CPHY_CTRL(0), 2u);
++	delay(10);
+ 	printf("PANDORA SLICEB: p4test phy4 CTRL5=%#x CTRL6=%#x CTRL7=%#x STATUS0=%#x\n",
+ 	    pc_rd(phy4, PC_CPHY_CTRL(5)), pc_rd(phy4, PC_CPHY_CTRL(6)),
+ 	    pc_rd(phy4, PC_CPHY_CTRL(7)), pc_rd(phy4, PC_CPHY_STATUS(0)));
+@@ -5117,6 +5707,7 @@
+ 		(void)pandora_log_sync();
+ 	}
+ 	uint32_t base = pc_sliceb_arm(csid0, 0x00432103u);
++	pc_sliceb_p4_phy_status(phy4, "before-stream");
+ 	if (base) {
+ 		pc_sliceb_stream_on(1);
+ 		pc_sleep(30);
+@@ -5134,6 +5725,7 @@
+ 		}
+ 		seen_rdi = pc_sliceb_poll(csid0, 800, NULL, NULL);
+ 	}
++	pc_sliceb_p4_phy_status(phy4, "after-poll");
+ 	printf("PANDORA SLICEB: p4test RESULT rdi=%#x sof=%u eof=%u arm=%#x "
+ 	    "phy4_status0=%#x ctrl7=%#x\n", seen_rdi,
+ 	    (seen_rdi & PC_RDIN_INPUT_SOF) ? 1u : 0u,
+@@ -5354,6 +5946,1417 @@
+ 	pc_csiphy_mark("xtest done (sensor left in standby)");
+ }
+ 
++/* Vendor CSIPHY 2.4.0 3-phase tables, generated from
++ * cam_csiphy_2_4_0_hwreg.h: csiphy_3ph_v2_4_0_reg and
++ * datarate_240_2p6Gsps (the 2.667 Gsps trio rate of an 8 Gbps CPHY link).
++ * Generated table bytes are kept verbatim; type 1/2 substitute the computed
++ * settle count, type 3 is the CDR lane value written with sweep disabled. */
++struct pc_csiphy_3ph_reg { uint32_t addr; uint32_t val; unsigned delay_us; unsigned type; };
++static const struct pc_csiphy_3ph_reg pc_csiphy_3ph_base_regs[] = {
++	{ 0x0094, 0x01, 0, 0 },	/* v71: vendor 3PH SKEW_CAL value (was 0x0d) */
++	{ 0x00f4, 0x00, 0, 0 },
++	{ 0x00f8, 0x00, 0, 0 },
++	{ 0x00fc, 0x00, 0, 0 },
++	{ 0x00f0, 0xef, 211, 0 },
++	{ 0x0004, 0x00, 0, 0 },
++	{ 0x00e4, 0x00, 0, 0 },
++	{ 0x00e8, 0x7f, 0, 0 },
++	{ 0x00ec, 0x7f, 0, 0 },
++	{ 0x0018, 0x3e, 0, 0 },
++	{ 0x001c, 0x41, 0, 0 },
++	{ 0x0020, 0x41, 0, 0 },
++	{ 0x020C, 0x23, 0, 0 },	/* v84: Android lane settle_cnt=0x23 (35) */
++	{ 0x0024, 0x7f, 0, 0 },
++	{ 0x0028, 0x00, 0, 0 },
++	{ 0x002c, 0x00, 0, 0 },
++	{ 0x0064, 0x01, 0, 0 },
++	{ 0x0044, 0xb2, 0, 0 },
++	{ 0x0110, 0x35, 0, 0 },
++	{ 0x00bc, 0xd0, 0, 0 },
++	{ 0x0054, 0x00, 0, 0 },
++	{ 0x0040, 0x00, 0, 0 },
++	{ 0x0060, 0xa8, 0, 0 },
++	{ 0x0084, 0x00, 0, 0 },
++	{ 0x0090, 0x02, 0, 0 },
++};
++#define PC_CSIPHY_3PH_BASE_REGS_N 25
++/* v27: Android's actual 8 Gbps selection is the 3.5 Gsps band, not the
++ * 2.6 Gsps table used through v26. The vendor selector walks ascending
++ * bandwidth limits (3.3G = 7.524 Gbps, 3.5G = 7.98 Gbps), so 8 Gbps falls
++ * into 3.5G. Values below are from two independent, complete CSIPHY0 dumps
++ * of this device's qcom,csiphy-v2.4.0-1 variant. Only four AFE fields differ
++ * from 2.6G (0x6c/0x74/0x78/0x8c); settle remains the observed 35. */
++/* v57: exact vendor datarate_240_4p0Gsps_1, the high-rate table owned by the
++ * qcom,csiphy-v2.4.0-1 register set. This PHY is the -1 variant (DT says so,
++ * and the vendor module carries ctrl_reg_2_4_0_1 / data_rate_settings_2_4_0_1),
++ * but every probe through v56 used the plain 2_4_0 tables. The -1 high-rate
++ * row is 0x68=f1 0x6c=07 0x70=00 0x74=03 0x8c=38, i.e. the same analog front
++ * end as 3p5Gsps_2 but CDR 0x78=0x0c. 0x0c/0x08 are the settle low/high
++ * bytes; the observed Android settle count 35 is substituted into 0x0c. */
++static const struct pc_csiphy_3ph_reg pc_csiphy_3ph_3p5g_regs[] = {
++	{ 0x0068, 0xf1, 0, 0 },
++	{ 0x006c, 0x3d, 0, 0 },
++	{ 0x0070, 0x00, 0, 0 },
++	{ 0x0074, 0x03, 0, 0 },
++	{ 0x0078, 0x0f, 0, 0 },
++	{ 0x0088, 0x00, 0, 0 },
++	{ 0x008c, 0x30, 0, 0 },
++	{ 0x0090, 0x02, 0, 0 },
++	{ 0x000c, 0x1e, 0, 1 },
++	{ 0x0008, 0x00, 0, 2 },
++	{ 0x0010, 0x00, 0, 0 },
++	{ 0x0014, 0x00, 0, 0 },
++};
++#define PC_CSIPHY_3PH_3P5G_REGS_N 12
++
++/* v73: Android reports Datarate 8000000000 (8 Gbps -> 2.667 Gsps trio rate),
++ * not 3.5 Gsps. 2p6 table with the corrected 266.7 MHz cphy_rx clock; every
++ * previous 2.6G probe was at 400 MHz and never locked. */
++static const struct pc_csiphy_3ph_reg pc_csiphy_3ph_2p6g_regs[] = {
++	{ 0x0068, 0xf1, 0, 0 },
++	{ 0x006c, 0x1d, 0, 0 },
++	{ 0x0070, 0x00, 0, 0 },
++	{ 0x0074, 0x00, 0, 0 },
++	{ 0x0078, 0x1c, 0, 3 },
++	{ 0x0088, 0x00, 0, 0 },
++	{ 0x008c, 0x03, 0, 0 },
++	{ 0x0090, 0x02, 0, 0 },
++	{ 0x000c, 0x22, 0, 1 },
++	{ 0x0008, 0x00, 0, 2 },
++	{ 0x0010, 0x00, 0, 0 },
++	{ 0x0014, 0x00, 0, 0 },
++};
++#define PC_CSIPHY_3PH_2P6G_REGS_N 12
++/* v79: exact Android live AFE, decoded from cam_csiphy_io_dump (2048 regs)
++ * while Camera ID 5 streamed 4096x2304: lane0 0x268=f1, 0x26c=07, 0x274=03,
++ * 0x278=0c, 0x28c=38, 0x294=0d, 0x20c=23(settle35), 0x310=35. This is
++ * datarate_240_4p0Gsps_1, not 2p6/3p5_2: CDR 0x78=0x0c and 0x6c=0x07. */
++static const struct pc_csiphy_3ph_reg pc_csiphy_3ph_4p0g_regs[] = {
++	{ 0x0068, 0xf1, 0, 0 },
++	{ 0x006c, 0x07, 0, 0 },
++	{ 0x0070, 0x00, 0, 0 },
++	{ 0x0074, 0x03, 0, 0 },
++	{ 0x0078, 0x0c, 0, 3 },
++	{ 0x0088, 0x00, 0, 0 },
++	{ 0x008c, 0x38, 0, 0 },
++	{ 0x0090, 0x02, 0, 0 },
++	{ 0x000c, 0x1c, 0, 1 },
++	{ 0x0008, 0x00, 0, 2 },
++	{ 0x0010, 0x00, 0, 0 },
++	{ 0x0014, 0x00, 0, 0 },
++};
++#define PC_CSIPHY_3PH_4P0G_REGS_N 12
++
++/* CPHY probe (pandora_csiphy=18). The live Android camera HAL binds the wide
++ * sensor to CSIPHY0 as a THREE-LANE CPHY device, not to csiphy4/DPHY:
++ *   CAM_START_PHYDEV: 0, CSID:2, Type: CPHY, slot: 0, skew_en: 0,
++ *   Datarate: 8000000000, Settlecount: 35
++ *   lane_reg_addr 0x1014 lane_assign 0x210 lane_enable 0x2a
++ * and the CAMCC golden dump taken while that camera streamed shows
++ *   cam_cc_cphy_rx_clk_src CFG_RCGR=0x00100108 (266.67 MHz), CMD_RCGR=0x2
++ *   cam_cc_csiphy0_clk     CBCR=0x08000001 (running)
++ *   cam_cc_csid_clk_src    CFG_RCGR=0x00100105, cam_cc_csid_clk CBCR=0x1
++ *   cam_cc_csi4phytimer_*  root off (a D-PHY timer is not used by CPHY)
++ * w79..w83 configured csiphy4 as 4-lane D-PHY, which this sensor never uses.
++ * This probe applies the vendor 2.4.0 3-phase lane/datarate tables at the
++ * vendor CPHY lane offsets 0x0200/0x0600/0x0A00, enables the same clock state
++ * Android uses while streaming, and arms CSID2 with
++ * (phy 0 << 20) | (lane_assign 0x210 << 4) | (lane_cnt-1 = 2). */
++static void
++pc_sliceb_cphy_phy_status(vm_offset_t phy0, const char *phase)
++{
++	uint32_t t0 = pc_rd(phy0, 0x0358u), t1 = pc_rd(phy0, 0x0758u),
++	    t2 = pc_rd(phy0, 0x0B58u);
++
++	/* Vendor cam_csiphy_core.c reads each trio status masked with 0x1F and
++	 * treats 0 or 8 as the normal idle/locked value; anything else is worth
++	 * reporting. Raw values are printed so the mask is auditable. */
++	printf("PANDORA SLICEB: cphytest %s stat1138=%#x trio=%#x/%#x/%#x "
++	    "trio_low=%#x/%#x/%#x refgen=%#x irq=%#x/%#x\n", phase,
++	    pc_rd(phy0, 0x1138u), t0, t1, t2, t0 & 0x1Fu, t1 & 0x1Fu, t2 & 0x1Fu,
++	    pc_rd(phy0, 0x1184u), pc_rd(phy0, 0x1138u), pc_rd(phy0, 0x113cu));
++	/* v70: vendor cam_csiphy_common_status_reg_dump addresses this block at
++	 * PHY+0x1138, 20 words (0x1138..0x1184). Earlier probes read 0x0340 and
++	 * 0x0358/0x758/0xB58, which are not the common status block; Android's
++	 * live reference is STATUS0=0 STATUS1=4 STATUS3=0x80 STATUS6=0x10
++	 * STATUS11=0x2a STATUS19=0xd6. Print the whole block in one line so the
++	 * comparison is exact. */
++	{
++		uint32_t cs[20];
++
++		for (unsigned i = 0; i < 20; i++)
++			cs[i] = pc_rd(phy0, 0x1138u + i * 4u);
++		printf("PANDORA SLICEB: cphytest %s common1138="
++		    "%#x/%#x/%#x/%#x/%#x/%#x/%#x/%#x/%#x/%#x/"
++		    "%#x/%#x/%#x/%#x/%#x/%#x/%#x/%#x/%#x/%#x\n", phase,
++		    cs[0], cs[1], cs[2], cs[3], cs[4], cs[5], cs[6], cs[7],
++		    cs[8], cs[9], cs[10], cs[11], cs[12], cs[13], cs[14],
++		    cs[15], cs[16], cs[17], cs[18], cs[19]);
++	}
++	{
++		static const uint32_t lanes[3] = { 0x0200u, 0x0600u, 0x0A00u };
++		unsigned dead = 0;
++
++		for (unsigned i = 0; i < 3; i++) {
++			uint32_t a = pc_rd(phy0, lanes[i] + 0x178u);
++			uint32_t b = pc_rd(phy0, lanes[i] + 0x17cu);
++			uint32_t c = pc_rd(phy0, lanes[i] + 0x180u);
++
++			printf("PANDORA SLICEB: cphytest %s lane%u st14_16="
++			    "%#x/%#x/%#x\n", phase, i, a, b, c);
++			if (!a && !b && !c)
++				dead++;
++		}
++		/* v95: the 11-20 17:36 boot was the only full-replay boot whose
++		 * lane bank read back as nine zeros (ctrl0=0xe, refgen=0xd5 and
++		 * common1138 were normal) and which then showed rx=0x70000 with
++		 * rdin=0. Make that condition loud so the next boot can confirm
++		 * or refute it instead of inferring it from a log diff. */
++		/* v95: vendor `csiphy_3ph_v2_4_0_reg` starts with {lane+0x94 = 0x0d}
++		 * (the C-PHY lane mode word) and `csiphy_reset_exit_reg_2_4_0` says
++		 * {0x1000 = 0x02, delay 10}, while this driver writes 0x1000=0x0E and
++		 * never writes 0x94. Read both back so one boot can tell whether the
++		 * lane bank is dead because the lane mode word / reset state diverges
++		 * from vendor (cf. the 11-20 17:36 boot: nine lane reads all zero). */
++		printf("PANDORA SLICEB: v95 phy-state %s reset1000=%#x "
++		    "lane94=%#x/%#x/%#x\n", phase, pc_rd(phy0, 0x1000u),
++		    pc_rd(phy0, lanes[0] + 0x94u), pc_rd(phy0, lanes[1] + 0x94u),
++		    pc_rd(phy0, lanes[2] + 0x94u));
++		if (dead)
++			printf("PANDORA SLICEB: v95 lane-bank %s dead=%u/3\n",
++			    phase, dead);
++	}
++	(void)pandora_log_sync();
++}
++
++/* Infra bring-up shared with the TPG path. The TPG probe enables the titan-top
++ * GDSC, the six camera RCGs, CORE_AHB and the thirteen AHB/camnoc/vfe branches,
++ * and with that tree CSID0 acks reset (log-cam-p6diag-w41: rst_done=1
++ * top_irq=0x1). The w84 probe only ran csiphy0/csid_rx/csid, so CSID2's reset
++ * FSM sat behind unclocked CPAS/camnoc AHB and never raised INFO_RST_DONE.
++ * Reuse the proven tree instead of inventing a new one. */
++static void
++pc_sliceb_infra_up(const char *tag)
++{
++	static const uint32_t gdscs[4] = {
++		PC_GDSCR, PC_TFE0_GDSCR, PC_TFE1_GDSCR, PC_TFE2_GDSCR };
++	static const char *gdsc_names[4] = { "titan_top", "tfe_0", "tfe_1", "tfe_2" };
++	/* v12: complete the per-IFE trees. CSID0/1/2 share every csid clock (DT:
++	 * the three csid1080 nodes list the same csid_clk_src/csid/csiphy_rx
++	 * phandles; camcc-kaanapali.c has ONE csid RCG 0x212a4 and one csid
++	 * branch 0x212bc), yet the v11 discriminator showed CSID0 acking the
++	 * strobe while CSID1 and CSID2 never do. The per-instance resources left
++	 * are the paired TFE/IFE blocks: camcc-kaanapali.c gives each tfe_N its
++	 * own RCG parent PLL (tfe_0 0x21018<-PLL3 0x3000, tfe_1 0x21094<-PLL4
++	 * 0x4000, tfe_2 0x210f8<-PLL5 0x5000; identical TAYCAN_EKO_T program as
++	 * the proven PLL3 call), main (0x21030/0x210ac/0x21110) and
++	 * main_fast_ahb (0x2105c/0x210d8/0x2113c) branches. The TPG set only
++	 * completed ife0's tree (it never used ife1/2), and the v11 trial even
++	 * ran with the tfe_0 RCG update=TIMEOUT (PLL3 off) while CSID0 still
++	 * acked - so the lever completes all three trees instead of guessing
++	 * which instance needs them. camcc also lists cam_cc_camnoc_xo_clk
++	 * (0x2130c, XO parent) as the one camnoc clock the TPG set omits
++	 * (CAMERA_W84 22.7 lever 2, whose precondition "infra up, reset still
++	 * failing" is now met). */
++	static const struct pc_tpg_rcg v12_rcgs[] = {
++		{ 0x21094u, 6u, 1u, "tfe_1" },  /* PLL4_EVEN/1 = 360.28 MHz */
++		{ 0x210f8u, 6u, 1u, "tfe_2" }   /* PLL5_EVEN/1 = 360.28 MHz */
++	};
++	static const uint32_t v12_branches[] = {
++		0x210acu, 0x21110u,             /* tfe_1/2_main */
++		0x210d8u, 0x2113cu,             /* tfe_1/2_main_fast_ahb */
++		0x21124u, 0x21140u,             /* tfe_2_bayer / bayer_fast_ahb */
++		0x2130cu                        /* camnoc_xo */
++	};
++
++	for (unsigned i = 0; i < 4; i++)
++		(void)pc_tpg_gdsc_up(gdscs[i], gdsc_names[i]);
++	(void)pc_tpg_pll_enable(0x3000u, 0x00480025u, 0x8777u, 0x40fu, "pll3");
++	(void)pc_tpg_pll_enable(0x4000u, 0x00480025u, 0x8777u, 0x40fu, "pll4");
++	(void)pc_tpg_pll_enable(0x5000u, 0x00480025u, 0x8777u, 0x40fu, "pll5");
++	for (unsigned i = 0; i < PC_TPG_NRCG; i++)
++		(void)pc_tpg_rcg_set(&pc_tpg_rcgs[i]);
++	for (unsigned i = 0; i < sizeof(v12_rcgs) / sizeof(v12_rcgs[0]); i++)
++		(void)pc_tpg_rcg_set(&v12_rcgs[i]);
++	pc_wr(pc_camcc, PC_CORE_AHB_CBCR,
++	    pc_rd(pc_camcc, PC_CORE_AHB_CBCR) | PC_CBCR_ENABLE);
++	pc_sleep(1);
++	for (unsigned i = 0; i < PC_TPG_NBRANCH; i++)
++		pc_wr(pc_camcc, pc_tpg_branches[i],
++		    pc_rd(pc_camcc, pc_tpg_branches[i]) | PC_CBCR_ENABLE);
++	pc_sleep(2);
++	for (unsigned i = 0; i < sizeof(v12_branches) / sizeof(v12_branches[0]); i++) {
++		pc_wr(pc_camcc, v12_branches[i],
++		    pc_rd(pc_camcc, v12_branches[i]) | PC_CBCR_ENABLE);
++		(void)pc_wait_branch_on(tag, v12_branches[i]);
++	}
++	printf("PANDORA SLICEB: %s infra core_ahb=%#x cpas_ahb=%#x fast_ahb=%#x "
++	    "rt=%#x nrt=%#x qdss=%#x tfe0main=%#x tfe1main=%#x tfe2main=%#x "
++	    "tfe2bayer=%#x tfe2bayer_fast=%#x camnoc_xo=%#x\n", tag,
++	    pc_rd(pc_camcc, PC_CORE_AHB_CBCR), pc_rd(pc_camcc, 0x2137cu),
++	    pc_rd(pc_camcc, 0x2136cu), pc_rd(pc_camcc, 0x212e4u),
++	    pc_rd(pc_camcc, 0x212f8u), pc_rd(pc_camcc, 0x21330u),
++	    pc_rd(pc_camcc, 0x21030u), pc_rd(pc_camcc, 0x210acu),
++	    pc_rd(pc_camcc, 0x21110u), pc_rd(pc_camcc, 0x21124u),
++	    pc_rd(pc_camcc, 0x21140u), pc_rd(pc_camcc, 0x2130cu));
++	(void)pandora_log_sync();
++}
++
++/* v37: Android sets CAM_START_PHYDEV ~54 ms before the sensor starts
++ * streaming; our probe arms CSIPHY0 ~6 s before the replay tail writes
++ * 0x0100=1. Re-run the exact vendor 2.4.0 3-phase programming block AFTER
++ * the replay, while the sensor is already streaming, to test whether the
++ * PHY's lane/CDR state decays or latches off during that idle gap. The
++ * sequence and values are identical to the one at cphytest start; only the
++ * timing relative to sensor stream-on changes. */
++static void
++pc_csiphy0_rearm(vm_offset_t phy0, unsigned settle)
++{
++	static const uint32_t lanes[3] = { 0x0200u, 0x0600u, 0x0A00u };
++	static const struct { uint32_t addr; uint32_t val; } irq[11] = {
++		{ 0x102Cu, 0xffu }, { 0x1030u, 0xffu }, { 0x1034u, 0xfbu },
++		{ 0x1038u, 0xffu }, { 0x103Cu, 0x7fu }, { 0x1040u, 0xffu },
++		{ 0x1044u, 0xffu }, { 0x1048u, 0xefu }, { 0x104Cu, 0xffu },
++		{ 0x1050u, 0xffu }, { 0x1054u, 0xffu },
++	};
++
++	pc_wr(phy0, 0x1000u, 0x01u);
++	delay(20);
++	{
++		uint32_t refgen = 0;
++		unsigned waited = 0;
++
++		for (; waited < 100u; waited++) {
++			refgen = pc_rd(phy0, 0x1184u);
++			if (refgen & 0x80u)
++				break;
++			pc_sleep(1);
++		}
++		printf("PANDORA SLICEB: v37 rearm refgen=%#x ready=%u wait_ms=%u\n",
++		    refgen, (refgen & 0x80u) ? 1u : 0u, waited);
++		(void)pandora_log_sync();
++	}
++	pc_wr(phy0, 0x1084u, 0x00u);
++	pc_wr(phy0, 0x108Cu, 0x0Eu);
++	pc_wr(phy0, 0x101Cu, 0x7Au);
++	pc_wr(phy0, 0x1018u, 0x01u);
++	/* v51: vendor update_lane_selection writes lane_enable_mask | readl(0x1014).
++	 * Android's live value is 0x2a. v49's 0x23a was wrong: 0x1014 does not carry
++	 * lane_assign (that is CSID RX_CFG0's 0x210), and bit9 filtered. */
++	pc_wr(phy0, PC_CSIPHY_V240_LANE_EN, 0x2Au);	/* v61: 0x2A lost lock */
++	for (unsigned l = 0; l < 3; l++) {
++		uint32_t off = lanes[l];
++
++		for (unsigned i = 0; i < PC_CSIPHY_3PH_BASE_REGS_N; i++) {
++			const struct pc_csiphy_3ph_reg *r = &pc_csiphy_3ph_base_regs[i];
++
++			pc_wr(phy0, off + r->addr, r->val);
++			if (r->delay_us)
++				delay(r->delay_us);
++		}
++		for (unsigned i = 0; i < PC_CSIPHY_3PH_4P0G_REGS_N; i++) {
++			const struct pc_csiphy_3ph_reg *r = &pc_csiphy_3ph_4p0g_regs[i];
++			uint32_t val = r->val;
++
++			if (r->type == 1u)
++				val = settle & 0xffu;
++			else if (r->type == 2u)
++				val = (settle >> 8) & 0xffu;
++			pc_wr(phy0, off + r->addr, val);
++			if (r->delay_us)
++				delay(r->delay_us);
++		}
++	}
++	pc_wr(phy0, PC_CSIPHY_V240_LANE_EN, 0x2Au);	/* v61: 0x2A lost lock */
++	for (unsigned pass = 0; pass < 2; pass++) {
++		for (unsigned k = 0; k < 11; k++) {
++			pc_wr(phy0, irq[k].addr, irq[k].val);
++			if (k == 10)
++				delay(100);
++		}
++	}
++	pc_wr(phy0, 0x1000u, 0x0Eu);
++	delay(10);
++	printf("PANDORA SLICEB: v37 rearm done ctrl0=%#x lane_en=%#x "
++	    "refgen=%#x\n", pc_rd(phy0, 0x1000u),
++	    pc_rd(phy0, PC_CSIPHY_V240_LANE_EN), pc_rd(phy0, 0x1184u));
++	(void)pandora_log_sync();
++}
++
++/* v45: the WM block is 0x1500 + 0x100*index on tfe1080, but the vendor
++ * rdi_hw_info table maps RDI0 to WM bit 12/13 (blocks 0x2100/0x2200), not
++ * mainline's 0x17 (0x2c00). Parameterize the block so one boot can sweep the
++ * three candidates and use frame bytes, not CSID BUF_DONE, as the oracle. */
++static void
++pc_sliceb_vfe2_arm_at(vm_offset_t vfe2, uint32_t wm)
++{
++	uint32_t stride = 4096u * 10u / 8u;               /* 5120 */
++	uint32_t incr = (stride * 2304u) >> 8;            /* 46080 */
++
++	pc_wr(vfe2, 0x1008u, 0x7ffffffu);  /* WM_CGC_OVERRIDE */
++	pc_wr(vfe2, 0x1128u, 0x0u);        /* WM_TEST_BUS_CTRL */
++	pc_wr(vfe2, wm + 0x08u, incr);     /* WM_FRAME_INCR */
++	pc_wr(vfe2, wm + 0x0cu, 0xffffu);  /* WM_IMAGE_CFG_0 */
++	pc_wr(vfe2, wm + 0x14u, 0xffffu);  /* WM_IMAGE_CFG_2 */
++	pc_wr(vfe2, wm + 0x18u, 0x0u);     /* WM_PACKER_CFG */
++	pc_wr(vfe2, wm + 0x30u, 0x0u);     /* IRQ_SUBSAMPLE_PERIOD */
++	pc_wr(vfe2, wm + 0x34u, 0x1u);     /* IRQ_SUBSAMPLE_PATTERN */
++	pc_wr(vfe2, wm + 0x38u, 0x0u);     /* FRAMEDROP_PERIOD */
++	pc_wr(vfe2, wm + 0x3cu, 0x1u);     /* FRAMEDROP_PATTERN */
++	pc_wr(vfe2, wm + 0x60u, 0x1u);     /* MMU_PREFETCH_CFG */
++	pc_wr(vfe2, wm + 0x64u, 0xffffffffu); /* MMU_PREFETCH_MAX_OFFSET */
++	pc_wr(vfe2, wm + 0x04u, (uint32_t)(PC_CAM_IOVA >> 8)); /* IMAGE_ADDR */
++	pc_wr(vfe2, wm + 0x00u, 0x10001u); /* WM_CFG: EN | MODE */
++	printf("PANDORA SLICEB: v45 VFE2 WM off=%#x cfg=%#x addr=%#x incr=%#x\n",
++	    wm, pc_rd(vfe2, wm), pc_rd(vfe2, wm + 0x04u),
++	    pc_rd(vfe2, wm + 0x08u));
++	(void)pandora_log_sync();
++}
++
++static void
++pc_sliceb_vfe2_arm(vm_offset_t vfe2)
++{
++	pc_sliceb_vfe2_arm_at(vfe2, 0x2c00u);
++}
++
++static void
++pc_sliceb_cphytest(void)
++{
++	static const uint32_t lane_off[] = { 0x0200u, 0x0600u, 0x0A00u };	/* v75: vendor/Android natural order */
++	static const uint32_t rcgs[2][2] = {
++		{ 0x21064u, 0x00100108u },	/* cphy_rx_clk_src 266.67 MHz */
++		{ 0x212a4u, 0x00100105u },	/* csid_clk_src 400 MHz */
++	};
++	vm_offset_t phy0, csid2, vfe2;
++	uint32_t seen_rdi = 0, base = 0, seen_buf = 0;
++	unsigned settle = 35u;	/* Android CAM_START_PHYDEV Settlecount */
++	int ret = 0;
++
++	pc_csiphy_mark("cphytest start: csiphy0 CPHY 3-lane -> CSID2");
++	phy0 = ml_io_map_unmappable(PC_CSIPHY0_PA, 0x2000u, VM_WIMG_IO);
++	csid2 = ml_io_map_unmappable(PC_CSID2_PA, 0x5e80u, VM_WIMG_IO);
++	vfe2 = ml_io_map_unmappable(PC_VFE2_PA, 0x4000u, VM_WIMG_IO);
++	pc_bdistm = ml_io_map_unmappable(PC_BDISTM_PA, 0x6000u, VM_WIMG_IO);
++	pc_tlmm = ml_io_map_unmappable(PC_TLMM_PA, 0xb0000u, VM_WIMG_IO);
++	pc_cci[0] = ml_io_map_unmappable(PC_CCI_PA(0), 0x1000u, VM_WIMG_IO);
++	if (!phy0 || !csid2 || !vfe2 || !pc_bdistm || !pc_tlmm || !pc_cci[0] ||
++	    !pc_camcc) {
++		printf("PANDORA SLICEB: cphytest map failed phy0=%#llx csid2=%#llx "
++		    "vfe2=%#llx\n", (unsigned long long)phy0,
++		    (unsigned long long)csid2, (unsigned long long)vfe2);
++		(void)pandora_log_sync();
++		return;
++	}
++	pc_csiphy0_va = phy0;
++
++	/* The slice-A clock bring-up enables PLL0 and reads MODE=0x20000105 at
++	 * 4.216 s; the same register only reads 0xe0000005 (LOCK_DET) about 97 ms
++	 * later. The v5 probe programmed the RCGs and branch enables inside that
++	 * lock window, so every CBCR still reported halted and CSID2's reset never
++	 * completed. Wait for LOCK_DET before touching any clock switch. */
++	{
++		uint32_t mode = 0;
++		unsigned waited = 0;
++
++		for (; waited < 300u; waited++) {
++			mode = pc_rd(pc_camcc, 0x00u);
++			if (mode & 0x80000000u)
++				break;
++			pc_sleep(1);
++		}
++		printf("PANDORA SLICEB: cphytest pll0 mode=%#x locked=%u wait_ms=%u\n",
++		    mode, (mode & 0x80000000u) ? 1u : 0u, waited);
++		(void)pandora_log_sync();
++	}
++
++	/* Clock/power tree the TPG path proved against CSID0. Without the CPAS and
++	 * camnoc AHB clocks the CSID register file answers reads (AHB decode) but
++	 * its reset FSM never runs, which is exactly the w84 CSID2 symptom
++	 * (id readable, RST_CFG latched, INFO_RST_DONE never set). */
++	pc_sliceb_infra_up("cphytest");
++
++	/* v12 read-only instance map. The three CSID register files answer reads
++	 * (equal HW_VERSION), so print the per-instance resources no earlier
++	 * probe looked at: the head of each paired IFE window (the DT resolves
++	 * every CSID's rt-wrapper-base to 0x151000, i.e. inside ife0's window,
++	 * while ife1/ife2 have their own windows at 0x9171000/0x9191000), the
++	 * two CAMNOC windows and the CPAS top page (CPAS reg-names
++	 * cam_camnoc_rt/nrt/cam_cpas_top). Each IFE window read is gated on its
++	 * main branch having cleared halt: a read into a still-powered-off block
++	 * is a Synchronous External Abort (the TPG learned this on VFE0). */
++	{
++		static const struct { uint32_t pa; const char *name; } map[6] = {
++			{ 0x9151000u, "ife0" }, { 0x9171000u, "ife1" },
++			{ 0x9191000u, "ife2" }, { 0x9405000u, "camnoc_rt" },
++			{ 0x9117000u, "camnoc_nrt" }, { 0x900b000u, "cpas_top" }
++		};
++		static const uint32_t gate[3] = { 0x21030u, 0x210acu, 0x21110u };
++
++		for (unsigned i = 0; i < 6; i++) {
++			vm_offset_t b = ml_io_map_unmappable(map[i].pa, 0x100u, VM_WIMG_IO);
++
++			if (!b) {
++				printf("PANDORA SLICEB: %s map failed\n", map[i].name);
++				continue;
++			}
++			if (i < 3 && (pc_rd(pc_camcc, gate[i]) & 0x80000000u)) {
++				printf("PANDORA SLICEB: %s @%#x SKIPPED (main branch halted "
++				    "cbcr=%#x)\n", map[i].name, map[i].pa,
++				    pc_rd(pc_camcc, gate[i]));
++				continue;
++			}
++			printf("PANDORA SLICEB: %s @%#x = %#x %#x %#x\n", map[i].name,
++			    map[i].pa, pc_rd(b, 0x0), pc_rd(b, 0x4), pc_rd(b, 0x8));
++		}
++		(void)pandora_log_sync();
++	}
++
++	/* The PHY's 0.9 V analog rail is a camera-gated RPMh regulator.
++	 * DT `qcom,csiphy0@9523000`: csi-vdd-0p9-supply -> phandle 0x383 ->
++	 * /soc/rsc@18900000/drv@2/rpmh-regulator-l3i-e0 (regulator-name
++	 * pmh0110_i_l3, 880000-920000 uV, 151 mA), csi-vdd-1p2-supply ->
++	 * phandle 0x40 -> rpmh-regulator-l1d-e0 (pmh0110_d_l1, 1.2 V, already
++	 * enabled). The Android regulator class shows i_l3 DISABLED while the
++	 * camera is closed, and neither w79..w83 nor this probe's clock path
++	 * votes it. Without it the PHY keeps its register file readable over
++	 * AHB but cannot bring the lanes up. Vote it before touching the PHY. */
++	/* No PMIC rail writes here. Static review (see CAMERA_W84 §20) shows
++	 * pmh0110_i_l3 is a dynamic-domain rail whose TCS payloads are packed and
++	 * change every second; an earlier session was stopped from writing it.
++	 * Trials without this vote kept SpringBoard at 1 exec; every trial that
++	 * voted it re-exec'd SpringBoard ~20 times. The PHY's 0.9 V domain must be
++	 * handled by the proper domain vote, not a raw LDO write. */
++	/* Clock state copied from the streaming golden dump. The PLL0 is not
++	 * touched: L_VAL lives at 0x10 (0x0044003e) and USER_CTL at 0x18
++	 * (0x840f); w80 wrote 0x8608 into 0x10, which is not a clock control. */
++	for (unsigned i = 0; i < 2; i++) {
++		uint32_t cmd = pc_rd(pc_camcc, rcgs[i][0]);
++		pc_wr(pc_camcc, rcgs[i][0] + 4u, rcgs[i][1]);
++		pc_wr(pc_camcc, rcgs[i][0], (cmd & ~0x80000000u) | 0x3u);
++		for (unsigned k = 0; k < 50; k++) {
++			if (!(pc_rd(pc_camcc, rcgs[i][0]) & 0x1u))
++				break;
++			pc_sleep(1);
++		}
++		printf("PANDORA SLICEB: cphytest rcg%#x cmd=%#x cfg=%#x\n", rcgs[i][0],
++		    pc_rd(pc_camcc, rcgs[i][0]), pc_rd(pc_camcc, rcgs[i][0] + 4u));
++	}
++	pc_wr(pc_camcc, PC_CSIPHY0_CLK_CBCR,
++	    pc_rd(pc_camcc, PC_CSIPHY0_CLK_CBCR) | PC_CBCR_ENABLE);
++	/* cam_cc_csid_csiphy_rx_clk is the CSID-side gate of cphy_rx_clk_src and
++	 * appears in the CSID2 DT clock list ("csiphy_rx_clk"). Mainline
++	 * camcc-sm8750 registers it at 0x10020; every Canoe offset is that value
++	 * +0x10000 (camcc-canoe.ko contains no 0x1xxxx register constants), so
++	 * the Canoe register is 0x20020. Without it the CSID's PHY interface is
++	 * not clocked even though csid_clk itself is running. */
++	pc_wr(pc_camcc, 0x20020u, pc_rd(pc_camcc, 0x20020u) | PC_CBCR_ENABLE);
++	pc_wr(pc_camcc, 0x212bcu,
++	    pc_rd(pc_camcc, 0x212bcu) | PC_CBCR_ENABLE);
++	(void)pc_wait_branch_on("csiphy0", PC_CSIPHY0_CLK_CBCR);
++	(void)pc_wait_branch_on("csid_csiphy_rx", 0x20020u);
++	(void)pc_wait_branch_on("csid", 0x212bcu);
++	printf("PANDORA SLICEB: cphytest clocks csiphy0=%#x csid_rx=%#x csid=%#x "
++	    "core_ahb=%#x\n", pc_rd(pc_camcc, PC_CSIPHY0_CLK_CBCR),
++	    pc_rd(pc_camcc, 0x20020u), pc_rd(pc_camcc, 0x212bcu),
++	    pc_rd(pc_camcc, PC_CORE_AHB_CBCR));
++	/* Bounded confirmation that the halt bit actually cleared; a halted
++	 * branch means CSID's reset will never acknowledge (v5 result). */
++	for (unsigned k = 0; k < 3; k++) {
++		uint32_t off = (k == 0) ? PC_CSIPHY0_CLK_CBCR :
++		    ((k == 1) ? 0x20020u : 0x212bcu);
++		unsigned ms = 0;
++
++		for (; ms < 100u; ms++) {
++			if (!(pc_rd(pc_camcc, off) & 0x80000000u))
++				break;
++			pc_sleep(1);
++		}
++		printf("PANDORA SLICEB: cphytest branch%#x halt_clear_ms=%u cbcr=%#x\n",
++		    off, ms, pc_rd(pc_camcc, off));
++	}
++	(void)pandora_log_sync();
++
++	/* Stage 19: clocks only. No PHY, no sensor power, no CSID. */
++	if (pc_csiphy == 19u) {
++		printf("PANDORA SLICEB: cphytest stage19 done (clocks only)\n");
++		(void)pandora_log_sync();
++		return;
++	}
++
++	/* Vendor 2.4.0 order: reset asserted, common registers, per-lane 3-phase
++	 * table then the data-rate table at the same lane offset, lane enable,
++	 * and a 3-phase reset release writing 0x0E (not the D-PHY 0x02). */
++	pc_wr(phy0, 0x1000u, 0x01u);
++	delay(20);
++	/* Vendor start path polls the refgen status (0x1184, bit 7) after
++	 * enable_hw and before program_common_registers; configuring a PHY whose
++	 * reference generator is not up would silently lose the lane writes. */
++	{
++		uint32_t refgen = 0;
++		unsigned waited = 0;
++
++		for (; waited < 100u; waited++) {
++			refgen = pc_rd(phy0, 0x1184u);
++			if (refgen & 0x80u)
++				break;
++			pc_sleep(1);
++		}
++		printf("PANDORA SLICEB: cphytest refgen=%#x ready=%u wait_ms=%u\n",
++		    refgen, (refgen & 0x80u) ? 1u : 0u, waited);
++		(void)pandora_log_sync();
++	}
++	pc_wr(phy0, 0x1084u, 0x00u);
++	pc_wr(phy0, 0x108Cu, 0x0Eu);
++	pc_wr(phy0, 0x101Cu, 0x7Au);
++	pc_wr(phy0, 0x1018u, 0x01u);
++	pc_wr(phy0, PC_CSIPHY_V240_LANE_EN, 0x2Au);	/* v70: v65 lane enable */
++	for (unsigned l = 0; l < 3; l++) {
++		uint32_t off = lane_off[l];
++		for (unsigned i = 0; i < PC_CSIPHY_3PH_BASE_REGS_N; i++) {
++			const struct pc_csiphy_3ph_reg *r = &pc_csiphy_3ph_base_regs[i];
++			pc_wr(phy0, off + r->addr, r->val);
++			if (r->delay_us)
++				delay(r->delay_us);
++		}
++		for (unsigned i = 0; i < PC_CSIPHY_3PH_4P0G_REGS_N; i++) {
++			const struct pc_csiphy_3ph_reg *r = &pc_csiphy_3ph_4p0g_regs[i];
++			uint32_t val = r->val;
++			if (r->type == 1u)
++				val = settle & 0xffu;
++			else if (r->type == 2u)
++				val = (settle >> 8) & 0xffu;
++			pc_wr(phy0, off + r->addr, val);
++			if (r->delay_us)
++				delay(r->delay_us);
++		}
++	}
++	pc_wr(phy0, PC_CSIPHY_V240_LANE_EN, 0x2Au);	/* v70: v65 lane enable */
++	/* v27: do NOT run Force AON EQ here. Two complete Android dumps contain
++	 * zero AON Offset/Val write records and retain the base-table values
++	 * (lane+0x94 = 0x0d, +0x90 = 0x02). v26's forced sequence changed these
++	 * to 0x07/0x0f and was the only source of the artificial 0x13 trio state. */
++	/* v25: vendor csiphy_irq_reg_2_4_0 - cam_csiphy_cphy_irq_config() writes
++	 * these eleven 0x102C..0x1054 registers TWICE before the reset release
++	 * (the whole set read 0xff/0xfb/0x7f/0xef, i.e. IRQ sources ENABLED).
++	 * Slice A masked this exact window to 0 (CTRL11..21=0) and never
++	 * unmasked it; the C-PHY BIST status registers (lane+0x144) and the lane
++	 * event paths live in this domain, which explains the BIST=0 readings. */
++	{
++		static const struct { uint32_t addr; uint32_t val; } irq[11] = {
++			{ 0x102Cu, 0xffu }, { 0x1030u, 0xffu }, { 0x1034u, 0xfbu },
++			{ 0x1038u, 0xffu }, { 0x103Cu, 0x7fu }, { 0x1040u, 0xffu },
++			{ 0x1044u, 0xffu }, { 0x1048u, 0xefu }, { 0x104Cu, 0xffu },
++			{ 0x1050u, 0xffu }, { 0x1054u, 0xffu },
++		};
++		for (unsigned pass = 0; pass < 2; pass++) {
++			for (unsigned k = 0; k < 11; k++) {
++				pc_wr(phy0, irq[k].addr, irq[k].val);
++				if (k == 10)
++					delay(100);	/* vendor: 0x64 us on the last entry */
++			}
++		}
++		printf("PANDORA SLICEB: cphytest v25 irq window enabled "
++		    "(0x102C..0x1054 x2 passes)\n");
++		(void)pandora_log_sync();
++	}
++	pc_wr(phy0, 0x1000u, 0x0Eu);
++delay(10);
++	printf("PANDORA SLICEB: cphytest phy ctrl0=%#x lane_en=%#x ctrl6=%#x "
++	    "ctrl7=%#x common108c=%#x\n", pc_rd(phy0, 0x1000u),
++	    pc_rd(phy0, PC_CSIPHY_V240_LANE_EN), pc_rd(phy0, 0x1018u),
++	    pc_rd(phy0, 0x101Cu), pc_rd(phy0, 0x108Cu));
++	pc_sliceb_cphy_phy_status(phy0, "before-stream");
++
++	/* v16: Android order. The sensor's streaming state is volatile across a
++	 * stream-off/on cycle (v13/v14: the whole register block reverts to the
++	 * standby defaults) AND a second table replay cannot restore it (v15:
++	 * ~6944 acked writes still left the standby values - the sensor accepts
++	 * CCI configuration once per power-up). Android streams exactly ONCE per
++	 * CAM_START, so the probe must too: arm the CSID FIRST (sensor-independent:
++	 * v11/v12 showed CSID0/CSID2 resets ack with no sensor work at all), then
++	 * power the sensors up, perform the v30 probe-cycle experiment, and replay
++	 * the table once; its tail turns the stream on for the one sample window. */
++	/* v39: v38 proved the C-PHY type bit was required but also showed the
++	 * working input is PHY_NUM_SEL=1, not 0: the primary cphy0 arm stayed
++	 * silent while the v24 fallback "cphy1/0x210" produced
++	 * rdi=0x4851010, sof=1, rx_irq=0x10007077 on real sensor data.
++	 * Adopt 0x01102102 = PHY_NUM_SEL 1 + PHY_TYPE_SEL 1 (C-PHY). */
++	base = pc_sliceb_arm(csid2, 0x01102102u);
++	pc_rx_cfg0_report(csid2, "cphytest post-arm");
++	pc_rdi_irq_report(csid2, "cphytest post-arm");
++	/* v42: arm the paired VFE2 WM before the sensor table reaches its
++	 * stream-on tail, so the RDI address is committed before the first
++	 * frame. Prefill lets the readback distinguish DMA from stale bytes. */
++	if (base && pc_frame_va) {
++		volatile uint32_t *fb = (volatile uint32_t *)pc_frame_va;
++
++		for (unsigned i = 0; i < PC_CAM_FRAME_BYTES / 4; i++)
++			fb[i] = 0xa5a5a5a5u;
++		clean_dcache64(pc_frame_pa, PC_CAM_FRAME_BYTES, TRUE);
++		pc_sliceb_vfe2_arm(vfe2);
++		pc_wr(csid2, 0x114u, 0x100u); /* RUP_CMD: RDI0 register update */
++		pc_wr(csid2, 0x118u, 0x100u); /* AUP_CMD: RDI0 address update */
++		pc_wr(csid2, 0x11cu, 0x1u);   /* RUP_AUP_CMD: trigger both */
++	} else {
++		printf("PANDORA SLICEB: v42 VFE2 skipped base=%#x frame_va=%#llx\n",
++		    base, (unsigned long long)pc_frame_va);
++		(void)pandora_log_sync();
++	}
++	/* Liveness probe: a silent 0x180 with 0x0 here means the block is not
++	 * clocked/powered, which is what v6 showed. */
++	printf("PANDORA SLICEB: cphytest csid2 id=%#x rst_cfg=%#x top_irq=%#x\n",
++	    pc_rd(csid2, 0x0u), pc_rd(csid2, 0x108u), pc_rd(csid2, 0x180u));
++	(void)pandora_log_sync();
++	pc_sliceb_cphy_phy_status(phy0, "after-arm");
++	if (base) {
++		if (!pc_sensor_power_up()) {
++			int cleanup = pc_sensor_power_down_probe_pair();
++			printf("PANDORA SLICEB: v30 initial sensor bring-up failed; "
++			    "cleanup=%d; abort\n", cleanup);
++			(void)pandora_log_sync();
++			return;
++		}
++		pc_sleep(20);
++		/* v30: the vendor probe trace shows a real power cycle. This bring-up
++		 * also powers tele, so the paired helper shuts down both sensor paths;
++		 * levels that additionally power front/ultra skip this experiment. */
++		if (pc_level >= 3u) {
++			printf("PANDORA SLICEB: v30 probe cycle skipped pc_level=%u\n",
++			    pc_level);
++		} else {
++			int cycle_err = pc_sensor_power_down_probe_pair();
++			if (cycle_err) {
++				unsigned recovery = pc_sensor_power_up();
++				printf("PANDORA SLICEB: v30 cycle failed err=%d recovery=%s; "
++				    "abort table replay\n", cycle_err,
++				    recovery ? "ok" : "failed");
++				(void)pandora_log_sync();
++				return;
++			}
++			pc_sleep(5);
++			if (!pc_sensor_power_up()) {
++				int cleanup = pc_sensor_power_down_probe_pair();
++				printf("PANDORA SLICEB: v30 second sensor bring-up failed; "
++				    "cleanup=%d; abort table replay\n", cleanup);
++				(void)pandora_log_sync();
++				return;
++			}
++			pc_sleep(20);
++		}
++		/* v29: the Android power-up capture (W84 33) shows the vendor
++		 * sensor driver performs a CPAS "Main/AON camera select" before
++		 * every power-up: __csiphy_cpas_configure_for_main_or_aon
++		 * "Selecting MainCamera over AON Camera". The disassembled
++		 * sequence (vendor-aon-disasm/) is a read-modify-write of the
++		 * AON phy's aon_cam_select registers: offset 0x1E0/0x1E4 with
++		 * cam_sel_mask BIT(0) and mclk_sel_mask BIT(8) - Select Main
++		 * CLEARS both bits, Release to AON SETS them. The AON phy for
++		 * the wide camera is csiphy index 2 (DT cell-index 2,
++		 * qcom,csiphy2@9527000). The iOS probe never touched this
++		 * routing: with the AON domain holding the PHY/mclk mux, main
++		 * camera data cannot reach CSID - exactly the "all configs
++		 * correct but no data on the wire" symptom. Replicate the
++		 * Select-Main RMW on csiphy2 (and log csiphy0's value too for
++		 * comparison) right after power_up, before the table replay. */
++		{
++			vm_offset_t aon2 = ml_io_map_unmappable(0x09527000u, 0x2000u,
++			    VM_WIMG_IO);
++
++			if (!aon2) {
++				printf("PANDORA SLICEB: v29 aon phy2 map failed\n");
++			} else {
++				uint32_t sel0 = pc_rd(aon2, 0x1E0u);
++				uint32_t sel1 = pc_rd(aon2, 0x1E4u);
++
++				printf("PANDORA SLICEB: v29 aon2 sel before "
++				    "1E0=%#x 1E4=%#x\n", sel0, sel1);
++				(void)pandora_log_sync();
++				pc_wr(aon2, 0x1E0u, sel0 & ~(0x1u | 0x100u));
++				pc_wr(aon2, 0x1E4u, sel1 & ~(0x1u | 0x100u));
++				printf("PANDORA SLICEB: v29 aon2 sel after "
++				    "1E0=%#x 1E4=%#x (cam+mclk cleared)\n",
++				    pc_rd(aon2, 0x1E0u), pc_rd(aon2, 0x1E4u));
++				(void)pandora_log_sync();
++			}
++		}
++		pc_csiphy_mark("cphytest full sensor table replay (single pass)");
++		pc_sensor_apply_wide_v34("wide-cphytest", 0u);
++		(void)pandora_log_sync();
++		/* v44: OVX10500U stream-control block. Android's live snapshot has
++		 * 0x4608=0x00 and 0x4609=0x04; the trace-derived wide table never
++		 * writes either register. Force the observed values after the replay
++		 * so a missing frame-end enable cannot hide behind sensor defaults. */
++		printf("PANDORA SLICEB: v44 pre-stream 0103=%#x 4608=%#x 4609=%#x\n",
++		    pc_sliceb_rd8(0x0103u, &ret), pc_sliceb_rd8(0x4608u, &ret),
++		    pc_sliceb_rd8(0x4609u, &ret));
++		(void)pandora_log_sync();
++		pc_sliceb_wprobe(0x4608u, 0x0000u, 1u, "v44-fs-enable");
++		pc_sliceb_wprobe(0x4609u, 0x0004u, 1u, "v44-fe-enable");
++		printf("PANDORA SLICEB: v44 post-stream 4608=%#x 4609=%#x\n",
++		    pc_sliceb_rd8(0x4608u, &ret), pc_sliceb_rd8(0x4609u, &ret));
++		(void)pandora_log_sync();
++		pc_sleep(30);
++		/* v37: sensor is streaming now; refresh the PHY that was armed 6 s
++		 * earlier, then let the existing samplers observe the result. */
++		/* v64: sensor is streaming; do NOT reset PHY here. v37-v63 reset it
++		 * at the first-frame boundary and every version only saw a transient
++		 * trio. Keep the CSID/VFE2 rearm below. */
++		printf("PANDORA SLICEB: v64 skip post-stream PHY rearm (settle=%u)\n",
++		    settle);
++		/* pc_csiphy0_rearm(phy0, settle); */
++		(void)pandora_log_sync();
++		/* v46: the CSID RDI was armed ~6 s before the sensor's stream-on
++		 * tail. A receiver held idle that long may latch a stale RX error
++		 * state or park its packet FSM; refreshing the PHY alone did not
++		 * produce an EOF. Re-arm the whole CSID RDI after the sensor is
++		 * actually transmitting, then re-arm VFE2 so the WM address and
++		 * RUP/AUP commit happen against the live stream. Clear the sticky
++		 * RX IRQ immediately before the sampler so any error seen there is
++		 * generated by the post-stream configuration, not by the 6 s idle
++		 * window. */
++		base = pc_sliceb_arm(csid2, 0x01102102u);
++		if (base) {
++			pc_wr(csid2, 0x1b8u, 0xffffffffu); /* RX IRQ clear */
++			pc_wr(csid2, 0x1a8u, 0x10000u);    /* RDI0 BUF_DONE clear */
++			pc_sliceb_vfe2_arm(vfe2);
++			pc_wr(csid2, 0x114u, 0x100u);
++			pc_wr(csid2, 0x118u, 0x100u);
++			pc_wr(csid2, 0x11cu, 0x1u);
++		}
++	printf("PANDORA SLICEB: v46 post-stream rearm base=%#x rx=%#x "
++	    "rdi=%#x top=%#x\n", base, pc_rd(csid2, 0x1b0u),
++	    pc_rd(csid2, 0x224u), pc_rd(csid2, 0x180u));
++	pc_rx_cfg0_report(csid2, "cphytest post-rearm");
++	pc_rdi_irq_report(csid2, "cphytest post-rearm");
++	(void)pandora_log_sync();
++		pc_sleep(50);
++		pc_wr(csid2, 0x1b8u, 0xffffffffu); /* clear any startup/arming error */
++		(void)pandora_log_sync();
++		printf("PANDORA SLICEB: cphytest sensor 0100=%#x 0000=%#x "
++		    "4600=%#x 4800=%#x frame=%#x/%#x\n", pc_sliceb_rd8(0x0100u, &ret),
++		    pc_sliceb_rd8(0x0000u, &ret), pc_sliceb_rd8(0x4600u, &ret),
++		    pc_sliceb_rd8(0x4800u, &ret),
++		    pc_sliceb_rd16(0x034Cu, &ret), pc_sliceb_rd16(0x034Eu, &ret));
++		(void)pandora_log_sync();
++		/* v28: the Android live-read (W84 31.2) showed the streaming trio
++		 * registers hold a TRANSIENT activity value (0x5, gone within one
++		 * shell round-trip) and status0 reads 0x67 while data flows. The
++		 * v13 sampler slept 100 ms between samples - long enough to miss
++		 * the transient entirely, so its all-zero readings prove nothing
++		 * about arrival. Burst-sample with NO sleeps right after the
++		 * replay tail (the stream-on write is the last table entry) and
++		 * keep a peak latch; then report whether ANY sample caught
++		 * activity. */
++		{
++			uint32_t peak_t0 = 0, peak_t1 = 0, peak_t2 = 0, peak_s0 = 0;
++
++			for (unsigned s = 0; s < 64u; s++) {
++				uint32_t t0 = pc_rd(phy0, 0x0358u), t1 = pc_rd(phy0, 0x0758u),
++				    t2 = pc_rd(phy0, 0x0B58u), s0 = pc_rd(phy0, 0x0340u);
++
++				peak_t0 |= t0; peak_t1 |= t1; peak_t2 |= t2; peak_s0 |= s0;
++				if ((s & 7u) == 7u) {
++					printf("PANDORA SLICEB: v28 burst s%u trio=%#x/%#x/%#x "
++					    "st0=%#x peak=%#x/%#x/%#x/%#x\n", s, t0, t1, t2, s0,
++					    peak_t0, peak_t1, peak_t2, peak_s0);
++					(void)pandora_log_sync();
++					pc_sleep(1);	/* ~1 ms only every 8 samples */
++				}
++			}
++			printf("PANDORA SLICEB: v28 burst done peak trio=%#x/%#x/%#x "
++			    "st0=%#x activity=%s\n", peak_t0, peak_t1, peak_t2, peak_s0,
++			    (peak_t0 || peak_t1 || peak_t2 || (peak_s0 != 0x6u &&
++			    peak_s0 != 0x0u)) ? "SEEN" : "NONE");
++			(void)pandora_log_sync();
++		}
++		/* v28: dump the sensor's MIPI output control domains after the
++		 * replay - if the sensor is actually transmitting, its output
++		 * enable chain (0x0100 stream, 0x3106/0x4800 access+lane control,
++		 * 0x0114 lane count) reads back configured. Comparing these
++		 * against the Android table entries separates "CCI accepted but
++		 * sensor never transmitted" (W84 31.3 suspicion 1) from a PHY-side
++		 * receive failure. */
++		{
++			printf("PANDORA SLICEB: v28 mipi-ctl 0100=%#x 0101=%#x 0114=%#x "
++			    "3106=%#x 4800=%#x\n", pc_sliceb_rd8(0x0100u, &ret),
++			    pc_sliceb_rd8(0x0101u, &ret), pc_sliceb_rd8(0x0114u, &ret),
++			    pc_sliceb_rd8(0x3106u, &ret), pc_sliceb_rd8(0x4800u, &ret));
++			printf("PANDORA SLICEB: v28 pll 0300=%#x 0301=%#x 0302=%#x "
++			    "0303=%#x 0304=%#x 0305=%#x\n", pc_sliceb_rd8(0x0300u, &ret),
++			    pc_sliceb_rd8(0x0301u, &ret), pc_sliceb_rd8(0x0302u, &ret),
++			    pc_sliceb_rd8(0x0303u, &ret), pc_sliceb_rd8(0x0304u, &ret),
++			    pc_sliceb_rd8(0x0305u, &ret));
++			(void)pandora_log_sync();
++		}
++		/* v35: Android stream-state witness block. With the native camera
++		 * open on the wide sensor we read 0x0308=0x02, 0x0309=0x02,
++		 * 0x0316=0x38, 0x4811=0xff, 0x4813=0x10; v34 only sampled
++		 * 0x0300..0x0305, so these witness registers were never compared.
++		 * Read the same block after the replay to test whether the sensor's
++		 * PLL/stream-status domain agrees with Android's. */
++		{
++			static const uint16_t addrs[] = {
++				0x0102u, 0x0103u, 0x0308u, 0x0309u, 0x0316u, 0x3288u,
++				0x3501u, 0x4603u, 0x4608u, 0x4811u, 0x4813u, 0x4818u
++			};
++			uint32_t vals[sizeof(addrs) / sizeof(addrs[0])];
++
++			for (unsigned i = 0; i < sizeof(addrs) / sizeof(addrs[0]); i++)
++				vals[i] = pc_sliceb_rd8(addrs[i], &ret);
++			printf("PANDORA SLICEB: v35 sensor-status");
++			for (unsigned i = 0; i < sizeof(addrs) / sizeof(addrs[0]); i++)
++				printf(" %#x=%#x", addrs[i], vals[i]);
++			printf("\n");
++			(void)pandora_log_sync();
++		}
++		/* v17 read-only physical-link dump, taken INSIDE the stream window.
++		 * v16 closed the CSID and sensor-register questions (CSID acks at
++		 * 4.3 s with no sensor work; the single replay holds the Android PLL
++		 * values), yet the C-PHY lanes read 0. Dump the link evidence no
++		 * earlier probe captured: the TLMM state of mclk(89)/reset(106)/
++		 * analog(107)/vaf(116) - CTL word then IO word (IO bit1 = sampled
++		 * input); the per-lane CSIPHY status window 0x140..0x16c; and the
++		 * sensor's frame-size / mode blocks 0x0340..0x034f, 0x0100..0x010f. */
++		{
++			static const struct { unsigned gpio; const char *name; } gpios[4] = {
++				{ 89u, "mclk" }, { 106u, "rst" }, { 107u, "ana" }, { 116u, "vaf" } };
++			static const uint32_t lanes[3] = { 0x0200u, 0x0600u, 0x0A00u };
++
++			for (unsigned i = 0; i < 4; i++) {
++				uint32_t off = gpios[i].gpio * 0x1000u;
++
++				printf("PANDORA SLICEB: gpio%u %s ctl=%#x io=%#x\n",
++				    gpios[i].gpio, gpios[i].name, pc_rd(pc_tlmm, off),
++				    pc_rd(pc_tlmm, off + 4u));
++			}
++			for (unsigned i = 0; i < 3; i++) {
++				printf("PANDORA SLICEB: lane%u st:", i);
++				for (uint32_t off = 0x140u; off <= 0x180u; off += 4u)
++					printf(" +%#x=%#x", off, pc_rd(phy0, lanes[i] + off));
++				printf("\n");
++			}
++			printf("PANDORA SLICEB: sensor 034x:");
++			for (unsigned r = 0x0340u; r <= 0x034fu; r++)
++				printf(" %#x", pc_sliceb_rd8(r, &ret));
++			printf("\nPANDORA SLICEB: sensor 010x:");
++			for (unsigned r = 0x0100u; r <= 0x010fu; r++)
++				printf(" %#x", pc_sliceb_rd8(r, &ret));
++			printf("\n");
++			(void)pandora_log_sync();
++		}
++		/* v13 read-only RX sampler: sample the receive-side state during the
++		 * stream window so a silent poll leaves per-sample evidence instead
++		 * of one aggregate zero. All reads; the trio/IRQ status registers
++		 * accumulate regardless of the PHY IRQ mask (CTRL11..21=0 only gates
++		 * the IRQ output, not the status). The sampler reports the sensor
++		 * PLL/frame-size registers per sample (v14). */
++		for (unsigned s = 0; s < 8; s++) {
++			printf("PANDORA SLICEB: cphytest s%u top=%#x rx=%#x rdin=%#x "
++			    "rdinm=%#x rdic=%#x rdist=%#x "
++			    "pkt=%#x/%#x/%#x trio=%#x/%#x/%#x pll=%#x/%#x/%#x "
++			    "size=%#x/%#x\n", s,
++			    pc_rd(csid2, 0x180u), pc_rd(csid2, 0x1b0u),
++			    pc_rd(csid2, 0x224u), pc_rd(csid2, 0x228u),
++			    pc_rd(csid2, 0x22cu), pc_rd(csid2, base + 0x4u),
++			    pc_rd(csid2, 0x160u),
++			    pc_rd(csid2, 0x164u), pc_rd(csid2, 0x168u),
++			    pc_rd(phy0, 0x0358u),
++			    pc_rd(phy0, 0x0758u), pc_rd(phy0, 0x0B58u),
++			    pc_sliceb_rd8(0x0301u, &ret), pc_sliceb_rd8(0x0304u, &ret),
++			    pc_sliceb_rd8(0x0305u, &ret), pc_sliceb_rd8(0x034Cu, &ret),
++			    pc_sliceb_rd8(0x034Du, &ret));
++			(void)pandora_log_sync();
++			pc_sleep(100);
++		}
++		/* Clear the stale RDI0 buffer-done latch so the poll below reports
++		 * only frames that complete during the v42 capture window. */
++		pc_wr(csid2, 0x1a8u, 0x10000u);
++		seen_rdi = pc_sliceb_poll(csid2, 800, NULL, &seen_buf);
++		/* v92: if the first window saw no input event at all, cycle the
++		 * sensor and replay once more. The v30 cycle above already proves the
++		 * sensor accepts one configuration per power-up; a second power-up
++		 * should accept a second one. Diagnostic recovery attempt: on a
++		 * successful first window this block does nothing. */
++		if (!(seen_rdi & (PC_RDIN_INPUT_SOF | PC_RDIN_INPUT_EOF)) && pc_level < 3u) {
++			int down = pc_sensor_power_down_probe_pair();
++			unsigned up = 0;
++			uint32_t retry_rdi = 0, retry_buf = 0;
++
++			if (!down) {
++				pc_sleep(20);
++				up = pc_sensor_power_up();
++				pc_sleep(20);
++			}
++			printf("PANDORA SLICEB: v92 retry cycle down=%d up=%u\n", down, up);
++			(void)pandora_log_sync();
++			if (!down && up) {
++				pc_sensor_apply_wide_v34("wide-v92-retry", 0u);
++				base = pc_sliceb_arm(csid2, 0x01102102u);
++				if (base) {
++					pc_wr(csid2, 0x1b8u, 0xffffffffu);
++					pc_wr(csid2, 0x1a8u, 0x10000u);
++					pc_sliceb_vfe2_arm(vfe2);
++					pc_wr(csid2, 0x114u, 0x100u);
++					pc_wr(csid2, 0x118u, 0x100u);
++					pc_wr(csid2, 0x11cu, 0x1u);
++				}
++				retry_rdi = pc_sliceb_poll(csid2, 800, NULL, &retry_buf);
++				printf("PANDORA SLICEB: v92 retry result base=%#x rdi=%#x "
++				    "buf=%#x\n", base, retry_rdi, retry_buf);
++				(void)pandora_log_sync();
++			}
++		}
++		/* v91: count SOF observations over a longer window instead of only
++		 * OR-ing the latch, and capture the first/last RX error signatures.
++		 * Additive logging only: no register value, arm order or existing
++		 * timing is modified. */
++		{
++			unsigned edges = 0, prev = 0, samples = 1500;
++			uint32_t rx_first = 0, rx_last = 0;
++
++			for (unsigned k = 0; k < samples; k++) {
++				uint32_t st = pc_rd(csid2, 0x224u);
++				unsigned sof = (st & PC_RDIN_INPUT_SOF) ? 1u : 0u;
++
++				if (sof && !prev)
++					edges++;
++				prev = sof;
++				if (!rx_first)
++					rx_first = pc_rd(csid2, 0x1b0u);
++				rx_last = pc_rd(csid2, 0x1b0u);
++				pc_sleep(1);
++			}
++			printf("PANDORA SLICEB: v91 events sof_edges=%u sof_last=%u "
++			    "rx_first=%#x rx_last=%#x\n", edges, prev, rx_first, rx_last);
++			(void)pandora_log_sync();
++		}
++		printf("PANDORA SLICEB: v42 VFE2 post-poll buf_done=%#x wm=%#x/%#x/%#x\n",
++		    seen_buf, pc_rd(vfe2, 0x2c00u), pc_rd(vfe2, 0x2c04u),
++		    pc_rd(vfe2, 0x2c08u));
++		(void)pandora_log_sync();
++		if (pc_frame_va) {
++			volatile uint32_t *fb = (volatile uint32_t *)pc_frame_va;
++			unsigned n_a5 = 0, n_other = 0, first_idx = 0;
++			uint32_t first_other = 0;
++
++			pc_dcache_invalidate(pc_frame_va, PC_CAM_FRAME_BYTES);
++			for (unsigned i = 0; i < 0x100000u / 4u; i++) {
++				uint32_t w = fb[i];
++
++				if (w == 0xa5a5a5a5u)
++					n_a5++;
++				else {
++					if (!n_other) {
++						first_idx = i;
++						first_other = w;
++					}
++					n_other++;
++				}
++			}
++			printf("PANDORA SLICEB: v42 frame first=%#x/%#x/%#x/%#x "
++			    "a5=%u other=%u first_other=%#x@%u\n", fb[0], fb[1],
++			    fb[2], fb[3], n_a5, n_other, first_other, first_idx);
++			(void)pandora_log_sync();
++			pc_wr(vfe2, 0x2c00u, 0x0u); /* stop VFE2 WM after one look */
++		}
++
++		/* v24: re-sweep the RX_CFG0 mux candidates INSIDE the stream window.
++		 * The w52-era sweep (phy 0/1 x lane_assign 0x210/0x0139) ran while
++		 * CSID2's reset never acked, i.e. the RX was dead for every
++		 * candidate - the sweep proved nothing. The reset is fixed now and
++		 * the sensor streams continuously (single table replay), so each
++		 * candidate gets a fresh arm (reset acked per candidate) + 300 ms
++		 * poll while real C-PHY data is flowing. */
++		pc_csiphy_mark("cphytest v24 RX_CFG0 mux re-sweep (reset fixed, sensor streaming)");
++		{
++			static const struct { uint32_t cfg; const char *name; } cands[6] = {
++				{ 0x01002102u, "cphy0/0x210" }, { 0x01102102u, "cphy1/0x210" },
++				{ 0x01102102u, "phy1/0x210" }, { 0x00002102u, "phy0/0x210" },
++				{ 0x00101392u, "phy1/0x0139" }, { 0x00001392u, "phy0/0x0139" },
++			};
++
++			for (unsigned i = 0; i < 6; i++) {
++				uint32_t b = pc_sliceb_arm(csid2, cands[i].cfg);
++
++				if (!b) {
++					printf("PANDORA SLICEB: v24 %s arm FAILED (rst_done=0)\n",
++					    cands[i].name);
++					continue;
++				}
++				uint32_t seen = pc_sliceb_poll(csid2, 300, NULL, NULL);
++				printf("PANDORA SLICEB: v24 %s rdi=%#x sof=%u eof=%u "
++				    "rx_irq=%#x rdin=%#x\n", cands[i].name, seen,
++				    (seen & PC_RDIN_INPUT_SOF) ? 1u : 0u,
++				    (seen & PC_RDIN_INPUT_EOF) ? 1u : 0u,
++				    pc_rd(csid2, 0x1b0u), pc_rd(csid2, 0x224u));
++				(void)pandora_log_sync();
++			}
++		}
++	}
++	pc_sliceb_cphy_phy_status(phy0, "after-poll");
++	printf("PANDORA SLICEB: cphytest RESULT rdi=%#x rup=%u buf_done=%#x "
++	    "arm=%#x rx_irq=%#x frame_done_irq=none\n", seen_rdi,
++	    (seen_rdi & PC_RDIN_RUP_DONE) ? 1u : 0u, seen_buf, base,
++	    pc_rd(csid2, 0x1b0u));
++	(void)pandora_log_sync();
++
++	/* v19 TPG-mux bisect, dual test. v18 retargeted CSID2's RX to tpg2 but
++	 * stayed silent while CSID0 proved the same mux at w41 - the v18 attempt
++	 * skipped the AUP/RUP strobes that pc_sliceb_arm fires AFTER RX_CFG0.
++	 * This round runs BOTH instances with the full proven sequence:
++	 *   - CSID0 positive control: reset -> tpg2 config -> RX_CFG0=0x38032103
++	 *     -> RDI0 latch -> AUP/RUP -> poll (w41 expected SOF);
++	 *   - CSID2 retry: the same full sequence on CSID2 (no reset repeat; the
++	 *     reset already acked at arm time). */
++	pc_csiphy_mark("cphytest v19 TPG-mux dual test (CSID0 control + CSID2 retry)");
++	{
++		vm_offset_t tpg2 = ml_io_map_unmappable(PC_TPG2_PA, 0x400u, VM_WIMG_IO);
++		uint32_t tv = tpg2 ? pc_rd(tpg2, 0x0u) : 0u;
++
++		if (!tpg2) {
++			printf("PANDORA SLICEB: tpg2 map failed (bisect skipped)\n");
++		} else if (tv != 0x20040000u) {
++			printf("PANDORA SLICEB: tpg2 hwver=%#x unexpected (bisect skipped)\n",
++			    tv);
++		} else {
++			static const struct { uint32_t pa; const char *name; } inst[2] = {
++				{ 0x09253000u, "csid0" }, { 0x09273000u, "csid2" } };
++
++			printf("PANDORA SLICEB: tpg2 hwver=%#x (2.4.0)\n", tv);
++			/* v20: the TPG path's S9 step - enable the GCC camera hf/sf AXI
++			 * bridge BEFORE streaming. pc_tpg_p0_bringup does this between
++			 * the CAMCC tree and every successful TPG->CSID stream (w41);
++			 * the cphytest path never did, which is the one remaining
++			 * environment difference the v19 dual test had vs w41. */
++			vm_offset_t gccaxi = ml_io_map_unmappable(PC_GCC_CAM_AXI_PA,
++			    0x1000u, VM_WIMG_IO);
++
++			if (gccaxi) {
++				uint32_t hf = pc_rd(gccaxi, PC_GCC_HF_AXI_OFF);
++				uint32_t sf = pc_rd(gccaxi, PC_GCC_SF_AXI_OFF);
++
++				pc_wr(gccaxi, PC_GCC_HF_AXI_OFF, hf | PC_CBCR_ENABLE);
++				pc_wr(gccaxi, PC_GCC_SF_AXI_OFF, sf | PC_CBCR_ENABLE);
++				printf("PANDORA SLICEB: gcc cam-axi hf %#x->%#x sf "
++				    "%#x->%#x\n", hf, pc_rd(gccaxi, PC_GCC_HF_AXI_OFF),
++				    sf, pc_rd(gccaxi, PC_GCC_SF_AXI_OFF));
++				(void)pandora_log_sync();
++			} else {
++				printf("PANDORA SLICEB: gcc cam-axi map failed\n");
++			}
++			pc_wr(tpg2, PC_TPG_CTRL_CMD, PC_TPG_CMD_HW_RESET);
++			pc_sleep(1);
++			pc_wr(tpg2, 0x68u, 0x0u);         /* VC_0_CFG0: continuous */
++			pc_wr(tpg2, 0x6cu, 0x12345678u);  /* VC_0_LSFR_SEED */
++			pc_wr(tpg2, 0x70u, 0x442u);       /* VC_0_HBI_CFG */
++			pc_wr(tpg2, 0x74u, 0x30u);        /* VC_0_VBI_CFG */
++			pc_wr(tpg2, 0x78u, 0xa00u);       /* VC_0_COLOR_BARS_CFG */
++			pc_wr(tpg2, 0x7cu, 0x028001e0u);  /* DT_0_CFG_0: 640x480 */
++			pc_wr(tpg2, 0x80u, 0x2bu);        /* DT_0_CFG_1: RAW10 */
++			pc_wr(tpg2, 0x84u, 0x20000be8u);  /* DT_0_CFG_2: payload 8 */
++			pc_wr(tpg2, PC_TPG_CTRL, PC_TPG_CTRL_4LANE_1VC); /* 4 lane, 1 VC */
++			pc_sleep(2);
++			(void)pandora_log_sync();
++
++			for (unsigned i = 0; i < 2; i++) {
++				vm_offset_t c = ml_io_map_unmappable(inst[i].pa, 0x5e80u,
++				    VM_WIMG_IO);
++				unsigned rst = 0, try = 0;
++				uint32_t rdi_base = 0;
++
++				if (!c) {
++					printf("PANDORA SLICEB: %s map failed\n",
++					    inst[i].name);
++					continue;
++				}
++				if (i == 0) {
++					/* positive control: fresh reset on CSID0 */
++					rst = pc_csid_reset_once(c);
++				} else {
++					/* CSID2 already reset+armed at 4.3 s; do not repeat */
++					rst = 1;
++				}
++				printf("PANDORA SLICEB: %s rst=%u\n", inst[i].name, rst);
++				pc_wr(c, 0x880u, 0x38032103u);  /* RX_CFG0: tpg2 mux */
++				pc_wr(c, 0x884u, 0x1u);         /* RX_CFG1: ECC */
++				for (try = 0; try < 50; try++) {
++					pc_wr(c, PC_RDI_CFG0(0), 0x002bf160u);
++					if (pc_rd(c, PC_RDI_CFG0(0)) == 0x002bf160u) {
++						rdi_base = PC_RDI_CFG0(0);
++						break;
++					}
++					pc_sleep(1);
++				}
++				if (!rdi_base) {
++					printf("PANDORA SLICEB: %s RDI0 latch failed\n",
++					    inst[i].name);
++					continue;
++				}
++				pc_wr(c, PC_RDI_CFG0(0), 0x002bf160u);
++				pc_wr(c, PC_RDI_CFG1(0), 0x8000u);
++				pc_wr(c, 0x5498u, 0x9u);        /* PIX_STORE */
++				pc_wr(c, PC_RDI_CTRL(0), 0x0u); /* START_CMD: stop */
++				pc_wr(c, PC_RDI_CFG0(0),
++				    pc_rd(c, PC_RDI_CFG0(0)) | 0x80000000u);
++				for (unsigned k = 0; k < 2; k++) {
++					pc_wr(c, 0x118u, 0x100u);   /* AUP_CMD: RDI0 */
++					pc_wr(c, 0x11cu, 0x1u);     /* RUP_AUP_CMD */
++				}
++				pc_wr(c, 0x114u, 0x100u);       /* RUP_CMD: RDI0 */
++				pc_wr(c, 0x11cu, 0x1u);
++				pc_wr(c, PC_RDI_CTRL(0), PC_RDI_CTRL_START); /* START_CMD: 1 */
++				pc_sleep(2);
++				pc_rx_cfg0_report(c, "v19-bisect");
++				pc_rdi_irq_report(c, "v19-bisect");
++				pc_sleep(2);
++				/* v21: the missing piece v18-v20 had - the TPG only
++				 * produces frames after CTRL_CMD TEST_EN (P5b of the
++				 * proven stream: "start TPG after RX/RDI ready"). Fire it
++				 * once when the first instance's RX/RDI is ready; the
++				 * second instance's RX muxes to the same running TPG. */
++				if (i == 0) {
++					pc_wr(tpg2, PC_TPG_CTRL_CMD, PC_TPG_CMD_TEST_EN);
++					pc_sleep(2);
++					printf("PANDORA SLICEB: tpg2 TEST_EN fired "
++					    "ctrl_cmd=%#x hw_status=%#x\n",
++					    pc_rd(tpg2, 0x1f4u), pc_rd(tpg2, 0x4u));
++					(void)pandora_log_sync();
++				}
++				uint32_t seen_buf = 0;
++				uint32_t seen = pc_sliceb_poll(c, 500, NULL, &seen_buf);
++				if (i == 1) {
++					/* v45 differential: CSID2 has already proved TPG
++					 * EOF. Sweep the three WM block candidates and
++					 * use *frame bytes*, not BUF_DONE, as the oracle:
++					 * 0x2c00 = mainline WM 0x17; 0x2100/0x2200 =
++					 * vendor RDI0 bitmap bits 12/13. */
++					/* v87: 0x2100/0x2200 are not camera RDI0 WMs; v45
++					 * proved only 0x2c00 ever writes frame bytes. Do
++					 * not touch the two non-camera WM blocks while
++					 * checking the desktop. */
++					static const uint32_t wm_cands[] = { 0x2c00u };
++
++					for (unsigned wi = 0;
++					    wi < sizeof(wm_cands) / sizeof(wm_cands[0]);
++					    wi++) {
++						uint32_t wm = wm_cands[wi];
++						unsigned a5n = 0, other = 0;
++						uint32_t first = 0;
++						unsigned first_idx = 0;
++
++						if (pc_frame_va) {
++							volatile uint32_t *fb =
++							    (volatile uint32_t *)pc_frame_va;
++
++							for (unsigned k = 0;
++							    k < PC_CAM_FRAME_BYTES / 4; k++)
++								fb[k] = 0xa5a5a5a5u;
++							clean_dcache64(pc_frame_pa,
++							    PC_CAM_FRAME_BYTES, TRUE);
++						}
++						pc_sliceb_vfe2_arm_at(vfe2, wm);
++						pc_wr(vfe2, wm + 0x08u, 0x5dcu);
++						pc_wr(c, 0x1a8u, 0x10000u);
++						pc_wr(c, 0x114u, 0x100u);
++						pc_wr(c, 0x118u, 0x100u);
++						pc_wr(c, 0x11cu, 0x1u);
++						seen_buf = 0;
++						seen = pc_sliceb_poll(c, 500, NULL,
++						    &seen_buf);
++						if (pc_frame_va) {
++							volatile uint32_t *fb =
++							    (volatile uint32_t *)pc_frame_va;
++
++							pc_dcache_invalidate(pc_frame_va,
++							    PC_CAM_FRAME_BYTES);
++							for (unsigned k = 0;
++							    k < PC_CAM_FRAME_BYTES / 4; k++) {
++								uint32_t v = fb[k];
++
++								if (v == 0xa5a5a5a5u)
++									a5n++;
++								else {
++									if (!other) {
++										first = v;
++										first_idx = k;
++									}
++									other++;
++								}
++							}
++						}
++						printf("PANDORA SLICEB: v45 wmprobe "
++						    "off=%#x sof=%u eof=%u buf=%#x "
++						    "a5=%u other=%u first=%#x@%u\n",
++						    wm, (seen >> 12) & 1,
++						    (seen >> 9) & 1, seen_buf,
++						    a5n, other, first, first_idx);
++						(void)pandora_log_sync();
++						pc_wr(vfe2, wm, 0x0u);
++					}
++				}
++				printf("PANDORA SLICEB: %s TPG-mux RESULT rdi=%#x sof=%u "
++				    "eof=%u rx_irq=%#x rdin=%#x buf=%#x\n",
++				    inst[i].name, seen,
++				    (seen & PC_RDIN_INPUT_SOF) ? 1u : 0u,
++				    (seen & PC_RDIN_INPUT_EOF) ? 1u : 0u,
++				    pc_rd(c, 0x1b0u), pc_rd(c, 0x224u), seen_buf);
++				(void)pandora_log_sync();
++			}
++		}
++	}
++	pc_sliceb_stream_on(0);
++
++	/* v22 C-PHY BIST: the vendor 2.4.0 bist_3ph array programs a known
++	 * pattern into each lane's own receive path (final write 0x0040=0x85
++	 * arms it) and the per-lane BIST status/counters at lane+0x144 then
++	 * move. This bypasses the sensor entirely: nonzero counters = the
++	 * CSIPHY0 lane analog/digital receive path works, pointing the silent
++	 * real-sensor window at the sensor output or the electrical link; zero
++	 * counters = the lane receive path itself is dead (consistent with the
++	 * hw_version=0 anomaly). Runs last: the writes replace the lane receive
++	 * config, which is fine because every sensor-window measurement is done. */
++	pc_csiphy_mark("cphytest v22 C-PHY BIST on lanes 0/1/2");
++	{
++		static const struct { uint32_t addr; uint32_t val; } bist[15] = {
++			{ 0x0030u, 0x1Cu }, { 0x0034u, 0xFAu }, { 0x0038u, 0xD4u },
++			{ 0x003Cu, 0x59u }, { 0x0058u, 0x10u }, { 0x00C8u, 0xAAu },
++			{ 0x00D0u, 0xAAu }, { 0x00D4u, 0x64u }, { 0x00D8u, 0x3Eu },
++			{ 0x0048u, 0x00u }, { 0x004Cu, 0x07u }, { 0x0050u, 0x00u },
++			{ 0x0044u, 0xB1u }, { 0x005Cu, 0x04u }, { 0x0040u, 0x85u },
++		};
++		static const uint32_t lanes[3] = { 0x0200u, 0x0600u, 0x0A00u };
++
++		for (unsigned i = 0; i < 3; i++) {
++			for (unsigned k = 0; k < 15; k++)
++				pc_wr(phy0, lanes[i] + bist[k].addr, bist[k].val);
++			pc_sleep(5);
++			printf("PANDORA SLICEB: bist lane%u armed: st344=%#x st744=%#x "
++			    "stB44=%#x trio=%#x/%#x/%#x\n", i, pc_rd(phy0, 0x0344u),
++			    pc_rd(phy0, 0x0744u), pc_rd(phy0, 0x0B44u),
++			    pc_rd(phy0, 0x0358u), pc_rd(phy0, 0x0758u),
++			    pc_rd(phy0, 0x0B58u));
++		}
++		pc_sleep(50);
++		printf("PANDORA SLICEB: bist settle: st344=%#x st744=%#x stB44=%#x "
++		    "cnt348=%#x cnt748=%#x cntB48=%#x trio=%#x/%#x/%#x\n",
++		    pc_rd(phy0, 0x0344u), pc_rd(phy0, 0x0744u), pc_rd(phy0, 0x0B44u),
++		    pc_rd(phy0, 0x0348u), pc_rd(phy0, 0x0748u), pc_rd(phy0, 0x0B48u),
++		    pc_rd(phy0, 0x0358u), pc_rd(phy0, 0x0758u), pc_rd(phy0, 0x0B58u));
++		(void)pandora_log_sync();
++	}
++
++	/* v23 variant scan: the DT says csiphy0/3/4 are "qcom,csiphy-v2.4.0-1"
++	 * while csiphy1/2/5 are plain "qcom,csiphy-v2.4.0" - two register-set
++	 * variants of the same 2.4.0 hardware. Every anomaly (hw_version=0,
++	 * trio=0, BIST=0) was measured on the -1 variant with the plain-v2.4.0
++	 * tables. Scan ALL six PHYs with the identical probe (CTRL6=2 hw-version
++	 * strobe + lane0 BIST arm) and read back: if the plain-v2.4.0 PHYs
++	 * respond and the -1 ones do not, the w84 tables are the wrong variant
++	 * for this PHY and the whole receive bring-up must be redone from the
++	 * -1 register set. */
++	pc_csiphy_mark("cphytest v23 six-PHY variant scan");
++	{
++		static const struct { uint32_t pa; unsigned variant; } phys[6] = {
++			{ 0x09523000u, 1 }, { 0x09525000u, 0 }, { 0x09527000u, 0 },
++			{ 0x09529000u, 1 }, { 0x0952B000u, 1 }, { 0x0952D000u, 0 },
++		};
++
++		for (unsigned i = 0; i < 6; i++) {
++			vm_offset_t b = ml_io_map_unmappable(phys[i].pa, 0x2000u,
++			    VM_WIMG_IO);
++
++			if (!b) {
++				printf("PANDORA SLICEB: v23 csiphy%u map failed\n", i);
++				continue;
++			}
++			pc_wr(b, PC_CPHY_CTRL(6), 2u);
++			pc_sleep(1);
++			printf("PANDORA SLICEB: v23 csiphy%u (variant -%d) hwver=%#x "
++			    "%#x %#x %#x ctrl4=%#x\n", i, phys[i].variant,
++			    pc_rd(b, PC_CPHY_STATUS(12)), pc_rd(b, PC_CPHY_STATUS(13)),
++			    pc_rd(b, PC_CPHY_STATUS(14)), pc_rd(b, PC_CPHY_STATUS(15)),
++			    pc_rd(b, 0x0210u));
++			pc_wr(b, 0x0200u + 0x0040u, 0x85u); /* lane0 BIST arm */
++			pc_sleep(5);
++			printf("PANDORA SLICEB: v23 csiphy%u bist arm40=%#x st=%#x "
++			    "cnt=%#x trio=%#x\n", i, pc_rd(b, 0x0240u),
++			    pc_rd(b, 0x0344u), pc_rd(b, 0x0348u), pc_rd(b, 0x0358u));
++			(void)pandora_log_sync();
++		}
++	}
++	/* Drop the camera-gated 0.9 V analog vote again. */
++	pc_csiphy_mark("cphytest done (sensor left in standby)");
++}
++
++/* Stage 20 (pandora_csiphy=20): RPMh + sensor power path only.
++ * No CAMCC clock writes, no PHY register writes, no CSID touch. Used to
++ * bisect which probe side effect disturbs userland. */
++static void
++pc_sliceb_poweronly(void)
++{
++	int ret = 0;
++
++	pc_csiphy_mark("poweronly start: L3I_E0 + sensor power_up + replay");
++	if (!pc_bdistm)
++		pc_bdistm = ml_io_map_unmappable(PC_BDISTM_PA, 0x6000u, VM_WIMG_IO);
++	if (!pc_tlmm)
++		pc_tlmm = ml_io_map_unmappable(PC_TLMM_PA, 0xb0000u, VM_WIMG_IO);
++	if (!pc_cci[0])
++		pc_cci[0] = ml_io_map_unmappable(PC_CCI_PA(0), 0x1000u, VM_WIMG_IO);
++	if (!pc_bdistm || !pc_tlmm || !pc_cci[0]) {
++		printf("PANDORA SLICEB: poweronly map failed\n");
++		(void)pandora_log_sync();
++		return;
++	}
++	(void)pc_sensor_power_up();
++	pc_sleep(20);
++	pc_sensor_apply_tbl(pc_wide_tbl, pc_wide_tbl_n, PC_SLICEB_MASTER,
++	    PC_SLICEB_SLAVE, 1u, 0u, "wide-poweronly");
++	pc_sliceb_stream_on(0);
++	pc_sleep(2);
++	printf("PANDORA SLICEB: poweronly chip_id=%#x ret=%d\n",
++	    pc_sliceb_rd8(0x0000u, &ret), ret);
++	(void)pandora_log_sync();
++	pc_csiphy_mark("poweronly done");
++}
++
++/* Stage 21 (pandora_csiphy=21): read-only PHY liveness, no writes. */
++static void
++pc_sliceb_phyread(void)
++{
++	vm_offset_t phy0;
++
++	pc_csiphy_mark("phyread start: csiphy0 read-only");
++	phy0 = ml_io_map_unmappable(PC_CSIPHY0_PA, 0x2000u, VM_WIMG_IO);
++	if (!phy0) {
++		printf("PANDORA SLICEB: phyread map failed\n");
++		(void)pandora_log_sync();
++		return;
++	}
++	pc_csiphy0_va = phy0;
++	pc_sliceb_cphy_phy_status(phy0, "readonly");
++	printf("PANDORA SLICEB: phyread ctrl0=%#x lane_en=%#x ctrl6=%#x ctrl7=%#x "
++	    "common1084=%#x common108c=%#x\n", pc_rd(phy0, 0x1000u),
++	    pc_rd(phy0, PC_CSIPHY_V240_LANE_EN), pc_rd(phy0, 0x1018u),
++	    pc_rd(phy0, 0x101Cu), pc_rd(phy0, 0x1084u), pc_rd(phy0, 0x108Cu));
++	(void)pandora_log_sync();
++	pc_csiphy_mark("phyread done");
++}
++
++/* v100: deferred probe plumbing. Kept at file scope (static storage) exactly like
++ * fuxi_adreno.c does, to avoid the fixed thread_call pool's panic-on-exhaustion. */
++static thread_call_data_t pc_probe_call;
++
++static void
++pc_probe_callout(thread_call_param_t p0, thread_call_param_t p1)
++{
++	(void)p0;
++	(void)p1;
++	printf("PANDORA SLICEB: cphytest deferred callout running\n");
++	(void)pandora_log_sync();
++	pc_sliceb_cphytest();
++}
++
+ static void
+ pc_sliceb_stream(void)
+ {
+@@ -5413,6 +7416,54 @@
+ 	}
+ 	if (pc_csiphy == 16u) {
+ 		pc_sliceb_mitest();
++		return;
++	}
++	if (pc_csiphy == 18u || pc_csiphy == 19u) {
++		/* v42e: the cphytest branch returns before the later TPG SMMU map,
++		 * so lease the camera SMMU bank and allocate the 16 MB frame buffer
++		 * here, before pc_sliceb_arm/pc_sliceb_vfe2_arm run. */
++		if (!pc_frame_va) {
++			int smmu_err = pc_tpg_smmu_map();
++			printf("PANDORA SLICEB: v42e pre-cphytest SMMU map "
++			    "result=%d frame_va=%#llx\n", smmu_err,
++			    (unsigned long long)pc_frame_va);
++			(void)pandora_log_sync();
++		}
++		{
++			/* v100: with pandora_csiphy_delay=N, run the probe from a delayed
++			 * thread_call instead of inside the boot path. This is the only way
++			 * to tell "the probe itself breaks the desktop" apart from
++			 * "the desktop never came up" while still validating both. */
++			int delay_s = 0;
++
++			(void)PE_parse_boot_argn("pandora_csiphy_delay", &delay_s,
++			    sizeof(delay_s));
++			if (delay_s > 0) {
++				uint64_t deadline;
++
++				thread_call_setup_with_options(&pc_probe_call,
++				    pc_probe_callout, NULL,
++				    THREAD_CALL_PRIORITY_KERNEL,
++				    THREAD_CALL_OPTIONS_ONCE);
++				clock_interval_to_deadline(delay_s, NSEC_PER_SEC,
++				    &deadline);
++				(void)thread_call_enter_delayed(&pc_probe_call,
++				    deadline);
++				printf("PANDORA SLICEB: cphytest deferred %d s\n",
++				    delay_s);
++				(void)pandora_log_sync();
++			} else {
++				pc_sliceb_cphytest();
++			}
++		}
++		return;
++	}
++	if (pc_csiphy == 20u) {
++		pc_sliceb_poweronly();
++		return;
++	}
++	if (pc_csiphy == 21u) {
++		pc_sliceb_phyread();
+ 		return;
+ 	}
+ 	if (pc_csiphy >= 17u) {
+@@ -5511,19 +7562,22 @@
+ 		}
+ 	}
+ 	printf("PANDORA SLICEB: RESULT rdi_irq=%#x rx_irq=%#x buf_done=%#x "
+-	    "sof=%u eof=%u rup=%u\n", seen_rdi, seen_rx, seen_buf,
+-	    (seen_rdi & PC_RDIN_INPUT_SOF) ? 1u : 0u,
++	    "sof=%u eof=%u rup=%u frame_done_irq=none\n", seen_rdi, seen_rx,
++	    seen_buf, (seen_rdi & PC_RDIN_INPUT_SOF) ? 1u : 0u,
+ 	    (seen_rdi & PC_RDIN_INPUT_EOF) ? 1u : 0u,
+ 	    (seen_rdi & PC_RDIN_RUP_DONE) ? 1u : 0u);
+ 	(void)pandora_log_sync();
+-	pc_csiphy_mark((seen_rdi & (PC_RDIN_INPUT_SOF | PC_RDIN_INPUT_EOF))
+-	    ? "slice B1 PASS: real sensor frame events at CSID RDI0"
+-	    : "slice B1 FAIL: no SOF/EOF at CSID RDI0");
+-
+-	pc_csiphy_mark("slice B1: stop (stream off + RDI0 stop; no teardown)");
++	/* PASS is CSID BUF_DONE, not SOF/EOF: SOF/EOF are input-side boundary
++	 * events, and 1080 VFE has no frame-done IRQ to wait on. */
++	pc_csiphy_mark(seen_buf
++	    ? "slice B1 PASS: CSID BUF_DONE (VC0) observed at CSID0 RDI0"
++	    : "slice B1 FAIL: no CSID BUF_DONE at CSID0 RDI0");
++
++	pc_csiphy_mark("slice B1: stop (stream off + RDI0 START_CMD=0; no teardown)");
+ 	pc_sliceb_stream_on(0);
+ 	if (base)
+-		pc_wr(csid0, base + 0x8, 0x0u);
++		pc_wr(csid0, PC_RDI_CTRL(0), 0x0u);  /* START_CMD: 0 = stop */
++	pc_sleep(1);
+ 	pc_sleep(1);
+ 	pc_csiphy_mark("slice B1 done (PHY+sensor parked; VFE DMA/FRAME_INCR is B2)");
+ }
