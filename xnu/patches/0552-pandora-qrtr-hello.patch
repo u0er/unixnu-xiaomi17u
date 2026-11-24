@@ -1,0 +1,207 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1471,6 +1471,10 @@
+ 	return 0;
+ }
+ 
++/* Defined in pandora_qrtr.c: the lookups the attached QRTR client has made. */
++extern void pandora_qrtr_fresh(void);
++static bool ad_qrtr_on;                            /* 0552: attach succeeded, its poll runs here */
++
+ static void
+ gl_service(struct edge *e)
+ {
+@@ -1487,6 +1491,13 @@
+ 		}
+ 	}
+ 	(void)qcom_glink_poll(&e->gl);
++	/*
++	 * 0552: the QRTR client attached to this link is polled here.  Without this the service
++	 * directory and the port table never run on the ADSP link, even after attach.
++	 */
++	if (e == &ed_adsp && ad_qrtr_on) {
++		pandora_qrtr_fresh();
++	}
+ }
+ 
+ /* The link's state when it changed (agreed, broken, opens nobody serves) and with FORCE (every 5 s at first, then
+@@ -1529,7 +1540,7 @@
+ 		if (!qrtr_tried && e == &ed_adsp && e->gl.version_agreed &&
+ 		    PE_parse_boot_argn("pandora_adsp_qrtr", &on, sizeof(on)) && on == 1) {
+ 			qrtr_tried = true;
+-			(void)pandora_qrtr_attach(&e->gl, "IPCRTR");
++			ad_qrtr_on = pandora_qrtr_attach(&e->gl, "IPCRTR") != NULL;
+ 		}
+ 	}
+ }
+diff --git a/bsd/dev/pandora_mpss.c b/bsd/dev/pandora_mpss.c
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -203,6 +203,12 @@
+  * the rest of the QRTR-to-GLINK glue.
+  */
+ static QcomGlinkChannel *mp_qrtr_channel;
++/*
++ * 0552: the link and the channel of a QRTR client attached to a subsystem other than the
++ * modem (pandora_qrtr_attach(), the ADSP's IPCRTR).  Both NULL when the modem's link is used.
++ */
++static QcomGlink *mp_qrtr_attached_gl;
++static QcomGlinkChannel *mp_qrtr_attached_channel;
+ static void mp_qrtr_receive(void *context, QcomGlinkChannel *channel, const uint8_t *data, uint32_t length);
+ static void mp_qrtr_state(void *context, QcomGlinkChannel *channel, int up);
+ static void mp_link_thread(void *parameter, wait_result_t result);
+@@ -1627,6 +1633,9 @@
+ 	}
+ 	printf("PANDORA MPSS: %s opened on another subsystem's link, intents %u+%u+%u bytes\n", name, 0x800u,
+ 	    0x2000u, 0x4400u);
++	/* 0552: remember which link this channel lives on: the QRTR block sends through it. */
++	mp_qrtr_attached_gl = gl;
++	mp_qrtr_attached_channel = c;
+ 	return c;
+ }
+ 
+@@ -1731,16 +1740,38 @@
+ {
+ 	QcomGlinkChannel *channel = mp_qrtr_channel;
+ 
+-	if (name == NULL || channel == NULL || !channel->up || strcmp(channel->name, name) != 0) {
++	if (name == NULL) {
+ 		return NULL;
+ 	}
+-	return (struct pandora_glink_channel *)channel;
++	if (channel != NULL && channel->up && strcmp(channel->name, name) == 0) {
++		return (struct pandora_glink_channel *)channel;
++	}
++	/*
++	 * 0552: when step 10 failed there is no modem channel, and the only IPCRTR is the one
++	 * pandora_qrtr_attach() opened on the ADSP's link.  The QRTR block asks by name and cannot
++	 * tell the two links apart, so the attached channel stands in for the modem's.
++	 */
++	channel = mp_qrtr_attached_channel;
++	if (channel != NULL && channel->up && strcmp(channel->name, name) == 0) {
++		return (struct pandora_glink_channel *)channel;
++	}
++	return NULL;
+ }
+ 
+ int pandora_mpss_glink_send(struct pandora_glink_channel *channel, const void *data, uint32_t length);
+ int
+ pandora_mpss_glink_send(struct pandora_glink_channel *channel, const void *data, uint32_t length)
+ {
++	/*
++	 * 0552: a channel opened on another subsystem's link is sent on THAT link's gl.  Sending
++	 * it through mp_gl wrote to the modem's FIFO, which this boot never created (step 10
++	 * FAILED), so qcom_glink_send() returned argument error and the HELLO that came in on
++	 * the ADSP was answered into nothing.
++	 */
++	if (channel != NULL && (QcomGlinkChannel *)channel == mp_qrtr_attached_channel &&
++	    mp_qrtr_attached_gl != NULL) {
++		return qcom_glink_send(mp_qrtr_attached_gl, (QcomGlinkChannel *)channel, data, length);
++	}
+ 	return qcom_glink_send(&mp_gl, (QcomGlinkChannel *)channel, data, length);
+ }
+ 
+diff --git a/bsd/dev/pandora_qrtr.c b/bsd/dev/pandora_qrtr.c
+--- a/bsd/dev/pandora_qrtr.c
++++ b/bsd/dev/pandora_qrtr.c
+@@ -114,6 +114,15 @@
+ } pq_servers[64];
+ static uint32_t pq_peer;                      /* the modem's node; 0: it has not said */
+ static uint32_t pq_next_port = QRTR_FIRST_PORT, pq_in, pq_out, pq_hellos, pq_lookups;
++/*
++ * 0552: the HELLO that could not be answered.  pq_hellos counts answers actually sent, never
++ * attempts; the node waits here for the next poll and is tried no more than QRTR_HELLO_TRIES
++ * times.  The poll and the input both run on the link's thread, so no lock is added.
++ */
++#define QRTR_HELLO_TRIES 3u
++static uint32_t pq_hello_node, pq_hello_tries;
++static int pq_hello_error;
++static bool pq_hello_waiting;
+ thread_t pandora_qrtr_link_thread;
+ 
+ /*
+@@ -186,21 +195,53 @@
+  * pandora_qrtr_announce() and pandora_qrtr_announce_all() here, defined in pandora_rmtfs.c and
+  * declared in pandora_qrtr.h. */
+ 
++/*
++ * Answer one HELLO, once.  The first one comes from pq_control(), a retry from the link's poll
++ * (pandora_qrtr_fresh()); the error is returned so the caller can tell SENT from NOT SENT.
++ */
++static int
++pq_hello_answer(const char *when)
++{
++	struct pq_control_message hello = { .command = QRTR_HELLO };
++	int error;
++
++	error = pandora_mpss_qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, pq_hello_node, QRTR_CONTROL, &hello,
++	    sizeof(hello));
++	if (error == 0) {
++		pq_hellos++;
++		pq_hello_waiting = false;
++	} else {
++		pq_hello_error = error;
++		pq_hello_waiting = true;
++	}
++	printf("mpss: qrtr: HELLO FROM NODE %u; ours to it: %s\n", pq_hello_node, error == 0 ? "SENT" : "NOT SENT");
++	if (error != 0) {
++		printf("mpss: qrtr: HELLO to node %u: error %d on try %u of %u (%s)\n", pq_hello_node, error, pq_hello_tries,
++		    QRTR_HELLO_TRIES, when);
++	} else if (pq_hello_tries > 1) {
++		printf("mpss: qrtr: HELLO to node %u answered on try %u of %u (%s)\n", pq_hello_node, pq_hello_tries,
++		    QRTR_HELLO_TRIES, when);
++	}
++	return error;
++}
++
+ /* The control port's part: Linux's name service, with our one service to tell of. */
+ static void
+ pq_control(const struct pq_header *header, const struct pq_control_message *control)
+ {
+-	struct pq_control_message hello = { .command = QRTR_HELLO };
+ 	int found = -1, error;
+ 
+ 	switch (control->command) {
+ 	case QRTR_HELLO:
+-		if (pq_hellos++ != 0) {
+-			break;                                  /* (answered once: two that answer every hello never end) */
+-		}
+-		error = pandora_mpss_qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, header->from_node, QRTR_CONTROL, &hello, sizeof(hello));
+-		printf("mpss: qrtr: HELLO FROM NODE %u; ours to it: %s\n", header->from_node, error == 0 ? "SENT" : "NOT SENT");
+-		pandora_qrtr_announce_all(header->from_node);    /* (the name service's part: what we offer) */
++		if (pq_hellos != 0 || pq_hello_tries >= QRTR_HELLO_TRIES) {
++			break;                                  /* (answered once, or out of tries: two that answer every hello never end) */
++		}
++		pq_hello_node = header->from_node;
++		pq_hello_tries++;
++		error = pq_hello_answer("first");
++		if (error == 0) {
++			pandora_qrtr_announce_all(header->from_node);    /* (the name service's part: what we offer) */
++		}
+ 		break;
+ 	case QRTR_NEW_SERVER:
+ 		lck_mtx_lock(&pq_lock);
+@@ -339,6 +380,22 @@
+ void
+ pandora_qrtr_fresh(void)
+ {
++	/*
++	 * 0552: a HELLO that did not go out is tried again here, on every poll of the link, no
++	 * more than QRTR_HELLO_TRIES times.  qcom_glink_send()'s error is kept for the last word.
++	 */
++	if (pq_hello_waiting) {
++		if (pq_hello_tries >= QRTR_HELLO_TRIES) {
++			pq_hello_waiting = false;
++			printf("mpss: qrtr: HELLO to node %u given up after %u tries (last error %d)\n", pq_hello_node,
++			    pq_hello_tries, pq_hello_error);
++		} else {
++			pq_hello_tries++;
++			if (pq_hello_answer("retry") == 0) {
++				pandora_qrtr_announce_all(pq_hello_node);
++			}
++		}
++	}
+ 	for (unsigned p = 0; p < sizeof(pq_ports) / sizeof(pq_ports[0]); p++) {
+ 		for (unsigned l = 0; l < 4; l++) {
+ 			pandora_qrtr_server_t server;
