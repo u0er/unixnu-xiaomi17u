@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -1475,6 +1475,32 @@
+             vidc_cc_rd(rcgs[i].off + 8), vidc_cc_rd(rcgs[i].off + 0xC),
+             vidc_cc_rd(rcgs[i].off + 0x10));
+     }
++    /* The RCGs above are parked exactly the way clk_rcg2_shared_init() parks
++     * them (CFG src_sel = 0 -> XO, div = 0); nothing in this port ever programs
++     * a rate back because there is no clock framework here.  Whether the video
++     * core therefore runs at XO, at nothing, or at the intended 240 MHz depends
++     * on the four video PLLs and on the branch clk_on feedback -- and the port
++     * has never looked at the PLLs.  Dump them raw (taycan-eko-t layout,
++     * bases 0x0/0x1000/0x2000/0x3000 per videocc-kaanapali.c) plus the
++     * clk_on-sync spare (0x9f24 bit0), read-only, so the next round can tell
++     * "PLL locked" from "PLL off" without another guess. */
++    static const uint32_t pll_bases[] = { 0x0000u, 0x1000u, 0x2000u, 0x3000u };
++    for (unsigned i = 0; i < sizeof(pll_bases) / sizeof(pll_bases[0]); i++) {
++        uint32_t b = pll_bases[i];
++        printf("PANDORA VIDC: videocc pll%u %04x: %08x %08x %08x %08x | "
++               "%08x %08x %08x %08x | %08x %08x %08x %08x | "
++               "%08x %08x %08x %08x\n", i, b,
++            vidc_cc_rd(b + 0x00), vidc_cc_rd(b + 0x04),
++            vidc_cc_rd(b + 0x08), vidc_cc_rd(b + 0x0C),
++            vidc_cc_rd(b + 0x10), vidc_cc_rd(b + 0x14),
++            vidc_cc_rd(b + 0x18), vidc_cc_rd(b + 0x1C),
++            vidc_cc_rd(b + 0x20), vidc_cc_rd(b + 0x24),
++            vidc_cc_rd(b + 0x28), vidc_cc_rd(b + 0x2C),
++            vidc_cc_rd(b + 0x30), vidc_cc_rd(b + 0x34),
++            vidc_cc_rd(b + 0x38), vidc_cc_rd(b + 0x3C));
++    }
++    printf("PANDORA VIDC: videocc spare1 0x9f24=%08x (bit0 = clk_on sync for MVS0/VPP)\n",
++        vidc_cc_rd(0x9F24u));
+     /* Every reader of the GCC/videocc windows has now run (snapshot + RCG
+      * dump).  The ordering is load-bearing: releasing first made the snapshot
+      * print zeros and hid the RCG configuration -- the very evidence this driver
