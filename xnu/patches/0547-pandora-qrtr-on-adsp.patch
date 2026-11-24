@@ -1,0 +1,104 @@
+From: baseband lane
+Subject: 0547 pandora: exercise the QRTR client on the ADSP's link, which already works
+
+The modem's GLINK is not running when XNU boots -- the mpss SMEM partition holds only this lane's own
+items and the AOP's link register reads 0xffff -- so the QRTR client in pandora_qrtr.c has never been
+run against anything on this phone.  Everything it does (grouped intents, the hello, the service
+directory walk, the port table) is therefore untested, and the modem cannot be used to test it without
+starting it, which the task book does not allow without evidence this lane does not have.
+
+The ADSP's link is the one that works: ring 1795494675 shows it agreeing a GLINK version, and its peer
+opening IPCRTR while nothing here serves it ("opens nobody serves 4 (glink_ssr pcie_drv mhi_sat
+IPCRTR)").  So pandora_qrtr_attach(glink, name) opens that same channel on any link, with the same
+intent groups the DT gives both edges, and the same client the modem path uses.
+
+gl_report() calls it once, only when pandora_adsp_qrtr=1 is on the boot command line, only after the
+link has agreed a version.  With the argument absent nothing changes: the ADSP path is untouched, the
+modem path is untouched, and no new work runs.
+
+diff --git a/bsd/dev/pandora_adsp.c b/b/bsd/dev/pandora_adsp.c
+index 5574dfa..e298a81 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1492,6 +1492,9 @@ gl_service(struct edge *e)
+ /* The link's state when it changed (agreed, broken, opens nobody serves) and with FORCE (every 5 s at first, then
+  * every 60 s). 0298: no longer for every doorbell: with the speaker graph up (pandora_spk_live) each 20 ms buffer
+  * rings, and the line filled the log (aud23-aud26). */
++/* Defined in pandora_mpss.c: the QRTR client, attachable to a link that is not the modem's. */
++extern QcomGlinkChannel *pandora_qrtr_attach(QcomGlink *gl, const char *name);
++
+ static void
+ gl_report(struct edge *e, bool force)
+ {
+@@ -1513,6 +1516,22 @@ gl_report(struct edge *e, bool force)
+ 	    e->gl.tx_messages, e->gl.rx_data, e->gl.dropped, e->gl.unknown_opens, e->gl.unknown_names, *e->gl.tx.tail,
+ 	    *e->gl.tx.head, *e->gl.rx.tail, *e->gl.rx.head, e->bells[0], e->bells[1], ad_ipcc_aop, ad_ipcc_other,
+ 	    ad_ipcc_last, ad_irq_state, ad_irq_count, ad_irq_empty);
++
++	/*
++	 * One attempt, only when asked for, on a link that is already agreed: see pandora_qrtr_attach().
++	 * This is how the QRTR client gets exercised without the modem, whose link cannot be reached
++	 * without starting it.
++	 */
++	{
++		static bool qrtr_tried;
++		uint32_t on = 0;
++
++		if (!qrtr_tried && e->gl.version_agreed &&
++		    PE_parse_boot_argn("pandora_adsp_qrtr", &on, sizeof(on)) && on == 1) {
++			qrtr_tried = true;
++			(void)pandora_qrtr_attach(&e->gl, "IPCRTR");
++		}
++	}
+ }
+ 
+ /* ---- the audio DSP's GPR channel ------------------------------------------------------- */
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 1a052ed..1e8e8b5 100644
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -1592,6 +1592,44 @@ step_link(void)
+ 	return mp_gl.version_agreed != 0;
+ }
+ 
++/*
++ * Attach the QRTR client to a GLINK that is not the modem's.
++ *
++ * The ADSP's link is the one that already works on this phone, and its peer opens IPCRTR there while
++ * nothing on this side serves it (ring 1795494675: "opens nobody serves ... IPCRTR").  Opening the same
++ * channel on that link exercises exactly the code the modem path needs -- the grouped intents, the
++ * QRTR hello, the service directory parse, the port table -- without touching the modem at all, which
++ * is the thing the task book and the lane must not touch while there is no evidence for starting it.
++ *
++ * Caller owns the boot-arg gate; this only does the work.
++ */
++QcomGlinkChannel *
++pandora_qrtr_attach(QcomGlink *gl, const char *name)
++{
++	static const QcomGlinkIntentGroup groups[] = {{0x800u, 5u}, {0x2000u, 3u}, {0x4400u, 2u}};
++	static const QcomGlinkClient client = {mp_qrtr_state, mp_qrtr_receive};
++	const uint32_t bytes = 0x800u * 5u + 0x2000u * 3u + 0x4400u * 2u;
++
++	if (!gl || !name) {
++		return NULL;
++	}
++	uint8_t *storage = kalloc_data(bytes, Z_WAITOK | Z_ZERO);
++	if (!storage) {
++		printf("PANDORA MPSS: no memory for %s's intents (%u bytes)\n", name, bytes);
++		return NULL;
++	}
++	QcomGlinkChannel *c = qcom_glink_channel_intents(gl, name, groups, sizeof(groups) / sizeof(groups[0]),
++	    storage, &client, NULL, 1);
++	if (!c) {
++		kfree_data(storage, bytes);
++		printf("PANDORA MPSS: %s could not be opened on the other link\n", name);
++		return NULL;
++	}
++	printf("PANDORA MPSS: %s opened on another subsystem's link, intents %u+%u+%u bytes\n", name, 0x800u,
++	    0x2000u, 0x4400u);
++	return c;
++}
++
+ /* ---- the steps, and their thread ------------------------------------------------------- */
+ 
+ static bool
