@@ -1,0 +1,79 @@
+From: baseband lane
+Subject: 0540 pandora_mpss: two defects that made attach mode impossible, found by reading it
+
+Both of these are in step_queues, and both only show up in the state attach mode exists for -- a
+GLINK session that an earlier boot already created.
+
+1. "Exists" was treated as failure.
+
+   qcom_smem_alloc() returns QcomSmemExists when the item is already in the SMEM table, and it
+   returns early without touching the payload (QcomSmem.c:97-101).  step_queues treated that
+   non-zero code as an error and returned false, so step 9 failed whenever the GLINK descriptor and
+   FIFO were already there -- which is precisely the attach case, and also why a second boot in the
+   same session would fail at step 9.  Exists now means "kept", err is cleared, and the log says
+   which of the two happened.
+
+2. qcom_glink_init() zeroed the head and tail of a FIFO it did not create.
+
+   qcom_glink_init() writes *tx.head = 0 and *rx.tail = 0 unconditionally.  When the descriptor is
+   reused, d[0] is our write pointer and d[2] is the modem's write pointer into our FIFO, and the
+   earlier session may well have moved both.  Clearing only those two leaves them disagreeing with
+   the pointers at d[1] and d[3], so the link would look full or hand over stale bytes.  The values
+   read at the top of the step are now put back when the descriptor was kept, and printed.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 432e4fc..3d2eda8 100644
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -1420,20 +1420,49 @@ step_queues(void)
+ 		printf("PANDORA MPSS: GLINK descriptor from an earlier session: our FIFO tail %u head %u, theirs tail %u head "
+ 		    "%u\n", was[0], was[1], was[2], was[3]);
+ 	}
++	/*
++	 * Exists means attach, not failure.
++	 *
++	 * qcom_smem_alloc() returns QcomSmemExists when the item is already in the table, and it does
++	 * not touch the payload in that case (QcomSmem.c:97-101 returns early).  This step used to
++	 * treat that non-zero code as an error and bail out -- which made the whole attach path
++	 * unreachable, because "the items are already there" is exactly the state attach is built on,
++	 * and it also made a second boot in the same session fail at step 9 for the same reason.
++	 */
+ 	int err = mp_smem_alloc(MP_ITEM_GL_DESC, 32);
++	bool desc_kept = err == QcomSmemExists;
++	if (desc_kept) {
++		err = 0;
++	}
+ 	if (!err) {
+ 		err = mp_smem_alloc(MP_ITEM_GL_TX, MP_GL_FIFO);
++		if (err == QcomSmemExists) {
++			err = 0;
++		}
+ 	}
+ 	uint32_t tsize = 0;
+ 	volatile uint8_t *desc = mp_smem_item(MP_ITEM_GL_DESC, &dsize), *txf = mp_smem_item(MP_ITEM_GL_TX, &tsize);
+-	printf("PANDORA MPSS: GLINK items %u (%u bytes) %u (%u bytes) -> %d\n", MP_ITEM_GL_DESC, dsize, MP_ITEM_GL_TX,
+-	    tsize, err);
++	printf("PANDORA MPSS: GLINK items %u (%u bytes, %s) %u (%u bytes) -> %d\n", MP_ITEM_GL_DESC, dsize,
++	    desc_kept ? "kept from the earlier session" : "allocated now", MP_ITEM_GL_TX, tsize, err);
+ 	if (err || !desc || !txf || dsize < 32) {
+ 		return false;
+ 	}
+ 	volatile uint32_t *d = (volatile uint32_t *)desc;
+ 	QcomGlinkFifo tx = {&d[1], &d[0], txf, tsize}, rx = {&d[3], &d[2], NULL, 0};
+ 	qcom_glink_init(&mp_gl, tx, rx, mp_gl_kick, NULL);
++	/*
++	 * qcom_glink_init zeroes *tx.head and *rx.tail.  That is right when this boot is the one that
++	 * creates the FIFOs, and wrong when they are being reused: d[0] is our write pointer and d[2] is
++	 * the modem's write pointer into our FIFO, both of which the earlier session may well have moved.
++	 * Clearing them would make the modem's tail disagree with our head and the link would look full
++	 * or hand us stale bytes.  Put back exactly what was read above.
++	 */
++	if (desc_kept) {
++		d[0] = was[0];
++		d[2] = was[2];
++		printf("PANDORA MPSS: FIFO pointers kept: our head %u, their tail %u (their head %u)\n",
++		    was[0], was[2], was[3]);
++	}
+ 	mp_gl_on = true;
+ 	return true;
+ }
