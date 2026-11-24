@@ -1,0 +1,53 @@
+From: baseband lane
+Subject: 0543 pandora_mpss: attach keeps step 7, because announcing is not loading
+
+The first attach boot (ring 1795494675, kernel 0540) reached the desktop and ran steps 1,2,3 and 9,
+then stopped at step 10:
+
+  PANDORA MPSS: the modem has not made its FIFO (item 480)
+
+Item 480 is the modem's own RX FIFO.  The modem creates it when the AP announces itself: the SMP2P
+"master-kernel" item, the GLINK marks and the doorbells, which is step_our_item -- step 7.  Attach
+mode skipped 4 through 8 in one condition, so the modem was never told that this side exists and had
+no reason to build the FIFO the next step waits for.
+
+Step 7 does not load or reset anything: it writes our own SMEM item and rings the doorbells.  The
+steps that must stay skipped are the ones that put firmware in or start it -- 4 and 5 (INIT_IMAGE for
+the DTB and the main image), 6 (the segment copy) and 8 (AUTH_AND_RESET).  Attach now skips exactly
+{4,5,6,8} and keeps 7.
+
+The comment above mp_attach said "steps 4..8 are skipped" and now says what is actually true, with the
+ring that proved it.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 3d2eda8..421350f 100644
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -1685,10 +1685,14 @@ mp_steps_over(uint32_t done)
+  * firmware" -- and to build the AP<->modem IPC and QRTR discovery on top of that.  Section 7.1
+  * forbids triggering modem crash/SSR as an early debugging tool, which is what PAS_SHUTDOWN was.
+  *
+- * So steps 4..8 (INIT_IMAGE, MEM_SETUP, the segment copy, the SMP2P handshake that starts what we
+- * copied, and AUTH_AND_RESET) are exactly the reload path and are skipped in attach mode.  What is
+- * kept is what observes and what talks: the SMEM survey, the firmware identity, the mailbox, then
+- * the GLINK queues, our side of the link, and QRTR.
++ * So steps 4..6 and 8 (INIT_IMAGE for the DTB and the main image, the segment copy, and the
++ * AUTH_AND_RESET that would start what we copied) are the reload path and are skipped in attach
++ * mode.  Step 7 stays: writing our SMP2P "master-kernel" item and the GLINK marks is how this side
++ * ANNOUNCES ITSELF to a modem that is already running -- it starts nothing, and without it the modem
++ * never creates the FIFO step 10 waits for (ring 1795494675: "the modem has not made its FIFO
++ * (item 480)", which is exactly what skipping the announcement produces).  What is kept is what
++ * observes and what talks: the SMEM survey, the firmware identity, the mailbox, our item, the GLINK
++ * queues, our side of the link, and QRTR.
+  */
+ static bool mp_attach;
+ 
+@@ -1698,7 +1702,7 @@ mp_run_steps(void)
+ 	uint32_t done = 0;
+ 	for (uint32_t s = 1; s <= mp_last_step; s++) {
+ 		pandora_step = s;
+-		if (mp_attach && s >= 4 && s <= 8) {
++		if (mp_attach && ((s >= 4 && s <= 6) || s == 8)) {
+ 			printf("PANDORA MPSS: step %u skipped (attach mode: no firmware is loaded or reset)\n", s);
+ 			continue;
+ 		}
