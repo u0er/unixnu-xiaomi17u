@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..1c07b26a436d2dcc42be3006ecb2419d734919e1
+index 0000000..10dae30482929fe28dc11c76ab61a0e57c6c3ac5
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,5113 @@
+@@ -0,0 +1,5122 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4085,16 +4085,23 @@ index 0000000..1c07b26a436d2dcc42be3006ecb2419d734919e1
 +static unsigned
 +bt_peri_drain_silence(unsigned quiet_ms, unsigned max_ms, const char *what)
 +{
-+	uint64_t start, last_rx, quiet_ns, max_ns;
++	uint64_t start, last_rx, quiet_ns, max_ns, first_ns;
 +	unsigned bytes = 0;
 +	uint8_t head[48] = {0};
 +	unsigned head_n = 0;
++	bool seen = false;   /* any byte at all, so the 48-byte head cap does not gate it */
 +
 +	/* Compare durations throughout: clock_interval_to_deadline() produces an
 +	 * absolute deadline, and comparing a delta against it silently disables the
 +	 * bound (the first version of this helper did exactly that). */
 +	max_ns = (uint64_t)max_ms * NSEC_PER_MSEC;
 +	quiet_ns = (uint64_t)quiet_ms * NSEC_PER_MSEC;
++	/* Level 20.54: waiting for the first byte and waiting inside a stream are not
++	 * the same problem. With one 4 ms threshold the drain gives up before a late
++	 * answer even starts - exactly what 20.53 meant to fix (map A's answer arrived
++	 * after the fixed 60 ms drain). The first byte now gets up to 200 ms, the gaps
++	 * inside the stream keep the tight 4 ms that makes "silence" meaningful. */
++	first_ns = 200ull * NSEC_PER_MSEC;
 +	last_rx = mach_absolute_time();
 +	start = last_rx;
 +
@@ -4102,7 +4109,7 @@ index 0000000..1c07b26a436d2dcc42be3006ecb2419d734919e1
 +		uint8_t b;
 +
 +		if (!(bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
-+			if (mach_absolute_time() - last_rx >= quiet_ns) {
++			if (mach_absolute_time() - last_rx >= (seen ? quiet_ns : first_ns)) {
 +				break;
 +			}
 +			bt_sleep(100);
@@ -4113,9 +4120,11 @@ index 0000000..1c07b26a436d2dcc42be3006ecb2419d734919e1
 +			const uint8_t ack = 0xfc;
 +
 +			(void)bt_uart_tx(&ack, 1, "PERI silence wake ACK FC");
++			seen = true;
 +			last_rx = mach_absolute_time();
 +			continue;
 +		}
++		seen = true;
 +		bytes++;
 +		if (head_n < sizeof(head)) {
 +			/* What the drain is throwing away decides whether the line carries
