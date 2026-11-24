@@ -1,0 +1,24 @@
+From: baseband lane
+Subject: 0548 pandora_adsp: the QRTR experiment attaches on the ADSP edge, not on whichever agrees first
+
+gl_report() runs once per edge, and 0547 put the one-shot qrtr_tried guard in it without asking which
+edge it was looking at.  There are two edges (ed_adsp "ADSP" and ed_soccp "SOCCP"), and the first one to
+agree a GLINK version would have taken the single attempt -- on this phone that is not guaranteed to be
+the ADSP, and attaching the QRTR client to the SOCCP's link would have exercised it against the wrong
+peer and told the wrong story.
+
+The condition now also requires e == &ed_adsp.
+
+diff --git a/bsd/dev/pandora_adsp.c b/b/bsd/dev/pandora_adsp.c
+index e298a81..7ccd2fe 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1526,7 +1526,7 @@ gl_report(struct edge *e, bool force)
+ 		static bool qrtr_tried;
+ 		uint32_t on = 0;
+ 
+-		if (!qrtr_tried && e->gl.version_agreed &&
++		if (!qrtr_tried && e == &ed_adsp && e->gl.version_agreed &&
+ 		    PE_parse_boot_argn("pandora_adsp_qrtr", &on, sizeof(on)) && on == 1) {
+ 			qrtr_tried = true;
+ 			(void)pandora_qrtr_attach(&e->gl, "IPCRTR");
