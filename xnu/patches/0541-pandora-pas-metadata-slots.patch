@@ -1,0 +1,65 @@
+From: baseband lane
+Subject: 0541 pandora_pas: one metadata slot per pas, and release every slot for it
+
+The 16-slot table at the top of pandora_pas.c keeps a metadata blob and its SHM bridge alive between
+INIT_IMAGE and AUTH_AND_RESET.  Two lines in it disagreed with each other:
+
+  pas_meta_hold()    took the first free slot without checking whether this pas already held one
+  pas_meta_release() freed the first matching slot and returned
+
+So loading the same image twice in one boot -- which the probes do deliberately, and which a retry
+after a failed auth does -- took two slots and freed one, leaking a blob and a TrustZone bridge every
+time.  After sixteen the table was full, and pas_meta_hold()'s "no slot" path released the new metadata
+immediately, so the next INIT_IMAGE was handed nothing and the load failed for a reason that had
+nothing to do with the load.
+
+Now a slot for this pas is reused, and released first, which is also the only safe order: TrustZone has
+to be told to forget the old blob before the memory under it is freed.  The release walks every slot
+rather than stopping at the first.
+
+diff --git a/bsd/dev/pandora_pas.c b/b/bsd/dev/pandora_pas.c
+index ceb1dcc..f2c1e8c 100644
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -70,9 +70,24 @@ struct pas_meta {
+ };
+ static struct pas_meta pas_meta[PAS_META_SLOTS];
+ 
++static void
++pas_meta_release(unsigned pas);
++
++/*
++ * One slot per pas.
++ *
++ * This used to take the first free slot without looking for one already held for the same pas, and
++ * pas_meta_release() freed only the first match.  Loading the same image twice in one boot -- which
++ * the probes do on purpose, and which a retry after a failed auth also does -- therefore took two
++ * slots and leaked one, and after sixteen the "no slot" path below released the new metadata
++ * immediately, so the next INIT_IMAGE was handed nothing.  A slot for this pas is now reused: the old
++ * one is released first, which is also the only safe order, because TrustZone must be told to forget
++ * the old blob before the memory behind it is freed.
++ */
+ static void
+ pas_meta_hold(unsigned pas, vm_offset_t md, uint64_t size, uint64_t bridge)
+ {
++	pas_meta_release(pas);
+ 	for (unsigned i = 0; i < PAS_META_SLOTS; i++) {
+ 		if (!pas_meta[i].used) {
+ 			pas_meta[i].used = true;
+@@ -89,7 +104,7 @@ pas_meta_hold(unsigned pas, vm_offset_t md, uint64_t size, uint64_t bridge)
+ 	kmem_free(kernel_map, md, (vm_size_t)size);
+ }
+ 
+-/* Frees the metadata of pas -- only after INIT_IMAGE has been told to forget it. */
++/* Frees every metadata slot held for pas -- only after INIT_IMAGE has been told to forget it. */
+ static void
+ pas_meta_release(unsigned pas)
+ {
+@@ -99,7 +114,6 @@ pas_meta_release(unsigned pas)
+ 			pas_meta[i].bridge = 0;
+ 			kmem_free(kernel_map, pas_meta[i].md, (vm_size_t)pas_meta[i].size);
+ 			pas_meta[i].used = false;
+-			return;
+ 		}
+ 	}
+ }
