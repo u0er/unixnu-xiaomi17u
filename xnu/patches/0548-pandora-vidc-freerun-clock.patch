@@ -1,0 +1,58 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -1298,6 +1298,14 @@
+     return *(volatile uint32_t *)(vidc_cc + off);
+ }
+ 
++static inline void
++vidc_cc_wr(uint32_t off, uint32_t v)
++{
++    if (!vidc_cc) return;             /* videocc window released after power-up */
++    *(volatile uint32_t *)(vidc_cc + off) = v;
++    __asm__ volatile ("dmb oshst" ::: "memory");
++}
++
+ /* GCC branch with BRANCH_HALT_SKIP: enable = set bit0, verify bit0 only. */
+ static int
+ vidc_gcc_branch_on(uint32_t off, const char *name)
+@@ -1420,10 +1428,35 @@
+         if (vidc_gcc_branch_on(GCC_VIDEO_AXI1_CLK - GCC_MAP_OFF, "video_axi1") != 0) failed++;
+     }
+     vidc_branch_on(0x8164u);           /* mvs0c (AXI)   */
+-    /* 0x80e4 is NOT a plain branch: its captured clock object has no +0x30/+0x34
+-     * fields and a write there does not stick (`20010c00 -> 20010c00`), so the
+-     * freerun clock cannot be enabled through it.  Left out deliberately
+-     * instead of pretending it was turned on. */
++    /* video_cc_mvs0_freerun_clk is a clk_mem_branch, not a plain branch
++     * (videocc-kaanapali.c): branch enable at 0x80e0 BIT(0), mem handshake at
++     * 0x80e4 BIT(3) (inverted) with ACK in GENMASK(11,10), polled <=200 us
++     * (clk-branch.c clk_branch2_mem_enable).  The previous revision wrote
++     * BIT(0) to 0x80e4 -- the ACK/status register -- and read 20010c00 back
++     * unchanged, then skipped the clock.  Upstream iris_vpu35_power_on_hw
++     * enables HW_FREERUN before HW_CLK; without it the Xtensa fetch domain has
++     * no clock source.  This round enables it exactly as upstream does. */
++    {
++        const uint32_t fr_before = vidc_cc_rd(0x80E4u);
++        const uint32_t fb_before = vidc_cc_rd(0x80E0u);
++        int mem_acked = 0;
++        vidc_cc_wr(0x80E4u, fr_before & ~(1u << 3));   /* mem_enable_invert */
++        for (unsigned i = 0; i < 200; i++) {
++            if (vidc_cc_rd(0x80E4u) & (0x3u << 10)) {  /* ACK bits 11:10 */
++                mem_acked = 1;
++                break;
++            }
++            delay(1);
++        }
++        vidc_cc_wr(0x80E0u, fb_before | 1u);           /* CBCR_CLOCK_ENABLE */
++        printf("PANDORA VIDC: freerun branch 80e0 %08x -> %08x, "
++               "mem 80e4 %08x -> %08x ack=%d clk_off=%d fsm=%u\n",
++            fb_before, vidc_cc_rd(0x80E0u),
++            fr_before, vidc_cc_rd(0x80E4u), mem_acked,
++            (vidc_cc_rd(0x80E0u) >> 31) & 1u,
++            (vidc_cc_rd(0x80E0u) >> 28) & 0x7u);
++        if (!mem_acked) failed++;
++    }
+     vidc_branch_on(0x80D0u);           /* mvs0 (HW)     */
+     vidc_branch_on(0x80BCu);           /* mvs0b (BSE)   */
+     vidc_branch_on(0x8134u);           /* vpp0          */
