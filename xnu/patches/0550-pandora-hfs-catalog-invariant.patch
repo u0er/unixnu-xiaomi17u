@@ -1,0 +1,143 @@
+diff --git a/bsd/sweet_hfs/core/hfs_vnops.c b/bsd/sweet_hfs/core/hfs_vnops.c
+--- a/bsd/sweet_hfs/core/hfs_vnops.c
++++ b/bsd/sweet_hfs/core/hfs_vnops.c
+@@ -2989,11 +2989,16 @@
+ 
+ 	struct cat_fork dfork_buf;
+ 	const struct cat_fork *dfork, *rfork;
++	int perr = 0;
+ 
+ 	dfork = hfs_prepare_fork_for_update(to_cp->c_datafork, NULL,
+-										&dfork_buf, hfsmp->blockSize);
++										&dfork_buf, hfsmp->blockSize, &perr);
+ 	rfork = hfs_prepare_fork_for_update(from_rfork, NULL,
+-										&rfork_buf.ff_data, hfsmp->blockSize);
++										&rfork_buf.ff_data, hfsmp->blockSize, &perr);
++	if (perr != 0) {
++		error = perr;
++		goto exit;
++	}
+ 
+ 	// Update the catalog nodes, to_cp first
+ 	if ((error = cat_update(hfsmp, &to_cp->c_desc, &to_cp->c_attr, 
+@@ -3032,9 +3037,13 @@
+ 
+ 	// Currently unnecessary, but might be useful in future...
+ 	dfork = hfs_prepare_fork_for_update(from_cp->c_datafork, NULL, &dfork_buf,
+-										hfsmp->blockSize);
++										hfsmp->blockSize, &perr);
+ 	rfork = hfs_prepare_fork_for_update(from_rfork, NULL, &rfork_buf.ff_data,
+-										hfsmp->blockSize);
++										hfsmp->blockSize, &perr);
++	if (perr != 0) {
++		error = perr;
++		goto exit;
++	}
+ 
+ 	// Update from_cp
+ 	if ((error = cat_update(hfsmp, &from_cp->c_desc, &from_cp->c_attr, 
+@@ -6184,6 +6193,13 @@
+ }
+ 
+ /*
++ * P0-b: set once we have reported a fork invariant violation.  A poisoned
++ * volume hits the getattr sanity check hundreds of times per boot; one
++ * report (with the fileID) plus one hfs_mark_inconsistent() is enough.
++ */
++static boolean_t hfs_fork_invariant_reported = FALSE;
++
++/*
+  * Prepares a fork for cat_update by making sure ff_size and ff_blocks
+  * are no bigger than the valid data on disk thus reducing the chance
+  * of exposing uninitialised data in the event of a non clean unmount.
+@@ -6194,7 +6210,8 @@
+ hfs_prepare_fork_for_update(filefork_t *ff,
+ 							const struct cat_fork *cf,
+ 							struct cat_fork *cf_buf,
+-							uint32_t block_size)
++							uint32_t block_size,
++							int *errorp)
+ {
+ 	if (!ff)
+ 		return NULL;
+@@ -6210,6 +6227,32 @@
+ 	if (!TAILQ_EMPTY(&ff->ff_invalidranges))
+ 		max_size = TAILQ_FIRST(&ff->ff_invalidranges)->rl_start;
+ 
++	/*
++	 * P0-b: refuse to hand cat_update a fork that claims more blocks than it
++	 * owns while nothing is loaned.  That is exactly the shape a failed
++	 * truncate used to write into the catalog (logicalSize > 0,
++	 * totalBlocks == 0); re-publishing it makes the volume permanently
++	 * inconsistent, because the getattr sanity check in hfs_cnode.c then
++	 * rejects every lookup.  Callers must treat *errorp != 0 as fatal and
++	 * must not call cat_update.
++	 */
++	if (block_size != 0 && !ff->ff_unallocblocks
++		&& howmany((uint64_t)ff->ff_size, block_size) > (uint64_t)ff->ff_blocks) {
++		struct hfsmount *hfsmp = ff->ff_cp ? FCBTOVCB(ff) : NULL;
++
++		if (hfsmp && !hfs_fork_invariant_reported) {
++			hfs_fork_invariant_reported = TRUE;
++			printf("hfs: fork invariant violated for fileID %llu: "
++				   "size %lld, %u block(s) allocated, 0 loaned; "
++				   "refusing catalog update\n",
++				   (unsigned long long)FTOC(ff)->c_fileid,
++				   (long long)ff->ff_size, ff->ff_blocks);
++			hfs_mark_inconsistent(hfsmp, HFS_INCONSISTENCY_DETECTED);
++		}
++		if (errorp)
++			*errorp = EIO;
++		return cf;
++	}
+ 	if (!ff->ff_unallocblocks && ff->ff_size <= max_size)
+ 		return cf; // Nothing to do
+ 
+@@ -6344,8 +6387,18 @@
+      * Modify the values passed to cat_update based on whether or not
+      * the file has invalid ranges or borrowed blocks.
+      */
+-    dataforkp = hfs_prepare_fork_for_update(cp->c_datafork, NULL, &datafork, hfsmp->blockSize);
+-	rsrcforkp = hfs_prepare_fork_for_update(cp->c_rsrcfork, NULL, &rsrcfork, hfsmp->blockSize);
++	int perr = 0;
++
++	dataforkp = hfs_prepare_fork_for_update(cp->c_datafork, NULL, &datafork,
++										hfsmp->blockSize, &perr);
++	rsrcforkp = hfs_prepare_fork_for_update(cp->c_rsrcfork, NULL, &rsrcfork,
++										hfsmp->blockSize, &perr);
++	if (perr != 0) {
++		/* P0-b: do not publish an inconsistent fork to the catalog. */
++		hfs_end_transaction(hfsmp);
++		error = perr;
++		goto exit;
++	}
+ 
+ 	if (__builtin_expect(kdebug_enable & KDEBUG_TRACE, 0)) {
+ 		long dbg_parms[NUMPARMS];
+diff --git a/bsd/sweet_hfs/core/hfs.h b/bsd/sweet_hfs/core/hfs.h
+--- a/bsd/sweet_hfs/core/hfs.h
++++ b/bsd/sweet_hfs/core/hfs.h
+@@ -1244,7 +1244,8 @@
+ hfs_prepare_fork_for_update(filefork_t *ff,
+ 							const struct cat_fork *cf,
+ 							struct cat_fork *cf_buf,
+-							uint32_t block_size);
++							uint32_t block_size,
++							int *errorp);
+ 
+ struct decmpfs_cnode;
+ struct decmpfs_cnode *hfs_lazy_init_decmpfs_cnode (struct cnode *cp);
+diff --git a/bsd/sweet_hfs/core/hfs_extents.c b/bsd/sweet_hfs/core/hfs_extents.c
+--- a/bsd/sweet_hfs/core/hfs_extents.c
++++ b/bsd/sweet_hfs/core/hfs_extents.c
+@@ -297,7 +297,9 @@
+ 		struct cat_fork fork;
+ 
+ 		hfs_fork_copy(&fork, &VTOF(iter->vp)->ff_data, extents);
+-		hfs_prepare_fork_for_update(VTOF(iter->vp), &fork, &fork, hfsmp->blockSize);
++		int perr = 0;
++		hfs_prepare_fork_for_update(VTOF(iter->vp), &fork, &fork, hfsmp->blockSize, &perr);
++		CHECK(perr, ret, exit);
+ 
+ 		bool is_rsrc = VNODE_IS_RSRC(iter->vp);
+ 		CHECK(cat_update(hfsmp, &cp->c_desc, &cp->c_attr,
