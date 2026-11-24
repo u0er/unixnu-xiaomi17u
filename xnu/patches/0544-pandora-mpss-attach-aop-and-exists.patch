@@ -1,0 +1,138 @@
+From: baseband lane
+Subject: 0544 pandora_mpss: attach stops telling the AOP the modem is off, and three items are reused
+
+Everything here comes from the first attach boot (ring 1795494675).
+
+1. step_mailbox() sent "modem: off" in attach mode.
+
+   "told the AOP: {class: image, res: load_state, name: modem, val: off}" at 0.207 s, four lines
+   before step 10 waited for a FIFO from that modem.  Attach opens the mailbox and leaves its state
+   alone; the write is what starting a modem of our own would need, and there is no modem of ours.
+
+2. step_queues() trusted qcom_smem_alloc() to say "already there".
+
+   0540 made QcomSmemExists count as success, but the ring proves the allocator never answers that
+   for these items: step 1 printed "items there: 478:32 479:16384" and step 9 still printed
+   "allocated now" with err 0, i.e. both lookups walked past them and the allocator rewrote their
+   headers, lengths and payload.  For the GLINK descriptor that zeroes a possibly live session's
+   FIFO pointers.  Existence is now asked with mp_smem_item(), the same call step 1 uses.
+
+3. step_our_item() had the same failure-on-exists shape as step 9.
+
+   `if (mp_smem_alloc(MP_ITEM_OUT, ...)) return false;` reads QcomSmemExists as failure, so a second
+   boot in the same power cycle would fail at step 7 for exactly the state step 7 exists to handle.
+   It now reuses the item when mp_smem_item() finds it.
+
+diff --git a/bsd/dev/pandora_mpss.c b/b/bsd/dev/pandora_mpss.c
+index 421350f..96929fc 100644
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -169,6 +169,13 @@ static unsigned mp_pas = MP_PAS, mp_pas_dtb = MP_PAS_DTB;
+ #define MP_FW_PART        "modemfirmware"  /* the modem's own image; NOT Android's firmware_mnt */
+ #define MP_STEPS          11
+ 
++/*
++ * pandora_mpss_attach=1: observe and talk, load nothing.
++ *
++ * Declared here because step_mailbox() reads it; the meaning is explained beside mp_run_steps().
++ */
++static bool mp_attach;
++
+ static vm_offset_t mp_qmp, mp_ipcc, mp_smem_va, mp_mutex;
+ static uint32_t mp_mutex_off, mp_mutex_pa;
+ static QcomSmem mp_smem;
+@@ -979,6 +986,19 @@ step_mailbox(void)
+ 			return false;
+ 		}
+ 	}
++	/*
++	 * Attach mode opens the mailbox and stops there.
++	 *
++	 * "modem: off" is a write telling the AOP that this host believes the modem is down.  The whole
++	 * point of attach is to reach a modem somebody else started, so saying that -- and then announcing
++	 * ourselves in step 7 while we wait for the modem's FIFO in step 10 -- contradicts itself.  Ring
++	 * 1795494675 did exactly that: "told the AOP: {... name: modem, val: off}" at 0.207 s, four lines
++	 * before "the modem has not made its FIFO (item 480)".
++	 */
++	if (mp_attach) {
++		printf("PANDORA MPSS: the mailbox is open; attach mode leaves its state alone\n");
++		return true;
++	}
+ 	mp_mailbox_send("{class: image, res: load_state, name: modem, val: off}");
+ 	return true;
+ }
+@@ -1238,9 +1258,20 @@ mp_smem_alloc(uint16_t item, uint32_t size)
+ static bool
+ step_our_item(void)
+ {
+-	if (mp_smem_alloc(MP_ITEM_OUT, QCOM_SMP2P_ITEM_BYTES)) {
++	/*
++	 * The same existence rule as the GLINK items: if the item is already there, use it.
++	 *
++	 * mp_smem_alloc() answers QcomSmemExists for an item that exists, and the test below used to
++	 * read any non-zero answer as failure -- so a second boot in the same power cycle would fail at
++	 * step 7 for the very reason that step 7 is meant to handle.  mp_smem_item() reads the table
++	 * step 1 read; if it finds the item, the allocator is not called at all.
++	 */
++	uint32_t ohave = 0;
++	bool out_kept = mp_smem_item(MP_ITEM_OUT, &ohave) != NULL;
++	if (!out_kept && mp_smem_alloc(MP_ITEM_OUT, QCOM_SMP2P_ITEM_BYTES)) {
+ 		return false;
+ 	}
++	(void)ohave;
+ 	uint32_t osize = 0;
+ 	volatile uint8_t *out = mp_smem_item(MP_ITEM_OUT, &osize);
+ 	if (!out || osize < QCOM_SMP2P_ITEM_BYTES) {
+@@ -1429,21 +1460,32 @@ step_queues(void)
+ 	 * unreachable, because "the items are already there" is exactly the state attach is built on,
+ 	 * and it also made a second boot in the same session fail at step 9 for the same reason.
+ 	 */
+-	int err = mp_smem_alloc(MP_ITEM_GL_DESC, 32);
+-	bool desc_kept = err == QcomSmemExists;
+-	if (desc_kept) {
+-		err = 0;
+-	}
+-	if (!err) {
++	/*
++	 * Existence is asked with mp_smem_item(), not with mp_smem_alloc()'s return code.
++	 *
++	 * The 0540 version expected qcom_smem_alloc() to answer QcomSmemExists for an item that is
++	 * already there.  Ring 1795494675 shows it does not: step 1 had just printed
++	 * "items there: 478:32 479:16384", and step 9 still said "allocated now" with err 0 -- the
++	 * allocator walked past both items and rewrote their headers and payload.  For the GLINK
++	 * descriptor that means zeroing the FIFO pointers of a session that may still be live.
++	 * mp_smem_item() reads the same table step 1 read, so if it finds the item, the item is there
++	 * and is used untouched.
++	 */
++	uint32_t dhave = 0, thave = 0;
++	bool desc_kept = mp_smem_item(MP_ITEM_GL_DESC, &dhave) != NULL;
++	bool tx_kept = mp_smem_item(MP_ITEM_GL_TX, &thave) != NULL;
++	int err = 0;
++	if (!desc_kept) {
++		err = mp_smem_alloc(MP_ITEM_GL_DESC, 32);
++	}
++	if (!err && !tx_kept) {
+ 		err = mp_smem_alloc(MP_ITEM_GL_TX, MP_GL_FIFO);
+-		if (err == QcomSmemExists) {
+-			err = 0;
+-		}
+ 	}
+ 	uint32_t tsize = 0;
+ 	volatile uint8_t *desc = mp_smem_item(MP_ITEM_GL_DESC, &dsize), *txf = mp_smem_item(MP_ITEM_GL_TX, &tsize);
+-	printf("PANDORA MPSS: GLINK items %u (%u bytes, %s) %u (%u bytes) -> %d\n", MP_ITEM_GL_DESC, dsize,
+-	    desc_kept ? "kept from the earlier session" : "allocated now", MP_ITEM_GL_TX, tsize, err);
++	printf("PANDORA MPSS: GLINK items %u (%u bytes, %s) %u (%u bytes, %s) -> %d\n", MP_ITEM_GL_DESC, dsize,
++	    desc_kept ? "kept from the earlier session" : "allocated now", MP_ITEM_GL_TX, tsize,
++	    tx_kept ? "kept" : "allocated now", err);
+ 	if (err || !desc || !txf || dsize < 32) {
+ 		return false;
+ 	}
+@@ -1694,8 +1736,6 @@ mp_steps_over(uint32_t done)
+  * observes and what talks: the SMEM survey, the firmware identity, the mailbox, our item, the GLINK
+  * queues, our side of the link, and QRTR.
+  */
+-static bool mp_attach;
+-
+ static void
+ mp_run_steps(void)
+ {
