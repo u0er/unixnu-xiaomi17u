@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..d779e4ebfee2e55e654db7f5a3519becad3b1414
+index 0000000..d47f83c5bcae02ac153265b4e639de568aaf7719
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,5150 @@
+@@ -0,0 +1,5159 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -4222,8 +4222,13 @@ index 0000000..d779e4ebfee2e55e654db7f5a3519becad3b1414
 +	if (last == 0u) {
 +		last = BT_FW_SEG_MAX;
 +	}
-+	printf("PANDORA BT: %s: TLV 06 %02x stage, %u bytes -> %u frames (last %u), wire speed\n",
-+	    what, sub06, size, nseg, last);
++	/* Level 20.57: the log must not claim wire speed while 20.51 paces this stage.
++	 * The v2050 log still said "wire speed" for map A even though every segment
++	 * now waits 1.5 ms - a lie of exactly the kind that has misled this lane
++	 * three times today (a stale marker, a discarded payload, a mis-scaled drain). */
++	printf("PANDORA BT: %s: TLV 06 %02x stage, %u bytes -> %u frames (last %u), %s\n",
++	    what, sub06, size, nseg, last,
++	    (bt_level >= 20) ? "paced 1500 us" : "wire speed");
 +	pandora_log_sync();
 +	bt_tx_long_quiet = true;
 +	bt_tx_long_frames = 0;
@@ -4859,7 +4864,10 @@ index 0000000..d779e4ebfee2e55e654db7f5a3519becad3b1414
 +		    lerr == 0 ? "answered" : "silent", lerr);
 +		pandora_log_sync();
 +	}
-+	bt_peri_baud_probe();
++	/* Level 20.58: the baud scan used to sit here, between the liveness probe and
++	 * the 0x23 request. It reconfigures the SE six times, so putting a diagnostic
++	 * directly in front of a command we need answered is backwards. It now runs
++	 * after the phase C attempt, where it cannot disturb a command/answer pair. */
 +	/* Phase C (trace 11.209352 0x23, then 57 frames to 11.380534): the nv
 +	 * stage carries gngbtnv20.bin behind a 4-byte 04 22 4c 00 header. This
 +	 * is the only stage the ROM answers frame by frame, so it runs with the
@@ -4894,6 +4902,7 @@ index 0000000..d779e4ebfee2e55e654db7f5a3519becad3b1414
 +	/* Phase D (trace 11.761406): the closing 0x20, answered with the 117-byte
 +	 * build-info event whose payload carries "oBTFW.GANGES.". Android reaches
 +	 * a live HCI state right after it. */
++	bt_peri_baud_probe();
 +	err = bt_peri_vs_cmd(0x20u, 2000u, "PERI TME-L map close");
 +	if (err) {
 +		printf("PANDORA BT: level 20 close command unanswered (error %d)\n", err);
