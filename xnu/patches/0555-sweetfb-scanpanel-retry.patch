@@ -1,0 +1,69 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0f60982..83ac144 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -438,7 +438,7 @@ public:
+ #if defined(PANDORA)
+ 	uint32_t scanIova(SweetSurface *s);
+ 	bool scanPresent(const uint8_t *rec, uint32_t mask);
+-	void scanPanel(void);
++	bool scanPanel(void);
+ 	void scanTick(void);
+ 	bool scanSettle(void);
+ 	bool scanIrqFilter(IOFilterInterruptEventSource *source);
+@@ -1523,12 +1523,21 @@ AppleCLCD::scanPresent(const uint8_t *rec, uint32_t mask)
+ }
+ 
+ /* 0217: the pipes back on the panel memory; the surface holds go once that is on screen (scanTick). */
+-void
++/* 0555: keep trying until the pipes really go back to the panel memory.  A single
++ * attempt in displayOff() used to latch the failure: while the flush was busy the
++ * screen kept showing the last scanned surface (the boot logo) for the whole boot. */
++bool
+ AppleCLCD::scanPanel(void)
+ {
+-	if (fScanOn && !fScanToPanel && (fScanShown != NULL || fScanQueued != NULL) && pandora_scanout_panel()) {
+-		fScanToPanel = true;
++	if (!fScanOn || fScanToPanel) {
++		return fScanToPanel;
++	}
++	if ((fScanShown == NULL && fScanQueued == NULL) || !pandora_scanout_panel()) {
++		return false;
+ 	}
++	fScanToPanel = true;
++	IOLog("SWEET FB: scanout back on panel memory\n");
++	return true;
+ }
+ 
+ /* 0217: drop what the pipes no longer read (0218: scanSettle, once they latched a frame). */
+@@ -1632,6 +1641,7 @@ AppleCLCD::presentLoop(void)
+ 		}
+ 		present(rec);
+ 		last = mach_absolute_time();
++		(void)scanPanel();      /* 0555: retry until the panel memory is scanned */
+ 		(void)scanSettle();
+ 		if (swapAbs) {
+ 			const uint64_t took = mach_absolute_time() - swapAbs;
+@@ -1659,7 +1669,12 @@ AppleCLCD::displayOff(void)
+ 		}
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	scanPanel();
++	/* 0555: bounded retry while the scanout flush is busy (1 ms apart, 50 ms). */
++	for (int i = 0; i < 50 && !scanPanel(); i++) {
++		AbsoluteTime deadline;
++		nanoseconds_to_absolutetime(NSEC_PER_MSEC, &deadline);
++		clock_delay_until(deadline);
++	}
+ 	(void)scanSettle();
+ }
+ 
+@@ -2048,7 +2063,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ 	if (dh != NULL) {
+ 		/* 0217: a scanned-out frame is not in the panel memory */
+-		uint32_t ow = 0, oh = 0, n = scanned ? 0 : pandora_fbdump_scale(dump + dumpLen, dumpCap - dumpLen,
++		uint32_t ow = 0, oh = 0, n = pandora_fbdump_scale(dump + dumpLen, dumpCap - dumpLen,
+ 		    (uintptr_t)fPixels, fRowBytes, fWidth, fHeight, &ow, &oh);
+ 		if (n) {
+ 			uint32_t i = dh->frames;
