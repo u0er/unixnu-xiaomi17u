@@ -1,0 +1,33 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1944,6 +1944,14 @@
+ 				    (uint64_t)fHeight);
+ 				uint32_t k = sweet_fb_dim;
+ 				uint32_t lastY = ~0u;
++				/* The panel's first two columns both come from logical x = 0
++				 * (fFillX[0] == fFillX[1] == 0), so a 1 px seam in that source
++				 * column shows as a 1 px line along the panel's left edge. A
++				 * layer that spans the panel reads logical x = 1 instead: a one
++				 * pixel shift, not visible, and the seam is not shown. The index
++				 * is clamped to the copied row so a layer placed left of the
++				 * panel cannot read outside it. */
++				int32_t lo = (px0 == 0 && px1 == fWidth && w > 1) ? 1 : 0;
+ 				for (uint32_t Y = py0; Y < py1; Y++) {
+ 					uint32_t ly = (uint32_t)((uint64_t)Y * fLogicalH / fHeight);
+ 					const uint32_t *srow = (const uint32_t *)(src + s->offset +
+@@ -1957,11 +1965,13 @@
+ 					uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)Y * fRowBytes);
+ 					if (k >= 256) {
+ 						for (uint32_t X = px0; X < px1; X++) {
+-							drow[X] = fFillRow[(int32_t)fFillX[X] - dx];
++							int32_t ix = (int32_t)fFillX[X] - dx;
++							drow[X] = fFillRow[ix < lo ? lo : ix];
+ 						}
+ 					} else {
+ 						for (uint32_t X = px0; X < px1; X++) {
+-							drow[X] = sweet_fb_scale(fFillRow[(int32_t)fFillX[X] - dx], k);
++							int32_t ix = (int32_t)fFillX[X] - dx;
++							drow[X] = sweet_fb_scale(fFillRow[ix < lo ? lo : ix], k);
+ 						}
+ 					}
+ 				}
