@@ -13,10 +13,10 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/pandora_cpu.c			standard
 diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
 new file mode 100644
-index 0000000..e3cfaba42ecc5ec0c4ced11ae1d3fe817466a332
+index 0000000..ae1e820a01bd3b35cad635e5a376ed5a4ca9c3be
 --- /dev/null
 +++ b/bsd/dev/pandora_bt.c
-@@ -0,0 +1,5186 @@
+@@ -0,0 +1,5304 @@
 +/*
 + * PANDORA Bluetooth: Nezha combo-controller UART on QUPv3 wrapper 3 SE5 (0x01994000).
 + *
@@ -3091,7 +3091,7 @@ index 0000000..e3cfaba42ecc5ec0c4ced11ae1d3fe817466a332
 + * but never the GetVer that precedes it in the Android sequence; this is
 + * the remaining PERI-session frame. Observation only. */
 +static int
-+bt_peri_getver_peri(void)
++bt_peri_getver_window(unsigned window_ms)
 +{
 +	static const uint8_t request[] = { 0x31, 0x00, 0xf0, 0xff, 0x02, 0x05, 0x00 };
 +	uint8_t rx[BT_PERI_EVT_MAX] = {0};
@@ -3103,7 +3103,10 @@ index 0000000..e3cfaba42ecc5ec0c4ced11ae1d3fe817466a332
 +	if (err) {
 +		return err;
 +	}
-+	clock_interval_to_deadline(700, NSEC_PER_MSEC, &deadline);
++	/* Level 20.61 (v2055-A): the window is a parameter so the withheld-B
++	 * liveness probe can ask the same question with 400 ms; the level-19
++	 * caller below keeps the 700 ms it has always used. */
++	clock_interval_to_deadline(window_ms, NSEC_PER_MSEC, &deadline);
 +	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x05,
 +	    "PERI GetVer(00)");
 +	if (err) {
@@ -3111,13 +3114,22 @@ index 0000000..e3cfaba42ecc5ec0c4ced11ae1d3fe817466a332
 +		    err, got);
 +		bt_dump("PERI GetVer(00) raw", rx, got);
 +		pandora_log_sync();
-+		return 0;
++		return err;
 +	}
 +	printf("PANDORA BT: GetVer(00) reply: status %u subcmd %u ssid %u, %u bytes\n",
 +	    got >= 10u ? rx[9] : 0xffu, got >= 11u ? rx[10] : 0xffu,
 +	    got >= 12u ? rx[11] : 0xffu, got);
 +	bt_dump("PERI GetVer(00) reply", rx, got);
 +	pandora_log_sync();
++	return 0;
++}
++
++/* The level-19 chain keeps its 700 ms window and its continue-on-silence
++ * behaviour; only the probe that needs the answer state takes the error. */
++static int
++bt_peri_getver_peri(void)
++{
++	(void)bt_peri_getver_window(700u);
 +	return 0;
 +}
 +
@@ -4729,6 +4741,111 @@ index 0000000..e3cfaba42ecc5ec0c4ced11ae1d3fe817466a332
 +	return 0;
 +}
 +
++/* Level 20.61 (v2055-A): both 0x19 windows closed and the B stage was
++ * withheld. Two states produce that log and the fix differs: the ROM
++ * stopped answering, or it still lives and only the 0x19 open is rejected.
++ * Ask the two paths that answered before the B open, each with a 400 ms
++ * window (the post-B liveness probe uses the same 400 ms and answered at
++ * 0.44 s in the 0568 capture). GetVer(00) goes first so a 0x19 answer is
++ * not masked by the PERI frame in front of it. Observation only: two TX
++ * commands, no retry, no stage change; the caller returns either way. */
++static void
++bt_peri_b_open_liveness(void)
++{
++	int gerr = bt_peri_getver_window(400u);
++	int verr = bt_peri_vs_cmd(0x19u, 400u,
++	    "PERI map B open liveness probe (0x19)");
++	const char *g = (gerr == 0) ? "answered" : "silent";
++	const char *v = (verr == 0) ? "answered" : "silent";
++	const char *why;
++
++	if (gerr == 0 && verr == 0) {
++		why = "ROM alive, only the 0x19 open rejected";
++	} else if (gerr == 0) {
++		why = "ROM alive on GetVer, 0x19 path stalled";
++	} else if (verr == 0) {
++		why = "0x19 answered, GetVer path stalled";
++	} else {
++		why = "ROM stalled, no probe answered";
++	}
++	printf("PANDORA BT: map B open liveness: GetVer(00) %s (error %d), 0x19 %s (error %d) -> %s\n",
++	    g, gerr, v, verr, why);
++	pandora_log_sync();
++}
++
++/* Level 20.61 (v2055-A): keep the f0 04 dc..df vendor records whole. The
++ * 0568 capture put four of them (dc/dd/de/df) in the first 1024 bytes after
++ * the withheld B open, each inside a 34 00 ff fc record; bt_peri_raw_dump
++ * keeps a flat 1024-byte window, so a record can be cut at the cap and the
++ * log carries no boundary to say which bytes belong to which packet. Parse
++ * the record header here and print 4 + plen bytes per match, so the payload
++ * can be decoded offline without guessing where a record starts. */
++static void
++bt_peri_vendor_dcdf_dump(unsigned window_ms, const char *what)
++{
++	static const uint8_t ack = 0xfc;
++	uint8_t buf[2048];
++	unsigned n = 0;
++	unsigned records = 0;
++	unsigned matches = 0;
++	unsigned cut = 0;
++	uint64_t deadline;
++
++	printf("PANDORA BT: %s: vendor watch %u ms, whole 34 00 ff packet(s)\n",
++	    what, window_ms);
++	pandora_log_sync();
++	clock_interval_to_deadline(window_ms, NSEC_PER_MSEC, &deadline);
++	while (n < sizeof(buf) && mach_absolute_time() < deadline) {
++		uint8_t byte = 0;
++		unsigned field = 0;
++		int err;
++
++		err = bt_rx_exact(&byte, 1, &field, deadline);
++		if (err) {
++			break;
++		}
++		if (byte == 0xfdu) {
++			(void)bt_uart_tx(&ack, 1, "vendor watch ACK FC");
++		}
++		buf[n++] = byte;
++	}
++	printf("PANDORA BT: %s: vendor watch %u byte(s)\n", what, n);
++
++	for (unsigned i = 0; i + 4u <= n; ) {
++		unsigned plen;
++		const uint8_t *body;
++
++		if (buf[i] != 0x34u || buf[i + 1u] != 0x00u || buf[i + 2u] != 0xffu) {
++			i++;
++			continue;
++		}
++		plen = buf[i + 3u];
++		if (i + 4u + plen > n) {
++			cut++;
++			printf("PANDORA BT: %s: record at %u declares %u body byte(s), %u captured\n",
++			    what, i, plen, n - i - 4u);
++			break;
++		}
++		body = buf + i + 4u;
++		records++;
++		if (plen >= 7u && body[0] == 0xf0u && body[1] == 0x04u &&
++		    body[2] >= 0xdcu && body[2] <= 0xdfu) {
++			matches++;
++			printf("PANDORA BT: %s: record %u at %u: plen %u, vendor event f0 04 %02x, %u byte(s) whole\n",
++			    what, records, i, plen, body[2], 4u + plen);
++			bt_dump_wide("PERI f0 04 dc-df record", buf + i, 4u + plen);
++			pandora_log_sync();
++		}
++		i += 4u + plen;
++	}
++	if (matches == 0u && n != 0u) {
++		bt_dump("PERI vendor watch head", buf, n < 32u ? n : 32u);
++	}
++	printf("PANDORA BT: %s: %u record(s), %u matching f0 04 dc-df, %u truncated\n",
++	    what, records, matches, cut);
++	pandora_log_sync();
++}
++
 +/* Level 20.21: drain whatever the ROM left after a bulk-answered stage, then
 + * answer its wake request. Phases A and B produce no per-frame event, but the
 + * ROM does raise 0xfd once the batch is complete - and the trace shows that
@@ -4844,7 +4961,8 @@ index 0000000..e3cfaba42ecc5ec0c4ced11ae1d3fe817466a332
 +		printf("PANDORA BT: level 20 phase B open command unanswered after 2 x 1500 ms (error %d); withholding %u B frame(s)\n",
 +		    err, (unsigned)sizeof(pandora_peri_tmel_mbn));
 +		pandora_log_sync();
-+		bt_peri_raw_dump(2000u, "PERI TME-L map B open failure raw");
++		bt_peri_b_open_liveness();
++		bt_peri_vendor_dcdf_dump(2000u, "PERI TME-L map B open failure raw");
 +		return err;
 +	}
 +	err = bt_peri_hci_stage(pandora_peri_tmel_mbn,
