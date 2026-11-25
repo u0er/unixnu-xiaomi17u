@@ -1,0 +1,16 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ac70ce6..697ae8f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2101,8 +2101,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 				    (uint64_t)dx * 4);
+ 				for (int32_t x = 0; x < w; x++) {
+ 					uint32_t pv = srow[x];
+-					drow[x] = (pv & 0xff00ff00u) | ((pv & 0x000000ffu) << 16) |
+-					    ((pv >> 16) & 0x000000ffu);
++					/* 0567: the straight copy must rotate bytes the same way as
++					 * the scaled path (0564), not swap R/B (0559). */
++					drow[x] = (pv >> 8) | (pv << 24);
+ 				}
+ 			}
+ #if defined(FUXI)
