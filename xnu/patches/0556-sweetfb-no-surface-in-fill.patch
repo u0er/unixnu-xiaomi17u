@@ -1,0 +1,30 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 83ac144..14fd002 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1469,6 +1469,12 @@ AppleCLCD::scanPresent(const uint8_t *rec, uint32_t mask)
+ 	if (!fScanWanted || !fConsolePaused || fPowerOff || sweet_fb_dim < 256) {
+ 		return false;
+ 	}
++	/* 0556: with CPU composition into the panel (sweetfb_fill=1) the surface path
++	 * must not run as well: show(fill) and scanPanel() then alternate the scanout
++	 * between panel and surface on every frame, which is the visible flicker. */
++	if (fFill) {
++		return false;
++	}
+ 	if (!fScanOn) {
+ 		if (fScanTried) {
+ 			return false;
+@@ -1551,7 +1557,11 @@ AppleCLCD::scanTick(void)
+ 		if (pandora_scanout_current(0)) {
+ 			sweet_scan_drop(&fScanShown);
+ 			sweet_scan_drop(&fScanQueued);
+-			fScanToPanel = false;
++			/* 0556: keep the panel latch while fill-mode composition is in use;
++			 * clearing it made scanPanel() re-log and re-enter every frame. */
++			if (!fFill) {
++				fScanToPanel = false;
++			}
+ #if defined(PANDORA)
+ 			pandora_shot_note(NULL);
+ #endif
