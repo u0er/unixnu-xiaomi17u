@@ -1,0 +1,268 @@
+diff --git a/bsd/dev/pandora_pas.c b/bsd/dev/pandora_pas.c
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -16,6 +16,7 @@
+  * fail (it did: -3145738 from init_image).
+  */
+ #include <sys/param.h>
++#include <pexpert/device_tree.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+@@ -73,6 +74,105 @@ static struct pas_meta pas_meta[PAS_META_SLOTS];
+ static void
+ pas_meta_release(unsigned pas);
+ 
++/*
++ * The PIL metadata blob has to be below 4 GiB.
++ *
++ * INIT_IMAGE answered 0xffcfffbb (-3145797, "invalid parameter") for every candidate id while the
++ * blob sat at 0x8d0... (2026-11-21), and the ceiling ladder below has never found a low page on
++ * this phone: the low 4 GiB are the platform's carveouts, so every kmem_alloc_contig() ceiling
++ * fails and the blob lands at 0x8caf... (about 37 GiB).  The ladder is a set of failing requests,
++ * not a strategy.  What works on this hardware is the reservation the loader already makes for the
++ * DSP (/chosen pandora-dsp-shm, mapped by pandora_adsp.c's ad_shm_setup()), so the same shape is
++ * used here: /chosen pandora-pil-shm = {pa, size}, 4 KiB pages below 4 GiB, in the free DRAM hole
++ * the live FDT leaves outside /chosen dram-base (XNU never allocates from it).
++ *
++ * One slab per pas id.  A reload of the same image reuses its own slab only after TrustZone has
++ * been told to forget the old blob (pas_meta_release() in pas_meta_arena_take()), and a slab that
++ * another pas still holds is never reused: the ADSP and the modem load different ids, and their
++ * INIT_IMAGE metadata must not overwrite each other before each one's AUTH_AND_RESET.
++ *
++ * ml_io_map_unmappable() entries are permanent (see the trap on ml_io_unmap() below), so the arena
++ * is mapped once for the life of the boot and never freed; pas_meta_free() knows the difference.
++ */
++#define PAS_META_ARENA_SLAB  (16u << 10)
++#define PAS_META_ARENA_SIZE  ((uint64_t)PAS_META_SLOTS * PAS_META_ARENA_SLAB)
++
++static vm_offset_t pas_meta_arena_va;
++static uint64_t pas_meta_arena_pa;
++static bool pas_meta_arena_tried;
++
++static void
++pas_meta_arena_setup(void)
++{
++	DTEntry chosen;
++	const uint64_t *r;
++	unsigned int size;
++
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "pandora-pil-shm", (void const **)&r, &size) != kSuccess || size != 16) {
++		printf("PANDORA PAS: no pandora-pil-shm in the ADT: metadata uses the kernel allocator\n");
++		return;
++	}
++	if (!r[1] || ((r[0] | r[1]) & 0xfff) || r[1] < PAS_META_ARENA_SIZE || r[0] + r[1] > (1ull << 32)) {
++		printf("PANDORA PAS: pandora-pil-shm %#llx + %#llx is not %llu bytes of 4 KiB pages below 4 GiB: "
++		    "metadata uses the kernel allocator\n", r[0], r[1], (unsigned long long)PAS_META_ARENA_SIZE);
++		return;
++	}
++	vm_offset_t va = ml_io_map_unmappable((vm_offset_t)r[0], (vm_size_t)PAS_META_ARENA_SIZE, VM_WIMG_IO);
++	if (!va) {
++		printf("PANDORA PAS: pandora-pil-shm %#llx + %#llx not mapped\n", r[0], r[1]);
++		return;
++	}
++	bzero((void *)va, (size_t)PAS_META_ARENA_SIZE);
++	pas_meta_arena_va = va;
++	pas_meta_arena_pa = r[0];
++	printf("PANDORA PAS: metadata arena %#llx + %#llx below 4 GiB, %u slabs of %u bytes\n", r[0],
++	    (unsigned long long)PAS_META_ARENA_SIZE, (unsigned)PAS_META_SLOTS, (unsigned)PAS_META_ARENA_SLAB);
++}
++
++/* The reserved slab for this pas, or 0 when the caller must fall back to the kernel allocator. */
++static vm_offset_t
++pas_meta_arena_take(unsigned pas, uint64_t size, uint64_t *pa)
++{
++	if (!pas_meta_arena_va) {
++		return 0;
++	}
++	if (size > PAS_META_ARENA_SLAB) {
++		printf("PANDORA PAS: pas %u metadata is %llu bytes, more than a %u-byte slab\n", pas,
++		    (unsigned long long)size, (unsigned)PAS_META_ARENA_SLAB);
++		return 0;
++	}
++	unsigned slot = pas % PAS_META_SLOTS;
++	for (unsigned i = 0; i < PAS_META_SLOTS; i++) {
++		if (!pas_meta[i].used) {
++			continue;
++		}
++		if (pas_meta[i].pas == pas) {
++			/* TrustZone must forget the old blob before its memory is handed out again. */
++			pas_meta_release(pas);
++			break;
++		}
++		if (pas_meta[i].md == pas_meta_arena_va + (uint64_t)slot * PAS_META_ARENA_SLAB) {
++			printf("PANDORA PAS: arena slab %u is live for pas %u: pas %u falls back to the "
++			    "kernel allocator\n", slot, pas_meta[i].pas, pas);
++			return 0;
++		}
++	}
++	*pa = pas_meta_arena_pa + (uint64_t)slot * PAS_META_ARENA_SLAB;
++	return pas_meta_arena_va + (uint64_t)slot * PAS_META_ARENA_SLAB;
++}
++
++/* Free only what kmem_alloc_contig() handed out; the arena lives for the whole boot. */
++static void
++pas_meta_free(vm_offset_t md, uint64_t size)
++{
++	if (pas_meta_arena_va && md >= pas_meta_arena_va &&
++	    md + size <= pas_meta_arena_va + PAS_META_ARENA_SIZE) {
++		return;
++	}
++	kmem_free(kernel_map, md, (vm_size_t)size);
++}
++
+ /*
+  * One slot per pas.
+  *
+@@ -101,7 +201,7 @@ pas_meta_hold(unsigned pas, vm_offset_t md, uint64_t size, uint64_t bridge)
+ 	/* No free slot: release here rather than leak silently. */
+ 	printf("PANDORA PAS: no slot for pas %u's metadata; releasing it now\n", pas);
+ 	pas_bridge_delete(bridge, pas);
+-	kmem_free(kernel_map, md, (vm_size_t)size);
++	pas_meta_free(md, size);
+ }
+ 
+ /* Frees every metadata slot held for pas -- only after INIT_IMAGE has been told to forget it. */
+@@ -112,7 +212,7 @@ pas_meta_release(unsigned pas)
+ 		if (pas_meta[i].used && pas_meta[i].pas == pas) {
+ 			pas_bridge_delete(pas_meta[i].bridge, pas);
+ 			pas_meta[i].bridge = 0;
+-			kmem_free(kernel_map, pas_meta[i].md, (vm_size_t)pas_meta[i].size);
++			pas_meta_free(pas_meta[i].md, pas_meta[i].size);
+ 			pas_meta[i].used = false;
+ 		}
+ 	}
+@@ -318,33 +418,45 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 	 * at worst and gives the platform every chance to hand back a low page, which is the only part
+ 	 * of this call the code cannot verify before making it.
+ 	 */
+-	static const ppnum_t ceilings[] = { 0x40000u, 0x80000u, 0xc0000u, MD_MAX_PNUM };
+-	bool low = false;
+-	for (unsigned i = 0; i < sizeof(ceilings) / sizeof(ceilings[0]) && !low; i++) {
+-		if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, ceilings[i], 0,
+-		    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
+-			low = true;
++	uint64_t md_pa = 0;
++	if (!pas_meta_arena_tried) {
++		pas_meta_arena_tried = true;
++		pas_meta_arena_setup();
++	}
++	md = pas_meta_arena_take(pas, md_size, &md_pa);
++	bool reserved = md != 0;
++	bool low = reserved;
++	if (!reserved) {
++		static const ppnum_t ceilings[] = { 0x40000u, 0x80000u, 0xc0000u, MD_MAX_PNUM };
++		for (unsigned i = 0; i < sizeof(ceilings) / sizeof(ceilings[0]) && !low; i++) {
++			if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, ceilings[i], 0,
++			    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
++				low = true;
++			}
+ 		}
++		if (!low && kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("PANDORA PAS: %s: no metadata buffer (%u bytes), not even unconstrained\n",
++			    name, (unsigned)md_size);
++			err = ENOMEM;
++			goto out;
++		}
++		if (!low) {
++			printf("PANDORA PAS: %s: metadata does not fit below 4 GiB at any ceiling, allocated "
++			    "above\n", name);
++		}
++		md_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)md));
+ 	}
+-	if (!low && kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("PANDORA PAS: %s: no metadata buffer (%u bytes), not even unconstrained\n",
+-		    name, (unsigned)md_size);
+-		err = ENOMEM;
+-		goto out;
+-	}
+-	if (!low) {
+-		printf("PANDORA PAS: %s: metadata does not fit below 4 GiB at any ceiling, allocated "
+-		    "above\n", name);
+-	}
+-	uint64_t md_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)md));
++	printf("PANDORA PAS: %s: metadata %u bytes at %#llx, blob %#llx (%s)\n", name,
++	    ehdr_size + hash_size, md, md_pa, reserved ? "reserved below 4 GiB" :
++	    low ? "kernel allocator, below 4 GiB" : "kernel allocator, above 4 GiB");
+ 	memcpy((void *)md, hdr, ehdr_size);
+ 	if (ehdr_size + hash_size == mdt_size) {
+ 		memcpy((void *)(md + ehdr_size), hdr + ehdr_size, hash_size);
+ 	} else if ((uint64_t)ph[hash].p_offset + hash_size <= mdt_size) {
+ 		memcpy((void *)(md + ehdr_size), hdr + ph[hash].p_offset, hash_size);
+ 	} else if ((err = mdt_segment(prefix, base, mdt, &ph[hash], hash, (void *)(md + ehdr_size)))) {
+-		kmem_free(kernel_map, md, (vm_size_t)md_size);
++		pas_meta_free(md, md_size);
+ 		goto out;
+ 	}
+ 	flush_dcache64((addr64_t)md_pa, (unsigned)md_size, TRUE);
+@@ -510,7 +622,7 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 		pas_meta_hold(pas, md, md_size, bridge);
+ 	} else {
+ 		pas_bridge_delete(bridge, pas);
+-		kmem_free(kernel_map, md, (vm_size_t)md_size);
++		pas_meta_free(md, md_size);
+ 	}
+ out:
+ 	kfree_data(hdr, PAS_MDT_MAX);
+@@ -624,18 +736,31 @@ pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64
+ 	 * whole window spent proving nothing.  So the constraint stays as a preference and the
+ 	 * unconstrained allocation is the fallback; whichever one happens is printed.
+ 	 */
+-	if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, MD_MAX_PNUM, 0,
+-	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0, 0,
++	uint64_t md_pa = 0;
++	if (!pas_meta_arena_tried) {
++		pas_meta_arena_tried = true;
++		pas_meta_arena_setup();
++	}
++	md = pas_meta_arena_take(pas, md_size, &md_pa);
++	bool reserved = md != 0;
++	bool low = reserved;
++	if (!reserved) {
++		if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, MD_MAX_PNUM, 0,
+ 		    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-			printf("PANDORA PAS: %s: no metadata buffer (%u bytes), not even unconstrained\n",
+-			    name, (unsigned)md_size);
+-			err = ENOMEM;
+-			goto out;
++			if (kmem_alloc_contig(kernel_map, &md, (vm_size_t)md_size, PAGE_MASK, 0, 0,
++			    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++				printf("PANDORA PAS: probe: %s: no metadata buffer (%u bytes), not even unconstrained\n",
++				    name, (unsigned)md_size);
++				err = ENOMEM;
++				goto out;
++			}
++			printf("PANDORA PAS: probe: %s: metadata does not fit below 4 GiB, allocated above\n", name);
+ 		}
+-		printf("PANDORA PAS: %s: metadata does not fit below 4 GiB, allocated above\n", name);
++		md_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)md));
+ 	}
+-	uint64_t md_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)md));
++	printf("PANDORA PAS: probe: %s: metadata %u bytes at %#llx, blob %#llx (%s)\n", name,
++	    ehdr_size + hash_size, md, md_pa, reserved ? "reserved below 4 GiB" :
++	    low ? "kernel allocator, below 4 GiB" : "kernel allocator, above 4 GiB");
+ 	memcpy((void *)md, hdr, ehdr_size);
+ 	if (ehdr_size + hash_size == mdt_size) {
+ 		memcpy((void *)(md + ehdr_size), hdr + ehdr_size, hash_size);
+@@ -644,7 +769,7 @@ pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64
+ 	} else {
+ 		err = mdt_segment(prefix, base, mdt, &ph[hash], hash, (void *)(md + ehdr_size));
+ 		if (err) {
+-			kmem_free(kernel_map, md, (vm_size_t)md_size);
++			pas_meta_free(md, md_size);
+ 			goto out;
+ 		}
+ 	}
+@@ -813,7 +938,7 @@ static void
+ pas_release_meta(unsigned pas, vm_offset_t md, uint64_t size, uint64_t bridge)
+ {
+ 	pas_bridge_delete(bridge, pas);
+-	kmem_free(kernel_map, md, (vm_size_t)size);
++	pas_meta_free(md, size);
+ }
+ 
+ /* PAS_AUTH_AND_RESET: lets the processor out of reset. */
