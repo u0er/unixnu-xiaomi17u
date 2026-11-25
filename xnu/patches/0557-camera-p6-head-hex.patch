@@ -1,0 +1,34 @@
+diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
+index e025c8b..ced06c3 100644
+--- a/bsd/dev/pandora_camera.c
++++ b/bsd/dev/pandora_camera.c
+@@ -4543,10 +4543,25 @@ pc_tpg_stream_2a(vm_offset_t tpg2, vm_offset_t csid0, vm_offset_t vfe0)
+ 		for (unsigned i = PC_CANARY_OFF + PC_CANARY_BYTES;
+ 		    i < PC_SENT_TAIL_OFF; i++)
+ 			hash = (hash ^ fb[i]) * 16777619u;
+-		printf("PANDORA TPG: P6 window head=%s canary=%s tail=%s a5w=%u "
+-		    "hash=%#x frame_va=%#llx\n", head_ok ? "ok" : "BAD",
+-		    canary_ok ? "ok" : "BAD", tail_ok ? "ok" : "BAD", n_a5,
+-		    hash, (unsigned long long)pc_frame_va);
++		/* 0557: BAD means the sentinel was overwritten, i.e. the DMA write
++		 * happened; report that explicitly plus the bytes actually written
++		 * and a 16-byte head sample (the offline verdict consumes it). */
++		const unsigned total_words = PC_CAM_FRAME_BYTES / 4u;
++		const unsigned used = (total_words - n_a5) * 4u;
++		const int write_seen = !(head_ok && canary_ok && tail_ok && n_a5 == total_words);
++		char hex[33];
++		for (unsigned k = 0; k < 16; k++) {
++			static const char digs[] = "0123456789abcdef";
++			uint8_t v = fb[PC_CANARY_OFF + PC_CANARY_BYTES + k];
++			hex[2 * k] = digs[v >> 4];
++			hex[2 * k + 1] = digs[v & 0xfu];
++		}
++		hex[32] = 0;
++		printf("PANDORA TPG: P6 window head=%s canary=%s tail=%s a5w=%u used=%u "
++		    "write_seen=%d hash=%#x frame_va=%#llx head_hex=%s\n",
++		    head_ok ? "intact" : "overwritten", canary_ok ? "intact" : "overwritten",
++		    tail_ok ? "intact" : "overwritten", n_a5, used, write_seen, hash,
++		    (unsigned long long)pc_frame_va, hex);
+ 		(void)pandora_log_sync();
+ 	}
+ 
