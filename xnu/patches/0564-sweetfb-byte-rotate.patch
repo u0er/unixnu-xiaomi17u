@@ -1,20 +1,19 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 455dfa8..ac70ce6 100644
+index 455dfa8..fd741f2 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -2007,10 +2007,13 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -2007,10 +2007,12 @@ AppleCLCD::present(const uint8_t *rec)
  						 * k>=256 straight copy and the scaled sweet_fb_scale)
  						 * deliver BGRA to the DPU; 0558/0559 only covered the
  						 * scaled branch and the k==256 fast path bypassed them. */
-+						/* 0564: the calibration bars proved the display reads the
-+						 * pixel bytes from index 1 (screen RGB = memory G,B,A), i.e. a
-+						 * whole-byte rotation, not an R/B swap.  Rotate left 8 so the
-+						 * bytes on screen become R,G,B. */
++						/* 0564: calibration bars proved screen RGB = memory (b1,b0,b3):
++						 * the display starts one byte into each pixel.  Rotate the BGRA
++						 * bytes right by 8 so the panel receives R,G,B in that order. */
  						for (int32_t kx = 0; kx < w; kx++) {
  							uint32_t pv = fFillRow[kx];
 -							fFillRow[kx] = (pv & 0xff00ff00u) |
 -							    ((pv & 0x000000ffu) << 16) | ((pv >> 16) & 0x000000ffu);
-+							fFillRow[kx] = (pv << 8) | (pv >> 24);
++							fFillRow[kx] = (pv >> 8) | (pv << 24);
  						}
  						lastY = ly;
  					}
