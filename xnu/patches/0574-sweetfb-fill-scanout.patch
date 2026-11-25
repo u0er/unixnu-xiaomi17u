@@ -1,0 +1,58 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index fa1a753..34577cd 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1556,10 +1556,9 @@ AppleCLCD::scanPresent(const uint8_t *rec, uint32_t mask)
+ 	if (!fScanWanted || !fConsolePaused || fPowerOff || sweet_fb_dim < 256) {
+ 		return false;
+ 	}
+-	/* 0556: with CPU composition into the panel (sweetfb_fill=1) the surface path
+-	 * must not run as well: show(fill) and scanPanel() then alternate the scanout
+-	 * between panel and surface on every frame, which is the visible flicker. */
+-	if (fFill) {
++	/* 0574: fill mode goes to the pipes through the QSEED scaler as well; 0556
++	 * removed the alternation it saw, not the path. Only GPU-written frames. */
++	if (!sweetfb_gpu_frames()) {
+ 		return false;
+ 	}
+ 	if (!fScanOn) {
+@@ -1644,11 +1643,7 @@ AppleCLCD::scanTick(void)
+ 		if (pandora_scanout_current(0)) {
+ 			sweet_scan_drop(&fScanShown);
+ 			sweet_scan_drop(&fScanQueued);
+-			/* 0556: keep the panel latch while fill-mode composition is in use;
+-			 * clearing it made scanPanel() re-log and re-enter every frame. */
+-			if (!fFill) {
+-				fScanToPanel = false;
+-			}
++			fScanToPanel = false;
+ #if defined(PANDORA)
+ 			pandora_shot_note(NULL);
+ #endif
+@@ -1762,7 +1757,11 @@ AppleCLCD::presentLoop(void)
+ 			}
+ 		}
+ 		last = mach_absolute_time();
+-		(void)scanPanel();      /* 0555: retry until the panel memory is scanned */
++		/* 0574: while the pipes read a surface (queued or shown) they must not
++		 * be pulled back to the panel; only a CPU-copied frame retries it. */
++		if (fScanQueued == NULL && fScanShown == NULL) {
++			(void)scanPanel();  /* 0555: retry until the panel memory is scanned */
++		}
+ 		(void)scanSettle();
+ 		if (swapAbs) {
+ 			const uint64_t took = mach_absolute_time() - swapAbs;
+@@ -1984,7 +1983,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 	/* 0217: the pipes take the frame themselves when they can; else the panel memory and the copy below. */
+ 	const bool scanned = shows && scanPresent(rec, mask);
+ 	if (shows && !scanned) {
+-		scanPanel();
++		/* 0574: in fill mode a frame that cannot be scanned keeps the last
++		 * surface on the pipes; reverting to the panel for one frame is the
++		 * flicker 0556 removed. Display off forces the panel separately. */
++		if (!fFill || !fScanOn) {
++			scanPanel();
++		}
+ 	}
+ 	if (shows) {
+ 		if (scanned) {
