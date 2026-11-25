@@ -1,0 +1,67 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+index 3d4757c..eb3341a 100644
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -1213,6 +1213,22 @@ static int wifi_reset_endpoint(void)
+     return 0;
+ }
+ 
++/* Scan IEs are already bounded by ie_bytes; classify RSN (id 48) and the
++ * Microsoft WPA vendor IE (221/00:50:f2) without walking past the buffer. */
++static unsigned wifi_bss_ie_flags(const PeachWmiBss *b)
++{
++    unsigned flags = 0;
++    for (unsigned off = 0; off + 2 <= b->ie_bytes;) {
++        unsigned id = b->ies[off], len = b->ies[off + 1];
++        if (off + 2 + len > b->ie_bytes) break;
++        if (id == 48) flags |= 1u;
++        else if (id == 221 && len >= 4 && b->ies[off + 2] == 0x00 &&
++            b->ies[off + 3] == 0x50 && b->ies[off + 4] == 0xf2) flags |= 2u;
++        off += 2 + len;
++    }
++    return flags;
++}
++
+ static int wifi_mission_start(PeachMhiDma calibration)
+ {
+     int err;
+@@ -1289,6 +1305,39 @@ static int wifi_mission_start(PeachMhiDma calibration)
+         return EIO;
+     }
+     wifi_phase = 16;
++    /* BSS inventory for the Settings/manual-join experiment. Bounded output:
++     * one summary line, one line per BSS, and at most 128 IE bytes (8 rows)
++     * per BSS, so a full 32-entry scan stays near 290 ring lines. */
++    int scan_dump = 0;
++    (void)PE_parse_boot_argn("pandora_wifi_scan", &scan_dump, sizeof(scan_dump));
++    if (scan_dump == 1) {
++        wifi_barrier(NULL);
++        printf("PANDORA WIFI SCAN: phase %u id %u event %#x reason %u started %u finished %u channels %u bss %u dropped %u country %#x\n",
++            wifi_phase, wifi_wmi.scan_id, wifi_wmi.scan_event, wifi_wmi.scan_reason,
++            wifi_wmi.scan_started, wifi_wmi.scan_finished, wifi_wmi.channel_count,
++            wifi_wmi.bss_count, wifi_wmi.bss_dropped, wifi_wmi.regulatory[0].country);
++        unsigned dumped = 0;
++        for (unsigned i = 0; i < wifi_wmi.bss_count && i < PEACH_WMI_BSS_ENTRIES; i++) {
++            const PeachWmiBss *b = &wifi_wmi.bss[i];
++            unsigned flags = wifi_bss_ie_flags(b);
++            printf("PANDORA WIFI BSS %u/%u bssid %02x:%02x:%02x:%02x:%02x:%02x freq %u rssi %d ssid_len %u ssid \"%.*s\" cap %#x dtim %u beacon %u ie %u trunc %u age_us %llu rsn %u wpa %u\n",
++                i, wifi_wmi.bss_count,
++                b->bssid[0], b->bssid[1], b->bssid[2], b->bssid[3], b->bssid[4], b->bssid[5],
++                b->frequency, b->rssi, b->ssid_bytes, b->ssid_bytes, (const char *)b->ssid,
++                b->capability, b->dtim_period, b->beacon_interval, b->ie_bytes,
++                b->ies_truncated, b->seen_us, flags & 1u, (flags >> 1) & 1u);
++            unsigned limit = b->ie_bytes < 128u ? b->ie_bytes : 128u;
++            for (unsigned off = 0; off + 16 <= limit; off += 16)
++                printf("PANDORA WIFI BSS %u IE %u: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++                    i, off, b->ies[off], b->ies[off + 1], b->ies[off + 2], b->ies[off + 3],
++                    b->ies[off + 4], b->ies[off + 5], b->ies[off + 6], b->ies[off + 7],
++                    b->ies[off + 8], b->ies[off + 9], b->ies[off + 10], b->ies[off + 11],
++                    b->ies[off + 12], b->ies[off + 13], b->ies[off + 14], b->ies[off + 15]);
++            dumped++;
++        }
++        printf("PANDORA WIFI SCAN: dumped %u BSS (table %u), %u IE bytes per entry\n",
++            dumped, PEACH_WMI_BSS_ENTRIES, 128u);
++    }
+     int capture = 0;
+     (void)PE_parse_boot_argn("nezha_wifi_dump", &capture, sizeof(capture));
+     if (capture == 1) {
