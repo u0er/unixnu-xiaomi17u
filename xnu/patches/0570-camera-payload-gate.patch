@@ -1,0 +1,72 @@
+diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
+--- a/bsd/dev/pandora_camera.c
++++ b/bsd/dev/pandora_camera.c
+@@ -4354,6 +4354,50 @@
+ 	    (v & PC_RDIN_INPUT_EOF) ? 1u : 0u);
+ 	(void)pandora_log_sync();
+ }
++
++/* payload gate (draft): a sticky RX error bit only proves that an error was
++ * seen at some point in the stream. Clear the RX IRQ latch, then re-read the
++ * CSID1080 counters and the RX status inside the same window: a frame buffer
++ * may be consumed as P6 data only when PAYLOAD_CRC (bit25) does not re-latch
++ * after the clear (checked at +1 ms and +21 ms) and total_crc_err (0x8C8)
++ * is zero and not moving. The counters are cumulative since the CSID reset
++ * and are not cleared here, so a prior error keeps the gate closed for the
++ * whole stream. */
++#define PC_RX_IRQ_PAYLOAD_CRC  (1u << 25)
++static int
++pc_payload_gate(vm_offset_t csid, const char *tag)
++{
++	uint32_t rx_before, rx0, rx1, pkts0, pkts1, ecc0, ecc1, crc0, crc1;
++	int pass;
++
++	rx_before = pc_rd(csid, 0x1b0u);	/* CSI2_RX_IRQ_STATUS */
++	pc_wr(csid, 0x1b8u, 0xffffffffu);	/* RX IRQ clear */
++	pc_sleep(1);
++	pkts0 = pc_rd(csid, 0x8c0u);		/* total_pkts_rcvd */
++	ecc0  = pc_rd(csid, 0x8c4u);		/* stats_ecc */
++	crc0  = pc_rd(csid, 0x8c8u);		/* total_crc_err */
++	rx0   = pc_rd(csid, 0x1b0u);
++	pc_sleep(20);
++	pkts1 = pc_rd(csid, 0x8c0u);
++	ecc1  = pc_rd(csid, 0x8c4u);
++	crc1  = pc_rd(csid, 0x8c8u);
++	rx1   = pc_rd(csid, 0x1b0u);
++
++	pass = !(rx0 & PC_RX_IRQ_PAYLOAD_CRC) &&
++	    !(rx1 & PC_RX_IRQ_PAYLOAD_CRC) && crc1 == 0u && crc1 == crc0;
++	printf("PANDORA PAYLOADGATE: tag=%s csid=%#llx rx_before=%#x "
++	    "rx_after_clear=%#x rx_settled=%#x bit24=%u bit25=%u "
++	    "pkts0=%#x pkts1=%#x ecc0=%#x ecc1=%#x crc0=%#x crc1=%#x "
++	    "dcrc=%d dpkts=%d gate=%s\n",
++	    tag, (unsigned long long)csid, rx_before, rx0, rx1,
++	    (rx1 & (1u << 24)) ? 1u : 0u,
++	    (rx1 & PC_RX_IRQ_PAYLOAD_CRC) ? 1u : 0u,
++	    pkts0, pkts1, ecc0, ecc1, crc0, crc1,
++	    (int)(crc1 - crc0), (int)(pkts1 - pkts0),
++	    pass ? "PASS" : "FAIL");
++	(void)pandora_log_sync();
++	return pass;
++}
+ /* Increment 2a: drive the TPG->CSID RDI0 path far enough to observe frame
+  * events at the CSID, without VFE yet (VFE DMA is increment 2b). Spec:
+  * CAMERA_L2_TPG_IMPL_2026-11-12.md 閹? (TPG v2.4.0), 閹? (CSID 1080 reset/RX/RDI),
+@@ -6949,7 +6993,16 @@
+ 		    seen_buf, pc_rd(vfe2, 0x2c00u), pc_rd(vfe2, 0x2c04u),
+ 		    pc_rd(vfe2, 0x2c08u));
+ 		(void)pandora_log_sync();
+-		if (pc_frame_va) {
++		/* payload gate (draft): only consume this buffer as P6 data when
++		 * the cleared-window re-read sees no new PAYLOAD_CRC and a zero,
++		 * non-moving total_crc_err. TPG P6 earlier stays ungated: it is
++		 * the pre-gate positive control for the RDI/WM write path. */
++		int sensor_payload_ok = pc_payload_gate(csid2, "sensor-p6");
++		if (!sensor_payload_ok && pc_frame_va) {
++			printf("PANDORA SLICEB: v42 frame SKIP payload_gate=FAIL "
++			    "(P6 data not consumed)\n");
++			(void)pandora_log_sync();
++		} else if (pc_frame_va) {
+ 			volatile uint32_t *fb = (volatile uint32_t *)pc_frame_va;
+ 			unsigned n_a5 = 0, n_other = 0, first_idx = 0;
+ 			uint32_t first_other = 0;
