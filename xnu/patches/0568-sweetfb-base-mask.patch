@@ -1,0 +1,76 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d22f48b..b7bbf39 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1005,7 +1005,11 @@ AppleCLCD::start(IOService *provider)
+ 		return false;
+ 	}
+ 	PE_current_console(&video);
+-	fPhys = video.v_baseAddr;
++	/* 0568: the loader tags the console base with bit 0 (physical); using the
++	 * whole value put the panel mapping one byte late, which shifted every
++	 * pixel, forced the byte-rotation compensation and left a 1 px seam.
++	 * The real base is the address without those low tag bits. */
++	fPhys = video.v_baseAddr & ~3ULL;
+ 	fWidth = (uint32_t)video.v_width;
+ 	fHeight = (uint32_t)video.v_height;
+ 	fRowBytes = (uint32_t)video.v_rowBytes;
+@@ -1998,14 +2002,6 @@ AppleCLCD::present(const uint8_t *rec)
+ 				    (uint64_t)fHeight);
+ 				uint32_t k = sweet_fb_dim;
+ 				uint32_t lastY = ~0u;
+-				/* The panel's first two columns both come from logical x = 0
+-				 * (fFillX[0] == fFillX[1] == 0), so a 1 px seam in that source
+-				 * column shows as a 1 px line along the panel's left edge. A
+-				 * layer that spans the panel reads logical x = 1 instead: a one
+-				 * pixel shift, not visible, and the seam is not shown. The index
+-				 * is clamped to the copied row so a layer placed left of the
+-				 * panel cannot read outside it. */
+-				int32_t lo = (px0 == 0 && px1 == fWidth && w > 1) ? 1 : 0;
+ 				for (uint32_t Y = py0; Y < py1; Y++) {
+ 					uint32_t ly = (uint32_t)((uint64_t)Y * fLogicalH / fHeight);
+ 					const uint32_t *srow = (const uint32_t *)(src + s->offset +
+@@ -2014,29 +2010,16 @@ AppleCLCD::present(const uint8_t *rec)
+ 					 * access per scaled pixel, including duplicated rows/columns. */
+ 					if (ly != lastY) {
+ 						memcpy(fFillRow, srow + sx, (size_t)w * 4);
+-						/* 0562: swap R/B once here so BOTH downstream paths (the
+-						 * k>=256 straight copy and the scaled sweet_fb_scale)
+-						 * deliver BGRA to the DPU; 0558/0559 only covered the
+-						 * scaled branch and the k==256 fast path bypassed them. */
+-						/* 0564: calibration bars proved screen RGB = memory (b1,b0,b3):
+-						 * the display starts one byte into each pixel.  Rotate the BGRA
+-						 * bytes right by 8 so the panel receives R,G,B in that order. */
+-						for (int32_t kx = 0; kx < w; kx++) {
+-							uint32_t pv = fFillRow[kx];
+-							fFillRow[kx] = (pv >> 8) | (pv << 24);
+-						}
+ 						lastY = ly;
+ 					}
+ 					uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)Y * fRowBytes);
+ 					if (k >= 256) {
+ 						for (uint32_t X = px0; X < px1; X++) {
+-							int32_t ix = (int32_t)fFillX[X] - dx;
+-							drow[X] = fFillRow[ix < lo ? lo : ix];
++							drow[X] = fFillRow[(int32_t)fFillX[X] - dx];
+ 						}
+ 					} else {
+ 						for (uint32_t X = px0; X < px1; X++) {
+-							int32_t ix = (int32_t)fFillX[X] - dx;
+-							drow[X] = sweet_fb_scale(fFillRow[ix < lo ? lo : ix], k);
++							drow[X] = sweet_fb_scale(fFillRow[(int32_t)fFillX[X] - dx], k);
+ 						}
+ 					}
+ 				}
+@@ -2112,10 +2095,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 				uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes +
+ 				    (uint64_t)dx * 4);
+ 				for (int32_t x = 0; x < w; x++) {
+-					uint32_t pv = srow[x];
+-					/* 0567: the straight copy must rotate bytes the same way as
+-					 * the scaled path (0564), not swap R/B (0559). */
+-					drow[x] = (pv >> 8) | (pv << 24);
++					drow[x] = srow[x];
+ 				}
+ 			}
+ #if defined(FUXI)
