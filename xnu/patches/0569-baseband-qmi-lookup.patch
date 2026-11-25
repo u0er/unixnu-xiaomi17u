@@ -1,0 +1,244 @@
+diff --git a/bsd/dev/pandora_cell.c b/bsd/dev/pandora_cell.c
+index a57af1c..5b5a87f 100644
+--- a/bsd/dev/pandora_cell.c
++++ b/bsd/dev/pandora_cell.c
+@@ -869,6 +869,8 @@ pandora_cell_start(void)
+ 	if (error != 0) {
+ 		return error;
+ 	}
++	/* 0569: the service probe, in case this boot skips the link step (mp_qrtr_state() has it too). */
++	pandora_cell_qmi_probe();
+ 	pandora_ipa_receive = pandora_cell_receive;
+ 	cell_started = true;
+ 	if (kernel_thread_start(cell_thread_main, NULL, &cell_thread) != KERN_SUCCESS) {
+@@ -1142,9 +1144,15 @@ cell_link_transmit(void *context, uint32_t node, uint32_t port, const void *data
+ 	return pandora_mpss_qrtr_send(link->port, node, port, data, length);
+ }
+ 
+-/* The shared half of every server callback: note where the service is, or that it went. */
++/*
++ * The shared half of every server callback: note where the service is, or that it went.
++ *
++ * 0569: the router's answer carries the service and this half used to drop it.  The lane needs both
++ * ends of the binding in the ring -- the node the answer came from and the service id it names --
++ * so a lookup answer is printed whole.
++ */
+ static void
+-cell_link_server(struct cell_link *link, bool arrived, uint32_t node, uint32_t port)
++cell_link_server(struct cell_link *link, bool arrived, uint32_t service, uint32_t node, uint32_t port)
+ {
+ 	if (arrived) {
+ 		if (link->qmi.connected && link->qmi.node == node && link->qmi.port == port) {
+@@ -1153,7 +1161,8 @@ cell_link_server(struct cell_link *link, bool arrived, uint32_t node, uint32_t p
+ 		link->qmi.node = node;
+ 		link->qmi.port = port;
+ 		link->qmi.connected = true;
+-		pandora_say("QMI %s: the modem's service is at node %u port %u\n", link->name, node, port);
++		pandora_say("QMI %s: the modem's service is at node %u port %u (service %#x)\n", link->name,
++		    node, port, service);
+ 	} else if (link->qmi.connected && link->qmi.node == node && link->qmi.port == port) {
+ 		link->qmi.connected = false;
+ 		link->qmi.node = 0;
+@@ -1162,6 +1171,109 @@ cell_link_server(struct cell_link *link, bool arrived, uint32_t node, uint32_t p
+ 	}
+ }
+ 
++/* ---- 0569: the service probe ----------------------------------------------------------------- *
++ *
++ * The attach ring stops at step 10 (the modem's FIFO, item 480), so step 11 never runs and neither
++ * pandora_cell_start() nor cell_qmi_links_open() exists in that ring.  The eleven NEW_SERVER
++ * announcements the ADSP's IPCRTR edge sends -- 0x0f three times, 0x33 three times, then 0x2b,
++ * 0x42, 0x190, 0x301 and 0x1399, all at node 5 -- therefore land in pandora_qrtr.c's
++ * pq_servers[] with nobody asking for them, and no line says what any of those ids is.
++ *
++ * This is the smallest consumer of that table: two ports (a port holds four lookups) and one
++ * lookup per service id, each answer printed with the node and the service.  It sends no QMI
++ * message, allocates no transaction and starts no session; its only effect is that the next ring
++ * can put a name to 0x0f/0x33/0x190/0x301/0x1399.
++ *
++ * The modem's six QMI ids are not in this list: cell_qmi_links_open() looks them up, and
++ * cell_link_server() now prints the service they answered with, so asking for them again would
++ * only duplicate the lines.
++ */
++#define CELL_PROBE_PORTS        2       /* pq_ports is sixteen wide; the probe takes two */
++#define CELL_PROBE_PER_PORT     4       /* pq_ports[] lookups[4], the router's own limit */
++
++static const uint32_t cell_probe_services[] = {
++	0x0f, 0x2b, 0x33, 0x42, 0x190, 0x301, 0x1399,
++};
++
++static struct pandora_qrtr_port *cell_probe_port[CELL_PROBE_PORTS];
++static bool cell_probe_asked;
++
++/* One line per answer: the node it came from, the port, and the service. */
++static void
++cell_probe_server(void *context, bool arrived, uint32_t service, uint32_t version,
++    uint32_t instance, uint32_t node, uint32_t port)
++{
++	(void)context;
++	/*
++	 * The version and instance words are not printed: an announcement's instance reaches
++	 * pq_tell() raw while a lookup's answer reaches pandora_qrtr_fresh() as version|instance<<8,
++	 * so a line naming them would be right on one path and wrong on the other.  Node and port
++	 * are what both paths carry unchanged, and they are what this probe is for.
++	 */
++	(void)version;
++	(void)instance;
++	if (!arrived) {
++		pandora_say("QMI probe: service %#x at node %u port %u went away\n", service, node, port);
++		return;
++	}
++	pandora_say("QMI probe: service %#x at node %u port %u\n", service, node, port);
++}
++
++/*
++ * Idempotent, and refused by pandora_cell_probe=0.  Called from mp_qrtr_state() at the router
++ * channel's up edge (before the HELLO and the directory that follow it) and from
++ * pandora_cell_start(): the first is the only one that runs in the attach ring, the second covers
++ * a boot whose link step is skipped.
++ */
++void
++pandora_cell_qmi_probe(void)
++{
++	unsigned on = 1;
++	unsigned asked = 0;
++
++	if (cell_probe_asked) {
++		return;
++	}
++	cell_probe_asked = true;
++	if (PE_parse_boot_argn("pandora_cell_probe", &on, sizeof(on)) && on == 0) {
++		pandora_say("QMI probe: off (pandora_cell_probe=0)\n");
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(cell_probe_services) / sizeof(cell_probe_services[0]); i++) {
++		unsigned slot = asked / CELL_PROBE_PER_PORT;
++
++		if (slot >= CELL_PROBE_PORTS) {
++			break;
++		}
++		if (cell_probe_port[slot] == NULL) {
++			cell_probe_port[slot] = pandora_qrtr_open(NULL, cell_probe_server, NULL);
++			if (cell_probe_port[slot] == NULL) {
++				pandora_say("QMI probe: the router has no free port\n");
++				return;
++			}
++			pandora_say("QMI probe: port %u\n",
++			    pandora_qrtr_port_number(cell_probe_port[slot]));
++		}
++		if (pandora_qrtr_lookup(cell_probe_port[slot], cell_probe_services[i], 0, 0) != 0) {
++			pandora_say("QMI probe: no lookup slot for %#x\n", cell_probe_services[i]);
++			return;
++		}
++		pandora_say("QMI probe: looking up %#x\n", cell_probe_services[i]);
++		asked++;
++	}
++	if (asked != 0) {
++		pandora_say("QMI probe: %u services in\n", asked);
++		/*
++		 * A lookup stays "fresh" until the router's own pump replays it, and pq_tell() holds a
++		 * fresh one back on purpose.  In the attach ring that pump is never reached -- step 10
++		 * fails before pandora_mpss.c starts mp_link_thread -- so this call is what makes the
++		 * lookups live: from here on every NEW_SERVER the peer sends rings cell_probe_server(),
++		 * and any service already in the table is answered now.
++		 */
++		pandora_qrtr_fresh();
++	}
++}
++
+ /* A request slot: at most one in flight per message, and its answer is read on a later tick. */
+ struct cell_request {
+ 	struct pandora_qmi_txn *txn;
+@@ -2454,7 +2566,7 @@ cell_dms_server(void *context, bool arrived, uint32_t service, uint32_t version,
+ 	if (service != QMI_DMS) {
+ 		return;
+ 	}
+-	cell_link_server(context, arrived, node, port);
++	cell_link_server(context, arrived, service, node, port);
+ }
+ 
+ static void
+@@ -2499,7 +2611,7 @@ cell_uim_server(void *context, bool arrived, uint32_t service, uint32_t version,
+ 	if (service != QMI_UIM) {
+ 		return;
+ 	}
+-	cell_link_server(context, arrived, node, port);
++	cell_link_server(context, arrived, service, node, port);
+ }
+ 
+ static void
+@@ -2551,7 +2663,7 @@ cell_nas_server(void *context, bool arrived, uint32_t service, uint32_t version,
+ 	if (service != QMI_NAS) {
+ 		return;
+ 	}
+-	cell_link_server(context, arrived, node, port);
++	cell_link_server(context, arrived, service, node, port);
+ }
+ 
+ static void
+@@ -2636,7 +2748,7 @@ cell_wds_server(void *context, bool arrived, uint32_t service, uint32_t version,
+ 	if (service != QMI_WDS) {
+ 		return;
+ 	}
+-	cell_link_server(context, arrived, node, port);
++	cell_link_server(context, arrived, service, node, port);
+ }
+ 
+ static void
+@@ -2660,7 +2772,7 @@ cell_dpm_server(void *context, bool arrived, uint32_t service, uint32_t version,
+ 	if (service != QMI_DPM) {
+ 		return;
+ 	}
+-	cell_link_server(context, arrived, node, port);
++	cell_link_server(context, arrived, service, node, port);
+ }
+ 
+ static void
+@@ -2694,7 +2806,7 @@ cell_wda_server(void *context, bool arrived, uint32_t service, uint32_t version,
+ 	if (service != QMI_WDA) {
+ 		return;
+ 	}
+-	cell_link_server(context, arrived, node, port);
++	cell_link_server(context, arrived, service, node, port);
+ }
+ 
+ /* ---- 10.2.4 the tick, and the thread's other half -------------------------------------------- */
+diff --git a/bsd/dev/pandora_cell.h b/bsd/dev/pandora_cell.h
+index 1fd2132..1cc20e3 100644
+--- a/bsd/dev/pandora_cell.h
++++ b/bsd/dev/pandora_cell.h
+@@ -51,6 +51,14 @@
+  */
+ int pandora_cell_start(void);
+ 
++/*
++ * 0569: the smallest consumer of the router's service table -- two ports, seven lookups, one line
++ * per answer with the node and the service.  Sends nothing and starts no session; idempotent and
++ * refused by pandora_cell_probe=0.  Called at pandora_mpss.c's mp_qrtr_state() up edge and from
++ * pandora_cell_start().
++ */
++void pandora_cell_qmi_probe(void);
++
+ /*
+  * The interface half alone: make en1, attach it, attach BPF, and leave it down until a data
+  * session gives it an address. Returns 0 or an errno; EALREADY-and-quiet when en1 already exists.
+diff --git a/bsd/dev/pandora_mpss.c b/bsd/dev/pandora_mpss.c
+index 96c1ef8..8d27033 100644
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -1700,6 +1700,15 @@ mp_qrtr_state(void *context, QcomGlinkChannel *channel, int up)
+ {
+ 	(void)context;
+ 	printf("PANDORA MPSS: channel %s %s\n", channel->name, up ? "up" : "down");
++	/*
++	 * 0569: the service probe goes in here, at the channel's up edge, because this is the last
++	 * point that runs before the HELLO and the directory the peer sends next: its lookups must
++	 * already be in the router's table when those announcements are parsed.  With the attach ring
++	 * stopping at step 10 this edge is reached and step_qrtr()'s pandora_cell_start() is not.
++	 */
++	if (up) {
++		pandora_cell_qmi_probe();
++	}
+ }
+ 
+ /* The link's thread: GLINK, the doorbells, the fresh lookups, and the modem's words (hakios.mpss.c:3441). */
