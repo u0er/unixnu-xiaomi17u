@@ -1,0 +1,168 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b7bbf39..fa1a753 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -297,34 +297,109 @@ sweetfb_gpu_frames(void)
+ 	return on != 0;
+ }
+ 
+-/* Static Pro Max style mask, after the GPU fence and before either display path.
+- * Coordinates scale with the composed frame; no UI process or input handler. */
+-static void
+-nezha_draw_capsule(SweetSurface *s)
++/* LANE_ISLAND: UIKit frame {{132.5, 12.875}, {110, 32}} on the 375 pt logical
++ * screen, radius 16. Both paths rasterize that one integer box, so a UIKit
++ * aperture and this capsule cannot show a second black edge. */
++struct nezha_island_box {
++	uint32_t x0, y0, w, h, r;
++};
++
++static bool
++nezha_island_geometry(SweetSurface *s, struct nezha_island_box *b)
+ {
+ 	if (!s->memory || s->pixelFormat != 0x42475241 || s->bytesPerElement != 4 ||
+ 	    s->elementWidth != 1 || s->elementHeight != 1 || s->width < 375 ||
+ 	    s->bytesPerRow < (uint64_t)s->width * 4 ||
+ 	    (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
++		return false;
++	}
++	b->w = s->width * 110 / 375;
++	b->h = s->width * 32 / 375;
++	b->x0 = (s->width - b->w) / 2;
++	b->y0 = s->width * 14 / 375 - (s->width * 2 + 600) / 1200;
++	b->r = b->h / 2;
++	return b->w >= 4 && b->h >= 4 && b->y0 + b->h <= s->height;
++}
++
++/* 4x4 subpixel coverage of one pixel against the capsule; integer only. */
++static uint32_t
++nezha_island_coverage(uint32_t x, uint32_t y, const struct nezha_island_box *b)
++{
++	const int64_t c1 = ((int64_t)b->x0 + b->r) * 16, c2 = ((int64_t)b->x0 + b->w - b->r) * 16;
++	const int64_t cy = ((int64_t)b->y0 * 2 + b->h) * 8;
++	const int64_t r2 = (int64_t)b->r * b->r * 256;
++	uint32_t cov = 0;
++
++	for (uint32_t i = 0; i < 4; i++) {
++		const int64_t sx = (int64_t)x * 16 + 4 * (int64_t)i + 2;
++		const int64_t dx = sx < c1 ? c1 - sx : (sx > c2 ? sx - c2 : 0);
++		for (uint32_t j = 0; j < 4; j++) {
++			const int64_t sy = (int64_t)y * 16 + 4 * (int64_t)j + 2;
++			const int64_t dy = sy - cy;
++			if (dx * dx + dy * dy <= r2) {
++				cov++;
++			}
++		}
++	}
++	return cov;
++}
++
++/* Static Pro Max style mask, after the GPU fence and before either display path.
++ * Coordinates scale with the composed frame; no UI process or input handler. */
++static void
++nezha_draw_capsule(SweetSurface *s)
++{
++	struct nezha_island_box b;
++	if (!nezha_island_geometry(s, &b)) {
+ 		return;
+ 	}
+-	const uint32_t w = s->width * 110 / 375, h = s->width * 32 / 375;
+-	const uint32_t x0 = (s->width - w) / 2, y0 = s->width * 14 / 375 - (s->width * 2 + 600) / 1200;
+ 	uintptr_t pixels = s->kernelAddress();
+-	if (!pixels || y0 + h > s->height) {
++	if (!pixels) {
+ 		return;
+ 	}
+-	for (uint32_t y = 0; y < h; y++) {
+-		const int64_t dy = 2 * (int64_t)y + 1 - h;
++	for (uint32_t y = 0; y < b.h; y++) {
++		const int64_t dy = 2 * (int64_t)y + 1 - b.h;
+ 		uint32_t inset = 0;
+-		while ((2 * (int64_t)inset + 1 - h) * (2 * (int64_t)inset + 1 - h) + dy * dy > (int64_t)h * h) {
++		while ((2 * (int64_t)inset + 1 - b.h) * (2 * (int64_t)inset + 1 - b.h) + dy * dy > (int64_t)b.h * b.h) {
+ 			inset++;
+ 		}
+-		uint32_t *row = (uint32_t *)(pixels + s->offset + (uint64_t)(y0 + y) * s->bytesPerRow);
+-		for (uint32_t x = x0 + inset; x < x0 + w - inset; x++) {
++		uint32_t *row = (uint32_t *)(pixels + s->offset + (uint64_t)(b.y0 + y) * s->bytesPerRow);
++		for (uint32_t x = b.x0 + inset; x < b.x0 + b.w - inset; x++) {
+ 			row[x] = 0xff000000;
+ 		}
+-		flush_dcache((vm_offset_t)(row + x0), w * 4, FALSE);
++		flush_dcache((vm_offset_t)(row + b.x0), b.w * 4, FALSE);
++	}
++}
++
++/* nezha_system_island=1: the UIKit-shaped capsule (radius 16, 4x4 AA edges). */
++static void
++nezha_draw_system_capsule(SweetSurface *s)
++{
++	struct nezha_island_box b;
++	if (!nezha_island_geometry(s, &b)) {
++		return;
++	}
++	uintptr_t pixels = s->kernelAddress();
++	if (!pixels) {
++		return;
++	}
++	static int logged;
++	if (!logged) {
++		logged = 1;
++		IOLog("NEZHA island: UIKit capsule %ux%u at %u,%u r=%u\n", b.w, b.h, b.x0, b.y0, b.r);
++	}
++	for (uint32_t y = 0; y < b.h; y++) {
++		uint32_t *row = (uint32_t *)(pixels + s->offset + (uint64_t)(b.y0 + y) * s->bytesPerRow);
++		for (uint32_t x = 0; x < b.w; x++) {
++			const uint32_t cov = nezha_island_coverage(b.x0 + x, b.y0 + y, &b);
++			if (cov == 0) {
++				continue;
++			}
++			uint32_t *p = row + b.x0 + x;
++			*p = cov == 16 ? 0xff000000u :
++			    (0xff000000u | (sweet_fb_scale(*p, (16 - cov) * 16) & 0x00ffffffu));
++		}
++		flush_dcache((vm_offset_t)(row + b.x0), b.w * 4, FALSE);
+ 	}
+ }
+ #endif
+@@ -1871,22 +1946,37 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ 
+ #if defined(PANDORA)
+-	static int capsule = -1;
++	static int capsule = -1, system_capsule = -1;
+ 	if (capsule < 0) {
+ 		capsule = 0;
+ 		PE_parse_boot_argn("nezha_island", &capsule, sizeof(capsule));
+ 	}
++	if (system_capsule < 0) {
++		system_capsule = 0;
++		PE_parse_boot_argn("nezha_system_island", &system_capsule, sizeof(system_capsule));
++	}
+ 	uint32_t composed = 0;
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0) {
+ 			composed |= 1u << layer;
+ 		}
+ 	}
+-	if (capsule && composed && (composed & (composed - 1)) == 0) {
++	if (system_capsule && composed && (composed & (composed - 1)) != 0) {
++		static int skipped;
++		if (!skipped) {
++			skipped = 1;
++			IOLog("NEZHA island: UIKit capsule skipped, composed=0x%x\n", composed);
++		}
++	}
++	if ((capsule || system_capsule) && composed && (composed & (composed - 1)) == 0) {
+ 		for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 			SweetSurface *s = (mask & (1u << layer)) ? sweet_surface_copy(get32(rec, 0x54 + 4 * layer)) : NULL;
+ 			if (s && s != fSurface && s->width == fLogicalW && s->height == fLogicalH) {
+-				nezha_draw_capsule(s);
++				if (system_capsule) {
++					nezha_draw_system_capsule(s);
++				} else {
++					nezha_draw_capsule(s);
++				}
+ 			}
+ 			OSSafeReleaseNULL(s);
+ 		}
