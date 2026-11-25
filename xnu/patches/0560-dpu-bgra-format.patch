@@ -1,0 +1,18 @@
+diff --git a/bsd/dev/pandora_dpu.c b/bsd/dev/pandora_dpu.c
+index 1811c74..1f1b59e 100644
+--- a/bsd/dev/pandora_dpu.c
++++ b/bsd/dev/pandora_dpu.c
+@@ -617,6 +617,13 @@ pandora_scanout_init(void)
+ 		}
+ 		sc.saved_qop[p] = dpu_rd(sc_qseed[p] + SC_Q_OP_MODE);
+ 	}
++	/* 0560: the bootloader format/unpack describe its own framebuffer; the iOS
++	 * surfaces are 32-bit BGRA.  Program the pipes for BGRA explicitly (mdp4
++	 * mapping: pattern = (A<<24)|(B<<16)|(G<<8)|R) and drop alpha blending. */
++	for (unsigned p = 0; p < SC_PIPES; p++) {
++		dpu_wr(sc_rec[p] + 0x0, 0x000236ffu);
++		dpu_wr(sc_rec[p] + 0x4, 0x03010002u);
++	}
+ 	sc.on_panel = true;
+ 	sc.ready = true;
+ 	printf("PANDORA SCANOUT: the display reads through bank %u's tables, no fault: frames can be scanned out\n", sc.bank);
