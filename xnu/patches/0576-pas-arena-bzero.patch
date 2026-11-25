@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/pandora_pas.c b/bsd/dev/pandora_pas.c
 --- a/bsd/dev/pandora_pas.c
 +++ b/bsd/dev/pandora_pas.c
-@@ -123,7 +123,16 @@ pas_meta_arena_setup(void)
+@@ -123,7 +123,17 @@ pas_meta_arena_setup(void)
  		printf("PANDORA PAS: pandora-pil-shm %#llx + %#llx not mapped\n", r[0], r[1]);
  		return;
  	}
@@ -10,7 +10,8 @@ diff --git a/bsd/dev/pandora_pas.c b/bsd/dev/pandora_pas.c
 +	 * 0576: the arena is device memory (VM_WIMG_IO), and bzero() reached dc zva on it -- the
 +	 * cache-line store faulted with ESR 0x96000061 (data abort from the same EL, DFSC 0x21
 +	 * alignment fault) in the mpsslowmem ring of 2026-11-25 22:35.  Four-byte volatile stores
-+	 * are what this mapping accepts; the arena is 64 KiB, cleared once per boot.
++	 * are what this mapping accepts; the arena is 0x40000 bytes (16 slabs of 16 KiB), cleared
++	 * once per boot.
 +	 */
 +	volatile uint32_t *arena = (volatile uint32_t *)(void *)va;
 +	for (size_t cleared = 0; cleared < (size_t)PAS_META_ARENA_SIZE; cleared += sizeof(*arena)) {
