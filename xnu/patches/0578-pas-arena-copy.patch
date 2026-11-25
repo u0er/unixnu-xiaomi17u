@@ -1,0 +1,113 @@
+diff --git a/bsd/dev/pandora_pas.c b/bsd/dev/pandora_pas.c
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -289,6 +289,74 @@ mdt_segment(const char *prefix, const char *base, const struct pandora_fw *mdt,
+ 	return ENOENT;
+ }
+ 
++/*
++ * 0578: fill the metadata arena four bytes at a time.
++ *
++ * The arena is ml_io_map_unmappable(..., VM_WIMG_IO) -- pmap.c picks CACHE_ATTRINDX_POSTED_COMBINED_
++ * REORDERED for it -- and device memory of that attribute accepts a store only at the width of its
++ * alignment.  0576 removed the bzero() whose dc zva faulted (ESR 0x96000061, 2026-11-25 22:35); the
++ * 2026-11-26 02:33 boot then faulted the same way 0.224 s in at _memmove+0x90, because the generic
++ * memcpy() finishes a 148-byte copy with an eight-byte stp at the four-byte-aligned md+0x74 (far
++ * 0xfffffff93f499074, lr _pandora_pas_load+0x424).
++ *
++ * One-byte stores are legal at any address and four-byte stores at four-byte addresses, so the head
++ * and the tail go byte by byte and the body word by word; nothing is written past n, and no caller
++ * depends on p_filesz being a multiple of four.  The kmem_alloc_contig fallback buffer is ordinary
++ * memory and would take memcpy(), but one path for both is what keeps this from growing a second
++ * copy bug.
++ */
++static void
++pas_meta_store(vm_offset_t md, uint32_t off, const void *src, uint32_t n)
++{
++	const uint8_t *s = (const uint8_t *)src;
++	vm_offset_t at = md + off;
++	uint32_t done = 0;
++
++	while (done < n && (at & 3)) {
++		*(volatile uint8_t *)(void *)at = s[done];
++		at++;
++		done++;
++	}
++	while (n - done >= 4) {
++		*(volatile uint32_t *)(void *)at = (uint32_t)s[done] | ((uint32_t)s[done + 1] << 8) |
++		    ((uint32_t)s[done + 2] << 16) | ((uint32_t)s[done + 3] << 24);
++		at += 4;
++		done += 4;
++	}
++	while (done < n) {
++		*(volatile uint8_t *)(void *)at = s[done];
++		at++;
++		done++;
++	}
++}
++
++/*
++ * The mdt_segment() read path ends in pandora_fw_file_read(), which memcpy()s into whatever buffer
++ * it is handed, so it cannot write the arena either: read the segment into a bounce buffer and
++ * store it four bytes at a time.  p_filesz is already bounded by PAS_MDT_MAX (64 KiB) here.
++ */
++static int
++pas_meta_segment(const char *prefix, const char *base, const struct pandora_fw *mdt,
++    const struct elf32_phdr *p, unsigned i, vm_offset_t md, uint32_t off)
++{
++	void *bounce;
++	int err;
++
++	if (!p->p_filesz) {
++		return 0;
++	}
++	bounce = kalloc_data(p->p_filesz, Z_WAITOK);
++	if (!bounce) {
++		return ENOMEM;
++	}
++	err = mdt_segment(prefix, base, mdt, p, i, bounce);
++	if (!err) {
++		pas_meta_store(md, off, bounce, p->p_filesz);
++	}
++	kfree_data(bounce, p->p_filesz);
++	return err;
++}
++
+ /*
+  * One image: metadata to TrustZone, init, mem setup when relocatable, segments into the carveout.
+  * Returns 0 or an errno; the caller authenticates separately so a two-stage load can be verified
+@@ -460,12 +528,12 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 	printf("PANDORA PAS: %s: metadata %u bytes at %#llx, blob %#llx (%s)\n", name,
+ 	    ehdr_size + hash_size, md, md_pa, reserved ? "reserved below 4 GiB" :
+ 	    low ? "kernel allocator, below 4 GiB" : "kernel allocator, above 4 GiB");
+-	memcpy((void *)md, hdr, ehdr_size);
++	pas_meta_store(md, 0, hdr, ehdr_size);
+ 	if (ehdr_size + hash_size == mdt_size) {
+-		memcpy((void *)(md + ehdr_size), hdr + ehdr_size, hash_size);
++		pas_meta_store(md, ehdr_size, hdr + ehdr_size, hash_size);
+ 	} else if ((uint64_t)ph[hash].p_offset + hash_size <= mdt_size) {
+-		memcpy((void *)(md + ehdr_size), hdr + ph[hash].p_offset, hash_size);
+-	} else if ((err = mdt_segment(prefix, base, mdt, &ph[hash], hash, (void *)(md + ehdr_size)))) {
++		pas_meta_store(md, ehdr_size, hdr + ph[hash].p_offset, hash_size);
++	} else if ((err = pas_meta_segment(prefix, base, mdt, &ph[hash], hash, md, ehdr_size))) {
+ 		pas_meta_free(md, md_size);
+ 		goto out;
+ 	}
+@@ -771,13 +839,13 @@ pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64
+ 	printf("PANDORA PAS: probe: %s: metadata %u bytes at %#llx, blob %#llx (%s)\n", name,
+ 	    ehdr_size + hash_size, md, md_pa, reserved ? "reserved below 4 GiB" :
+ 	    low ? "kernel allocator, below 4 GiB" : "kernel allocator, above 4 GiB");
+-	memcpy((void *)md, hdr, ehdr_size);
++	pas_meta_store(md, 0, hdr, ehdr_size);
+ 	if (ehdr_size + hash_size == mdt_size) {
+-		memcpy((void *)(md + ehdr_size), hdr + ehdr_size, hash_size);
++		pas_meta_store(md, ehdr_size, hdr + ehdr_size, hash_size);
+ 	} else if ((uint64_t)ph[hash].p_offset + hash_size <= mdt_size) {
+-		memcpy((void *)(md + ehdr_size), hdr + ph[hash].p_offset, hash_size);
++		pas_meta_store(md, ehdr_size, hdr + ph[hash].p_offset, hash_size);
+ 	} else {
+-		err = mdt_segment(prefix, base, mdt, &ph[hash], hash, (void *)(md + ehdr_size));
++		err = pas_meta_segment(prefix, base, mdt, &ph[hash], hash, md, ehdr_size);
+ 		if (err) {
+ 			pas_meta_free(md, md_size);
+ 			goto out;
