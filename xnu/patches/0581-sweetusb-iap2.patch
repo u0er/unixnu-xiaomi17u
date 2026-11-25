@@ -1,0 +1,500 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index e120fc8..052ceb8 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -36,6 +36,12 @@
+ #include <net/if_media.h>
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
++#include <sys/conf.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/select.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
+ 
+ #include "apple_usb.h"
+ 
+@@ -215,7 +221,7 @@ static struct {
+ 	uint32_t    events;
+ 	bool        configured;
+ 	uint8_t     data_alt;       /* data interface alternate setting */
+-	int         personality;    /* UD_ECM, UD_APPLE, UD_NCM or UD_CARPLAY (composite) */
++	int         personality;    /* UD_ECM, UD_APPLE, UD_NCM, UD_CARPLAY or UD_IAP2 */
+ 	bool        ncm_tx_busy;    /* NCM bulk IN in flight (composite keeps it separate) */
+ 	/*
+ 	 * NCM 1.1 section 9.1 wants CONNECTION_SPEED_CHANGE then NETWORK_CONNECTION.
+@@ -235,6 +241,29 @@ static struct {
+ 	uint32_t    bulks;
+ } ud;
+ 
++/*
++ * /dev/iap2 producer state (sweetusb=6). The composite descriptor and the
++ * NCM function are unchanged; only interface 0's bulk pipe moves to user
++ * space, which then speaks the iAP2 link layer (0xFF 0x55 framing,
++ * DETECT/SYN) itself. One opener owns the pipe.
++ */
++#define UD_IAP2_RING    0x20000         /* bytes buffered from bulk-OUT */
++#define UD_IAP2_CHUNK   UD_FRAME_MAX    /* one TRB per write chunk */
++
++static struct {
++	uint8_t        *rx;
++	uint8_t        *stage_rx;       /* read staging, no lock held in uiomove */
++	uint8_t        *stage_tx;       /* write staging, one writer only */
++	uint32_t        head;           /* read index */
++	uint32_t        used;
++	lck_grp_t      *grp;
++	lck_mtx_t      *lock;
++	struct selinfo  sel;
++	bool            open;
++	uint32_t        dropped;
++	uint64_t        in_bytes, out_bytes;
++} ia;
++
+ static inline void
+ dwc_wr(uint32_t off, uint32_t v)
+ {
+@@ -450,6 +479,7 @@ static const char *const ud_ncm_strings[] = {
+  * NTBs can be in flight at the same time without sharing a buffer.
+  */
+ #define UD_CARPLAY      3
++#define UD_IAP2         4
+ 
+ static const uint8_t ud_carplay_dev_desc[18] = {
+ 	18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
+@@ -505,13 +535,26 @@ typedef char ud_carplay_cfg_desc_must_be_109_bytes[(sizeof(ud_carplay_cfg_desc)
+ static inline bool
+ ud_has_mux(void)
+ {
+-	return ud.personality == UD_APPLE || ud.personality == UD_CARPLAY;
++	return ud.personality == UD_APPLE || ud.personality == UD_CARPLAY ||
++	    ud.personality == UD_IAP2;
+ }
+ 
+ static inline bool
+ ud_has_ncm(void)
+ {
+-	return ud.personality == UD_NCM || ud.personality == UD_CARPLAY;
++	return ud.personality == UD_NCM || ud.personality == UD_CARPLAY ||
++	    ud.personality == UD_IAP2;
++}
++
++/*
++ * UD_IAP2 is the composite descriptor with interface 0 handed to user space:
++ * same three interfaces and endpoints, but the mux function on if0 is a raw
++ * pipe (/dev/iap2) instead of an in-kernel usbmux connection.
++ */
++static inline bool
++ud_is_composite(void)
++{
++	return ud.personality == UD_CARPLAY || ud.personality == UD_IAP2;
+ }
+ 
+ /*
+@@ -524,7 +567,7 @@ ud_has_ncm(void)
+ static unsigned
+ ud_ncm_ctrl_ifnum(void)
+ {
+-	return ud.personality == UD_CARPLAY ? 1 : 0;
++	return ud_is_composite() ? 1 : 0;
+ }
+ 
+ static unsigned
+@@ -592,7 +635,7 @@ ud_string(unsigned idx, uint8_t *out)
+ 		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;   /* en-US */
+ 		return 4;
+ 	}
+-	if (ud.personality == UD_CARPLAY) {
++	if (ud_is_composite()) {
+ 		/* Tested first: this set must expose both the three Apple indices
+ 		 * usbmuxd reads and index 4, the NCM iMACAddress. */
+ 		tab = ud_carplay_strings;
+@@ -625,6 +668,8 @@ static void ud_rx_arm(void);
+ static void ud_ncm_rx_arm(void);
+ static void ud_tx_kick_locked(void);
+ static void ud_apple_tx_kick(void);
++static void iap2_rx_push(const uint8_t *buf, uint32_t len);
++static void iap2_quiesce(void);
+ static void ud_link_event(bool up);
+ static void ud_carrier_publish(const char *why);
+ 
+@@ -844,7 +889,7 @@ ud_ncm_ntb_parse(const uint8_t *ntb, uint32_t len)
+ static void
+ ud_notify_connected(void)
+ {
+-	bool      composite = (ud.personality == UD_CARPLAY);
++	bool      composite = ud_is_composite();
+ 	uint32_t  buf = composite ? UD_NCM_NOTIFY : UD_NOTIFY;
+ 	uint8_t  *n = (uint8_t *)(ud.dma + buf);
+ 
+@@ -868,7 +913,7 @@ ud_notify_connected(void)
+ static void
+ ud_notify_speed(uint32_t downlink, uint32_t uplink)
+ {
+-	bool      composite = (ud.personality == UD_CARPLAY);
++	bool      composite = ud_is_composite();
+ 	uint32_t  buf = composite ? UD_NCM_NOTIFY : UD_NOTIFY;
+ 	uint8_t  *n = (uint8_t *)(ud.dma + buf);
+ 
+@@ -889,7 +934,7 @@ ud_configure(void)
+ 	if (ud.configured) {
+ 		return;
+ 	}
+-	if (ud.personality == UD_CARPLAY) {
++	if (ud_is_composite()) {
+ 		/*
+ 		 * Composite: five endpoints in one configuration.  mux keeps
+ 		 * EP_RX/EP_TX (0x01/0x81) configured exactly as the UD_APPLE path
+@@ -924,7 +969,13 @@ ud_configure(void)
+ 		ud_ncm_in_max = NCM_NTB_MAX;
+ 		ud_rx_arm();            /* mux bulk OUT on EP_RX */
+ 		ud_ncm_rx_arm();        /* NCM bulk OUT on EP_NCM_RX */
+-		apple_usbmux_link_up();
++		if (ud.personality == UD_IAP2) {
++			wakeup(&ia);
++			selwakeup(&ia.sel);
++			printf("SWEET IAP2: if0 handed to /dev/iap2\n");
++		} else {
++			apple_usbmux_link_up();
++		}
+ 		printf("SWEET USB: carplay composite endpoints configured\n");
+ 		return;
+ 	}
+@@ -1092,7 +1143,7 @@ ud_setup(void)
+ 		const uint8_t *dd = ud_dev_desc;
+ 		const uint8_t *cd = ud_cfg_desc;
+ 
+-		if (ud.personality == UD_CARPLAY) {
++		if (ud_is_composite()) {
+ 			dd = ud_carplay_dev_desc;
+ 			cd = ud_carplay_cfg_desc;
+ 		} else if (ud_has_mux()) {
+@@ -1220,9 +1271,15 @@ ud_rx_done(void)
+ 		}
+ 		ud.rx_frames++;
+ 		if (len != 0 && len <= ud.rx_req) {
+-			apple_usbmux_input((const uint8_t *)(ud.dma + UD_RX), len);
++			if (ud.personality == UD_IAP2) {
++				iap2_rx_push((const uint8_t *)(ud.dma + UD_RX), len);
++			} else {
++				apple_usbmux_input((const uint8_t *)(ud.dma + UD_RX), len);
++			}
++		}
++		if (ud.personality != UD_IAP2) {
++			ud_apple_tx_kick();
+ 		}
+-		ud_apple_tx_kick();
+ 		ud_rx_arm();
+ 		return;
+ 	}
+@@ -1305,7 +1362,7 @@ ud_tx_kick_locked(void)
+ 		 * NCM believe an NTB is still in flight (and the reverse), stalling
+ 		 * one function behind the other.
+ 		 */
+-		bool      composite = (ud.personality == UD_CARPLAY);
++		bool      composite = ud_is_composite();
+ 		bool     *busy = composite ? &ud.ncm_tx_busy : &ud.tx_busy;
+ 		uint32_t  buf = composite ? UD_NCM_TX : UD_TX;
+ 		uint32_t  trb = composite ? UD_TRB_NCM_TX : UD_TRB_TX;
+@@ -1356,7 +1413,8 @@ ud_apple_tx_kick(void)
+ {
+ 	uint32_t n;
+ 
+-	if (!ud_has_mux() || !ud.configured || ud.tx_busy) {
++	if (ud.personality == UD_IAP2 || !ud_has_mux() ||
++	    !ud.configured || ud.tx_busy) {
+ 		return;
+ 	}
+ 	n = apple_usbmux_next_tx((uint8_t *)(ud.dma + UD_TX), 512);
+@@ -1573,6 +1631,240 @@ ud_if_create(void)
+ 	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
+ }
+ 
++
++/* ---- /dev/iap2: raw if0 producer (sweetusb=6) ---- */
++
++static void
++iap2_rx_push(const uint8_t *buf, uint32_t len)
++{
++	uint32_t tail, first;
++
++	lck_mtx_lock(ia.lock);
++	if (!ia.open) {
++		ia.dropped += len;
++		lck_mtx_unlock(ia.lock);
++		return;
++	}
++	if (UD_IAP2_RING - ia.used < len) {
++		if (ia.dropped == 0) {
++			printf("SWEET IAP2: rx ring full, dropping (reader stalled)\n");
++		}
++		ia.dropped += len;
++		lck_mtx_unlock(ia.lock);
++		return;
++	}
++	tail = (ia.head + ia.used) % UD_IAP2_RING;
++	first = MIN(len, UD_IAP2_RING - tail);
++	memcpy(ia.rx + tail, buf, first);
++	if (len > first) {
++		memcpy(ia.rx, buf + first, len - first);
++	}
++	ia.used += len;
++	ia.in_bytes += len;
++	lck_mtx_unlock(ia.lock);
++	wakeup(&ia);
++	selwakeup(&ia.sel);
++}
++
++/* Bus reset: the endpoint dropped our TRB, so the writer must not wait on it. */
++static void
++iap2_quiesce(void)
++{
++	lck_mtx_lock(ia.lock);
++	ud.tx_busy = false;
++	ia.head = ia.used = 0;
++	lck_mtx_unlock(ia.lock);
++	wakeup(&ia);
++	selwakeup(&ia.sel);
++}
++
++static int
++iap2_open(dev_t dev __unused, int flags __unused, int devtype __unused,
++    proc_t p __unused)
++{
++	lck_mtx_lock(ia.lock);
++	if (ia.open) {
++		lck_mtx_unlock(ia.lock);
++		return EBUSY;
++	}
++	ia.open = true;
++	ia.head = ia.used = 0;
++	ia.dropped = 0;
++	ia.in_bytes = ia.out_bytes = 0;
++	lck_mtx_unlock(ia.lock);
++	printf("SWEET IAP2: producer opened /dev/iap2\n");
++	return 0;
++}
++
++static int
++iap2_close(dev_t dev __unused, int flags __unused, int devtype __unused,
++    proc_t p __unused)
++{
++	uint64_t in, out;
++	uint32_t dropped;
++
++	lck_mtx_lock(ia.lock);
++	ia.open = false;
++	in = ia.in_bytes;
++	out = ia.out_bytes;
++	dropped = ia.dropped;
++	ia.head = ia.used = 0;
++	lck_mtx_unlock(ia.lock);
++	wakeup(&ia);
++	selwakeup(&ia.sel);
++	printf("SWEET IAP2: producer closed, in %llu out %llu dropped %u\n",
++	    in, out, dropped);
++	return 0;
++}
++
++static int
++iap2_read(dev_t dev __unused, struct uio *uio, int ioflag __unused)
++{
++	int err = 0;
++
++	while (uio_resid(uio) > 0) {
++		uint32_t n, i;
++
++		lck_mtx_lock(ia.lock);
++		while (ia.used == 0) {
++			if (!ia.open) {
++				lck_mtx_unlock(ia.lock);
++				return 0;
++			}
++			err = msleep(&ia, ia.lock, PRIBIO | PCATCH, "iap2rd", NULL);
++			if (err) {
++				lck_mtx_unlock(ia.lock);
++				return err;
++			}
++		}
++		n = MIN(ia.used, (uint32_t)uio_resid(uio));
++		n = MIN(n, UD_IAP2_CHUNK);
++		for (i = 0; i < n; i++) {
++			ia.stage_rx[i] = ia.rx[(ia.head + i) % UD_IAP2_RING];
++		}
++		ia.head = (ia.head + n) % UD_IAP2_RING;
++		ia.used -= n;
++		lck_mtx_unlock(ia.lock);
++		if ((err = uiomove((caddr_t)ia.stage_rx, (int)n, uio)) != 0) {
++			return err;
++		}
++	}
++	return 0;
++}
++
++static int
++iap2_write(dev_t dev __unused, struct uio *uio, int ioflag __unused)
++{
++	int err = 0;
++
++	while (uio_resid(uio) > 0) {
++		uint32_t n = MIN((uint32_t)uio_resid(uio), UD_IAP2_CHUNK);
++
++		if ((err = uiomove((caddr_t)ia.stage_tx, (int)n, uio)) != 0) {
++			break;
++		}
++		lck_mtx_lock(ia.lock);
++		while (!err && ia.open && (!ud.configured || ud.tx_busy)) {
++			/* A bus reset clears configured/tx_busy outside this lock, so
++			 * a wakeup can be lost; the timeout keeps the writer making
++			 * progress instead of sleeping on a transfer that will never
++			 * complete. */
++			struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
++
++			err = msleep(&ia, ia.lock, PRIBIO | PCATCH, "iap2wr", &ts);
++			if (err == EWOULDBLOCK) {
++				err = 0;
++			}
++		}
++		if (!err && !ia.open) {
++			err = EIO;
++		}
++		if (!err) {
++			memcpy((void *)(ud.dma + UD_TX), ia.stage_tx, n);
++			ud.tx_busy = true;
++			ia.out_bytes += n;
++			ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, n, TRBCTL_NORMAL);
++		}
++		lck_mtx_unlock(ia.lock);
++		if (err) {
++			printf("SWEET IAP2: write %u failed, err %d\n", n, err);
++			break;
++		}
++	}
++	return err;
++}
++
++static int
++iap2_select(dev_t dev __unused, int which, void *wql, proc_t p)
++{
++	int ready = 0;
++
++	lck_mtx_lock(ia.lock);
++	if (which == FREAD) {
++		ready = ia.used != 0;
++	} else if (which == FWRITE) {
++		ready = ud.configured && !ud.tx_busy;
++	}
++	if (!ready) {
++		selrecord(p, &ia.sel, wql);
++	}
++	lck_mtx_unlock(ia.lock);
++	return ready;
++}
++
++static const struct cdevsw iap2_cdevsw = {
++	.d_open     = iap2_open,
++	.d_close    = iap2_close,
++	.d_read     = iap2_read,
++	.d_write    = iap2_write,
++	.d_ioctl    = eno_ioctl,
++	.d_stop     = eno_stop,
++	.d_reset    = eno_reset,
++	.d_ttys     = NULL,
++	.d_select   = iap2_select,
++	.d_mmap     = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_type     = 0,
++};
++
++static int
++iap2_dev_init(void)
++{
++	vm_offset_t va = 0;
++	int major;
++
++	if (ia.lock != NULL) {
++		return 0;
++	}
++	ia.grp = lck_grp_alloc_init("sweet_iap2", LCK_GRP_ATTR_NULL);
++	ia.lock = lck_mtx_alloc_init(ia.grp, LCK_ATTR_NULL);
++	if (kmem_alloc(kernel_map, &va, round_page(UD_IAP2_RING),
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		printf("SWEET IAP2: no rx ring\n");
++		return ENOMEM;
++	}
++	ia.rx = (uint8_t *)va;
++	if (kmem_alloc(kernel_map, &va, round_page(2 * UD_IAP2_CHUNK),
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		printf("SWEET IAP2: no staging buffer\n");
++		return ENOMEM;
++	}
++	ia.stage_rx = (uint8_t *)va;
++	ia.stage_tx = ia.stage_rx + UD_IAP2_CHUNK;
++	major = cdevsw_add(-1, &iap2_cdevsw);
++	if (major < 0) {
++		printf("SWEET IAP2: cdevsw_add failed\n");
++		return ENXIO;
++	}
++	if (devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL,
++	    0660, "iap2") == NULL) {
++		printf("SWEET IAP2: devfs node failed\n");
++		return ENXIO;
++	}
++	printf("SWEET IAP2: /dev/iap2 producer node ready\n");
++	return 0;
++}
++
+ static void
+ ud_event(uint32_t ev)
+ {
+@@ -1599,7 +1891,11 @@ ud_event(uint32_t ev)
+ 			ud_ncm_sequence = 0;
+ 			ud_ncm_in_max = NCM_NTB_MAX;
+ 			if (ud_has_mux()) {
+-				apple_usbmux_link_down();
++				if (ud.personality == UD_IAP2) {
++					iap2_quiesce();
++				} else {
++					apple_usbmux_link_down();
++				}
+ 			}
+ 			ud_carrier_publish("bus_reset");
+ 			printf("SWEET USB: bus reset (endpoints rebuilt on next SET_CONFIGURATION)\n");
+@@ -1632,8 +1928,16 @@ ud_event(uint32_t ev)
+ 	}
+ 	if (ep == EP_TX && type == 1) {
+ 		if (ud_has_mux()) {
+-			ud.tx_busy = false;
+-			ud_apple_tx_kick();
++			if (ud.personality == UD_IAP2) {
++				lck_mtx_lock(ia.lock);
++				ud.tx_busy = false;
++				lck_mtx_unlock(ia.lock);
++				wakeup(&ia);
++				selwakeup(&ia.sel);
++			} else {
++				ud.tx_busy = false;
++				ud_apple_tx_kick();
++			}
+ 			return;
+ 		}
+ 		lck_mtx_lock(ud.lock);
+@@ -1809,12 +2113,17 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		int mode = 1;
+ 
+ 		PE_parse_boot_argn("sweetusb", &mode, sizeof(mode));
+-		ud.personality = (mode >= 5) ? UD_CARPLAY :
++		ud.personality = (mode >= 6) ? UD_IAP2 :
++		    (mode >= 5) ? UD_CARPLAY :
+ 		    (mode >= 4) ? UD_NCM : (mode >= 3) ? UD_APPLE : UD_ECM;
+ 		printf("SWEET USB: personality %s (sweetusb=%d)\n",
++		    ud.personality == UD_IAP2 ? "carplay-iap2" :
+ 		    ud.personality == UD_CARPLAY ? "carplay-composite" :
+ 		    ud.personality == UD_NCM ? "cdc-ncm" :
+ 		    ud.personality == UD_APPLE ? "apple-usbmux" : "cdc-ecm", mode);
++		if (ud.personality == UD_IAP2) {
++			(void)iap2_dev_init();
++		}
+ 	}
+ 	/* Always create ue0 so userspace network configuration is happy,
+ 	 * even in the Apple personality where bulk endpoints carry mux
