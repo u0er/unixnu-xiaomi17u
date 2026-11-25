@@ -1,0 +1,557 @@
+diff --git a/bsd/sweet_hfs/core/FileExtentMapping.c b/bsd/sweet_hfs/core/FileExtentMapping.c
+index 4401f14..675615a 100644
+--- a/bsd/sweet_hfs/core/FileExtentMapping.c
++++ b/bsd/sweet_hfs/core/FileExtentMapping.c
+@@ -140,6 +140,18 @@ static OSErr SearchExtentRecord(
+ 	u_int32_t				*endingFABNPlusOne,
+ 	Boolean					*noMoreExtents);
+ 
++static u_int32_t ExtentRecordBlocks(
++	const HFSPlusExtentRecord	extents);
++
++static OSErr FindNextExtentRecord(
++	const ExtendedVCB		*vcb,
++	u_int8_t				forkType,
++	u_int32_t				fileID,
++	u_int32_t				startBlock,
++	HFSPlusExtentKey		*foundKey,
++	HFSPlusExtentRecord		foundData,
++	u_int32_t				*foundHint);
++
+ static OSErr ReleaseExtents(
+ 	ExtendedVCB				*vcb,
+ 	const HFSPlusExtentRecord	extentRecord,
+@@ -270,6 +282,89 @@ static OSErr FindExtentRecord(
+ 
+ 
+ 
++
++/*
++ *	Total number of blocks described by one extent record.
++ */
++static u_int32_t ExtentRecordBlocks(
++	const HFSPlusExtentRecord	extents)
++{
++	u_int32_t	blocks = 0;
++	int			index;
++
++	for (index = 0; index < kHFSPlusExtentDensity; ++index) {
++		if (extents[index].blockCount == 0)
++			break;
++		blocks += extents[index].blockCount;
++	}
++
++	return blocks;
++}
++
++
++/*
++ *	Routine:	FindNextExtentRecord
++ *
++ *	Purpose:	Find the first extent record of a fork whose key is greater
++ *				than startBlock.  A hit means the fork has records that its
++ *				chain cannot reach, which is how a hole is told apart from the
++ *				end of the chain.
++ */
++static OSErr FindNextExtentRecord(
++	const ExtendedVCB		*vcb,
++	u_int8_t				forkType,
++	u_int32_t				fileID,
++	u_int32_t				startBlock,
++	HFSPlusExtentKey		*foundKey,
++	HFSPlusExtentRecord		foundData,
++	u_int32_t				*foundHint)
++{
++	FCB *					fcb;
++	struct BTreeIterator *	btIterator = NULL;
++	FSBufferDescriptor		btRecord;
++	HFSPlusExtentKey *		extentKeyPtr;
++	OSErr					err;
++	u_int16_t				btRecordSize = 0;
++
++	fcb = GetFileControlBlock(vcb->extentsRefNum);
++
++	btIterator = hfs_malloc_type(struct BTreeIterator);
++	extentKeyPtr = (HFSPlusExtentKey*) &btIterator->key;
++	extentKeyPtr->keyLength	 = kHFSPlusExtentKeyMaximumLength;
++	extentKeyPtr->forkType	 = forkType;
++	extentKeyPtr->pad		 = 0;
++	extentKeyPtr->fileID	 = fileID;
++	extentKeyPtr->startBlock = startBlock;
++
++	btRecord.bufferAddress	= foundData;
++	btRecord.itemSize		= sizeof(HFSPlusExtentRecord);
++	btRecord.itemCount		= 1;
++
++	/*
++	 *	A miss leaves the iterator at the insert point, so one "next record"
++	 *	step lands on the first record with a greater key; a hit is stepped
++	 *	over for the same reason.
++	 */
++	err = BTSearchRecord(fcb, btIterator, &btRecord, &btRecordSize, btIterator);
++	if (err == noErr || err == btNotFound)
++		err = BTIterateRecord(fcb, kBTreeNextRecord, btIterator, &btRecord, &btRecordSize);
++
++	if (err == noErr) {
++		if (extentKeyPtr->fileID != fileID || extentKeyPtr->forkType != forkType) {
++			err = btNotFound;			/* following record is another fork */
++		} else {
++			if (foundKey)
++				BlockMoveData(extentKeyPtr, foundKey, sizeof(HFSPlusExtentKey));
++			if (foundHint)
++				*foundHint = btIterator->hint.nodeNum;
++		}
++	}
++
++	hfs_free_type(btIterator, struct BTreeIterator);
++	return err;
++}
++
++
+ static OSErr CreateExtentRecord(
+ 	ExtendedVCB	*vcb,
+ 	HFSPlusExtentKey	*key,
+@@ -311,9 +406,26 @@ static OSErr CreateExtentRecord(
+ 
+ 	if (err == noErr)
+ 		*hint = btIterator->hint.nodeNum;
++	if (err == noErr) {
++		OSErr	flushErr;
++
++		/*
++		 *	The record is in the tree now.  Hand the flush failure back to the
++		 *	caller, but take the record out again first: the caller deallocates
++		 *	the blocks the record describes, and leaving it behind would strand
++		 *	them behind an unreachable record.
++		 */
++		flushErr = BTFlushPath(GetFileControlBlock(vcb->extentsRefNum));
++		if (flushErr != noErr) {
++			if (BTDeleteRecord(GetFileControlBlock(vcb->extentsRefNum), btIterator) != noErr
++			||  BTFlushPath(GetFileControlBlock(vcb->extentsRefNum)) != noErr) {
++				hfs_mark_inconsistent((struct hfsmount *)vcb, HFS_ROLLBACK_FAILED);
++			}
++			*hint = 0;
++			err = flushErr;
++		}
++	}
+ 
+-	(void) BTFlushPath(GetFileControlBlock(vcb->extentsRefNum));
+-	
+ 	hfs_systemfile_unlock(vcb, lockflags);
+ 
+ 	hfs_free_type(btIterator, struct BTreeIterator);
+@@ -347,8 +459,11 @@ static OSErr DeleteExtentRecord(
+ 	}
+ 
+ 	err = BTDeleteRecord(GetFileControlBlock(vcb->extentsRefNum), btIterator);
+-	(void) BTFlushPath(GetFileControlBlock(vcb->extentsRefNum));
+-	
++	if (err == noErr) {
++		/*	A delete that never reaches the disk leaves the record (and the
++		 *	blocks it maps) behind, so the failure has to reach the caller. */
++		err = BTFlushPath(GetFileControlBlock(vcb->extentsRefNum));
++	}
+ 
+ 	hfs_free_type(btIterator, struct BTreeIterator);
+ 	return err;
+@@ -544,22 +659,37 @@ static OSErr TruncateExtents(
+ 	 */
+ 	lockflags = hfs_systemfile_lock(vcb, SFL_EXTENTS, HFS_EXCLUSIVE_LOCK);
+ 
++	/*
++	 *	Delete every record at or above startBlock.  Walking by key instead of
++	 *	by the running block count is what removes records that a hole left
++	 *	behind at a higher key: with the old "next key = startBlock + released"
++	 *	step those records were never looked at, and the fork kept a chain that
++	 *	its catalog extents cannot reach.
++	 */
+ 	while (true) {
+ 		err = FindExtentRecord(vcb, forkType, fileID, startBlock, false, &key, extents, &hint);
++		if (err == btNotFound)
++			err = FindNextExtentRecord(vcb, forkType, fileID, startBlock, &key, extents, &hint);
+ 		if (err != noErr) {
+ 			if (err == btNotFound)
+-				err = noErr;
++				err = noErr;		// nothing left to delete
+ 			break;
+ 		}
+-		
++
+ 		err = ReleaseExtents( vcb, extents, &numberExtentsReleased, &releasedLastExtent );
+ 		if (err != noErr) break;
+-		
+-		err = DeleteExtentRecord(vcb, forkType, fileID, startBlock);
++
++		if (numberExtentsReleased == 0) {
++			/*	An empty record cannot belong to a fork; stop rather than
++			 *	spin on it. */
++			err = ESTALE;
++			break;
++		}
++
++		err = DeleteExtentRecord(vcb, forkType, fileID, key.startBlock);
+ 		if (err != noErr) break;
+ 
+ 		*recordDeleted = true;
+-		startBlock += numberExtentsReleased;
+ 	}
+ 	hfs_systemfile_unlock(vcb, lockflags);
+ 	
+@@ -587,9 +717,39 @@ static OSErr DeallocateFork(
+ 	
+ 	//	Release the catalog extents
+ 	err = ReleaseExtents( vcb, catalogExtents, &numReleasedAllocationBlocks, &releasedLastExtent );
++	if (err != noErr)
++		return err;
++
+ 	// Release the extra extents, if present
+-	if (err == noErr && !releasedLastExtent)
+-		err = TruncateExtents(vcb, forkType, fileID, numReleasedAllocationBlocks, recordDeleted);
++	if (!releasedLastExtent) {
++		HFSPlusExtentKey	key;
++		HFSPlusExtentRecord	extents;
++		u_int32_t			hint;
++		int					lockflags;
++
++		/*
++		 *	The overflow records may only be released when they start exactly
++		 *	where the catalog extents end.  Records at any other key are not
++		 *	reachable from this fork, so their blocks may already belong to
++		 *	another file and must not be freed from here.
++		 */
++		lockflags = hfs_systemfile_lock(vcb, SFL_EXTENTS, HFS_EXCLUSIVE_LOCK);
++		err = FindExtentRecord(vcb, forkType, fileID, 0, false, &key, extents, &hint);
++		if (err == btNotFound)
++			err = FindNextExtentRecord(vcb, forkType, fileID, 0, &key, extents, &hint);
++		hfs_systemfile_unlock(vcb, lockflags);
++
++		if (err == btNotFound) {
++			err = noErr;			// the catalog record is all there is
++		} else if (err == noErr) {
++			if (key.startBlock != numReleasedAllocationBlocks) {
++				hfs_mark_inconsistent((struct hfsmount *)vcb, HFS_INCONSISTENCY_DETECTED);
++				err = ESTALE;
++			} else {
++				err = TruncateExtents(vcb, forkType, fileID, numReleasedAllocationBlocks, recordDeleted);
++			}
++		}
++	}
+ 
+ 	return( err );
+ }
+@@ -819,7 +979,8 @@ AddFileExtent(ExtendedVCB *vcb, FCB *fcb, u_int32_t startBlock, u_int32_t blockC
+ 			pin_blocks_if_needed(vcb, fcb, startBlock, blockCount);
+ 		}
+ 	}
+-	(void) FlushExtentFile(vcb);
++	if (error == 0)
++		error = FlushExtentFile(vcb);
+ 
+ 	return (error);
+ }
+@@ -856,6 +1017,7 @@ OSErr ExtendFileC (
+ 	Boolean				wantContig;
+ 	Boolean				useMetaZone;
+ 	Boolean				needsFlush;
++	Boolean				forceNewExtentRecord;
+ 	int					allowFlushTxns;
+ 	u_int32_t			actualStartBlock;
+ 	u_int32_t			actualNumBlocks;
+@@ -869,6 +1031,7 @@ OSErr ExtendFileC (
+ 	struct hfsmount *hfsmp = (struct hfsmount*)vcb;	
+ 	allowFlushTxns = 0;
+ 	needsFlush = false;
++	forceNewExtentRecord = false;
+ 	*actualBytesAdded = 0;
+ 	volumeBlockSize = vcb->blockSize;
+ 	allOrNothing = ((flags & kEFAllMask) != 0);
+@@ -965,12 +1128,42 @@ OSErr ExtendFileC (
+ 		FTOC(fcb)->c_flag |= C_MODIFIED;
+ 		goto Exit;
+ 	}
+-	if (err != fxRangeErr)		// Any real error?
++	if (err == ESTALE) {
++		/*
++		 *	The overflow chain is not reachable from the catalog extents
++		 *	(orphaned record or hole).  Growing the file along that mapping
++		 *	would write into blocks the volume may already have handed to
++		 *	another file, so re-reserve the missing blocks for real and open
++		 *	a new extent record at the end of the reachable chain.
++		 *	nextBlock and foundData/foundIndex already describe that end.
++		 */
++		hfs_mark_inconsistent(hfsmp, HFS_INCONSISTENCY_DETECTED);
++		forceNewExtentRecord = true;
++		err = noErr;
++	}
++	else if (err != fxRangeErr)	// Any real error?
+ 		goto ErrorExit;				// Yes, so exit immediately
+ 
+ 	//
+ 	//	Adjust the PEOF to the end of the last extent.
+ 	//
++	if (nextBlock < fcb->ff_blocks) {
++		/*
++		 *	Only a broken chain gets here: the blocks between the end of the
++		 *	reachable chain and the file's block count are not mapped by any
++		 *	extent.  Take them out of the file and let the allocation below
++		 *	replace them; without this the subtraction further down would
++		 *	wrap and turn into gigabytes of request.
++		 */
++		u_int32_t	unreachable = fcb->ff_blocks - nextBlock;
++
++		fcb->ff_blocks = nextBlock;
++		FTOC(fcb)->c_blocks -= unreachable;
++		FTOC(fcb)->c_flag |= C_MODIFIED;
++		bytesToAdd += (int64_t)unreachable * (int64_t)volumeBlockSize;
++		maximumBytes += (int64_t)unreachable * (int64_t)volumeBlockSize;
++	}
++
+ 	peof = (int64_t)((int64_t)nextBlock * (int64_t)volumeBlockSize);			// currently allocated PEOF
+ 	bytesThisExtent = (int64_t)(nextBlock - fcb->ff_blocks) * (int64_t)volumeBlockSize;
+ 	if (bytesThisExtent != 0) {
+@@ -1038,6 +1231,15 @@ OSErr ExtendFileC (
+ 		fastdev = HFS_ALLOC_FAST_DEV;
+ 
+ 	useMetaZone = flags & kEFMetadataMask;
++
++	/*
++	 *	With a broken chain the allocation must not grow the record that was
++	 *	found; anchor on its last extent so that startBlock lands on the chain
++	 *	end, and force a new record below.
++	 */
++	if (forceNewExtentRecord && numExtentsPerRecord != 0)
++		foundIndex = numExtentsPerRecord - 1;
++
+ 	do {
+ 		if (blockHint != 0)
+ 			startBlock = blockHint;
+@@ -1118,7 +1320,7 @@ OSErr ExtendFileC (
+ 		}
+ 		if (err == noErr) {
+ 			//	Add the new extent to the existing extent record, or create a new one.
+-			if ((actualStartBlock == startBlock) && (blockHint == 0)) {
++			if ((actualStartBlock == startBlock) && (blockHint == 0) && !forceNewExtentRecord) {
+ 				//	We grew the file's last extent, so just adjust the number of blocks.
+ 				foundData[foundIndex].blockCount += actualNumBlocks;
+ 				err = UpdateExtentRecord(vcb, fcb, 0, &foundKey, foundData, hint);
+@@ -1128,7 +1330,12 @@ OSErr ExtendFileC (
+ 				u_int16_t	i;
+ 
+ 				//	Need to add a new extent.  See if there is room in the current record.
+-				if (foundData[foundIndex].blockCount != 0)	//	Is current extent free to use?
++				if (forceNewExtentRecord) {
++					//	The chain is broken: never write into the record found,
++					//	open a record at the end of the reachable chain instead.
++					foundIndex = numExtentsPerRecord;
++				}
++				else if (foundData[foundIndex].blockCount != 0)	//	Is current extent free to use?
+ 					++foundIndex;							// 	No, so use the next one.
+ 				if (foundIndex == numExtentsPerRecord) {
+ 					//	This record is full.  Need to create a new one.
+@@ -1160,14 +1367,17 @@ OSErr ExtendFileC (
+ 					foundIndex = 0;
+ 					
+ 					err = CreateExtentRecord(vcb, &foundKey, foundData, &hint);
+-					if (err == fxOvFlErr) {
+-						//	We couldn't create an extent record because extents B-tree
+-						//	couldn't grow.  Dellocate the extent just allocated and
+-						//	return a disk full error.
++					if (err != noErr) {
++						//	The record is not in the tree (CreateExtentRecord takes it
++						//	back out when it cannot be flushed), so the blocks it was
++						//	supposed to describe are ours to release again.
+ 						(void) BlockDeallocate(vcb, actualStartBlock, actualNumBlocks, 0);
+-						err = dskFulErr;
++						if (err == fxOvFlErr) {
++							//	The extents B-tree could not grow: report disk full.
++							err = dskFulErr;
++						}
++						break;
+ 					}
+-					if (err != noErr) break;
+ 
+ 					needsFlush = true;		//	We need to update the B-tree header
+ 				}
+@@ -1229,8 +1439,12 @@ Exit:
+ 					  (int64_t)prevblocks - fcb->ff_blocks);
+ 	}
+ 
+-	if (needsFlush)
+-		(void) FlushExtentFile(vcb);
++	if (needsFlush) {
++		OSErr	flushErr = FlushExtentFile(vcb);
++
++		if (err == noErr)
++			err = flushErr;
++	}
+ 
+ 	return err;
+ }
+@@ -1421,8 +1635,12 @@ OSErr TruncateFileC (
+ 
+ Done:
+ ErrorExit:
+-	if (recordDeleted)
+-		(void) FlushExtentFile(vcb);
++	if (recordDeleted) {
++		OSErr	flushErr = FlushExtentFile(vcb);
++
++		if (err == noErr)
++			err = flushErr;
++	}
+ 
+ 	return err;
+ }
+@@ -1565,7 +1783,8 @@ CopyExtents:
+ 		FTOC(fcb)->c_flag |= C_MODIFIED;
+ 		FTOC(fcb)->c_touch_chgtime = TRUE;
+ 
+-		(void) FlushExtentFile(vcb);
++		if (error == 0)
++			error = FlushExtentFile(vcb);
+ 	}
+ 
+ ErrorExit:	
+@@ -1713,6 +1932,14 @@ OSErr SearchExtentFile(
+ 	int64_t                         temp64;
+ 	Boolean				noMoreExtents;
+ 	int  lockflags;
++	u_int32_t			chainEnd;
++	u_int8_t			forkType;
++	u_int32_t			fileID;
++	Boolean				reached;
++	u_int32_t			reachedKey;
++	HFSPlusExtentKey	probeKey;
++	HFSPlusExtentRecord	probeData;
++	u_int32_t			probeHint;
+ 	
+ 	temp64 = filePosition / (int64_t)vcb->blockSize;
+ 	filePositionBlock = (u_int32_t)temp64;
+@@ -1743,38 +1970,90 @@ OSErr SearchExtentFile(
+ 	}
+ 	
+ 	//
+-	//	Find the desired record, or the previous record if it is the same fork
++	//	Walk the overflow extent chain from the end of the catalog extents.
++	//	A record is only reachable when its key is exactly the current chain
++	//	end: a record below it was orphaned by an earlier truncation, and one
++	//	above it leaves a hole.  Either one means the fork no longer has a
++	//	single mapping, so refuse to map through it instead of handing back
++	//	blocks that the volume may already have given to another file.
+ 	//
++	forkType = FORK_IS_RSRC(fcb) ? kResourceForkType : kDataForkType;
++	fileID = FTOC(fcb)->c_fileid;
++	chainEnd = *endingFABNPlusOne;		// first FABN the first overflow record must map
++	reached = false;
++	reachedKey = 0;
++
+ 	lockflags = hfs_systemfile_lock(vcb, SFL_EXTENTS, HFS_EXCLUSIVE_LOCK);
+ 
+-	err = FindExtentRecord(vcb, FORK_IS_RSRC(fcb) ? kResourceForkType : kDataForkType,
+-						   FTOC(fcb)->c_fileid, filePositionBlock, true, foundExtentKey, foundExtentData, extentBTreeHint);
+-	hfs_systemfile_unlock(vcb, lockflags);
++	for (;;) {
++		err = FindExtentRecord(vcb, forkType, fileID, chainEnd, false,
++							   &probeKey, probeData, &probeHint);
++		if (err == btNotFound) {
++			/*
++			 *	Nothing at chainEnd.  A record past it is a hole, and a record
++			 *	before it is unreachable; a record that ends exactly at chainEnd
++			 *	is the one just walked, which means a clean end of the chain.
++			 */
++			err = FindNextExtentRecord(vcb, forkType, fileID, chainEnd,
++									   &probeKey, probeData, &probeHint);
++			if (err == noErr) {
++				err = ESTALE;
++				break;
++			}
++			if (err != btNotFound)
++				break;
+ 
+-	if (err == btNotFound) {
+-		//
+-		//	If we get here, the desired position is beyond the extents in the FCB, and there are no extents
+-		//	in the extents file.  Return the FCB's extents and a range error.
+-		//
+-		*extentBTreeHint = kNoHint;
+-		foundExtentKey->keyLength = 0;
+-		err = GetFCBExtentRecord(fcb, foundExtentData);
+-		//	Note: foundExtentIndex and endingFABNPlusOne have already been set as a result of the very
+-		//	first SearchExtentRecord call in this function (when searching in the FCB's extents, and
+-		//	we got a range error).
+-		
+-		return fxRangeErr;
+-	}
+-	
+-	//
+-	//	If we get here, there was either a BTree error, or we found an appropriate record.
+-	//	If we found a record, then search it for the correct index into the extents.
+-	//
+-	if (err == noErr) {
+-		//	Find appropriate index into extent record
+-		err = SearchExtentRecord(vcb, filePositionBlock, foundExtentData, foundExtentKey->startBlock,
+-								 foundExtentIndex, endingFABNPlusOne, &noMoreExtents);
++			err = FindExtentRecord(vcb, forkType, fileID, chainEnd, true,
++								   &probeKey, probeData, &probeHint);
++			if (err == noErr) {
++				if (!reached
++				||  probeKey.startBlock != reachedKey
++				||  probeKey.startBlock + ExtentRecordBlocks(probeData) != chainEnd) {
++					err = ESTALE;		// record the chain cannot reach
++					break;
++				}
++				err = fxRangeErr;		// intact chain ends here
++				break;
++			}
++			if (err != btNotFound)
++				break;
++
++			err = fxRangeErr;			// no overflow records at all
++			break;
++		}
++		if (err != noErr)
++			break;
++
++		/*	Publish the reachable record so that callers can extend it. */
++		*extentBTreeHint = probeHint;
++		BlockMoveData(&probeKey, foundExtentKey, sizeof(HFSPlusExtentKey));
++		BlockMoveData(probeData, foundExtentData, sizeof(HFSPlusExtentRecord));
++
++		reached = true;
++		reachedKey = probeKey.startBlock;
++
++		err = SearchExtentRecord(vcb, filePositionBlock, foundExtentData,
++								 probeKey.startBlock, foundExtentIndex,
++								 endingFABNPlusOne, &noMoreExtents);
++		if (err == noErr)
++			break;						// position is mapped by this record
++		if (err != fxRangeErr)
++			break;
++
++		/*
++		 *	The position is past this record.  Only the record just read can
++		 *	end at the next chain position, so follow the chain there.
++		 */
++		if (*endingFABNPlusOne <= chainEnd) {	// no forward progress
++			err = ESTALE;
++			break;
++		}
++		chainEnd = *endingFABNPlusOne;
+ 	}
++	hfs_systemfile_unlock(vcb, lockflags);
++
++	if (err == ESTALE)
++		hfs_mark_inconsistent((struct hfsmount *)vcb, HFS_INCONSISTENCY_DETECTED);
+ 
+ Exit:
+ 	return err;
+@@ -1857,7 +2136,8 @@ static OSErr UpdateExtentRecord (ExtendedVCB *vcb, FCB  *fcb, int deleted,
+ 				BlockMoveData(extentData, &foundData, sizeof(HFSPlusExtentRecord));
+ 				err = BTReplaceRecord(btFCB, btIterator, &btRecord, btRecordSize);
+ 			}
+-			(void) BTFlushPath(btFCB);
++			if (err == noErr)
++				err = BTFlushPath(btFCB);
+ 		}
+ 
+ 		hfs_systemfile_unlock(vcb, lockflags);
