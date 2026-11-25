@@ -1,0 +1,17 @@
+diff --git a/bsd/dev/pandora_amp_tas.c b/bsd/dev/pandora_amp_tas.c
+index 14e1ec5..777e588 100644
+--- a/bsd/dev/pandora_amp_tas.c
++++ b/bsd/dev/pandora_amp_tas.c
+@@ -664,8 +664,10 @@ ta_run_audio(void)
+ 	/* The graph-ready signal also establishes UFS/pack availability.
+ 	 * All waits are bounded; a failed DSP graph must never power the amps. */
+ 	unsigned wait;
+-	for (wait = 0; wait < 350 && !__atomic_load_n(&ta_tdm_running, __ATOMIC_ACQUIRE); wait++) ta_sleep(100);
+-	if (wait == 350) return ETIMEDOUT;
++	/* 1200 x 100 ms: the speaker graph came up 22.1 s into the audio3 boot,
++	 * so the old 35 s window (350) left only seconds for a slow APM/graph. */
++	for (wait = 0; wait < 1200 && !__atomic_load_n(&ta_tdm_running, __ATOMIC_ACQUIRE); wait++) ta_sleep(100);
++	if (wait == 1200) return ETIMEDOUT;
+ 	fw = pandora_fw_file("tismartpa_driver_tuning.bin", &size);
+ 	if (!fw) return ENOENT;
+ 	err = ta_parse_tuning(fw, size, tuning);
