@@ -1,0 +1,16 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 14fd002..5a648df 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -253,6 +253,11 @@ sweet_fb_brightness(const uint8_t *rec)
+ static inline uint32_t
+ sweet_fb_scale(uint32_t p, uint32_t k)
+ {
++	/* 0558: the iOS surfaces are RGBA in memory while the DPU source pipes are
++	 * programmed for BGRA (the bootloader's format).  Swap R/B before scaling so
++	 * the panel shows the colours the surface carries instead of a channel
++	 * rotation (red rendered as blue, green as red, blue as green). */
++	p = (p & 0xff00ff00u) | ((p & 0x000000ffu) << 16) | ((p >> 16) & 0x000000ffu);
+ 	uint32_t rb = ((p & 0x00ff00ffu) * k >> 8) & 0x00ff00ffu;
+ 	uint32_t g = (((p >> 8) & 0x000000ffu) * k) & 0x0000ff00u;
+ 	return (p & 0xff000000u) | rb | g;
