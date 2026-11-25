@@ -1,0 +1,20 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c285924..ac9e45e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1979,6 +1979,15 @@ AppleCLCD::present(const uint8_t *rec)
+ 					 * access per scaled pixel, including duplicated rows/columns. */
+ 					if (ly != lastY) {
+ 						memcpy(fFillRow, srow + sx, (size_t)w * 4);
++						/* 0562: swap R/B once here so BOTH downstream paths (the
++						 * k>=256 straight copy and the scaled sweet_fb_scale)
++						 * deliver BGRA to the DPU; 0558/0559 only covered the
++						 * scaled branch and the k==256 fast path bypassed them. */
++						for (int32_t kx = 0; kx < w; kx++) {
++							uint32_t pv = fFillRow[kx];
++							fFillRow[kx] = (pv & 0xff00ff00u) |
++							    ((pv & 0x000000ffu) << 16) | ((pv >> 16) & 0x000000ffu);
++						}
+ 						lastY = ly;
+ 					}
+ 					uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)Y * fRowBytes);
