@@ -1,0 +1,35 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ac9e45e..455dfa8 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1655,6 +1655,30 @@ AppleCLCD::presentLoop(void)
+ 			(void)pandora_gpu_wait(seq, 500 * NSEC_PER_MSEC);   /* at most 0.5 s */
+ 		}
+ 		present(rec);
++		/* 0563: calibration frame, after composition so the bars reach the panel. */
++		{
++			static int cbars = -1;
++			if (cbars < 0) {
++				cbars = 0;
++				PE_parse_boot_argn("pandora_cbars", &cbars, sizeof(cbars));
++				if (cbars) {
++					printf("PANDORA CBARS: memory bars R,G,B,C,M,Y (BGRA words)\n");
++				}
++			}
++			if (cbars) {
++				static const uint32_t bars[6] = {
++					0xffff0000u, 0xff00ff00u, 0xff0000ffu,
++					0xff00ffffu, 0xffff00ffu, 0xffffff00u,
++				};
++				for (uint32_t y = 0; y < fHeight / 3; y++) {
++					uint32_t *row = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++					for (uint32_t x = 0; x < fWidth; x++) {
++						row[x] = bars[(x * 6) / fWidth];
++					}
++				}
++				__asm__ volatile ("dsb sy" ::: "memory");
++			}
++		}
+ 		last = mach_absolute_time();
+ 		(void)scanPanel();      /* 0555: retry until the panel memory is scanned */
+ 		(void)scanSettle();
