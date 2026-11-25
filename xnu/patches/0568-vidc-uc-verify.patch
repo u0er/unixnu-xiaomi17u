@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+index b1c3e83..cef4d91 100644
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -1024,18 +1024,17 @@ vidc_fill_queues(void)
+     *(volatile uint32_t *)vidc_sfr_va = VIDC_SFR_BYTES;   /* [M] first word = SFR size */
+     /* iris_vpu_common.c maps the UC region as its own 4 KiB page, zero-fills
+      * it and sets word 0 to 1; the core reads that page through 0xA0060.  It
+-     * then fills a {DA,size} region list at page+0x2C..0x58 from the buffers
+-     * mapped in venus_hfi_iommu_map_registers() [K 0x5b9b0-0x5ba10].  For a
+-     * non-CP session only the first pair is non-zero: the queue-table device
+-     * address and the published window -- the same values written to
+-     * 0xA0064/0xA0068.  The other three pairs stay zero because their core
+-     * fields are never written. */
++     * then fills a {DA,size} region list at page+0x2C..0x58.  0529 put the
++     * queue-table DA/window in the first pair; 0539 stages the DT-declared
++     * video_region@9A600000 (8 MiB) instead -- the only DDR region this
++     * non-CP session owns.  The other three pairs stay zero because their
++     * core fields are never written. */
+     memset((void *)vidc_uc_va, 0, VIDC_UC_BYTES);
+     {
+         volatile uint32_t *uc = (volatile uint32_t *)vidc_uc_va;
+         uc[0] = 1;
+-        uc[0x2C / 4] = vidc_qtable_da();     /* [K 0x5b9c8] +0x2C = DA */
+-        uc[0x30 / 4] = VIDC_QTABLE_BYTES;    /* [K 0x5b9d0] +0x30 = size */
++        uc[0x2C / 4] = VIDEO_REGION_PA;      /* 0x9A600000 video_region start */
++        uc[0x30 / 4] = VIDEO_REGION_SIZE;    /* 0x00800000, 8 MiB */
+     }
+ 
+     /* One clean for the header and every ring header the VPU will read. */
+@@ -1557,14 +1556,19 @@ vidc_publish_queues(void)
+     vidc_wr(R_CPU_QUEUE_TABLE_DA2, da);
+     vidc_wr(R_CPU_QUEUE_TABLE_EN, 1);
+     if (vidc_sfr_da()) {
+-        /* Round 27 single variable: the vendor writes 0xA0060 (the UC
+-         * descriptor page, core[0x13e8]) only when that pointer is non-zero
+-         * [K 0x15af8-0x15b08]; our port owns no such pointer, so the
+-         * vendor-equivalent action is to leave 0xA0060 at reset instead of
+-         * publishing the fabricated UC page that 0529 added.  The UC page
+-         * itself stays allocated/zeroed but is no longer advertised here. */
+-        printf("PANDORA VIDC: 0xA0060 left at %08x (vendor skips when core[0x13e8]==0)\n",
++        /* 0539 single variable: publish the UC descriptor page again, now
++         * that it carries the video_region pair instead of 0529's qtable
++         * pair.  The vendor writes 0xA0060 from core[0x13e8] only when that
++         * pointer is non-zero [K 0x15af8-0x15b08] -- and ours is.  0536
++         * stopped the write because the page content was wrong; the page
++         * content is the other half of the same hypothesis.  0568 brackets
++         * the write with a read before and a read after: the pre-read is the
++         * control (reset value 0), the read-back only witnesses the store. */
++        printf("PANDORA VIDC: 0xA0060 pre-publish=%08x (expect 0)\n",
+             vidc_rd(R_CPU_QUEUE_TABLE_ADDR2));
++        vidc_wr(R_CPU_QUEUE_TABLE_ADDR2, vidc_uc_da());
++        printf("PANDORA VIDC: 0xA0060 write=%08x readback=%08x\n",
++            vidc_uc_da(), vidc_rd(R_CPU_QUEUE_TABLE_ADDR2));
+         /* SFR_ADDR must carry sfr + core_arch (upstream), not the bare DA. */
+         vidc_wr(R_CPU_SFR_ADDR, vidc_sfr_da() + VIDC_CORE_ARCH);
+         /* Round 24 single variable: do NOT write SCIACMDARG3 (0xA0058).
