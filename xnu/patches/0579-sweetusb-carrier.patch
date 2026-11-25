@@ -1,0 +1,124 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 6d83623..e120fc8 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -626,6 +626,7 @@
+ static void ud_tx_kick_locked(void);
+ static void ud_apple_tx_kick(void);
+ static void ud_link_event(bool up);
++static void ud_carrier_publish(const char *why);
+ 
+ /*
+  * ---- CDC-NCM framing (personality UD_NCM) ----
+@@ -1114,7 +1115,13 @@
+ 	} else if (req == 9) {          /* SET_CONFIGURATION */
+ 		if (value == 1) {
+ 			ud_configure();
+-		}
++		} else {
++			/* The host dropped the configuration, so every interface is
++			 * back at alt 0 and the NCM link is down even though the
++			 * endpoints stay enabled for the host's re-select. */
++			ud.data_alt = 0;
++		}
++		ud_carrier_publish("set_configuration");
+ 		printf("SWEET USB: configured (%u)\n", value);
+ 	} else if (req == 8) {          /* GET_CONFIGURATION */
+ 		data[0] = ud.configured ? 1 : 0; n = 1;
+@@ -1142,12 +1149,12 @@
+ 				} else {
+ 					ud_notify_connected();
+ 				}
+-				ud_link_event(true);
++				ud_carrier_publish("set_interface alt1");
+ 			} else if (value == 0 && ud.configured && ud_has_ncm()) {
+ 				/* Back to alt 0 = NCM reset (section 6.3.4). */
+ 				ud_ncm_sequence = 0;
+ 				ud_ncm_in_max = NCM_NTB_MAX;
+-				ud_link_event(false);
++				ud_carrier_publish("set_interface alt0");
+ 			}
+ 		}
+ 	} else if (req == 10) {         /* GET_INTERFACE */
+@@ -1404,6 +1411,53 @@
+ 	}
+ }
+ 
++/*
++ * Carrier has exactly ONE source of truth: ud_carrier_up().  SIOCGIFMEDIA (what
++ * configd's KernelEventMonitor reads), the KEV_DL_LINK_ON/OFF event and the
++ * console line all call it, so the ring cannot disagree with the state the
++ * stack acts on.
++ *
++ * It is a LINK property, not a traffic property: ue0 carries frames whenever
++ * ud.configured is true (ud_if_output only checks that), and a host that
++ * leaves the NCM data interface at alt 0 still hands us NTBs.  That is why
++ * "rx/tx frames" could never prove the link was up.
++ */
++static bool
++ud_carrier_up(void)
++{
++	if (!ud.configured) {
++		return false;
++	}
++	/* NCM 1.1 section 6.2.2: alt 0 is the reset state of the data interface,
++	 * so the NCM link only exists at alt 1.  ECM and the Apple mux have a
++	 * single altsetting, where "configured" is the whole answer. */
++	if (ud_has_ncm()) {
++		return ud.data_alt == 1;
++	}
++	return true;
++}
++
++/*
++ * Publish a carrier transition once: the console line whose boot-time
++ * acceptance token is "ue0 carrier=1", plus the link event that belongs with
++ * it.  A repeated state prints nothing, so re-selects and re-enumerations
++ * cannot fake a second link-up.
++ */
++static void
++ud_carrier_publish(const char *why)
++{
++	static int last = -1;
++	int        up = ud_carrier_up() ? 1 : 0;
++
++	if (up == last) {
++		return;
++	}
++	last = up;
++	ud_link_event(up != 0);
++	printf("SWEET USB: ue0 carrier=%d (configured %u data_alt %u, %s)\n",
++	    up, ud.configured ? 1 : 0, (unsigned)ud.data_alt, why);
++}
++
+ static errno_t
+ ud_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
+ {
+@@ -1416,9 +1470,9 @@
+ 		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
+ 		int media = IFM_ETHER | IFM_AUTO;
+ 		ifmr->ifm_current = media;
+-		ifmr->ifm_active = ud.configured ? (IFM_ETHER | IFM_1000_T | IFM_FDX) : media;
++		ifmr->ifm_active = ud_carrier_up() ? (IFM_ETHER | IFM_1000_T | IFM_FDX) : media;
+ 		ifmr->ifm_mask = 0;
+-		ifmr->ifm_status = IFM_AVALID | (ud.configured ? IFM_ACTIVE : 0);
++		ifmr->ifm_status = IFM_AVALID | (ud_carrier_up() ? IFM_ACTIVE : 0);
+ 		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
+ 			ifmr->ifm_count = 1;
+ 			return copyout(&media, list, sizeof(media));
+@@ -1536,6 +1590,7 @@
+ 			 * the host starts from a fresh version handshake.
+ 			 */
+ 			ud.configured = false;
++			ud.data_alt = 0;         /* a USB reset returns every interface to alt 0 */
+ 			ud.tx_busy = false;
+ 			ud.ncm_tx_busy = false;
+ 			ud.rx_req = 0;
+@@ -1546,6 +1601,7 @@
+ 			if (ud_has_mux()) {
+ 				apple_usbmux_link_down();
+ 			}
++			ud_carrier_publish("bus_reset");
+ 			printf("SWEET USB: bus reset (endpoints rebuilt on next SET_CONFIGURATION)\n");
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
