@@ -1,0 +1,126 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+index c6bff1c..fb1c05b 100644
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -1507,61 +1507,76 @@ vidc_power_up(void)
+             vidc_cc_rd(rcgs[i].off + 8), vidc_cc_rd(rcgs[i].off + 0xC),
+             vidc_cc_rd(rcgs[i].off + 0x10));
+     }
+-    /* 0592 single variable: the clock source itself.  Everything above opens
+-     * gates (5 GDSCs + 7 branches) and the four RCGs just read back at
+-     * cfg=00100000 -- src_sel=XO, div=0, hw_ctrl on.  An open branch fed by an
+-     * unconfigured root hands the Xtensa no clock, which is exactly the
+-     * observed shape: no fetch, no register write, no SMMU transaction, while
+-     * every A-window register the driver wrote reads back self-consistent.
+-     * This block is the only change this round: start PLL1 (videocc 0x1000,
+-     * lucid-evo) and point video_cc_mvs0_clk_src (0x8030 CMD / 0x8034 CFG) at
+-     * it.  UC page, freerun clock, CP span and 0xA0058 are untouched. */
++    /* 0593 single variable: the PLL's own programming, nothing else.  The
++     * 0592 block below was the right idea -- open the gates, then start the
++     * root the branches hang off -- but its L_VAL write carried no CAL_L and
++     * it de-asserted RESET_N with OPMODE still at its power-on value.  Both
++     * are visible against mainline clk-alpha-pll: clk_alpha_pll_enable()
++     * returns early when the PLL is already enabled, and the lucid-evo
++     * sequence puts OPMODE in STANDBY before RESET_N is released.  L_VAL
++     * 0x00480019 is CAL_L 0x48 with L 0x19 (19.2 MHz * 25 = 480 MHz), the
++     * calibration code 0592 left at zero.  UC page, freerun clock, CP span
++     * and 0xA0058 stay untouched. */
+     {
+         const uint32_t pll = 0x1000u;              /* video_cc_pll1 */
+         const uint32_t mode_before = vidc_cc_rd(pll + 0x00u);
+         const uint32_t user_before = vidc_cc_rd(pll + 0x18u);
+         const uint32_t cmd_before = vidc_cc_rd(0x8030u);
+         const uint32_t cfg_before = vidc_cc_rd(0x8034u);
+-        uint32_t mode, lock = 0, upd = 0;
++        const uint32_t l_val = 0x00480019u;        /* CAL_L=0x48, L=0x19 */
++        uint32_t mode, lock = 0, upd = 0, skip = 0;
+         unsigned lock_us = 0, upd_us = 0;
+ 
+-        /* clk-alpha-pll lucid_evo: L=0x19, alpha=0 -> 19.2 MHz * 25 = 480 MHz.
+-         * CONFIG_CTL/U/U1 are the kaanapali videocc constants; alpha_pll_
+-         * configure() writes them before RESET_N is released. */
+-        vidc_cc_wr(pll + 0x10u, 0x00000019u);      /* L_VAL */
+-        vidc_cc_wr(pll + 0x14u, 0x00000000u);      /* ALPHA_VAL */
+-        vidc_cc_wr(pll + 0x18u, user_before | 0x00000008u);   /* USER_CTL */
+-        vidc_cc_wr(pll + 0x1Cu, 0x00000002u);      /* USER_CTL_U */
+-        vidc_cc_wr(pll + 0x20u, 0x25C400E7u);      /* CONFIG_CTL */
+-        vidc_cc_wr(pll + 0x24u, 0x0A8062E0u);      /* CONFIG_CTL_U */
+-        vidc_cc_wr(pll + 0x28u, 0xF51DEA20u);      /* CONFIG_CTL_U1 */
+-        __asm__ volatile ("dsb sy" ::: "memory");
+-        vidc_cc_wr(pll + 0x00u, mode_before | (1u << 2));     /* MODE |= RESET_N */
+-        vidc_cc_wr(pll + 0x04u, 1u);               /* OPMODE = RUN */
+-        /* LOCK_DET (MODE bit31) inside 1500 us; the loop is the whole budget,
+-         * so a slow lock is reported instead of silently accepted. */
+-        for (lock_us = 0; lock_us < 1500u; lock_us++) {
+-            mode = vidc_cc_rd(pll + 0x00u);
+-            if (mode & (1u << 31)) {
+-                lock = 1;
+-                break;
+-            }
+-            delay(1);
+-        }
+-        /* Outputs only after the loop has decided: a PLL that never locked
+-         * must not be routed into the core. */
+-        if (lock) {
+-            vidc_cc_wr(pll + 0x18u, vidc_cc_rd(pll + 0x18u) | 0x00000007u);
+-            vidc_cc_wr(pll + 0x00u, vidc_cc_rd(pll + 0x00u) | 1u);
++        printf("PANDORA VIDC: PLL1 pre mode=%08x L=%08x cal_l=%02x\n",
++            mode_before, l_val, 0x48u);
++        /* Mainline clk_alpha_pll_enable(): "If PLL is already enabled, bail
++         * out"; lucid-evo reports that as LOCK_DET (MODE bit31). */
++        if (mode_before & (1u << 31)) {
++            skip = 1;
++            lock = 1;
++            printf("PANDORA VIDC: PLL1 already enabled, program skipped\n");
++        } else {
++            /* clk-alpha-pll lucid_evo: L=0x19, alpha=0 -> 19.2 MHz * 25 = 480
++             * MHz; CAL_L 0x48 rides in L_VAL bits 15:8.  CONFIG_CTL/U/U1 are
++             * the kaanapali videocc constants, written while RESET_N is still
++             * asserted. */
++            vidc_cc_wr(pll + 0x10u, l_val);        /* L_VAL */
++            vidc_cc_wr(pll + 0x14u, 0x00000000u);  /* ALPHA_VAL */
++            vidc_cc_wr(pll + 0x18u, user_before | 0x00000008u);   /* USER_CTL */
++            vidc_cc_wr(pll + 0x1Cu, 0x00000002u);  /* USER_CTL_U */
++            vidc_cc_wr(pll + 0x20u, 0x25C400E7u);  /* CONFIG_CTL */
++            vidc_cc_wr(pll + 0x24u, 0x0A8062E0u);  /* CONFIG_CTL_U */
++            vidc_cc_wr(pll + 0x28u, 0xF51DEA20u);  /* CONFIG_CTL_U1 */
++            vidc_cc_wr(pll + 0x04u, 0u);           /* OPMODE = STANDBY */
+             __asm__ volatile ("dsb sy" ::: "memory");
++            vidc_cc_wr(pll + 0x00u, mode_before | (1u << 2)); /* MODE |= RESET_N */
++            vidc_cc_wr(pll + 0x04u, 1u);           /* OPMODE = RUN */
++            /* LOCK_DET (MODE bit31) inside 1500 us; the loop is the whole
++             * budget, so a slow lock is reported instead of silently accepted. */
++            for (lock_us = 0; lock_us < 1500u; lock_us++) {
++                mode = vidc_cc_rd(pll + 0x00u);
++                if (mode & (1u << 31)) {
++                    lock = 1;
++                    break;
++                }
++                delay(1);
++            }
++            /* Outputs only after the loop has decided: a PLL that never locked
++             * must not be routed into the core. */
++            if (lock) {
++                vidc_cc_wr(pll + 0x18u, vidc_cc_rd(pll + 0x18u) | 0x00000007u);
++                vidc_cc_wr(pll + 0x00u, vidc_cc_rd(pll + 0x00u) | 1u);
++                __asm__ volatile ("dsb sy" ::: "memory");
++            }
+         }
+-        printf("PANDORA VIDC: VIDEOCC PLL1 lock=%u wait=%uus mode=%08x->%08x "
+-               "opmode=%08x status=%08x L=%08x alpha=%08x user=%08x "
+-               "%s\n", lock, lock_us, mode_before, vidc_cc_rd(pll + 0x00u),
+-            vidc_cc_rd(pll + 0x04u), vidc_cc_rd(pll + 0x0Cu),
+-            vidc_cc_rd(pll + 0x10u), vidc_cc_rd(pll + 0x14u),
+-            vidc_cc_rd(pll + 0x18u),
+-            lock ? "outputs on" : "LOCK TIMEOUT, outputs left off");
++        printf("PANDORA VIDC: VIDEOCC PLL1 lock=%u skip=%u wait=%uus "
++               "mode=%08x->%08x opmode=%08x status=%08x L=%08x alpha=%08x "
++               "user=%08x %s\n", lock, skip, lock_us, mode_before,
++            vidc_cc_rd(pll + 0x00u), vidc_cc_rd(pll + 0x04u),
++            vidc_cc_rd(pll + 0x0Cu), vidc_cc_rd(pll + 0x10u),
++            vidc_cc_rd(pll + 0x14u), vidc_cc_rd(pll + 0x18u),
++            skip ? "already enabled, left on" :
++            (lock ? "outputs on" : "LOCK TIMEOUT, outputs left off"));
+ 
+         /* video_cc_mvs0_clk_src, clk_rcg2_shared order: ROOT_EN first, then
+          * CFG, then UPDATE and wait for the command bit to self-clear, then
