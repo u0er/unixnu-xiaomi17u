@@ -1,12 +1,12 @@
 diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
-index cef4d91..54c7394 100644
+index cef4d91..c6bff1c 100644
 --- a/bsd/dev/pandora_vidc.c
 +++ b/bsd/dev/pandora_vidc.c
 @@ -1507,6 +1507,82 @@ vidc_power_up(void)
              vidc_cc_rd(rcgs[i].off + 8), vidc_cc_rd(rcgs[i].off + 0xC),
              vidc_cc_rd(rcgs[i].off + 0x10));
      }
-+/* 0592 single variable: the clock source itself.  Everything above opens
++    /* 0592 single variable: the clock source itself.  Everything above opens
 +     * gates (5 GDSCs + 7 branches) and the four RCGs just read back at
 +     * cfg=00100000 -- src_sel=XO, div=0, hw_ctrl on.  An open branch fed by an
 +     * unconfigured root hands the Xtensa no clock, which is exactly the
