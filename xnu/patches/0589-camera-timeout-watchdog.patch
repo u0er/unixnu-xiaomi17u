@@ -1,0 +1,451 @@
+diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
+index 93f57dd..4588203 100644
+--- a/bsd/dev/pandora_camera.c
++++ b/bsd/dev/pandora_camera.c
+@@ -183,6 +183,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <sys/reboot.h>	/* reboot_kernel/RB_AUTOBOOT: watchdog exit */
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -362,6 +363,64 @@ static vm_offset_t pc_csiphy0_va;	/* CSIPHY0 aperture kept for slice-B diagnosti
+ static unsigned pc_steps_ms;
+ static bool pc_started;
+ 
++/* ---------------------------------------------------------------------------
++ * 0482: camera path deadline and watchdog (camera7a, 2026-11-26 17:38).
++ *
++ * camera7a enumerated as 05AC at 17:39:00 and was gone at 17:40:55 (+122 s
++ * after boot, 28 s before the pandora_reboot_after=150 clean shutdown), and it
++ * did not come back as Android.  Every individual wait in this file is
++ * bounded, but their sum is not: cphytest's 300 ms PLL, 100 ms refgen, 3x100 ms
++ * branch, 4x800 ms CSID poll, two sensor power cycles and one to two full
++ * table replays put the tail well past 100 s.  Worse, one MMIO read into a
++ * block whose GDSC/clock is not actually up is a Synchronous External Abort,
++ * not a timeout, so no in-path bound can cover that case.
++ *
++ * So the whole path gets one deadline, armed before the probe thread starts,
++ * and two independent exits:
++ *
++ *   1. pandora_camera_timeout s after pandora_camera_init(): a watchdog
++ *      thread prints and calls reboot_kernel(RB_AUTOBOOT), i.e. the existing
++ *      0481 process-stop/sync/unmount path that lands in Android.
++ *   2. pandora_camera_grace s later, if the orderly shutdown has not taken the
++ *      machine down (it can block on sweet_ufs_lock held by the wedged probe
++ *      inside pandora_log_sync), a second thread issues PSCI SYSTEM_RESET with
++ *      no lock, no log write and no MMIO.  The probe may have wedged anywhere;
++ *      this bound does not depend on where.
++ *
++ * The probe thread also cooperates: pc_sleep() returns immediately once the
++ * deadline has passed and pc_camera_abort() is checked between stages, so a
++ * slow-but-alive probe unwinds before the watchdog has to reset anything.  A
++ * probe that finishes normally cancels both threads (pc_camera_done without
++ * pc_camera_timed_out) and leaves the run to pandora_reboot_after=150; only a
++ * deadline expiry resets the phone early.
++ *
++ * Defaults: timeout 90 s, grace 75 s; timeout clamp 10..120 s, grace 5..90 s,
++ * and timeout+grace <= 200 s.  With pandora_camera_init() ~10-30 s into boot
++ * that bounds the reset at <= 230 s, inside the 240 s return-to-Android
++ * window even when the orderly shutdown never completes.  The grace is larger
++ * than the measured 52.6 s HFS shutdown (5t: 150.237 s trigger -> 202.84 s
++ * Android) so a slow-but-progressing shutdown is not hard-reset mid-sync.
++ * ------------------------------------------------------------------------- */
++#define PC_CAMERA_TIMEOUT_DEFAULT_S	90u
++#define PC_CAMERA_TIMEOUT_MAX_S	120u
++#define PC_CAMERA_GRACE_DEFAULT_S	75u
++#define PC_CAMERA_GRACE_MAX_S		90u
++#define PC_CAMERA_BUDGET_MAX_S		200u
++
++static uint64_t pc_wd_deadline;
++static uint64_t pc_wd_grace_abs;
++static unsigned pc_wd_timeout_s;
++static unsigned pc_wd_grace_s;
++static bool pc_wd_armed;
++static volatile bool pc_wd_fired;
++static volatile bool pc_camera_done;
++static volatile bool pc_probe_pending;
++static volatile bool pc_camera_timed_out;
++static bool pc_abort_reported;
++
++extern void pandora_camera_hard_reset(const char *why);
++extern bool pandora_log_sync(void);	/* sweet_ufs.c; used by pc_camera_abort() */
++
+ static uint32_t
+ pc_rd(vm_offset_t b, uint32_t o)
+ {
+@@ -382,8 +441,11 @@ pc_wr(vm_offset_t b, uint32_t o, uint32_t v)
+ 	(void)pc_rd(b, o);
+ }
+ 
++/* The watchdog threads must be able to sleep after the deadline has passed,
++ * while the camera thread must not: pc_sleep() is the probe's cooperative
++ * abort point, pc_wd_sleep() is the same wait without that early return. */
+ static void
+-pc_sleep(unsigned ms)
++pc_wd_sleep(unsigned ms)
+ {
+ 	uint64_t deadline;
+ 	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+@@ -391,6 +453,43 @@ pc_sleep(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++static bool
++pc_camera_expired(void)
++{
++	return pc_wd_armed && (pc_wd_fired ||
++	    mach_absolute_time() >= pc_wd_deadline);
++}
++
++/* Between probe stages: true means the deadline passed (or the watchdog has
++ * already declared it) and the caller must unwind instead of starting the next
++ * MMIO/CCI stage.  Prints and flushes once; a log write that blocks here cannot
++ * stop the watchdog, which never takes the UFS lock. */
++static bool
++pc_camera_abort(const char *stage)
++{
++	if (!pc_camera_expired())
++		return false;
++	pc_camera_timed_out = true;
++	if (!pc_abort_reported) {
++		pc_abort_reported = true;
++		printf("PANDORA CAMERA: probe aborted at %s "
++		    "(pandora_camera_timeout=%u s)\n", stage, pc_wd_timeout_s);
++		(void)pandora_log_sync();
++	}
++	return true;
++}
++
++static void
++pc_sleep(unsigned ms)
++{
++	/* pc_camera_expired() is time-based: the probe unwinds on its own even
++	 * before the soft watchdog thread wakes, without marking the hard
++	 * deadline (only pc_wd_thread() owns pc_wd_fired/pc_wd_grace_abs). */
++	if (pc_camera_expired())
++		return;
++	pc_wd_sleep(ms);
++}
++
+ static void
+ pc_step(const char *what, uint32_t pa)
+ {
+@@ -3665,6 +3764,9 @@ pc_sensor_apply_tbl(const struct pc_init_reg *t, unsigned n, unsigned master,
+ 		if (cap && applied >= cap) {
+ 			break;
+ 		}
++		if (pc_wd_fired) {
++			break;
++		}
+ 		unsigned chunk_end = i + 28u;
+ 		if (chunk_end > n) {
+ 			chunk_end = n;
+@@ -4965,6 +5067,8 @@ pc_sliceb_poll(vm_offset_t csid0, unsigned iters, uint32_t *rx_out,
+ 	unsigned frames = 0, last_vc0 = 0;
+ 
+ 	for (unsigned i = 0; i < iters; i++) {
++		if (pc_wd_fired)
++			break;
+ 		uint32_t buf = pc_rd(csid0, 0x1a0);
+ 		unsigned vc0 = (buf & 0x10000u) ? 1u : 0u;
+ 
+@@ -6493,6 +6597,8 @@ pc_sliceb_cphytest(void)
+ 	int ret = 0;
+ 	int lane94_ok = 0;
+ 
++	if (pc_camera_abort("cphytest start"))
++		return;
+ 	pc_csiphy_mark("cphytest start: csiphy0 CPHY 3-lane -> CSID2");
+ 	phy0 = ml_io_map_unmappable(PC_CSIPHY0_PA, 0x2000u, VM_WIMG_IO);
+ 	csid2 = ml_io_map_unmappable(PC_CSID2_PA, 0x5e80u, VM_WIMG_IO);
+@@ -6534,6 +6640,8 @@ pc_sliceb_cphytest(void)
+ 	 * camnoc AHB clocks the CSID register file answers reads (AHB decode) but
+ 	 * its reset FSM never runs, which is exactly the w84 CSID2 symptom
+ 	 * (id readable, RST_CFG latched, INFO_RST_DONE never set). */
++	if (pc_camera_abort("cphytest infra"))
++		return;
+ 	pc_sliceb_infra_up("cphytest");
+ 
+ 	/* v12 read-only instance map. The three CSID register files answer reads
+@@ -6647,6 +6755,8 @@ pc_sliceb_cphytest(void)
+ 	/* Vendor 2.4.0 order: reset asserted, common registers, per-lane 3-phase
+ 	 * table then the data-rate table at the same lane offset, lane enable,
+ 	 * and a 3-phase reset release writing 0x0E (not the D-PHY 0x02). */
++	if (pc_camera_abort("cphytest phy reset"))
++		return;
+ 	pc_wr(phy0, 0x1000u, 0x01u);
+ 	delay(20);
+ 	/* Vendor start path polls the refgen status (0x1184, bit 7) after
+@@ -6671,6 +6781,8 @@ pc_sliceb_cphytest(void)
+ 	pc_wr(phy0, 0x101Cu, 0x7Au);
+ 	pc_wr(phy0, 0x1018u, 0x01u);
+ 	pc_wr(phy0, PC_CSIPHY_V240_LANE_EN, 0x2Au);	/* v70: v65 lane enable */
++	if (pc_camera_abort("cphytest lane table"))
++		return;
+ 	for (unsigned l = 0; l < 3; l++) {
+ 		uint32_t off = lane_off[l];
+ 		for (unsigned i = 0; i < PC_CSIPHY_3PH_BASE_REGS_N; i++) {
+@@ -6724,6 +6836,8 @@ pc_sliceb_cphytest(void)
+ 		    lane94_ok ? "0x0d" : "0x01-fallback");
+ 		(void)pandora_log_sync();
+ 	}
++	if (pc_camera_abort("cphytest release"))
++		return;
+ 	pc_wr(phy0, 0x1000u, 0x0Eu);
+ 	delay(10);
+ 	/* camera7b: the mode word only takes effect at reset release; bound that
+@@ -6764,6 +6878,8 @@ pc_sliceb_cphytest(void)
+ 	 * silent while the v24 fallback "cphy1/0x210" produced
+ 	 * rdi=0x4851010, sof=1, rx_irq=0x10007077 on real sensor data.
+ 	 * Adopt 0x01102102 = PHY_NUM_SEL 1 + PHY_TYPE_SEL 1 (C-PHY). */
++	if (pc_camera_abort("cphytest csid arm"))
++		return;
+ 	base = pc_sliceb_arm(csid2, 0x01102102u);
+ 	pc_rx_cfg0_report(csid2, "cphytest post-arm");
+ 	pc_rdi_irq_report(csid2, "cphytest post-arm");
+@@ -6863,6 +6979,8 @@ pc_sliceb_cphytest(void)
+ 			}
+ 		}
+ 		pc_csiphy_mark("cphytest full sensor table replay (single pass)");
++		if (pc_camera_abort("cphytest replay"))
++			return;
+ 		pc_sensor_apply_wide_v34("wide-cphytest", 0u);
+ 		(void)pandora_log_sync();
+ 		/* v44: OVX10500U stream-control block. Android's live snapshot has
+@@ -7060,6 +7178,8 @@ pc_sliceb_cphytest(void)
+ 		 * sensor accepts one configuration per power-up; a second power-up
+ 		 * should accept a second one. Diagnostic recovery attempt: on a
+ 		 * successful first window this block does nothing. */
++		if (pc_camera_abort("cphytest retry"))
++			return;
+ 		if (!(seen_rdi & (PC_RDIN_INPUT_SOF | PC_RDIN_INPUT_EOF)) && pc_level < 3u) {
+ 			int down = pc_sensor_power_down_probe_pair();
+ 			unsigned up = 0;
+@@ -7407,6 +7527,8 @@ pc_sliceb_cphytest(void)
+ 	 * counters = the lane receive path itself is dead (consistent with the
+ 	 * hw_version=0 anomaly). Runs last: the writes replace the lane receive
+ 	 * config, which is fine because every sensor-window measurement is done. */
++	if (pc_camera_abort("cphytest bist"))
++		return;
+ 	pc_csiphy_mark("cphytest v22 C-PHY BIST on lanes 0/1/2");
+ 	{
+ 		static const struct { uint32_t addr; uint32_t val; } bist[15] = {
+@@ -7544,9 +7666,14 @@ pc_probe_callout(thread_call_param_t p0, thread_call_param_t p1)
+ {
+ 	(void)p0;
+ 	(void)p1;
++	pc_probe_pending = false;
+ 	printf("PANDORA SLICEB: cphytest deferred callout running\n");
+ 	(void)pandora_log_sync();
++	if (pc_camera_abort("deferred cphytest"))
++		goto out;
+ 	pc_sliceb_cphytest();
++out:
++	pc_camera_done = true;
+ }
+ 
+ static void
+@@ -7639,6 +7766,7 @@ pc_sliceb_stream(void)
+ 				    THREAD_CALL_OPTIONS_ONCE);
+ 				clock_interval_to_deadline(delay_s, NSEC_PER_SEC,
+ 				    &deadline);
++				pc_probe_pending = true;
+ 				(void)thread_call_enter_delayed(&pc_probe_call,
+ 				    deadline);
+ 				printf("PANDORA SLICEB: cphytest deferred %d s\n",
+@@ -7778,6 +7906,8 @@ static void
+ pc_csiphy0_bringup(void)
+ {
+ 	pc_sleep(4000);
++	if (pc_camera_abort("slice A start"))
++		return;
+ 	pc_csiphy_mark("slice A start: map CAMCC + CSIPHY0");
+ 	pc_camcc = ml_io_map_unmappable(PC_CAMCC_PA, 0x80000, VM_WIMG_IO);
+ 	pc_csiphy0_va = ml_io_map_unmappable(PC_CSIPHY0_PA, PC_CSIPHY0_BYTES, VM_WIMG_IO);
+@@ -7885,6 +8015,8 @@ pc_csiphy0_bringup(void)
+ 	pc_csiphy_mark("slice A done (PHY front-end up; CSID real mux is slice B)");
+ 	/* =2 adds slice B1 (real sensor -> CSID RX mux -> RDI0 SOF/EOF). =1 stops
+ 	 * here exactly as the verified w45 baseline did. */
++	if (pc_camera_abort("slice A done"))
++		return;
+ 	if (pc_csiphy >= 2u)
+ 		pc_sliceb_stream();
+ }
+@@ -8137,6 +8269,8 @@ pc_thread(void *arg, wait_result_t result)
+ 		printf("PANDORA CAMERA: waiting %u s before read-only diag\n", delay_s);
+ 		pc_sleep(delay_s * 1000u);
+ 	}
++	if (pc_camera_abort("camera thread start"))
++		goto out;
+ 	/* TPG P0 is a self-contained, separately-gated path (pandora_tpg=1). It
+ 	 * does not run the sensor/CCI diagnostics below, so it is a clean single
+ 	 * variable against the verified pandora_camera=1/2 baseline. */
+@@ -8196,6 +8330,10 @@ pc_thread(void *arg, wait_result_t result)
+ 	 * from the read-only diagnostics above. Leaves sensors powered for use. */
+ 	pc_sensor_init();
+ out:
++	/* The deferred cphytest keeps the watchdog alive after this thread ends;
++	 * pc_probe_callout() is then the one that declares the path finished. */
++	if (!pc_probe_pending)
++		pc_camera_done = true;
+ 	/* Deliberately no unmaps anywhere in this file: a one-shot boot diagnostic shares
+ 	 * the TLMM/CCI apertures with the worker threads (and the GCC aperture already taught
+ 	 * the lesson), so the maps stay for the whole boot, like the other pandora drivers. */
+@@ -8203,6 +8341,63 @@ out:
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++static void
++pc_wd_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++
++	while (!pc_camera_done) {
++		if (mach_absolute_time() >= pc_wd_deadline)
++			break;
++		pc_wd_sleep(250);
++	}
++	if (pc_camera_done && !pc_camera_timed_out)
++		goto out;
++	{
++		uint64_t rel;
++		nanoseconds_to_absolutetime((uint64_t)pc_wd_grace_s * NSEC_PER_SEC,
++		    &rel);
++		pc_wd_grace_abs = mach_absolute_time() + rel;
++	}
++	pc_wd_fired = true;
++	printf("PANDORA CAMERA: pandora_camera_timeout=%u s reached; orderly "
++	    "reboot to Android\n", pc_wd_timeout_s);
++	/*
++	 * reboot_kernel() can block on the same UFS lock a wedged probe held in
++	 * pandora_log_sync(); that is what pc_wd_hard_thread() covers.  Do not
++	 * touch the log file here: a blocking flush would defeat the deadline.
++	 */
++	int error = reboot_kernel(RB_AUTOBOOT, NULL);
++	printf("PANDORA CAMERA: orderly reboot returned %d; hard reset at +%u s\n",
++	    error, pc_wd_grace_s);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++pc_wd_hard_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++
++	/* Idle until the soft watchdog has fired: a healthy camera path must not
++	 * be reset by a hard deadline armed from boot. */
++	while (!pc_wd_fired) {
++		if (pc_camera_done && !pc_camera_timed_out)
++			goto out;
++		pc_wd_sleep(250);
++	}
++	while (mach_absolute_time() < pc_wd_grace_abs) {
++		pc_wd_sleep(250);
++	}
++	pandora_camera_hard_reset("camera watchdog");
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ void
+ pandora_camera_init(void)
+ {
+@@ -8216,7 +8411,59 @@ pandora_camera_init(void)
+ 		return;
+ 	}
+ 	pc_started = true;
++
++	unsigned timeout_s = 0, grace_s = 0;
++	(void)PE_parse_boot_argn("pandora_camera_timeout", &timeout_s,
++	    sizeof(timeout_s));
++	(void)PE_parse_boot_argn("pandora_camera_grace", &grace_s,
++	    sizeof(grace_s));
++	if (!timeout_s) {
++		timeout_s = PC_CAMERA_TIMEOUT_DEFAULT_S;
++	}
++	if (timeout_s > PC_CAMERA_TIMEOUT_MAX_S) {
++		printf("PANDORA CAMERA: pandora_camera_timeout=%u clamped to %u s\n",
++		    timeout_s, PC_CAMERA_TIMEOUT_MAX_S);
++		timeout_s = PC_CAMERA_TIMEOUT_MAX_S;
++	}
++	if (timeout_s < 10u) {
++		timeout_s = 10u;
++	}
++	if (!grace_s) {
++		grace_s = PC_CAMERA_GRACE_DEFAULT_S;
++	}
++	if (grace_s > PC_CAMERA_GRACE_MAX_S) {
++		grace_s = PC_CAMERA_GRACE_MAX_S;
++	}
++	if (grace_s < 5u) {
++		grace_s = 5u;
++	}
++	if (timeout_s + grace_s > PC_CAMERA_BUDGET_MAX_S) {
++		grace_s = PC_CAMERA_BUDGET_MAX_S - timeout_s;
++	}
++	pc_wd_timeout_s = timeout_s;
++	pc_wd_grace_s = grace_s;
++	{
++		uint64_t rel;
++		nanoseconds_to_absolutetime((uint64_t)timeout_s * NSEC_PER_SEC,
++		    &rel);
++		pc_wd_deadline = mach_absolute_time() + rel;
++	}
++	pc_wd_armed = true;
++	printf("PANDORA CAMERA: watchdog armed timeout=%u s grace=%u s "
++	    "(hard reset <= %u s after init)\n", pc_wd_timeout_s,
++	    pc_wd_grace_s, pc_wd_timeout_s + pc_wd_grace_s);
+ 	thread_t thread;
++	if (kernel_thread_start(pc_wd_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("PANDORA CAMERA: watchdog thread allocation failed\n");
++	}
++	if (kernel_thread_start(pc_wd_hard_thread, NULL, &thread) ==
++	    KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("PANDORA CAMERA: hard watchdog thread allocation failed\n");
++	}
+ 	if (kernel_thread_start(pc_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index b875684..69fb54c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -2017,6 +2017,27 @@ extern void sweet_bl_final(void);       /* SweetFramebuffer.cpp, 0263 */
+ extern void pandora_mpss_quiesce(void); /* bsd/dev/pandora_mpss.c */
+ #endif
+ 
++/*
++ * 0482: camera watchdog hard reset.  Called from a kernel thread only when the
++ * orderly reboot did not take the machine down inside pandora_camera_grace.
++ * The camera probe may have wedged while holding sweet_ufs_lock, inside a
++ * blocked log write, or on an unclocked MMIO read, so this path takes no lock,
++ * writes no log, quiesces no modem and touches no MMIO: PSCI SYSTEM_RESET
++ * only.  It cannot corrupt a volume that was already synced; it also cannot
++ * flush one, which is why the soft watchdog (reboot_kernel) remains the normal
++ * exit and this is only the last-resort bound.
++ */
++void
++pandora_camera_hard_reset(const char *why)
++{
++	(void)why;
++	register uint64_t x0 __asm__("x0") = 0x84000009ULL;	/* PSCI SYSTEM_RESET */
++	__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	for (;;) {
++		__builtin_arm_wfe();
++	}
++}
++
+ static void
+ pl_psci_reset(void)
+ {
