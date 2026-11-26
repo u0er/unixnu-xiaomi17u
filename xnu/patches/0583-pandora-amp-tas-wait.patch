@@ -1,0 +1,77 @@
+diff --git a/bsd/dev/pandora_amp_tas.c b/bsd/dev/pandora_amp_tas.c
+index 14e1ec5..f70aba8 100644
+--- a/bsd/dev/pandora_amp_tas.c
++++ b/bsd/dev/pandora_amp_tas.c
+@@ -97,6 +97,30 @@ ta_notify(void)
+ 	thread_wakeup((event_t)&ta_event);
+ }
+ 
++/* One bounded, event-driven wait for a worker publication. ta_notify() bumps
++ * the generation and wakes every waiter, so a signal published after this
++ * thread registers its wait cannot be missed. */
++static bool
++ta_await(uint32_t *flag, uint64_t deadline)
++{
++	for (;;) {
++		if (__atomic_load_n(flag, __ATOMIC_ACQUIRE)) return true;
++		uint32_t event = __atomic_load_n(&ta_event, __ATOMIC_ACQUIRE);
++		(void)assert_wait_deadline((event_t)&ta_event, THREAD_UNINT, deadline);
++		/* Recheck after registering: the publishing thread stores the flag
++		 * before ta_notify(), so a notification that lands between the load
++		 * above and this block must still win. */
++		if (__atomic_load_n(flag, __ATOMIC_ACQUIRE) ||
++		    __atomic_load_n(&ta_event, __ATOMIC_ACQUIRE) != event) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++			continue;
++		}
++		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT) {
++			return __atomic_load_n(flag, __ATOMIC_ACQUIRE) != 0;
++		}
++	}
++}
++
+ static uint32_t
+ ta_rd(vm_offset_t b, uint32_t o)
+ {
+@@ -597,7 +621,19 @@ pandora_amp_tas_io(int mode, unsigned wait_ms)
+ 	__atomic_store_n(&ta_want, (uint32_t)mode, __ATOMIC_RELEASE);
+ 	uint32_t req = __atomic_add_fetch(&ta_req, 1, __ATOMIC_ACQ_REL);
+ 	ta_notify();
+-	if (!__atomic_load_n(&ta_ready, __ATOMIC_ACQUIRE)) return ENODEV;
++	if (!__atomic_load_n(&ta_ready, __ATOMIC_ACQUIRE)) {
++		uint64_t deadline;
++		if (!mode || !wait_ms) return ENODEV;
++		/* CoreAudio routes the speaker before the ADSP graph is up (audio3:
++		 * route 21.9 s, graph 22.13 s), and only ta_run_audio publishes
++		 * ta_ready after the TDM clock runs and both chips are initialized.
++		 * Wait out the graph start and then the worker, each stage bounded
++		 * by the caller's wait_ms, instead of failing the route with ENODEV. */
++		clock_interval_to_deadline(wait_ms, NSEC_PER_MSEC, &deadline);
++		(void)ta_await(&ta_tdm_running, deadline);
++		clock_interval_to_deadline(wait_ms, NSEC_PER_MSEC, &deadline);
++		if (!ta_await(&ta_ready, deadline)) return ENODEV;
++	}
+ 	if (!wait_ms) return 0;
+ 	uint64_t deadline;
+ 	clock_interval_to_deadline(wait_ms, NSEC_PER_MSEC, &deadline);
+@@ -664,8 +700,10 @@ ta_run_audio(void)
+ 	/* The graph-ready signal also establishes UFS/pack availability.
+ 	 * All waits are bounded; a failed DSP graph must never power the amps. */
+ 	unsigned wait;
+-	for (wait = 0; wait < 350 && !__atomic_load_n(&ta_tdm_running, __ATOMIC_ACQUIRE); wait++) ta_sleep(100);
+-	if (wait == 350) return ETIMEDOUT;
++	/* 1200 x 100 ms: the speaker graph came up 22.1 s into the audio3 boot,
++	 * so the old 35 s window (350) left only seconds for a slow APM/graph. */
++	for (wait = 0; wait < 1200 && !__atomic_load_n(&ta_tdm_running, __ATOMIC_ACQUIRE); wait++) ta_sleep(100);
++	if (wait == 1200) return ETIMEDOUT;
+ 	fw = pandora_fw_file("tismartpa_driver_tuning.bin", &size);
+ 	if (!fw) return ENOENT;
+ 	err = ta_parse_tuning(fw, size, tuning);
+@@ -688,6 +726,7 @@ ta_run_audio(void)
+ 		 * final dominates an overlapping start and forbids future starts. */
+ 		__atomic_store_n(&ta_ready, 1, __ATOMIC_RELEASE);
+ 		printf("PANDORA AMP TAS: live speaker worker ready\n");
++		ta_notify();
+ 		for (;;) {
+ 			uint32_t event = __atomic_load_n(&ta_event, __ATOMIC_ACQUIRE);
+ 			uint32_t req = __atomic_load_n(&ta_req, __ATOMIC_ACQUIRE);
