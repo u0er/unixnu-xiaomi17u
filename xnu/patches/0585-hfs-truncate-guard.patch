@@ -1,0 +1,264 @@
+diff --git a/bsd/sweet_hfs/core/FileExtentMapping.c b/bsd/sweet_hfs/core/FileExtentMapping.c
+index 675615a..d5b4100 100644
+--- a/bsd/sweet_hfs/core/FileExtentMapping.c
++++ b/bsd/sweet_hfs/core/FileExtentMapping.c
+@@ -158,11 +158,19 @@ static OSErr ReleaseExtents(
+ 	u_int32_t				*numReleasedAllocationBlocks,
+ 	Boolean 				*releasedLastExtent);
+ 
++static OSErr ExtentBlocksReferencedByOtherFork(
++	const ExtendedVCB			*vcb,
++	u_int8_t					forkType,
++	u_int32_t					fileID,
++	const HFSPlusExtentRecord	extentRecord,
++	Boolean						*referenced);
++
+ static OSErr DeallocateFork(
+ 	ExtendedVCB 		*vcb,
+ 	HFSCatalogNodeID	fileID,
+ 	u_int8_t			forkType,
+ 	HFSPlusExtentRecord	catalogExtents,
++	u_int32_t			chainEnd,
+ 	Boolean *		recordDeleted);
+ 
+ static OSErr TruncateExtents(
+@@ -170,6 +178,7 @@ static OSErr TruncateExtents(
+ 	u_int8_t			forkType,
+ 	u_int32_t			fileID,
+ 	u_int32_t			startBlock,
++	u_int32_t			chainEnd,
+ 	Boolean *			recordDeleted);
+ 
+ static OSErr UpdateExtentRecord (
+@@ -365,6 +374,88 @@ static OSErr FindNextExtentRecord(
+ }
+ 
+ 
++/*
++ *	Routine:	ExtentBlocksReferencedByOtherFork
++ *
++ *	Purpose:	Report whether an allocation block described by extentRecord is
++ *				also mapped by another fork.  The extents B-tree is the only
++ *				place live mappings are recorded, so a hit means the blocks are
++ *				double-allocated and this fork may not release them on its own.
++ */
++static OSErr ExtentBlocksReferencedByOtherFork(
++	const ExtendedVCB			*vcb,
++	u_int8_t					forkType,
++	u_int32_t					fileID,
++	const HFSPlusExtentRecord	extentRecord,
++	Boolean						*referenced)
++{
++	FCB *					fcb;
++	struct BTreeIterator *	btIterator;
++	FSBufferDescriptor		btRecord;
++	HFSPlusExtentKey *		extentKeyPtr;
++	HFSPlusExtentRecord		foundData;
++	OSErr					err;
++	u_int16_t				btRecordSize = 0;
++	u_int32_t				extentIndex;
++	u_int32_t				foundIndex;
++
++	*referenced = false;
++
++	if (vcb->vcbSigWord == kHFSSigWord) {
++		return noErr;			/* plain HFS extent keys have another layout */
++	}
++
++	fcb = GetFileControlBlock(vcb->extentsRefNum);
++
++	btIterator = hfs_malloc_type(struct BTreeIterator);
++	extentKeyPtr = (HFSPlusExtentKey *) &btIterator->key;
++
++	btRecord.bufferAddress	= foundData;
++	btRecord.itemSize		= sizeof(HFSPlusExtentRecord);
++	btRecord.itemCount		= 1;
++
++	err = BTIterateRecord(fcb, kBTreeFirstRecord, btIterator, &btRecord, &btRecordSize);
++	while (err == noErr) {
++		if (extentKeyPtr->keyLength == kHFSPlusExtentKeyMaximumLength
++		&& (extentKeyPtr->fileID != fileID || extentKeyPtr->forkType != forkType)) {
++			for (extentIndex = 0; extentIndex < kHFSPlusExtentDensity; ++extentIndex) {
++				u_int64_t	targetStart;
++				u_int64_t	targetEnd;
++
++				if (extentRecord[extentIndex].blockCount == 0)
++					break;
++				targetStart = extentRecord[extentIndex].startBlock;
++				targetEnd = targetStart + extentRecord[extentIndex].blockCount;
++
++				for (foundIndex = 0; foundIndex < kHFSPlusExtentDensity; ++foundIndex) {
++					u_int64_t	foundStart;
++					u_int64_t	foundEnd;
++
++					if (foundData[foundIndex].blockCount == 0)
++						break;
++					foundStart = foundData[foundIndex].startBlock;
++					foundEnd = foundStart + foundData[foundIndex].blockCount;
++					if (targetStart < foundEnd && foundStart < targetEnd) {
++						*referenced = true;
++						break;
++					}
++				}
++				if (*referenced)
++					break;
++			}
++			if (*referenced)
++				break;
++		}
++		err = BTIterateRecord(fcb, kBTreeNextRecord, btIterator, &btRecord, &btRecordSize);
++	}
++	if (err == fsBTEndOfIterationErr || err == fsBTEmptyErr)
++		err = noErr;
++
++	hfs_free_type(btIterator, struct BTreeIterator);
++	return err;
++}
++
++
+ static OSErr CreateExtentRecord(
+ 	ExtendedVCB	*vcb,
+ 	HFSPlusExtentKey	*key,
+@@ -633,6 +724,8 @@ static OSErr ReleaseExtents(
+ //		fileID		Which file to operate on
+ //		startBlock	Starting file allocation block number for first extent
+ //					record to delete.
++//		chainEnd	File allocation block number one past the fork's last
++//					block.  A record at or past it is not part of this fork.
+ //‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹
+ 
+ static OSErr TruncateExtents(
+@@ -640,6 +733,7 @@ static OSErr TruncateExtents(
+ 	u_int8_t		forkType,
+ 	u_int32_t		fileID,
+ 	u_int32_t		startBlock,
++	u_int32_t		chainEnd,
+ 	Boolean *		recordDeleted)
+ {
+ 	OSErr				err;
+@@ -648,6 +742,7 @@ static OSErr TruncateExtents(
+ 	u_int32_t			hint;
+ 	HFSPlusExtentKey	key;
+ 	HFSPlusExtentRecord	extents;
++	Boolean				hfsPlus;
+ 	int  lockflags;
+ 
+ 	/*
+@@ -657,6 +752,8 @@ static OSErr TruncateExtents(
+ 	 * btree lock can be nested (its recursive) so we always take
+ 	 * it here.
+ 	 */
++	hfsPlus = (vcb->vcbSigWord != kHFSSigWord);
++
+ 	lockflags = hfs_systemfile_lock(vcb, SFL_EXTENTS, HFS_EXCLUSIVE_LOCK);
+ 
+ 	/*
+@@ -667,21 +764,61 @@ static OSErr TruncateExtents(
+ 	 *	its catalog extents cannot reach.
+ 	 */
+ 	while (true) {
++		Boolean				foundByNext = false;
++		Boolean				referenced;
++
+ 		err = FindExtentRecord(vcb, forkType, fileID, startBlock, false, &key, extents, &hint);
+-		if (err == btNotFound)
++		if (err == btNotFound) {
++			/*
++			 *	No record starts at the chain end.  A record further up is
++			 *	only a candidate while it still lies inside the fork; past
++			 *	that it was orphaned by an earlier truncation and its blocks
++			 *	may already belong to another file.
++			 */
+ 			err = FindNextExtentRecord(vcb, forkType, fileID, startBlock, &key, extents, &hint);
+-		if (err != noErr) {
+-			if (err == btNotFound)
+-				err = noErr;		// nothing left to delete
++			if (err == btNotFound) {
++				err = noErr;		// clean end of the chain
++				break;
++			}
++			if (err != noErr)
++				break;
++			foundByNext = true;
++		}
++
++		/*
++		 *	The key has to be reachable from this fork's chain: a record at or
++		 *	beyond the fork's last block cannot be its mapping, and a record
++		 *	whose extents run past chainEnd would release blocks that are not
++		 *	part of the file at all.
++		 */
++		if (hfsPlus
++		&& (key.startBlock > chainEnd
++		||  ExtentRecordBlocks(extents) > chainEnd - key.startBlock)) {
++			hfs_mark_inconsistent((struct hfsmount *)vcb, HFS_INCONSISTENCY_DETECTED);
++			err = ESTALE;
+ 			break;
+ 		}
+ 
++		if (foundByNext && hfsPlus) {
++			/*
++			 *	The record lies past a hole, so its blocks are only ours to
++			 *	release when no other fork has a live reference to them.
++			 */
++			err = ExtentBlocksReferencedByOtherFork(vcb, forkType, fileID, extents, &referenced);
++			if (err != noErr || referenced) {
++				hfs_mark_inconsistent((struct hfsmount *)vcb, HFS_INCONSISTENCY_DETECTED);
++				err = ESTALE;
++				break;
++			}
++		}
++
+ 		err = ReleaseExtents( vcb, extents, &numberExtentsReleased, &releasedLastExtent );
+ 		if (err != noErr) break;
+ 
+ 		if (numberExtentsReleased == 0) {
+ 			/*	An empty record cannot belong to a fork; stop rather than
+ 			 *	spin on it. */
++			hfs_mark_inconsistent((struct hfsmount *)vcb, HFS_INCONSISTENCY_DETECTED);
+ 			err = ESTALE;
+ 			break;
+ 		}
+@@ -690,6 +827,7 @@ static OSErr TruncateExtents(
+ 		if (err != noErr) break;
+ 
+ 		*recordDeleted = true;
++		startBlock = key.startBlock + numberExtentsReleased;
+ 	}
+ 	hfs_systemfile_unlock(vcb, lockflags);
+ 	
+@@ -709,6 +847,7 @@ static OSErr DeallocateFork(
+ 	HFSCatalogNodeID	fileID,
+ 	u_int8_t			forkType,
+ 	HFSPlusExtentRecord	catalogExtents,
++	u_int32_t			chainEnd,
+ 	Boolean *		recordDeleted) /* true if a record was deleted */
+ {
+ 	OSErr				err;
+@@ -746,7 +885,7 @@ static OSErr DeallocateFork(
+ 				hfs_mark_inconsistent((struct hfsmount *)vcb, HFS_INCONSISTENCY_DETECTED);
+ 				err = ESTALE;
+ 			} else {
+-				err = TruncateExtents(vcb, forkType, fileID, numReleasedAllocationBlocks, recordDeleted);
++				err = TruncateExtents(vcb, forkType, fileID, numReleasedAllocationBlocks, chainEnd, recordDeleted);
+ 			}
+ 		}
+ 	}
+@@ -1545,7 +1684,7 @@ OSErr TruncateFileC (
+ 		int i;
+ 		
+ 		//	Deallocate all the extents for this fork
+-		err = DeallocateFork(vcb, fileid, forkType, fcb->fcbExtents, &recordDeleted);
++		err = DeallocateFork(vcb, fileid, forkType, fcb->fcbExtents, physNumBlocks, &recordDeleted);
+ 		if (err != noErr) goto ErrorExit;	//	got some error, so return it
+ 		
+ 		//	Update the catalog extent record (making sure it's zeroed out)
+@@ -1631,7 +1770,7 @@ OSErr TruncateFileC (
+ 	//	blocks.
+ 	//
+ 	if (nextBlock < physNumBlocks)
+-		err = TruncateExtents(vcb, forkType, fileid, nextBlock, &recordDeleted);
++		err = TruncateExtents(vcb, forkType, fileid, nextBlock, physNumBlocks, &recordDeleted);
+ 
+ Done:
+ ErrorExit:
