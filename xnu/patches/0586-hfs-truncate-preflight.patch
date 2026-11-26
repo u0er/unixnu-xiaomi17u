@@ -1,0 +1,467 @@
+diff --git a/bsd/sweet_hfs/core/FileExtentMapping.c b/bsd/sweet_hfs/core/FileExtentMapping.c
+index 675615a..7a296d9 100644
+--- a/bsd/sweet_hfs/core/FileExtentMapping.c
++++ b/bsd/sweet_hfs/core/FileExtentMapping.c
+@@ -160,2 +160,17 @@ static OSErr ReleaseExtents(
+ 
++static Boolean ExtentRecordFull(
++	const HFSPlusExtentRecord	extents);
++
++static Boolean ExtentRunsOverlap(
++	const HFSPlusExtentRecord	first,
++	const HFSPlusExtentRecord	second);
++
++static OSErr CheckExtentChain(
++	ExtendedVCB					*vcb,
++	u_int8_t					forkType,
++	u_int32_t					fileID,
++	const HFSPlusExtentRecord	inlineExtents,
++	u_int32_t					startBlock,
++	u_int32_t					chainEnd);
++
+ static OSErr DeallocateFork(
+@@ -165,2 +180,3 @@ static OSErr DeallocateFork(
+ 	HFSPlusExtentRecord	catalogExtents,
++	u_int32_t			chainEnd,
+ 	Boolean *		recordDeleted);
+@@ -172,2 +188,3 @@ static OSErr TruncateExtents(
+ 	u_int32_t			startBlock,
++	u_int32_t			chainEnd,
+ 	Boolean *			recordDeleted);
+@@ -367,2 +384,149 @@ static OSErr FindNextExtentRecord(
+ 
++/*
++ *	Report whether every extent of a record is present.  Only the last record
++ *	of a chain may be partially filled.
++ */
++static Boolean ExtentRecordFull(
++	const HFSPlusExtentRecord	extents)
++{
++	int	index;
++
++	for (index = 0; index < kHFSPlusExtentDensity; ++index) {
++		if (extents[index].blockCount == 0)
++			return false;
++	}
++	return true;
++}
++
++
++/*
++ *	Report whether two extent records map any of the same volume blocks.
++ */
++static Boolean ExtentRunsOverlap(
++	const HFSPlusExtentRecord	first,
++	const HFSPlusExtentRecord	second)
++{
++	int			firstIndex;
++	int			secondIndex;
++
++	for (firstIndex = 0; firstIndex < kHFSPlusExtentDensity; ++firstIndex) {
++		u_int64_t	firstStart;
++		u_int64_t	firstEnd;
++
++		if (first[firstIndex].blockCount == 0)
++			break;
++		firstStart = first[firstIndex].startBlock;
++		firstEnd = firstStart + first[firstIndex].blockCount;
++
++		for (secondIndex = 0; secondIndex < kHFSPlusExtentDensity; ++secondIndex) {
++			u_int64_t	secondStart;
++			u_int64_t	secondEnd;
++
++			if (second[secondIndex].blockCount == 0)
++				break;
++			secondStart = second[secondIndex].startBlock;
++			secondEnd = secondStart + second[secondIndex].blockCount;
++			if (firstStart < secondEnd && secondStart < firstEnd)
++				return true;
++		}
++	}
++
++	return false;
++}
++
++
++/*
++ *	Routine:	CheckExtentChain
++ *
++ *	Purpose:	Preflight the overflow chain a truncate is about to release.
++ *				Every record must sit exactly at the cursor defined by the
++ *				catalog-inline record and the records already walked, must be
++ *				non-empty and fit below chainEnd, and may not re-map a block
++ *				the inline record owns.  Nothing is released here.
++ *
++ *				The inline extents belong to the fork whose record the caller
++ *				passed in, so their owner is known.  A double allocation
++ *				between an overflow record and *another* fork's inline extents
++ *				cannot be attributed without a catalog-wide block index, which
++ *				HFS+ does not keep; the exact cursor walk is the defense in
++ *				depth for that residual case.
++ */
++static OSErr CheckExtentChain(
++	ExtendedVCB					*vcb,
++	u_int8_t					forkType,
++	u_int32_t					fileID,
++	const HFSPlusExtentRecord	inlineExtents,
++	u_int32_t					startBlock,
++	u_int32_t					chainEnd)
++{
++	HFSPlusExtentKey	key;
++	HFSPlusExtentRecord	extents;
++	u_int32_t			hint;
++	u_int32_t			cursor;
++	u_int32_t			recordBlocks;
++	OSErr				err = noErr;
++	int					lockflags;
++
++	if (vcb->vcbSigWord == kHFSSigWord) {
++		return noErr;		/* plain HFS extent keys have another layout */
++	}
++
++	if (startBlock > chainEnd
++	||  ExtentRecordBlocks(inlineExtents) > chainEnd) {
++		hfs_mark_inconsistent((struct hfsmount *)vcb, HFS_INCONSISTENCY_DETECTED);
++		return ESTALE;
++	}
++
++	/*
++	 *	A catalog-inline record that is not full ends the fork's mapping, so
++	 *	no overflow record may follow it.
++	 */
++	if (!ExtentRecordFull(inlineExtents) && startBlock < chainEnd) {
++		hfs_mark_inconsistent((struct hfsmount *)vcb, HFS_INCONSISTENCY_DETECTED);
++		return ESTALE;
++	}
++
++	lockflags = hfs_systemfile_lock(vcb, SFL_EXTENTS, HFS_EXCLUSIVE_LOCK);
++
++	cursor = startBlock;
++	while (cursor < chainEnd) {
++		err = FindExtentRecord(vcb, forkType, fileID, cursor, false, &key, extents, &hint);
++		if (err == btNotFound) {
++			/*
++			 *	A record at a higher key is a hole; no record at all is a
++			 *	short chain.  Both leave [cursor, chainEnd) unmapped.
++			 */
++			err = ESTALE;
++			break;
++		}
++		if (err != noErr)
++			break;
++
++		recordBlocks = ExtentRecordBlocks(extents);
++		if (key.startBlock != cursor
++		||  recordBlocks == 0
++		||  recordBlocks > chainEnd - cursor
++		||  ExtentRunsOverlap(extents, inlineExtents)) {
++			err = ESTALE;
++			break;
++		}
++
++		/*
++		 *	Only the last record of a chain may be partially filled.
++		 */
++		if (!ExtentRecordFull(extents) && cursor + recordBlocks < chainEnd) {
++			err = ESTALE;
++			break;
++		}
++
++		cursor += recordBlocks;
++	}
++	hfs_systemfile_unlock(vcb, lockflags);
++
++	if (err == ESTALE)
++		hfs_mark_inconsistent((struct hfsmount *)vcb, HFS_INCONSISTENCY_DETECTED);
++
++	return err;
++}
++
+ static OSErr CreateExtentRecord(
+@@ -638,7 +802,8 @@ static OSErr ReleaseExtents(
+ static OSErr TruncateExtents(
+-	ExtendedVCB		*vcb,
+-	u_int8_t		forkType,
+-	u_int32_t		fileID,
+-	u_int32_t		startBlock,
+-	Boolean *		recordDeleted)
++	ExtendedVCB			*vcb,
++	u_int8_t			forkType,
++	u_int32_t			fileID,
++	u_int32_t			startBlock,
++	u_int32_t			chainEnd,
++	Boolean *			recordDeleted)
+ {
+@@ -651,2 +816,3 @@ static OSErr TruncateExtents(
+ 	int  lockflags;
++	Boolean				hfsPlus;
+ 
+@@ -659,38 +825,74 @@ static OSErr TruncateExtents(
+ 	 */
++	hfsPlus = (vcb->vcbSigWord != kHFSSigWord);
++
+ 	lockflags = hfs_systemfile_lock(vcb, SFL_EXTENTS, HFS_EXCLUSIVE_LOCK);
+ 
+-	/*
+-	 *	Delete every record at or above startBlock.  Walking by key instead of
+-	 *	by the running block count is what removes records that a hole left
+-	 *	behind at a higher key: with the old "next key = startBlock + released"
+-	 *	step those records were never looked at, and the fork kept a chain that
+-	 *	its catalog extents cannot reach.
+-	 */
+-	while (true) {
+-		err = FindExtentRecord(vcb, forkType, fileID, startBlock, false, &key, extents, &hint);
+-		if (err == btNotFound)
+-			err = FindNextExtentRecord(vcb, forkType, fileID, startBlock, &key, extents, &hint);
+-		if (err != noErr) {
+-			if (err == btNotFound)
+-				err = noErr;		// nothing left to delete
+-			break;
+-		}
++	err = noErr;
++	if (hfsPlus) {
++		/*
++		 *	The preflight already walked every record from startBlock to
++		 *	chainEnd.  Release only those records: there is deliberately no
++		 *	FindNext here, because jumping a hole is how an orphaned record
++		 *	used to be released.
++		 */
++		while (startBlock < chainEnd) {
++			err = FindExtentRecord(vcb, forkType, fileID, startBlock, false, &key, extents, &hint);
++			if (err == btNotFound) {
++				/* The preflight saw a record here; the tree moved. */
++				err = ESTALE;
++				break;
++			}
++			if (err != noErr)
++				break;
+ 
+-		err = ReleaseExtents( vcb, extents, &numberExtentsReleased, &releasedLastExtent );
+-		if (err != noErr) break;
++			if (key.startBlock != startBlock
++			||  ExtentRecordBlocks(extents) == 0
++			||  ExtentRecordBlocks(extents) > chainEnd - startBlock) {
++				err = ESTALE;
++				break;
++			}
+ 
+-		if (numberExtentsReleased == 0) {
+-			/*	An empty record cannot belong to a fork; stop rather than
+-			 *	spin on it. */
+-			err = ESTALE;
+-			break;
++			err = ReleaseExtents( vcb, extents, &numberExtentsReleased, &releasedLastExtent );
++			if (err != noErr) break;
++
++			err = DeleteExtentRecord(vcb, forkType, fileID, key.startBlock);
++			if (err != noErr) break;
++
++			*recordDeleted = true;
++			startBlock = key.startBlock + ExtentRecordBlocks(extents);
+ 		}
++	} else {
++		/* Plain HFS keeps the historical walk; its extent keys differ. */
++		while (true) {
++			err = FindExtentRecord(vcb, forkType, fileID, startBlock, false, &key, extents, &hint);
++			if (err == btNotFound)
++				err = FindNextExtentRecord(vcb, forkType, fileID, startBlock, &key, extents, &hint);
++			if (err != noErr) {
++				if (err == btNotFound)
++					err = noErr;		// nothing left to delete
++				break;
++			}
+ 
+-		err = DeleteExtentRecord(vcb, forkType, fileID, key.startBlock);
+-		if (err != noErr) break;
++			err = ReleaseExtents( vcb, extents, &numberExtentsReleased, &releasedLastExtent );
++			if (err != noErr) break;
+ 
+-		*recordDeleted = true;
++			if (numberExtentsReleased == 0) {
++				/*	An empty record cannot belong to a fork; stop rather
++				 *	than spin on it. */
++				err = ESTALE;
++				break;
++			}
++
++			err = DeleteExtentRecord(vcb, forkType, fileID, key.startBlock);
++			if (err != noErr) break;
++
++			*recordDeleted = true;
++			startBlock += numberExtentsReleased;
++		}
+ 	}
+ 	hfs_systemfile_unlock(vcb, lockflags);
+-	
++
++	if (err == ESTALE)
++		hfs_mark_inconsistent((struct hfsmount *)vcb, HFS_INCONSISTENCY_DETECTED);
++
+ 	return err;
+@@ -711,2 +913,3 @@ static OSErr DeallocateFork(
+ 	HFSPlusExtentRecord	catalogExtents,
++	u_int32_t			chainEnd,
+ 	Boolean *		recordDeleted) /* true if a record was deleted */
+@@ -716,3 +919,14 @@ static OSErr DeallocateFork(
+ 	Boolean				releasedLastExtent;
+-	
++	u_int32_t			inlineBlocks;
++
++	/*
++	 *	The catalog extents and the overflow chain they anchor are one
++	 *	mapping.  Validate the whole mapping to chainEnd before releasing
++	 *	the first inline block; an ESTALE here leaves the bitmap untouched.
++	 */
++	inlineBlocks = ExtentRecordBlocks(catalogExtents);
++	err = CheckExtentChain(vcb, forkType, fileID, catalogExtents, inlineBlocks, chainEnd);
++	if (err != noErr)
++		return err;
++
+ 	//	Release the catalog extents
+@@ -723,31 +937,4 @@ static OSErr DeallocateFork(
+ 	// Release the extra extents, if present
+-	if (!releasedLastExtent) {
+-		HFSPlusExtentKey	key;
+-		HFSPlusExtentRecord	extents;
+-		u_int32_t			hint;
+-		int					lockflags;
+-
+-		/*
+-		 *	The overflow records may only be released when they start exactly
+-		 *	where the catalog extents end.  Records at any other key are not
+-		 *	reachable from this fork, so their blocks may already belong to
+-		 *	another file and must not be freed from here.
+-		 */
+-		lockflags = hfs_systemfile_lock(vcb, SFL_EXTENTS, HFS_EXCLUSIVE_LOCK);
+-		err = FindExtentRecord(vcb, forkType, fileID, 0, false, &key, extents, &hint);
+-		if (err == btNotFound)
+-			err = FindNextExtentRecord(vcb, forkType, fileID, 0, &key, extents, &hint);
+-		hfs_systemfile_unlock(vcb, lockflags);
+-
+-		if (err == btNotFound) {
+-			err = noErr;			// the catalog record is all there is
+-		} else if (err == noErr) {
+-			if (key.startBlock != numReleasedAllocationBlocks) {
+-				hfs_mark_inconsistent((struct hfsmount *)vcb, HFS_INCONSISTENCY_DETECTED);
+-				err = ESTALE;
+-			} else {
+-				err = TruncateExtents(vcb, forkType, fileID, numReleasedAllocationBlocks, recordDeleted);
+-			}
+-		}
+-	}
++	if (inlineBlocks < chainEnd)
++		err = TruncateExtents(vcb, forkType, fileID, inlineBlocks, chainEnd, recordDeleted);
+ 
+@@ -1484,2 +1671,3 @@ OSErr TruncateFileC (
+ 	u_int32_t			extentNextBlock;
++	u_int32_t			chainCursor;		// end of the record being cut
+ 	u_int32_t			numExtentsPerRecord;
+@@ -1517,24 +1705,8 @@ OSErr TruncateFileC (
+ 
+-	//
+-	//	Update FCB's length
+-	//
+ 	/*
+-	 * XXX Any errors could cause ff_blocks and c_blocks to get out of sync...
++	 *	The FCB length is not updated yet: the preflight below has to run
++	 *	before any visible change, so that ESTALE leaves the in-core fork
++	 *	exactly as the caller handed it over.
+ 	 */
+ 	numBlocks = peof / vcb->blockSize;
+-	if (!deleted) {
+-		FTOC(fcb)->c_blocks -= (fcb->ff_blocks - numBlocks);
+-	}
+-	fcb->ff_blocks = numBlocks;
+-	
+-	// this catalog entry is modified and *must* get forced 
+-	// to disk when hfs_update() is called
+-	if (!deleted) {
+-		/* 
+-		 * If the file is already C_NOEXISTS, then the catalog record
+-		 * has been removed from disk already.  We wouldn't need to force 
+-		 * another update
+-		 */
+-		FTOC(fcb)->c_flag |= C_MODIFIED;
+-	}
+ 	//
+@@ -1546,12 +1718,21 @@ OSErr TruncateFileC (
+ 		
+-		//	Deallocate all the extents for this fork
+-		err = DeallocateFork(vcb, fileid, forkType, fcb->fcbExtents, &recordDeleted);
++		/*
++		 *	DeallocateFork preflights the catalog extents plus the whole
++		 *	overflow chain before it releases a single block.  On ESTALE the
++		 *	FCB below is left untouched.
++		 */
++		err = DeallocateFork(vcb, fileid, forkType, fcb->fcbExtents, physNumBlocks, &recordDeleted);
+ 		if (err != noErr) goto ErrorExit;	//	got some error, so return it
+-		
++
++		if (!deleted) {
++			FTOC(fcb)->c_blocks -= fcb->ff_blocks;
++		}
++		fcb->ff_blocks = 0;
++		if (!deleted)
++			FTOC(fcb)->c_flag |= C_MODIFIED;
++
+ 		//	Update the catalog extent record (making sure it's zeroed out)
+-		if (err == noErr) {
+-			for (i=0; i < kHFSPlusExtentDensity; i++) {
+-				fcb->fcbExtents[i].startBlock = 0;
+-				fcb->fcbExtents[i].blockCount = 0;
+-			}
++		for (i=0; i < kHFSPlusExtentDensity; i++) {
++			fcb->fcbExtents[i].startBlock = 0;
++			fcb->fcbExtents[i].blockCount = 0;
+ 		}
+@@ -1569,2 +1750,43 @@ OSErr TruncateFileC (
+ 
++	/*
++	 *	The record SearchExtentFile found is either the catalog-inline record
++	 *	(keyLength == 0) or an overflow record.  Everything from its end to
++	 *	the fork's old block count is about to be released, so validate that
++	 *	whole remainder before the first BlockDeallocate/UpdateExtentRecord.
++	 *	The walk starts at the record's own end block, never at the file
++	 *	position: blocks kept inside the record are not a chain hole.
++	 */
++	chainCursor = ExtentRecordBlocks(extentRecord);
++	if (key.keyLength != 0)
++		chainCursor += key.startBlock;
++
++	if (chainCursor > physNumBlocks
++	||  extentNextBlock > chainCursor) {
++		hfs_mark_inconsistent((struct hfsmount *)vcb, HFS_INCONSISTENCY_DETECTED);
++		err = ESTALE;
++		goto ErrorExit;
++	}
++	err = CheckExtentChain(vcb, forkType, fileid, fcb->fcbExtents, chainCursor, physNumBlocks);
++	if (err != noErr) goto ErrorExit;
++
++	/*
++	 *	Preflight passed.  Only now shrink the FCB; on ESTALE the size,
++	 *	c_blocks and C_MODIFIED stay as they were.
++	 */
++	if (!deleted) {
++		FTOC(fcb)->c_blocks -= (fcb->ff_blocks - numBlocks);
++	}
++	fcb->ff_blocks = numBlocks;
++	
++	// this catalog entry is modified and *must* get forced 
++	// to disk when hfs_update() is called
++	if (!deleted) {
++		/* 
++		 * If the file is already C_NOEXISTS, then the catalog record
++		 * has been removed from disk already.  We wouldn't need to force 
++		 * another update
++		 */
++		FTOC(fcb)->c_flag |= C_MODIFIED;
++	}
++
+ 	extentChanged = false;		//	haven't changed the extent yet
+@@ -1632,4 +1854,4 @@ OSErr TruncateFileC (
+ 	//
+-	if (nextBlock < physNumBlocks)
+-		err = TruncateExtents(vcb, forkType, fileid, nextBlock, &recordDeleted);
++	if (chainCursor < physNumBlocks)
++		err = TruncateExtents(vcb, forkType, fileid, chainCursor, physNumBlocks, &recordDeleted);
+ 
