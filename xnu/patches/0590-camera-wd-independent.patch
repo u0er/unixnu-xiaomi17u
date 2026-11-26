@@ -1,0 +1,135 @@
+diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
+index 4588203..791aa9a 100644
+--- a/bsd/dev/pandora_camera.c
++++ b/bsd/dev/pandora_camera.c
+@@ -389,10 +389,15 @@ static bool pc_started;
+  *
+  * The probe thread also cooperates: pc_sleep() returns immediately once the
+  * deadline has passed and pc_camera_abort() is checked between stages, so a
+- * slow-but-alive probe unwinds before the watchdog has to reset anything.  A
+- * probe that finishes normally cancels both threads (pc_camera_done without
+- * pc_camera_timed_out) and leaves the run to pandora_reboot_after=150; only a
+- * deadline expiry resets the phone early.
++ * slow-but-alive probe unwinds before the watchdog has to reset anything.
++ *
++ * 0590: probe completion is state, not an exemption.  pc_camera_done records
++ * that the probe returned; it no longer cancels either thread.  Both bounds
++ * are absolute and armed once in pandora_camera_init(): the soft thread waits
++ * for pc_wd_deadline, and the hard thread waits for pc_wd_grace_abs (deadline
++ * + grace) without reading pc_wd_fired.  A probe that returned early, a soft
++ * thread that failed to start, and a reboot_kernel() that blocks all still end
++ * in a reset inside the same budget.
+  *
+  * Defaults: timeout 90 s, grace 75 s; timeout clamp 10..120 s, grace 5..90 s,
+  * and timeout+grace <= 200 s.  With pandora_camera_init() ~10-30 s into boot
+@@ -407,6 +412,8 @@ static bool pc_started;
+ #define PC_CAMERA_GRACE_MAX_S		90u
+ #define PC_CAMERA_BUDGET_MAX_S		200u
+ 
++/* Both bounds are absolute-time values computed once in pandora_camera_init();
++ * pc_wd_grace_abs is never derived from pc_wd_fired (0590). */
+ static uint64_t pc_wd_deadline;
+ static uint64_t pc_wd_grace_abs;
+ static unsigned pc_wd_timeout_s;
+@@ -484,7 +491,8 @@ pc_sleep(unsigned ms)
+ {
+ 	/* pc_camera_expired() is time-based: the probe unwinds on its own even
+ 	 * before the soft watchdog thread wakes, without marking the hard
+-	 * deadline (only pc_wd_thread() owns pc_wd_fired/pc_wd_grace_abs). */
++	 * deadline (pc_wd_fired is set by pc_wd_thread(); pc_wd_grace_abs is
++	 * armed in pandora_camera_init() and never moved). */
+ 	if (pc_camera_expired())
+ 		return;
+ 	pc_wd_sleep(ms);
+@@ -7673,6 +7681,7 @@ pc_probe_callout(thread_call_param_t p0, thread_call_param_t p1)
+ 		goto out;
+ 	pc_sliceb_cphytest();
+ out:
++	/* Probe state only; the 0590 deadline/grace bounds stay armed. */
+ 	pc_camera_done = true;
+ }
+ 
+@@ -8330,8 +8339,10 @@ pc_thread(void *arg, wait_result_t result)
+ 	 * from the read-only diagnostics above. Leaves sensors powered for use. */
+ 	pc_sensor_init();
+ out:
+-	/* The deferred cphytest keeps the watchdog alive after this thread ends;
+-	 * pc_probe_callout() is then the one that declares the path finished. */
++	/* The deferred cphytest keeps this thread's probe state open;
++	 * pc_probe_callout() is then the one that declares the path finished.
++	 * 0590: pc_camera_done is probe state only -- it does not cancel the
++	 * deadline/grace armed in pandora_camera_init(). */
+ 	if (!pc_probe_pending)
+ 		pc_camera_done = true;
+ 	/* Deliberately no unmaps anywhere in this file: a one-shot boot diagnostic shares
+@@ -8347,20 +8358,17 @@ pc_wd_thread(void *arg, wait_result_t wr)
+ 	(void)arg;
+ 	(void)wr;
+ 
+-	while (!pc_camera_done) {
+-		if (mach_absolute_time() >= pc_wd_deadline)
+-			break;
++	/* 0590: the deadline is unconditional.  pc_camera_done is probe state
++	 * only; a probe that returned early (or never started) still gets the
++	 * reset here, so a hang after the probe cannot outlive the budget. */
++	while (mach_absolute_time() < pc_wd_deadline) {
+ 		pc_wd_sleep(250);
+ 	}
+-	if (pc_camera_done && !pc_camera_timed_out)
+-		goto out;
+-	{
+-		uint64_t rel;
+-		nanoseconds_to_absolutetime((uint64_t)pc_wd_grace_s * NSEC_PER_SEC,
+-		    &rel);
+-		pc_wd_grace_abs = mach_absolute_time() + rel;
+-	}
+ 	pc_wd_fired = true;
++	if (pc_camera_done) {
++		printf("PANDORA CAMERA: probe path finished; deadline still "
++		    "enforced (done clears probe state only)\n");
++	}
+ 	printf("PANDORA CAMERA: pandora_camera_timeout=%u s reached; orderly "
+ 	    "reboot to Android\n", pc_wd_timeout_s);
+ 	/*
+@@ -8371,7 +8379,6 @@ pc_wd_thread(void *arg, wait_result_t wr)
+ 	int error = reboot_kernel(RB_AUTOBOOT, NULL);
+ 	printf("PANDORA CAMERA: orderly reboot returned %d; hard reset at +%u s\n",
+ 	    error, pc_wd_grace_s);
+-out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+@@ -8382,18 +8389,15 @@ pc_wd_hard_thread(void *arg, wait_result_t wr)
+ 	(void)arg;
+ 	(void)wr;
+ 
+-	/* Idle until the soft watchdog has fired: a healthy camera path must not
+-	 * be reset by a hard deadline armed from boot. */
+-	while (!pc_wd_fired) {
+-		if (pc_camera_done && !pc_camera_timed_out)
+-			goto out;
+-		pc_wd_sleep(250);
+-	}
++	/* 0590: independent hard bound.  pc_wd_grace_abs is deadline + grace,
++	 * armed in pandora_camera_init(); this thread never reads pc_wd_fired or
++	 * pc_camera_done, so a soft thread that failed to start (or blocked in
++	 * reboot_kernel before setting fired) cannot suppress PSCI SYSTEM_RESET.
++	 */
+ 	while (mach_absolute_time() < pc_wd_grace_abs) {
+ 		pc_wd_sleep(250);
+ 	}
+ 	pandora_camera_hard_reset("camera watchdog");
+-out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+@@ -8447,6 +8451,9 @@ pandora_camera_init(void)
+ 		nanoseconds_to_absolutetime((uint64_t)timeout_s * NSEC_PER_SEC,
+ 		    &rel);
+ 		pc_wd_deadline = mach_absolute_time() + rel;
++		nanoseconds_to_absolutetime((uint64_t)grace_s * NSEC_PER_SEC,
++		    &rel);
++		pc_wd_grace_abs = pc_wd_deadline + rel;
+ 	}
+ 	pc_wd_armed = true;
+ 	printf("PANDORA CAMERA: watchdog armed timeout=%u s grace=%u s "
