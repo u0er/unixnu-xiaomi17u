@@ -1,0 +1,12 @@
+diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
+--- a/bsd/dev/pandora_camera.c
++++ b/bsd/dev/pandora_camera.c
+@@ -5953,7 +5953,7 @@ pc_sliceb_xtest(void)
+  * settle count, type 3 is the CDR lane value written with sweep disabled. */
+ struct pc_csiphy_3ph_reg { uint32_t addr; uint32_t val; unsigned delay_us; unsigned type; };
+ static const struct pc_csiphy_3ph_reg pc_csiphy_3ph_base_regs[] = {
+-	{ 0x0094, 0x01, 0, 0 },	/* v71: vendor 3PH SKEW_CAL value (was 0x0d) */
++	{ 0x0094, 0x0d, 0, 0 },	/* v71 wrote 0x01; Android 0x294/0x694/0xA94 read 0x0d */
+ 	{ 0x00f4, 0x00, 0, 0 },
+ 	{ 0x00f8, 0x00, 0, 0 },
+ 	{ 0x00fc, 0x00, 0, 0 },
