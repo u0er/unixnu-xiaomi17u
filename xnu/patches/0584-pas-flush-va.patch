@@ -1,0 +1,64 @@
+diff --git a/bsd/dev/pandora_pas.c b/bsd/dev/pandora_pas.c
+--- a/bsd/dev/pandora_pas.c
++++ b/bsd/dev/pandora_pas.c
+@@ -32,7 +32,6 @@
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+-extern uint64_t kvtophys(vm_offset_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern void pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t *a0,
+     uint64_t *a1);
+@@ -357,6 +356,34 @@ pas_meta_segment(const char *prefix, const char *base, const struct pandora_fw *
+ 	return err;
+ }
+ 
++/*
++ * 0584: flush the metadata through the mapping that owns it.
++ *
++ * flush_dcache64(pa, size, TRUE) turns the physical address into a virtual one with
++ * phystokv_range(), and that function panics for any PA outside the kernel's direct map
++ * (osfmk/arm64/arm_vm_init.c:406, "illegal PA").  The reserved PIL arena sits at 0xdf100000,
++ * below gPhysBase 0x8c0000000, so the 2026-11-26 13:33 boot died 0.226 s in, immediately after
++ * the arena's metadata line:
++ *   phystokv_range: illegal PA: 0xdf118000; phys base 0x8c0000000, size 0xbff00000
++ * (docs/MPSS3_BOOT_2026-11-26.md).  The arena is written through the VA that
++ * ml_io_map_unmappable() returned, so it is flushed through that VA: DC CIVAC over the range,
++ * then dsb sy.  No PA->VA conversion happens on this path, and kvtophys() is no alternative --
++ * it walks the same direct map and would panic on the identical address.
++ *
++ * The kmem_alloc_contig() fallback is ordinary kernel memory whose PA does map, and keeps the
++ * physical flush, which also drives the external caches through cpu_cache_dispatch.
++ */
++static void
++pas_meta_flush(vm_offset_t md, uint64_t md_pa, uint64_t size, bool reserved)
++{
++	if (reserved) {
++		FlushPoC_DcacheRegion(md, (size_t)size);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		return;
++	}
++	flush_dcache64((addr64_t)md_pa, (unsigned)size, TRUE);
++}
++
+ /*
+  * One image: metadata to TrustZone, init, mem setup when relocatable, segments into the carveout.
+  * Returns 0 or an errno; the caller authenticates separately so a two-stage load can be verified
+@@ -537,7 +564,7 @@ pandora_pas_load(const char *prefix, const char *base, unsigned pas, uint64_t me
+ 		pas_meta_free(md, md_size);
+ 		goto out;
+ 	}
+-	flush_dcache64((addr64_t)md_pa, (unsigned)md_size, TRUE);
++	pas_meta_flush(md, md_pa, md_size, reserved);
+ 	pas_enable_shm_bridge();
+ 	uint64_t bridge = pas_bridge_create(md_pa, md_size);
+ 	uint64_t a0 = 0, a1 = 0;
+@@ -851,7 +878,7 @@ pandora_pas_init_only(const char *prefix, const char *base, unsigned pas, uint64
+ 			goto out;
+ 		}
+ 	}
+-	flush_dcache64((addr64_t)md_pa, (unsigned)md_size, TRUE);
++	pas_meta_flush(md, md_pa, md_size, reserved);
+ 	pas_enable_shm_bridge();
+ 	uint64_t probe_bridge = pas_bridge_create(md_pa, md_size);
+ 	uint64_t a0 = 0, a1 = 0, arginfo = SCM_ARGS(2) | (SCM_RW << 6);
