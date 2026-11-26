@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/pandora_mpss.c b/bsd/dev/pandora_mpss.c
+--- a/bsd/dev/pandora_mpss.c
++++ b/bsd/dev/pandora_mpss.c
+@@ -57,6 +57,8 @@
+ #include "pandora_qrtr.h"
+ #include "pandora_ipa.h"
+ #include "pandora_cell.h"
++/* 0597 (lane7 C): force a ring flush at the two step boundaries. */
++extern bool pandora_log_sync(void);
+ 
+ extern kern_return_t thread_terminate(thread_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+@@ -1210,11 +1212,22 @@
+ static bool
+ step_image(void)
+ {
++	/*
++	 * 0597 (lane7 C): the 34 s reset left the log ring with no bytes at all because the
++	 * 43 MB segment load holds sweet_ufs_lock and pl_thread's first flush cannot run.
++	 * These two marks are flushed through pandora_log_sync() before and after the load,
++	 * so "begin" proves the thread reached step 6 and "end" proves the load returned.
++	 */
++	printf("PANDORA MPSS: MARK step_image begin %llu ms\n", mp_ms(mp_t0));
++	(void)pandora_log_sync();
+ 	if (pandora_pas_load(MP_FW_PART, "modem", mp_pas, MP_MEM_PA, MP_MEM_SIZE)) {
+ 		printf("PANDORA MPSS: modem.mdt did not load\n");
++		(void)pandora_log_sync();
+ 		return false;
+ 	}
+ 	mp_image_written = true;
++	printf("PANDORA MPSS: MARK step_image end %llu ms\n", mp_ms(mp_t0));
++	(void)pandora_log_sync();
+ 	return true;
+ }
+ 
+@@ -1409,12 +1422,16 @@
+ 	}
+ 	mp_rails(384);
+ 	mp_mailbox_send("{class: image, res: load_state, name: modem, val: on}");
++	printf("PANDORA MPSS: MARK auth begin %llu ms\n", mp_ms(mp_t0));
++	(void)pandora_log_sync();
+ 	if (pandora_pas_auth(mp_pas)) {
+ 		printf("PANDORA MPSS: TrustZone refused the modem's image\n");
+ 		return false;
+ 	}
+ 	mp_started = true;
+ 	mp_t0 = mach_absolute_time();
++	printf("PANDORA MPSS: MARK auth end %llu ms\n", mp_ms(0));
++	(void)pandora_log_sync();
+ 	printf("PANDORA MPSS: the modem has been let out of reset; watching for its words for %u ms\n", wait_ms);
+ 	for (unsigned waited = 0; waited < wait_ms; waited += 20) {
+ 		mp_ipcc_poll();
