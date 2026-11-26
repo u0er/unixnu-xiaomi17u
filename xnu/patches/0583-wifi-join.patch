@@ -1,0 +1,113 @@
+diff --git a/bsd/dev/pandora_wifi.c b/bsd/dev/pandora_wifi.c
+index 3d4757c..b50c424 100644
+--- a/bsd/dev/pandora_wifi.c
++++ b/bsd/dev/pandora_wifi.c
+@@ -91,6 +91,8 @@ static PeachTx wifi_tx;
+ static PeachStation wifi_station;
+ static PeachRsn wifi_rsn;
+ static PeachNetRequest wifi_request;
++static void wifi_boot_join_parse(void);
++static void wifi_boot_join_submit(void);
+ static unsigned wifi_net_attached, wifi_net_state = PeachNetStarting;
+ static uint32_t wifi_target_window = 0xffffffffu;
+ static uint64_t wifi_context_offset, wifi_dma_next, wifi_check_at;
+@@ -1312,6 +1314,8 @@ static int wifi_mission_start(PeachMhiDma calibration)
+             wifi_wmi.scan_event, wifi_wmi.scan_reason);
+         return 0;
+     }
++    wifi_boot_join_parse();
++    wifi_boot_join_submit();
+     printf("NEZHA WIFI: passive scan completed with %u BSS; awaiting explicit network selection\n",
+         wifi_wmi.bss_count);
+     return 0;
+@@ -1555,6 +1559,7 @@ wifi_thread(void *unused, wait_result_t result)
+         wifi_net_state = PeachNetReady;
+         peach_net_status(&wifi_wmi, wifi_net_state, wifi_wmi.scan_done ? 0 : EAGAIN);
+         wifi_step = "BSD/Apple80211 interface discovery";
++        wifi_boot_join_submit();
+         err = peach_net_attach(wifi_wmi.mac);
+         if (!err) wifi_net_attached = 1;
+     }
+@@ -1615,4 +1620,82 @@ pandora_wifi_init(void)
+     if (!nezha) return;
+     if (kernel_thread_start(wifi_thread, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+ }
++
++/* Windows cannot reach the root-only org.unixnu.nezha.wifi kern_ctl before
++ * userland, and XNU has no nl80211/cfg80211, so pandora_wifi_join=SSID[@bssid]
++ * is the only host-side join trigger. It fills the same PeachNetRequest the
++ * Settings/wifid path fills, and peach_net_request() validates it unchanged. */
++static PeachNetRequest wifi_boot_join_request;
++static unsigned wifi_boot_join_pending, wifi_boot_join_parsed;
++
++static int wifi_join_nibble(char c)
++{
++    if (c >= '0' && c <= '9') return c - '0';
++    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++    return -1;
++}
++
++static unsigned wifi_join_bssid(const char *text, unsigned char bssid[6])
++{
++    for (unsigned i = 0; i < 6; i++) {
++        int hi = wifi_join_nibble(text[i * 3]), lo = wifi_join_nibble(text[i * 3 + 1]);
++        if (hi < 0 || lo < 0 || (i < 5 && text[i * 3 + 2] != ':')) return 0;
++        bssid[i] = (unsigned char)((hi << 4) | lo);
++    }
++    return 1;
++}
++
++/* SSID is 1..32 bytes; the optional "@" tail is a 17-byte unicast BSSID.
++ * A multicast or all-zero tail is dropped (join by SSID) because
++ * peach_net_request() rejects it; the SSID itself is never rewritten. */
++static void wifi_boot_join_parse(void)
++{
++    char spec[40]; /* 32 B SSID, '@', 17 B BSSID, NUL */
++    if (wifi_boot_join_parsed) return;
++    if (!PE_parse_boot_argn("pandora_wifi_join", spec, sizeof(spec))) return;
++    spec[sizeof(spec) - 1] = 0;
++    unsigned len = (unsigned)strnlen(spec, sizeof(spec) - 1);
++    unsigned split = len >= 18 && spec[len - 18] == '@' ? len - 18 : len;
++    if (!split || split > sizeof(wifi_boot_join_request.join.ssid)) {
++        printf("NEZHA WIFI: pandora_wifi_join \"%s\" has a %u-byte SSID; ignored\n", spec, split);
++        return;
++    }
++    unsigned char bssid[6], valid = 0;
++    if (split != len && wifi_join_bssid(spec + split + 1, bssid)) {
++        unsigned multicast = bssid[0] & 1, zero = 1;
++        for (unsigned i = 0; i < 6; i++) zero &= bssid[i] == 0;
++        if (multicast || zero)
++            printf("NEZHA WIFI: pandora_wifi_join BSSID %02x:%02x:%02x:%02x:%02x:%02x is %s; joining by SSID\n",
++                bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
++                multicast ? "multicast" : "unspecified");
++        else valid = 1;
++    }
++    memset(&wifi_boot_join_request, 0, sizeof(wifi_boot_join_request));
++    wifi_boot_join_request.action = PeachControlJoin;
++    wifi_boot_join_request.join.version = PEACH_CONTROL_VERSION;
++    wifi_boot_join_request.join.security = PeachStationOpen;
++    wifi_boot_join_request.join.ssid_bytes = split;
++    memcpy(wifi_boot_join_request.join.ssid, spec, split);
++    wifi_boot_join_request.join.bssid_valid = valid;
++    if (valid) memcpy(wifi_boot_join_request.join.bssid, bssid, 6);
++    wifi_boot_join_pending = wifi_boot_join_parsed = 1;
++    printf("NEZHA WIFI: pandora_wifi_join SSID \"%.*s\" security %u bssid %s\n",
++        (int)split, spec, PeachStationOpen, valid ? "pinned" : "unpinned");
++}
++
++static void wifi_boot_join_submit(void)
++{
++    if (!wifi_boot_join_pending) return;
++    int err = peach_net_request(&wifi_boot_join_request);
++    if (err == EBUSY) return; /* net still Starting; retried once en0 is ready */
++    wifi_boot_join_pending = 0;
++    if (err) printf("NEZHA WIFI: boot join request rejected %d\n", err);
++    else printf("NEZHA WIFI: boot join queued security %u; worker prints manual join\n",
++        wifi_boot_join_request.join.security);
++    volatile unsigned char *secret = (void *)&wifi_boot_join_request;
++    for (size_t i = 0; i < sizeof(wifi_boot_join_request); i++) secret[i] = 0;
++}
++
++
+ #endif
