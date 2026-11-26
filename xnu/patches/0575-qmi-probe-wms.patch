@@ -1,0 +1,12 @@
+diff --git a/bsd/dev/pandora_cell.c b/bsd/dev/pandora_cell.c
+index 5b5a87f..d71be48 100644
+--- a/bsd/dev/pandora_cell.c
++++ b/bsd/dev/pandora_cell.c
+@@ -1193,6 +1193,7 @@ cell_link_server(struct cell_link *link, bool arrived, uint32_t service, uint32_
+ 
+ static const uint32_t cell_probe_services[] = {
+ 	0x0f, 0x2b, 0x33, 0x42, 0x190, 0x301, 0x1399,
++	0x05,   /* WMS: fills the probe's eighth and last lookup slot */
+ };
+ 
+ static struct pandora_qrtr_port *cell_probe_port[CELL_PROBE_PORTS];
