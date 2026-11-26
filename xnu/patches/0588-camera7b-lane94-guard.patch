@@ -1,0 +1,200 @@
+diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
+index e88eadb..93f57dd 100644
+--- a/bsd/dev/pandora_camera.c
++++ b/bsd/dev/pandora_camera.c
+@@ -4674,6 +4674,107 @@ pc_csiphy_settle(uint64_t link_freq, uint32_t timer_rate)
+ 	return (unsigned)(settle_ps / timer_ps - 6);
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * camera7b: guarded C-PHY lane mode word (lane+0x94).
++ *
++ * Android's live dump and the vendor 3-phase table both read 0x0d; every probe
++ * through camera6 wrote 0x01 and still saw CPHY header errors with no EOF.
++ * camera7 (0582) wrote 0x0d from the lane table with no guard and that boot
++ * never came back, so the word is applied here as a single-variable trial with
++ * a hard ceiling: establish 0x01 (the value every earlier boot survived),
++ * write 0x0d, settle, read all three lanes back, wait a bounded time, and on
++ * mismatch/timeout restore 0x01 and report. The wait cannot manufacture a
++ * pass; it only stops a non-answering PHY from holding the boot, and the probe
++ * then continues on the known-good word.
++ * ------------------------------------------------------------------------- */
++#define PC_CPHY_LANE94        0x94u
++#define PC_CPHY_LANE94_SAFE   0x01u
++#define PC_CPHY_LANE94_TRIAL  0x0du
++#define PC_CPHY_REFGEN        0x1184u
++#define PC_CPHY_REFGEN_READY  0x80u
++#define PC_CPHY_RESET         0x1000u
++#define PC_CPHY_RESET_ASSERT  0x01u
++#define PC_CPHY_SETTLE_US     200u
++#define PC_CPHY_TRIAL_MS      100u
++
++/* Write one lane word to all three C-PHY lane banks and read it back. pc_wr()
++ * already reads its own register back; this adds the cross-lane check that a
++ * single table entry cannot express. */
++static int
++pc_cphy_lane94_rw(vm_offset_t phy0, const uint32_t lane_off[3], uint32_t val,
++    uint32_t rb[3])
++{
++	for (unsigned i = 0; i < 3; i++)
++		pc_wr(phy0, lane_off[i] + PC_CPHY_LANE94, val);
++	delay(PC_CPHY_SETTLE_US);
++	for (unsigned i = 0; i < 3; i++)
++		rb[i] = pc_rd(phy0, lane_off[i] + PC_CPHY_LANE94);
++	return (rb[0] == val && rb[1] == val && rb[2] == val) ? 0 : -1;
++}
++
++/* Bounded readiness wait: require_release=0 asks only for refgen up (the word
++ * is written while reset is still asserted); 1 also asks reset to be released. */
++static int
++pc_cphy_wait(vm_offset_t phy0, unsigned budget_ms, int require_release)
++{
++	for (unsigned waited = 0; waited < budget_ms; waited++) {
++		if (pc_rd(phy0, PC_CPHY_REFGEN) & PC_CPHY_REFGEN_READY) {
++			if (!require_release ||
++			    !(pc_rd(phy0, PC_CPHY_RESET) & PC_CPHY_RESET_ASSERT))
++				return 0;
++		}
++		pc_sleep(1);
++	}
++	return -1;
++}
++
++/* Mask every PHY IRQ source in the v25 window. Used on a failed trial so a
++ * dead 0x0d lane cannot leave the BIST/event domain enabled while the probe
++ * continues on 0x01. */
++static void
++pc_cphy_irq_mask(vm_offset_t phy0)
++{
++	for (uint32_t o = 0x102Cu; o <= 0x1054u; o += 4u)
++		pc_wr(phy0, o, 0u);
++}
++
++__attribute__((noinline))
++static int
++pc_cphy_lane94_trial(vm_offset_t phy0, const uint32_t lane_off[3])
++{
++	uint32_t pre[3], rb[3];
++
++	(void)pc_cphy_lane94_rw(phy0, lane_off, PC_CPHY_LANE94_SAFE, pre);
++	if (pc_cphy_lane94_rw(phy0, lane_off, PC_CPHY_LANE94_TRIAL, rb)) {
++		printf("PANDORA SLICEB: camera7b lane94 w=%#x rb=%#x/%#x/%#x "
++		    "mismatch -> restore %#x\n", PC_CPHY_LANE94_TRIAL, rb[0],
++		    rb[1], rb[2], PC_CPHY_LANE94_SAFE);
++		(void)pc_cphy_lane94_rw(phy0, lane_off, PC_CPHY_LANE94_SAFE, rb);
++		pc_cphy_irq_mask(phy0);
++		printf("PANDORA SLICEB: camera7b RESULT lane94=0x01 "
++		    "fallback=readback rb=%#x/%#x/%#x irq=masked\n", rb[0], rb[1], rb[2]);
++		(void)pandora_log_sync();
++		return -1;
++	}
++	if (pc_cphy_wait(phy0, PC_CPHY_TRIAL_MS, 0)) {
++		printf("PANDORA SLICEB: camera7b lane94 CPHY timeout %ums "
++		    "refgen=%#x ctrl0=%#x\n", PC_CPHY_TRIAL_MS,
++		    pc_rd(phy0, PC_CPHY_REFGEN), pc_rd(phy0, PC_CPHY_RESET));
++		(void)pc_cphy_lane94_rw(phy0, lane_off, PC_CPHY_LANE94_SAFE, rb);
++		pc_cphy_irq_mask(phy0);
++		printf("PANDORA SLICEB: camera7b RESULT lane94=0x01 "
++		    "fallback=timeout rb=%#x/%#x/%#x irq=masked\n", rb[0], rb[1], rb[2]);
++		(void)pandora_log_sync();
++		return -1;
++	}
++	printf("PANDORA SLICEB: camera7b RESULT lane94=0x0d trial=ok "
++	    "w=%#x rb=%#x/%#x/%#x pre=%#x/%#x/%#x wait<=%ums\n",
++	    PC_CPHY_LANE94_TRIAL, rb[0], rb[1], rb[2], pre[0], pre[1],
++	    pre[2], PC_CPHY_TRIAL_MS);
++	(void)pandora_log_sync();
++	return 0;
++}
++
+ /* ---------------------------------------------------------------------------
+  * Slice B1: real sensor -> CSIPHY0 -> CSID real RX mux -> RDI0 input events.
+  * Boot arg pandora_csiphy=2 runs slice A (PHY front-end up) and then this.
+@@ -6012,7 +6113,7 @@ pc_sliceb_xtest(void)
+  * settle count, type 3 is the CDR lane value written with sweep disabled. */
+ struct pc_csiphy_3ph_reg { uint32_t addr; uint32_t val; unsigned delay_us; unsigned type; };
+ static const struct pc_csiphy_3ph_reg pc_csiphy_3ph_base_regs[] = {
+-	{ 0x0094, 0x0d, 0, 0 },	/* v71 wrote 0x01; Android 0x294/0x694/0xA94 read 0x0d */
++	{ 0x0094, 0x01, 0, 0 },	/* v71 SKEW_CAL; 0x0d is written only by the camera7b guard */
+ 	{ 0x00f4, 0x00, 0, 0 },
+ 	{ 0x00f8, 0x00, 0, 0 },
+ 	{ 0x00fc, 0x00, 0, 0 },
+@@ -6390,6 +6491,7 @@ pc_sliceb_cphytest(void)
+ 	uint32_t seen_rdi = 0, base = 0, seen_buf = 0;
+ 	unsigned settle = 35u;	/* Android CAM_START_PHYDEV Settlecount */
+ 	int ret = 0;
++	int lane94_ok = 0;
+ 
+ 	pc_csiphy_mark("cphytest start: csiphy0 CPHY 3-lane -> CSID2");
+ 	phy0 = ml_io_map_unmappable(PC_CSIPHY0_PA, 0x2000u, VM_WIMG_IO);
+@@ -6590,6 +6692,9 @@ pc_sliceb_cphytest(void)
+ 		}
+ 	}
+ 	pc_wr(phy0, PC_CSIPHY_V240_LANE_EN, 0x2Au);	/* v70: v65 lane enable */
++	/* camera7b: 0x0d is entered here, after every other lane word and with
++	 * the PHY still in reset, then guarded before the reset release below. */
++	lane94_ok = (pc_cphy_lane94_trial(phy0, lane_off) == 0);
+ 	/* v27: do NOT run Force AON EQ here. Two complete Android dumps contain
+ 	 * zero AON Offset/Val write records and retain the base-table values
+ 	 * (lane+0x94 = 0x0d, +0x90 = 0x02). v26's forced sequence changed these
+@@ -6607,23 +6712,42 @@ pc_sliceb_cphytest(void)
+ 			{ 0x1044u, 0xffu }, { 0x1048u, 0xefu }, { 0x104Cu, 0xffu },
+ 			{ 0x1050u, 0xffu }, { 0x1054u, 0xffu },
+ 		};
+-		for (unsigned pass = 0; pass < 2; pass++) {
++		for (unsigned pass = 0; pass < (lane94_ok ? 2u : 0u); pass++) {
+ 			for (unsigned k = 0; k < 11; k++) {
+ 				pc_wr(phy0, irq[k].addr, irq[k].val);
+ 				if (k == 10)
+ 					delay(100);	/* vendor: 0x64 us on the last entry */
+ 			}
+ 		}
+-		printf("PANDORA SLICEB: cphytest v25 irq window enabled "
+-		    "(0x102C..0x1054 x2 passes)\n");
++		printf("PANDORA SLICEB: cphytest v25 irq window passes=%u "
++		    "lane94=%s\n", lane94_ok ? 2u : 0u,
++		    lane94_ok ? "0x0d" : "0x01-fallback");
+ 		(void)pandora_log_sync();
+ 	}
+ 	pc_wr(phy0, 0x1000u, 0x0Eu);
+-delay(10);
++	delay(10);
++	/* camera7b: the mode word only takes effect at reset release; bound that
++	 * transition too, and mask the PHY IRQ sources before any lane-bank read
++	 * if the released 0x0d lane never reports ready. */
++	if (lane94_ok && pc_cphy_wait(phy0, PC_CPHY_TRIAL_MS, 1)) {
++		uint32_t rb[3];
++
++		printf("PANDORA SLICEB: camera7b post-release CPHY timeout "
++		    "refgen=%#x ctrl0=%#x\n", pc_rd(phy0, PC_CPHY_REFGEN),
++		    pc_rd(phy0, PC_CPHY_RESET));
++		(void)pc_cphy_lane94_rw(phy0, lane_off, PC_CPHY_LANE94_SAFE, rb);
++		pc_cphy_irq_mask(phy0);
++		lane94_ok = 0;
++		printf("PANDORA SLICEB: camera7b RESULT lane94=0x01 "
++		    "fallback=post-release rb=%#x/%#x/%#x irq=masked\n",
++		    rb[0], rb[1], rb[2]);
++		(void)pandora_log_sync();
++	}
+ 	printf("PANDORA SLICEB: cphytest phy ctrl0=%#x lane_en=%#x ctrl6=%#x "
+-	    "ctrl7=%#x common108c=%#x\n", pc_rd(phy0, 0x1000u),
++	    "ctrl7=%#x common108c=%#x lane94=%s\n", pc_rd(phy0, 0x1000u),
+ 	    pc_rd(phy0, PC_CSIPHY_V240_LANE_EN), pc_rd(phy0, 0x1018u),
+-	    pc_rd(phy0, 0x101Cu), pc_rd(phy0, 0x108Cu));
++	    pc_rd(phy0, 0x101Cu), pc_rd(phy0, 0x108Cu),
++	    lane94_ok ? "0x0d" : "0x01-fallback");
+ 	pc_sliceb_cphy_phy_status(phy0, "before-stream");
+ 
+ 	/* v16: Android order. The sensor's streaming state is volatile across a
+@@ -7063,9 +7187,9 @@ delay(10);
+ 	}
+ 	pc_sliceb_cphy_phy_status(phy0, "after-poll");
+ 	printf("PANDORA SLICEB: cphytest RESULT rdi=%#x rup=%u buf_done=%#x "
+-	    "arm=%#x rx_irq=%#x frame_done_irq=none\n", seen_rdi,
++	    "arm=%#x rx_irq=%#x frame_done_irq=none lane94=%s\n", seen_rdi,
+ 	    (seen_rdi & PC_RDIN_RUP_DONE) ? 1u : 0u, seen_buf, base,
+-	    pc_rd(csid2, 0x1b0u));
++	    pc_rd(csid2, 0x1b0u), lane94_ok ? "0x0d" : "0x01-fallback");
+ 	(void)pandora_log_sync();
+ 
+ 	/* v19 TPG-mux bisect, dual test. v18 retargeted CSID2's RX to tpg2 but
