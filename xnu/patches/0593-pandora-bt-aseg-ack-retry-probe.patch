@@ -1,0 +1,366 @@
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+index a31553b..c0773ae 100644
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -1984,13 +1984,28 @@ done:
+  * 284-frame TLV stage, not by the 333 KB bulk. 284 x 1.5 ms costs 0.43 s. */
+ #define BT_PERI_TLV_PACE_US 1500u
+ 
+-/* Level 20.62 (v2055-A follow-up): map A's last-segment ACK budget. The
+- * v2055-A boot measured map A's own tail at 0.501 s (A done 2.145 ->
+- * 2.646), and the map never asked the ROM whether it had consumed the
+- * 284th 243-byte frame: the next command's 0x19 silence was the first
+- * sign. One explicit gate, 3x the measured tail, no retry - a second wait
+- * would only move the same silence 1.5 s later. */
+-#define BT_PERI_ASEG_LAST_ACK_MS 1500u
++/* Level 20.63 (v2061): map A's last-segment ACK budget.
++ *
++ * v2060 asked the ROM and got a negative answer in 1 ms, not 1500 ms: the
++ * shared between-frame reader treated the first non-control byte 0xf9 as
++ * EPROTO (kernel @2.147 "error 100, 1 byte(s)", one ms after the 284th
++ * frame), so the 1500 ms budget never ran. This gate now has its own TLV
++ * reader that logs unknown single bytes as line noise and keeps waiting;
++ * 5000 ms is 10x the measured 0.501 s A tail. The retry path (0593)
++ * re-sends only the final 183-byte frame. B/C and every other phase keep
++ * the shared strict reader and v2060's bytes. */
++#define BT_PERI_ASEG_LAST_ACK_MS 5000u
++/* Level 20.64 (v2061, 0593): after a no-ACK timeout, re-send only
++ * the final frame and wait again. Two retries = three waits; an
++ * explicit NAK (EPROTO) is terminal and is not retried. */
++#define BT_PERI_ASEG_ACK_RETRIES 2u
++/* Level 20.64 (v2061, 0593): non-destructive liveness probe between the first
++ * 5 s wait and the first re-send. v2060's negative answer was one byte f9 with
++ * no statement about the ROM; an fd->fc one-byte handshake (measured 1.455 s
++ * valid on this board) plus a 500 ms record count tells "still committing"
++ * from "stopped" without touching map A, flushing, or resetting the ROM. */
++#define BT_PERI_ASEG_PROBE_MS 300u
++#define BT_PERI_ASEG_RECORD_MS 500u
+ #define BT_PERI_NVM_LAST_ACK_MS 3000u
+ /* Level 20.3/20.4: observation window after the TME-L map download. The ROM's
+  * 63-byte status-2 event arrived ~185 ms into the phase in both earlier runs,
+@@ -4204,6 +4219,70 @@ bt_peri_baud_probe(void)
+ 	pandora_log_sync();
+ }
+ 
++/* Level 20.63 (v2061): map A's tail reader - one TLV event, line noise tolerated.
++ *
++ * The shared bt_peri_wait_sub path treats any byte other than fd/fc/fe/ff as
++ * EPROTO. On the A tail the ROM emits 0xf9 as the last byte of the write
++ * (v2060 kernel @2.147: exactly one byte f9, one ms after the 284th frame),
++ * so the strict reader returned before the 1500 ms budget could apply. This
++ * reader is used by the A-tail gate only: unknown bytes are logged into the
++ * raw dump and ignored, fd still gets fc, and a 34 00 ff record is assembled
++ * normally. Silence stays bounded by the caller's deadline. */
++static int
++bt_peri_aseg_next_event(uint8_t *rx, unsigned cap, unsigned *got, uint64_t deadline,
++    uint8_t *raw, unsigned raw_cap, unsigned *raw_len)
++{
++	unsigned field = 0;
++	int err;
++
++	*got = 0;
++	for (;;) {
++		err = bt_rx_exact(rx, 1, &field, deadline);
++		if (err) {
++			return err;
++		}
++		*got = field;
++		if (rx[0] == 0x34) {
++			break;
++		}
++		if (*raw_len < raw_cap) {
++			raw[(*raw_len)++] = rx[0];
++		}
++		printf("PANDORA BT: PERI TME-L map A last segment: between-frame byte %#x tolerated (%u byte(s))\n",
++		    rx[0], *raw_len);
++		if (rx[0] == 0xfd) {
++			const uint8_t ack = 0xfc;
++
++			err = bt_uart_tx(&ack, 1, "PERI download wake ACK FC");
++			if (err) {
++				return err;
++			}
++		}
++		pandora_log_sync();
++		*got = 0;
++	}
++	err = bt_rx_exact(rx + 1, 3, &field, deadline);
++	*got += field;
++	if (err) {
++		return err;
++	}
++	if (rx[1] != 0 || rx[2] != 0xff) {
++		return EPROTO;
++	}
++	if ((unsigned)rx[3] > cap - 4u) {
++		return EMSGSIZE;
++	}
++	err = bt_rx_exact(rx + 4, rx[3], &field, deadline);
++	*got += field;
++	if (err) {
++		return err;
++	}
++	for (unsigned i = 0; i < *got && *raw_len < raw_cap; i++) {
++		raw[(*raw_len)++] = rx[i];
++	}
++	return 0;
++}
++
+ /* Level 20.62 (v2055-A follow-up): map A's final 243-byte 06 03 segment
+  * now waits for its TLV ACK (34 00 ff 08 f0 01 01 f0 ff <status> 06 <len>).
+  *
+@@ -4215,47 +4294,194 @@ bt_peri_baud_probe(void)
+  * the NVM). status 0 = map A consumed; no ACK or a non-zero status is printed
+  * with the raw bytes and returned, so phase A fails where it failed.
+  *
+- * One attempt, no retry, 1500 ms budget; the caller's B/C path is untouched
+- * and only runs when this gate passes. */
++ * v2061 keeps the gate and its three failure verdicts, but the wait now uses
++ * bt_peri_aseg_next_event() so a 0xf9 trailer cannot cut the budget short.
++ * A non-6 TLV event is logged and skipped (the ROM can still be committing);
++ * an explicit status/subcmd 6 NAK stays terminal, so phase A still
++ * fails where it failed. */
+ static int
+ bt_peri_aseg_last_ack(unsigned seg, unsigned ack_ms, const char *what)
+ {
+ 	static const uint8_t identity[] = { 0xf0, 0x01, 0x01, 0xf0, 0xff };
+-	uint8_t rx[64] = {0};
++	uint8_t rx[512] = {0};
++	uint8_t raw[256] = {0};
++	unsigned rawlen = 0;
+ 	unsigned got = 0;
++	unsigned oversized = 0;
+ 	uint64_t deadline;
+ 	int err;
+ 
+ 	clock_interval_to_deadline(ack_ms, NSEC_PER_MSEC, &deadline);
+-	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x06,
+-	    "PERI TME-L map A last segment");
+-	if (err) {
+-		printf("PANDORA BT: %s: last segment %u no ACK within %u ms (error %d, %u byte(s)); A stage unacknowledged\n",
+-		    what, seg, ack_ms, err, got);
+-		bt_dump("PERI map A last-segment raw", rx, got);
++	for (;;) {
++		err = bt_peri_aseg_next_event(rx, sizeof(rx), &got, deadline,
++		    raw, sizeof(raw), &rawlen);
++		if (err == EMSGSIZE) {
++			if (++oversized > 8u) {
++				err = EOVERFLOW;
++				break;
++			}
++			printf("PANDORA BT: %s: last segment %u: oversized event discarded while waiting for ACK (%u)\n",
++			    what, seg, oversized);
++			pandora_log_sync();
++			continue;
++		}
++		if (err) {
++			break;
++		}
++		if (got >= 11u && rx[10] == 0x06) {
++			if (!memcmp(rx + 4, identity, sizeof(identity)) && rx[9] == 0) {
++				printf("PANDORA BT: %s: last segment %u ACK status 0 subcmd 6 (%u bytes, %u ms budget)\n",
++				    what, seg, got, ack_ms);
++				pandora_log_sync();
++				return 0;
++			}
++			if (got >= 6u && rx[0] == 0x34 && rx[1] == 0 && rx[2] == 0xff &&
++			    memcmp(rx + 4, identity, sizeof(identity))) {
++				printf("PANDORA BT: %s: last segment %u: event is not a TLV ACK (plen %u, class %02x %02x), %u bytes\n",
++				    what, seg, (unsigned)rx[3], (unsigned)rx[4],
++				    (unsigned)rx[5], got);
++			} else {
++				printf("PANDORA BT: %s: last segment %u ACK rejected: status %u (%s) subcmd %u, %u bytes\n",
++				    what, seg, (unsigned)(got >= 10u ? rx[9] : 0xffu),
++				    got >= 10u && rx[9] ? bt_peri_edl_status_name(rx[9]) : "-",
++				    (unsigned)(got >= 11u ? rx[10] : 0xffu), got);
++			}
++			bt_dump("PERI map A last-segment ACK", rx, got);
++			pandora_log_sync();
++			return EPROTO;
++		}
++		printf("PANDORA BT: %s: last segment %u: event is not a TLV ACK (plen %u, class %02x %02x), %u bytes\n",
++		    what, seg, got >= 4u ? (unsigned)rx[3] : 0u,
++		    got >= 5u ? (unsigned)rx[4] : 0u,
++		    got >= 6u ? (unsigned)rx[5] : 0u, got);
+ 		pandora_log_sync();
+-		return err;
+ 	}
+-	if (got < 11u || memcmp(rx + 4, identity, sizeof(identity)) ||
+-	    rx[9] != 0 || rx[10] != 0x06) {
+-		if (got >= 6u && rx[0] == 0x34 && rx[1] == 0 && rx[2] == 0xff &&
+-		    memcmp(rx + 4, identity, sizeof(identity))) {
+-			printf("PANDORA BT: %s: last segment %u: event is not a TLV ACK (plen %u, class %02x %02x), %u bytes\n",
+-			    what, seg, (unsigned)rx[3], (unsigned)rx[4], (unsigned)rx[5], got);
+-		} else {
+-			printf("PANDORA BT: %s: last segment %u ACK rejected: status %u (%s) subcmd %u, %u bytes\n",
+-			    what, seg, (unsigned)(got >= 10u ? rx[9] : 0xffu),
+-			    got >= 10u && rx[9] ? bt_peri_edl_status_name(rx[9]) : "-",
+-			    (unsigned)(got >= 11u ? rx[10] : 0xffu), got);
+-		}
+-		bt_dump("PERI map A last-segment ACK", rx, got);
++	printf("PANDORA BT: %s: last segment %u no ACK within %u ms (error %d, %u byte(s)); A stage unacknowledged\n",
++	    what, seg, ack_ms, err, rawlen);
++	bt_dump("PERI map A last-segment raw", raw, rawlen);
++	pandora_log_sync();
++	return err;
++}
++
++/* Level 20.64 (v2061, 0593): re-send only map A's final frame.
++ *
++ * The 284th frame is 183 bytes and the only thing the ACK gate can attribute
++ * the missing commit to; the other 283 frames stay sent once. The header is
++ * rebuilt with the same 31 00 f0 ff <len+3> 06 <sub> <len> shape and the same
++ * payload bytes, so a re-send is byte-identical to the original final frame.
++ * No flush follows: the ACK may already be in the FIFO and the caller's gate
++ * is the correct reader. */
++static int
++bt_peri_aseg_resend_last(const uint8_t *body, unsigned len, uint8_t sub06, const char *what)
++{
++	uint8_t frame[BT_FW_SEG_MAX + 8u];
++	int err;
++
++	if (len == 0u || len > BT_FW_SEG_MAX) {
++		return EINVAL;
++	}
++	frame[0] = 0x31;
++	frame[1] = 0x00;
++	frame[2] = 0xf0;
++	frame[3] = 0xff;
++	frame[4] = (uint8_t)(len + 3u);
++	frame[5] = 0x06;
++	frame[6] = sub06;
++	frame[7] = (uint8_t)len;
++	for (unsigned i = 0; i < len; i++) {
++		frame[8u + i] = body[i];
++	}
++	err = bt_uart_tx_long(frame, len + 8u, what);
++	if (err == 0) {
++		printf("PANDORA BT: %s: last frame re-sent (%u bytes, same bytes as segment end)\n",
++		    what, len);
+ 		pandora_log_sync();
+-		return EPROTO;
+ 	}
+-	printf("PANDORA BT: %s: last segment %u ACK status 0 subcmd 6 (%u bytes, %u ms budget)\n",
+-	    what, seg, got, ack_ms);
++	return err;
++}
++
++/* Level 20.64 (v2061, 0593): A-tail liveness probe, non-destructive.
++ *
++ * Runs once, after the first 5000 ms wait timed out and before the first
++ * last-frame re-send. Sends the one-byte fd wake, answers a peer fd with fc,
++ * waits up to 300 ms for fc, then records every byte the ROM sends for 500 ms
++ * while counting 34 00 ff record starts and f0 04 records. No flush, no reset
++ * and no re-send happen here: map A's state and the caller's retry are
++ * untouched, and the captured bytes go to their own dump. */
++static void
++bt_peri_aseg_probe(const char *what)
++{
++	static const uint8_t wake = 0xfd, ack = 0xfc;
++	uint8_t raw[256] = {0};
++	unsigned rawlen = 0;
++	unsigned probeb = 0, recordb = 0, records = 0, f004 = 0, fds = 0;
++	uint8_t w0 = 0, w1 = 0, w2 = 0, q0 = 0, q1 = 0;
++	uint64_t deadline;
++	unsigned field = 0;
++	int err, alive = 0;
++
++	clock_interval_to_deadline(BT_PERI_ASEG_PROBE_MS, NSEC_PER_MSEC, &deadline);
++	err = bt_uart_tx(&wake, 1u, "PERI TME-L map A tail probe FD");
++	for (;;) {
++		uint8_t b = 0;
++
++		if (err) {
++			break;
++		}
++		err = bt_rx_exact(&b, 1u, &field, deadline);
++		if (err) {
++			break;
++		}
++		probeb++;
++		if (rawlen < sizeof(raw)) {
++			raw[rawlen++] = b;
++		}
++		if (b == 0xfc) {
++			alive = 1;
++			break;
++		}
++		if (b == 0xfd) {
++			fds++;
++			(void)bt_uart_tx(&ack, 1u, "PERI TME-L map A tail probe wake ACK FC");
++		}
++	}
++	printf("PANDORA BT: %s: PERI TME-L map A tail: fd->fc probe %s, %u byte(s) in %u ms, %u peer fd\n",
++	    what, alive ? "alive (fc)" : (err ? "silent" : "unexpected"), probeb,
++	    BT_PERI_ASEG_PROBE_MS, fds);
++	pandora_log_sync();
++
++	clock_interval_to_deadline(BT_PERI_ASEG_RECORD_MS, NSEC_PER_MSEC, &deadline);
++	for (;;) {
++		uint8_t b = 0;
++
++		err = bt_rx_exact(&b, 1u, &field, deadline);
++		if (err) {
++			break;
++		}
++		recordb++;
++		if (rawlen < sizeof(raw)) {
++			raw[rawlen++] = b;
++		}
++		if (b == 0xfd) {
++			fds++;
++			(void)bt_uart_tx(&ack, 1u, "PERI TME-L map A tail record wake ACK FC");
++		}
++		w0 = w1;
++		w1 = w2;
++		w2 = b;
++		if (w0 == 0x34 && w1 == 0x00 && w2 == 0xff) {
++			records++;
++		}
++		q0 = q1;
++		q1 = b;
++		if (q0 == 0xf0 && q1 == 0x04) {
++			f004++;
++		}
++	}
++	printf("PANDORA BT: %s: PERI TME-L map A tail: record window %u ms, %u byte(s), %u record(s) 34 00 ff, %u f0 04 record(s), %u fd wake(s), %u kept\n",
++	    what, BT_PERI_ASEG_RECORD_MS, recordb, records, f004, fds, rawlen);
++	bt_dump("PERI map A tail probe raw", raw, rawlen);
+ 	pandora_log_sync();
+-	return 0;
+ }
+ 
+ /* Level 20.21: phase A at the trace's own cadence.
+@@ -4340,7 +4566,31 @@ bt_peri_tlv_stage(const uint8_t *fw, unsigned size, const char *what, uint8_t su
+ 	printf("PANDORA BT: %s: %u TX command(s), %llu byte(s) on the wire, no per-frame log\n",
+ 	    what, bt_tx_long_frames, (unsigned long long)bt_tx_long_bytes);
+ 	if (last_ack_ms != 0u) {
+-		err = bt_peri_aseg_last_ack(seg, last_ack_ms, what);
++		unsigned retry = 0;
++		unsigned probed = 0;
++
++		for (;;) {
++			err = bt_peri_aseg_last_ack(seg, last_ack_ms, what);
++			if (err == 0 || err != ETIMEDOUT ||
++			    retry >= BT_PERI_ASEG_ACK_RETRIES) {
++				break;
++			}
++			if (!probed) {
++				bt_peri_aseg_probe(what);
++				probed = 1;
++			}
++			retry++;
++			printf("PANDORA BT: %s: last segment %u no ACK; re-sending only the final %u-byte frame and waiting %u ms again (retry %u/%u)\n",
++			    what, seg, last, last_ack_ms, retry,
++			    BT_PERI_ASEG_ACK_RETRIES);
++			pandora_log_sync();
++			err = bt_peri_aseg_resend_last(fw + size - last, last, sub06, what);
++			if (err) {
++				printf("PANDORA BT: %s: last segment %u re-send failed (error %d)\n",
++				    what, seg, err);
++				break;
++			}
++		}
+ 		if (err) {
+ 			pandora_log_sync();
+ 			return err;
