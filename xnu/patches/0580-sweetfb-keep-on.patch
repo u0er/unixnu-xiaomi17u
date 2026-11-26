@@ -1,0 +1,26 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 34577cd..2b0bdf4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2462,6 +2462,21 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
++			/*
++			 * 0580: keep the panel on for the whole bounded boot (demo / visual verification).
++			 * backboardd auto-locks a few seconds after its first swap and sends this request,
++			 * which blanks exactly the frame we want to inspect. sweetfb_keep_on=1 logs the
++			 * request and ignores it; no other behaviour changes.
++			 */
++			static int keep_on = -1;
++			if (keep_on < 0) {
++				uint32_t on = 0;
++				keep_on = (PE_parse_boot_argn("sweetfb_keep_on", &on, sizeof(on)) && on) ? 1 : 0;
++			}
++			if (off && keep_on) {
++				IOLog("SWEET FB: display off suppressed (sweetfb_keep_on)\n");
++				break;
++			}
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
