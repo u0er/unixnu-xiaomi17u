@@ -1,0 +1,87 @@
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+index 71ec5b5..2072c6f 100644
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -1995,6 +1995,10 @@ done:
+  * re-sends only the final 183-byte frame. B/C and every other phase keep
+  * the shared strict reader and v2060's bytes. */
+ #define BT_PERI_ASEG_LAST_ACK_MS 5000u
++/* Level 20.64 (v2061, 0593): after a no-ACK timeout, re-send only
++ * the final frame and wait again. Two retries = three waits; an
++ * explicit NAK (EPROTO) is terminal and is not retried. */
++#define BT_PERI_ASEG_ACK_RETRIES 2u
+ #define BT_PERI_NVM_LAST_ACK_MS 3000u
+ /* Level 20.3/20.4: observation window after the TME-L map download. The ROM's
+  * 63-byte status-2 event arrived ~185 ms into the phase in both earlier runs,
+@@ -4352,6 +4356,43 @@ bt_peri_aseg_last_ack(unsigned seg, unsigned ack_ms, const char *what)
+ 	return err;
+ }
+ 
++/* Level 20.64 (v2061, 0593): re-send only map A's final frame.
++ *
++ * The 284th frame is 183 bytes and the only thing the ACK gate can attribute
++ * the missing commit to; the other 283 frames stay sent once. The header is
++ * rebuilt with the same 31 00 f0 ff <len+3> 06 <sub> <len> shape and the same
++ * payload bytes, so a re-send is byte-identical to the original final frame.
++ * No flush follows: the ACK may already be in the FIFO and the caller's gate
++ * is the correct reader. */
++static int
++bt_peri_aseg_resend_last(const uint8_t *body, unsigned len, uint8_t sub06, const char *what)
++{
++	uint8_t frame[BT_FW_SEG_MAX + 8u];
++	int err;
++
++	if (len == 0u || len > BT_FW_SEG_MAX) {
++		return EINVAL;
++	}
++	frame[0] = 0x31;
++	frame[1] = 0x00;
++	frame[2] = 0xf0;
++	frame[3] = 0xff;
++	frame[4] = (uint8_t)(len + 3u);
++	frame[5] = 0x06;
++	frame[6] = sub06;
++	frame[7] = (uint8_t)len;
++	for (unsigned i = 0; i < len; i++) {
++		frame[8u + i] = body[i];
++	}
++	err = bt_uart_tx_long(frame, len + 8u, what);
++	if (err == 0) {
++		printf("PANDORA BT: %s: last frame re-sent (%u bytes, same bytes as segment end)\n",
++		    what, len);
++		pandora_log_sync();
++	}
++	return err;
++}
++
+ /* Level 20.21: phase A at the trace's own cadence.
+  *
+  * The 4 ms/segment pacing 20.13 introduced was a guess made before the Android
+@@ -4434,7 +4475,26 @@ bt_peri_tlv_stage(const uint8_t *fw, unsigned size, const char *what, uint8_t su
+ 	printf("PANDORA BT: %s: %u TX command(s), %llu byte(s) on the wire, no per-frame log\n",
+ 	    what, bt_tx_long_frames, (unsigned long long)bt_tx_long_bytes);
+ 	if (last_ack_ms != 0u) {
+-		err = bt_peri_aseg_last_ack(seg, last_ack_ms, what);
++		unsigned retry = 0;
++
++		for (;;) {
++			err = bt_peri_aseg_last_ack(seg, last_ack_ms, what);
++			if (err == 0 || err != ETIMEDOUT ||
++			    retry >= BT_PERI_ASEG_ACK_RETRIES) {
++				break;
++			}
++			retry++;
++			printf("PANDORA BT: %s: last segment %u no ACK; re-sending only the final %u-byte frame and waiting %u ms again (retry %u/%u)\n",
++			    what, seg, last, last_ack_ms, retry,
++			    BT_PERI_ASEG_ACK_RETRIES);
++			pandora_log_sync();
++			err = bt_peri_aseg_resend_last(fw + size - last, last, sub06, what);
++			if (err) {
++				printf("PANDORA BT: %s: last segment %u re-send failed (error %d)\n",
++				    what, seg, err);
++				break;
++			}
++		}
+ 		if (err) {
+ 			pandora_log_sync();
+ 			return err;
