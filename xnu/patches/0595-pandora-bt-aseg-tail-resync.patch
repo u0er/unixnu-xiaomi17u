@@ -1,0 +1,276 @@
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+index c0773ae..15f3d47 100644
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -4219,68 +4219,199 @@ bt_peri_baud_probe(void)
+ 	pandora_log_sync();
+ }
+ 
+-/* Level 20.63 (v2061): map A's tail reader - one TLV event, line noise tolerated.
++/* Level 20.65 (v2062, 0595): map A's tail reader - resynchronising, never fatal.
+  *
+- * The shared bt_peri_wait_sub path treats any byte other than fd/fc/fe/ff as
+- * EPROTO. On the A tail the ROM emits 0xf9 as the last byte of the write
+- * (v2060 kernel @2.147: exactly one byte f9, one ms after the 284th frame),
+- * so the strict reader returned before the 1500 ms budget could apply. This
+- * reader is used by the A-tail gate only: unknown bytes are logged into the
+- * raw dump and ignored, fd still gets fc, and a 34 00 ff record is assembled
+- * normally. Silence stays bounded by the caller's deadline. */
++ * v2061 made an unknown byte (0xf9) tolerable but still returned EPROTO on a
++ * 0x34 that was not a 34 00 ff header, and its own boot proved that reading
++ * wrong: 22 ms after the first last-frame re-send the ROM emitted a 62-byte
++ * high-entropy burst with an unaligned 0x34, the reader returned EPROTO
++ * (kernel @7.684 "error 100, 62 byte(s)"), and phase A ended while the ROM was
++ * still alive (fd->fc answered, 4 records per 500 ms in the probe window).
++ *
++ * This reader keeps the same budget and the same fd->fc rule, but framing is
++ * no longer an error:
++ *  - only the complete token 34 00 ff <len 04..ff> is a header. A lone 0x34,
++ *    a 34 xx with xx != 00, a 34 00 xx with xx != ff, and a 34 00 ff with
++ *    len < 4 are line noise: counted and kept in the raw dump, then skipped.
++ *  - inside a record body a 34 00 ff triplet is a record boundary: the
++ *    partial body is discarded into the raw dump and the reader restarts at
++ *    that header. The map A tail body is a high-entropy dump, so a pattern
++ *    hit is a boundary by design; only the caller's deadline stops the walk.
++ *  - framing never returns EPROTO: ETIMEDOUT (budget), EMSGSIZE (an
++ *    oversized record, drained) or 0 (a complete event) are the only exits.
++ */
+ static int
+ bt_peri_aseg_next_event(uint8_t *rx, unsigned cap, unsigned *got, uint64_t deadline,
+     uint8_t *raw, unsigned raw_cap, unsigned *raw_len)
+ {
++	uint8_t win[3] = {0};
++	unsigned have = 0, noise = 0, resyncs = 0;
++	unsigned body_have = 0;
+ 	unsigned field = 0;
++	bool in_body = false;
+ 	int err;
+ 
+ 	*got = 0;
++	if (cap < 4u) {
++		return EINVAL;
++	}
+ 	for (;;) {
+-		err = bt_rx_exact(rx, 1, &field, deadline);
++		uint8_t len = 0;
++		unsigned i;
++
++		/* Header hunt: only a complete 34 00 ff starts a record. */
++		for (;;) {
++			uint8_t b = 0;
++
++			if (have == 3u && win[0] == 0x34u && win[1] == 0x00u &&
++			    win[2] == 0xffu) {
++				break;
++			}
++			err = bt_rx_exact(&b, 1u, &field, deadline);
++			if (err) {
++				goto out;
++			}
++			if (b == 0xfd) {
++				const uint8_t ack = 0xfc;
++
++				err = bt_uart_tx(&ack, 1u,
++				    "PERI TME-L map A tail wake ACK FC");
++				if (err) {
++					goto out;
++				}
++			}
++			if (have == 3u) {
++				if (!(win[0] == 0x34u && win[1] == 0x00u &&
++				    win[2] == 0xffu)) {
++					if (noise < 5u) {
++						printf("PANDORA BT: PERI map A tail: between-frame byte %#x tolerated (%u byte(s))\n",
++						    win[0], noise + 1u);
++					}
++					if (*raw_len < raw_cap) {
++						raw[(*raw_len)++] = win[0];
++					}
++					noise++;
++				}
++				win[0] = win[1];
++				win[1] = win[2];
++				win[2] = b;
++			} else {
++				win[have++] = b;
++			}
++		}
++		rx[0] = 0x34;
++		rx[1] = 0x00;
++		rx[2] = 0xff;
++		err = bt_rx_exact(&len, 1u, &field, deadline);
+ 		if (err) {
+-			return err;
++			goto out;
+ 		}
+-		*got = field;
+-		if (rx[0] == 0x34) {
+-			break;
++		if (len < 4u) {
++			if (noise < 5u) {
++				printf("PANDORA BT: PERI map A tail: false header 34 00 ff %02x treated as line noise\n",
++				    (unsigned)len);
++			}
++			if (*raw_len + 4u <= raw_cap) {
++				raw[(*raw_len)++] = 0x34;
++				raw[(*raw_len)++] = 0x00;
++				raw[(*raw_len)++] = 0xff;
++				raw[(*raw_len)++] = len;
++			}
++			noise += 4u;
++			have = 0;
++			continue;
+ 		}
+-		if (*raw_len < raw_cap) {
+-			raw[(*raw_len)++] = rx[0];
++		rx[3] = len;
++		if ((unsigned)len > cap - 4u) {
++			uint8_t sink[64];
++			unsigned left = len;
++
++			while (left) {
++				unsigned take = left > sizeof(sink) ? sizeof(sink) : left;
++				unsigned got2 = 0;
++
++				err = bt_rx_exact(sink, take, &got2, deadline);
++				if (err) {
++					goto out;
++				}
++				left -= got2;
++			}
++			printf("PANDORA BT: PERI map A tail: record plen %u exceeds the %u-byte buffer, body drained\n",
++			    (unsigned)len, cap);
++			pandora_log_sync();
++			return EMSGSIZE;
+ 		}
+-		printf("PANDORA BT: PERI TME-L map A last segment: between-frame byte %#x tolerated (%u byte(s))\n",
+-		    rx[0], *raw_len);
+-		if (rx[0] == 0xfd) {
+-			const uint8_t ack = 0xfc;
++		*got = 4u;
++		have = 0;
++		body_have = 0;
++		in_body = true;
++		for (i = 0; i < len; i++) {
++			uint8_t b = 0;
+ 
+-			err = bt_uart_tx(&ack, 1, "PERI download wake ACK FC");
++			err = bt_rx_exact(&b, 1u, &field, deadline);
+ 			if (err) {
+-				return err;
++				goto out;
++			}
++			if (b == 0xfd) {
++				const uint8_t ack = 0xfc;
++
++				err = bt_uart_tx(&ack, 1u,
++				    "PERI TME-L map A tail wake ACK FC");
++				if (err) {
++					goto out;
++				}
++			}
++			rx[4u + i] = b;
++			body_have = i + 1u;
++			if (have == 3u) {
++				/* The retired byte is record payload, not line noise: it is
++				 * kept in rx and dumped only if this body is discarded at a
++				 * boundary (or the budget expires inside it). */
++				win[0] = win[1];
++				win[1] = win[2];
++				win[2] = b;
++			} else {
++				win[have++] = b;
++			}
++			if (have == 3u && win[0] == 0x34u && win[1] == 0x00u &&
++			    win[2] == 0xffu) {
++				unsigned disc = (i >= 2u) ? i - 2u : 0u;
++				unsigned k;
++
++				for (k = 0; k < disc && *raw_len < raw_cap; k++) {
++					raw[(*raw_len)++] = rx[4u + k];
++				}
++				resyncs++;
++				in_body = false;
++				printf("PANDORA BT: PERI map A tail: 34 00 ff boundary after %u byte(s) of a %u-byte body, resyncing (%u)\n",
++				    i + 1u, (unsigned)len, resyncs);
++				pandora_log_sync();
++				have = 3u;
++				*got = 3u;
++				break;
++			}
++			if (i + 1u == (unsigned)len) {
++				in_body = false;
++				*got = 4u + len;
++				return 0;
+ 			}
+ 		}
+-		pandora_log_sync();
+-		*got = 0;
+-	}
+-	err = bt_rx_exact(rx + 1, 3, &field, deadline);
+-	*got += field;
+-	if (err) {
+-		return err;
+-	}
+-	if (rx[1] != 0 || rx[2] != 0xff) {
+-		return EPROTO;
+ 	}
+-	if ((unsigned)rx[3] > cap - 4u) {
+-		return EMSGSIZE;
+-	}
+-	err = bt_rx_exact(rx + 4, rx[3], &field, deadline);
+-	*got += field;
+-	if (err) {
+-		return err;
++
++out:
++	if (in_body && body_have) {
++		unsigned k;
++
++		for (k = 0; k < body_have && *raw_len < raw_cap; k++) {
++			raw[(*raw_len)++] = rx[4u + k];
++		}
+ 	}
+-	for (unsigned i = 0; i < *got && *raw_len < raw_cap; i++) {
+-		raw[(*raw_len)++] = rx[i];
++	if (noise || resyncs || in_body) {
++		printf("PANDORA BT: PERI map A tail resync summary: %u noise byte(s), %u boundary resync(s), %u byte(s) kept, error %d\n",
++		    noise, resyncs, *raw_len, err);
++		pandora_log_sync();
+ 	}
+-	return 0;
++	return err;
+ }
+ 
+ /* Level 20.62 (v2055-A follow-up): map A's final 243-byte 06 03 segment
+@@ -4296,9 +4427,11 @@ bt_peri_aseg_next_event(uint8_t *rx, unsigned cap, unsigned *got, uint64_t deadl
+  *
+  * v2061 keeps the gate and its three failure verdicts, but the wait now uses
+  * bt_peri_aseg_next_event() so a 0xf9 trailer cannot cut the budget short.
+- * A non-6 TLV event is logged and skipped (the ROM can still be committing);
+- * an explicit status/subcmd 6 NAK stays terminal, so phase A still
+- * fails where it failed. */
++ * v2062/0595 makes that reader resynchronise: an unaligned 0x34, a 34 xx and
++ * a 34 00 ff that begins inside a body are line noise or a new boundary, not
++ * EPROTO. A non-6 TLV event is still logged and skipped (the ROM can still be
++ * committing); an explicit status/subcmd 6 NAK stays terminal, so phase A
++ * still fails where it honestly failed. */
+ static int
+ bt_peri_aseg_last_ack(unsigned seg, unsigned ack_ms, const char *what)
+ {
+@@ -4325,6 +4458,15 @@ bt_peri_aseg_last_ack(unsigned seg, unsigned ack_ms, const char *what)
+ 			pandora_log_sync();
+ 			continue;
+ 		}
++		if (err == EPROTO) {
++			/* Level 20.65 (v2062, 0595): framing must not end the stage. The
++			 * reader no longer returns EPROTO for a bad 34/34 00ff shape, but
++			 * this guard keeps the old contract observable if one leaks. */
++			printf("PANDORA BT: %s: last segment %u: framing EPROTO ignored, A tail keeps waiting (%u ms budget)\n",
++			    what, seg, ack_ms);
++			pandora_log_sync();
++			continue;
++		}
+ 		if (err) {
+ 			break;
+ 		}
