@@ -1,0 +1,68 @@
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -2032,7 +2032,7 @@
+  * window by bytes before any DEAD verdict. Protocol frames, ack_ms, the
+  * 0x19 windows and the 0602/0620 withhold rules are untouched.
+  *
+- * 0622b-B (v2068): the only change is the drain budget, see D1 below.
++ * 0622b-C (v2069): the only change is the drain budget, see D1 below.
+  * pandora_bt_recovery: 0 (default) defers the arm when the stream never
+  * goes quiet; 1/2 are reserved for 0622b's ladder and here only relax that
+  * deferral, because the ladder does not exist in this build.
+@@ -2041,9 +2041,9 @@
+ #define BT_PERI_MAP_A_RECOVERY_OFF  0
+ #define BT_PERI_MAP_A_RECOVERY_ON   1
+ #define BT_PERI_MAP_A_RECOVERY_FULL 2
+-#define BT_STREAM_MAX_MS            12000u
++#define BT_STREAM_MAX_MS            24000u
+ #define BT_STREAM_QUIET_MS          200u
+-#define BT_STREAM_MAX_BYTES         524288u
++#define BT_STREAM_MAX_BYTES         1048576u
+ #define BT_STREAM_ALIVE_MIN_BYTES   1024u
+ #define BT_STREAM_ALIVE_MIN_SPAN_MS 300u
+ #define BT_POST_RESET_WINDOW_MS     500u
+@@ -4432,7 +4432,7 @@
+ /* One place for the version the driver prints. It used to be a literal inside the
+  * banner and fell seven levels behind (the log said 20.24 while the code was
+  * 20.35), which makes any post-hoc reading of a log attribute the wrong revision. */
+-#define BT_PERI_VER "20.38B"
++#define BT_PERI_VER "20.39C"
+ 
+ /* Level 20.43: drain the line to silence, the way upstream qbt_geni does.
+  *
+@@ -5721,17 +5721,19 @@
+ }
+ 
+ 
+-/* Level 20.70 (v2068, 0622b-B): D1 bulk drain, wider budget. 0621's quiesce called
++/* Level 20.71 (v2069, 0622b-C): D1 bulk drain, 24 s window. 0621's quiesce called
+  * bt_rx_exact() for one byte and bt_sleep(1000) when empty; bt_sleep takes
+  * microseconds, so an empty poll cost 1 ms (about 1 B/ms) while the ROM
+  * emitted 15,980 B/s. The FIFO never drained and "quiet" was never reached.
+  * This takes the whole RX FIFO word count per read and polls every 50 us.
+  *
+- * 0622b-B keeps the drain's ACK and gives it twice the budget: 12,000 ms
+- * and 524,288 B. At bt2066's measured 29,534 B/s the time cap binds
+- * first (about 354 KB), so the byte cap is the backstop and the ring
+- * says which cap ended the wait. Arm 4 s + 12 s stays inside the 45 s
+- * watchdog. */
++ * 0622b-C keeps the drain's ACK and doubles the window again: 24,000 ms
++ * and 1,048,576 B. At bt2066's measured 29,534 B/s the time cap binds
++ * first (about 709 KB), so the byte cap is the backstop. The point is
++ * the 512 KiB-dump hypothesis: at bt2068's 28,961 B/s a 524,288 B dump
++ * would end at 18.10 s, leaving 5.90 s of quiet inside this window and
++ * opening the 200 ms arm gate. Arm 4 s + 24 s + a <= 4.5 s reset chain
++ * stays inside the 45 s watchdog. */
+ static unsigned
+ bt_peri_stream_drain(unsigned max_ms, unsigned quiet_ms, unsigned max_bytes,
+     const char *what, struct bt_peri_stream_obs *obs)
+@@ -6115,7 +6117,7 @@
+ 	    (unsigned)sizeof(pandora_peri_tmel_elf),
+ 	    (unsigned)sizeof(pandora_peri_tmel_mbn),
+ 	    (unsigned)sizeof(pandora_peri_tmel_nvm));
+-	printf("PANDORA BT: map A reset policy %d, recovery %d (v2068 0622b-B: drain 12000 ms / 524288 B)\n",
++	printf("PANDORA BT: map A reset policy %d, recovery %d (v2069 0622b-C: drain 24000 ms / 1048576 B)\n",
+ 	    bt_map_a_reset_arm, bt_map_a_recovery);
+ 	pandora_log_sync();
+ 	/* Level 20.19: GetVer(00) and ActivateSS now happen in the level-19 chain
