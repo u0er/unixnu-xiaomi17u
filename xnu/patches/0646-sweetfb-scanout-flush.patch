@@ -1,0 +1,46 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2b0bdf4..1d09727 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -297,6 +297,27 @@ sweetfb_gpu_frames(void)
+ 	return on != 0;
+ }
+ 
++/* Patch 0646: with fill=1 the pipes read the client's surface straight from memory, and
++ * the only cache maintenance on that surface is the Metal client's own -finish flush,
++ * which runs after the fence the framebuffer waits on (ctc 0.9-2.9 ms in the img26g ring).
++ * A cacheable writer's dirty lines can therefore still sit in the CPU when the pipes latch
++ * the frame, and the screen shows a mix of this frame and the one before. img26i runs it by
++ * default: the scanned rectangle is cleaned right before the pipes are given it, the one
++ * ordering the display can rely on; sweetfb_scan_flush=0 restores the pre-0646 bytes. */
++static bool
++sweetfb_scan_flush(void)
++{
++	static int on = -1;
++	if (on < 0) {
++		on = 1;
++		PE_parse_boot_argn("sweetfb_scan_flush", &on, sizeof(on));
++		if (on) {
++			IOLog("SWEET FB: scanout flush on (sweetfb_scan_flush=1 default; =0 off): surfaces cleaned before the pipes read them\n");
++		}
++	}
++	return on != 0;
++}
++
+ /* LANE_ISLAND: UIKit frame {{132.5, 12.875}, {110, 32}} on the 375 pt logical
+  * screen, radius 16. Both paths rasterize that one integer box, so a UIKit
+  * aperture and this capsule cannot show a second black edge. */
+@@ -1590,6 +1611,13 @@ AppleCLCD::scanPresent(const uint8_t *rec, uint32_t mask)
+ 	    get32(a, 0) == 0 && get32(a, 4) == 0 && get32(a, 8) == s->width && get32(a, 12) == s->height &&
+ 	    get32(b, 0) == 0 && get32(b, 4) == 0 && get32(b, 8) == fLogicalW && get32(b, 12) == fLogicalH;
+ 	const uint32_t iova = ok ? scanIova(s) : 0;
++	/* 0646: the pipes read this surface uncached; whatever wrote it through a cacheable
++	 * mapping must reach memory first. After presentLoop's fence wait, so the client's
++	 * last writes are covered too. */
++	if (iova != 0 && s->kernelAddress() != 0 && sweetfb_scan_flush()) {
++		flush_dcache((vm_offset_t)(s->kernelAddress() + s->offset),
++		    (unsigned)((uint64_t)s->bytesPerRow * s->height), FALSE);
++	}
+ 	if (iova == 0 || !pandora_scanout_show(iova + s->offset, s->bytesPerRow, s->width, s->height, fFill)) {
+ 		if (ok && fScanRefused++ < 8) {
+ 			IOLog("SWEET FB: scanout refused surface %u (map %#x)\n", s->id, iova);

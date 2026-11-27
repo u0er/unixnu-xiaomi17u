@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/pandora_dpu.c b/bsd/dev/pandora_dpu.c
+index 1811c74..837a91b 100644
+--- a/bsd/dev/pandora_dpu.c
++++ b/bsd/dev/pandora_dpu.c
+@@ -389,6 +389,7 @@ static struct {
+ 	unsigned tnext, bank, smr;
+ 	uint32_t panel_s2cr, cb_off;
+ 	uint32_t saved[SC_PIPES][SC_SAVED], saved_qop[SC_PIPES];
++	uint32_t fmt, pat;              /* REC0 format/unpack the pipes read the surface with */
+ 	uint32_t panel_addr;            /* what the pipes read before (0xfc800000) */
+ 	bool slot_used[SC_SLOTS];
+ 	uint64_t shows, faults;
+@@ -617,6 +618,28 @@ pandora_scanout_init(void)
+ 		}
+ 		sc.saved_qop[p] = dpu_rd(sc_qseed[p] + SC_Q_OP_MODE);
+ 	}
++	/* Patch 0648: the 0560/0561 format work never reached the built kernel (an img26e/img26g
++	 * byte scan finds no "pipe format" string), so the pipes kept the bootloader's format and
++	 * unpack, which describe its own framebuffer, not the 32-bit BGRA iOS surface. Program the
++	 * mdp4 mapping (A<<24)|(B<<16)|(G<<8)|R for BGRA. pandora_fmt/pandora_up override the pair
++	 * for a boot without a rebuild; pandora_scanout_fmt=0 or pandora_fmt=0 keeps the
++	 * bootloader's values. */
++	sc.fmt = 0x000236ffu;
++	sc.pat = 0x03010002u;
++	{
++		int on = 1;
++		(void)PE_parse_boot_argn("pandora_scanout_fmt", &on, sizeof(on));
++		(void)PE_parse_boot_argn("pandora_fmt", &sc.fmt, sizeof(sc.fmt));
++		(void)PE_parse_boot_argn("pandora_up", &sc.pat, sizeof(sc.pat));
++		if (!on || sc.fmt == 0) {
++			sc.fmt = 0;
++		}
++	}
++	for (unsigned p = 0; sc.fmt && p < SC_PIPES; p++) {
++		dpu_wr(sc_rec[p] + 0x0, sc.fmt);
++		dpu_wr(sc_rec[p] + 0x4, sc.pat);
++	}
++	printf("PANDORA SCANOUT: pipe format %08x unpack %08x\n", sc.fmt, sc.pat);
+ 	sc.on_panel = true;
+ 	sc.ready = true;
+ 	printf("PANDORA SCANOUT: the display reads through bank %u's tables, no fault: frames can be scanned out\n", sc.bank);
+@@ -688,6 +711,12 @@ pandora_scanout_show(uint32_t addr, uint32_t stride, uint32_t w, uint32_t h, boo
+ 			dh = h;
+ 		}
+ 		const uint32_t r = sc_rec[p], q = sc_qseed[p];
++		/* 0648: panel() restores the saved block, which holds no format register: keep the
++		 * pair programmed on every frame the pipes take a surface. */
++		if (sc.fmt) {
++			dpu_wr(r + 0x0, sc.fmt);
++			dpu_wr(r + 0x4, sc.pat);
++		}
+ 		dpu_wr(r + SC_SRC0_ADDR, addr);
+ 		dpu_wr(r + SC_YSTRIDE0, stride & 0xffff);
+ 		dpu_wr(r + SC_SRC_SIZE, (h << 16) | sw);

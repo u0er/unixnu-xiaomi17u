@@ -1,0 +1,17 @@
+diff --git a/bsd/dev/pandora_dpu.c b/bsd/dev/pandora_dpu.c
+index 837a91b..d26762c 100644
+--- a/bsd/dev/pandora_dpu.c
++++ b/bsd/dev/pandora_dpu.c
+@@ -743,7 +743,11 @@ pandora_scanout_show(uint32_t addr, uint32_t stride, uint32_t w, uint32_t h, boo
+ 			dpu_wr(q + SC_Q_SRC_SIZE_UV, sw | (h << 16));
+ 			dpu_wr(q + SC_Q_DST_SIZE, dw | (dh << 16));
+ 			/* enable, Y/RGB filter bilinear (3), blend, non-DX format, alpha bilinear (1) */
+-			dpu_wr(q + SC_Q_OP_MODE, 1u | (3u << 16) | (1u << 31) | (1u << 14) | (1u << 10) | (1u << 29));
++			/* 0650: img26i carries img26h's proven XRGB op mode. fill=1 hands the pipes an
++			 * opaque BGRA surface; QSEED's alpha (BIT10/BIT29) and blend (BIT31) turned it
++			 * pure blue while the surface itself was clean. Keep enable, bilinear RGB and
++			 * non-DX; alpha and blend off. img26h proved this word via prelink patch. */
++			dpu_wr(q + SC_Q_OP_MODE, 0x00034401u);
+ 		} else {
+ 			dpu_wr(r + SC_OP_MODE, sc.saved[p][0]);
+ 			dpu_wr(q + SC_Q_OP_MODE, sc.saved_qop[p]);

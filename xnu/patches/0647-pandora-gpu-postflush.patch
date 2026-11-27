@@ -1,0 +1,41 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index ae76e1b..406425b 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -2157,6 +2157,25 @@ ring_put_n(uint32_t op, const uint32_t *p, uint32_t n)
+ 	}
+ }
+ 
++/* Patch 0647: the fence that follows is what the framebuffer waits on before the pipes
++ * read a surface, and a retired fence only says the IB is done, not that its writes left
++ * the GPU's caches. pandora_gpu_postflush=1 flushes them and waits for idle before the
++ * timestamp, so a retired fence means the writes are in memory. img26i runs it by default;
++ * pandora_gpu_postflush=0 restores the pre-0647 ring bytes. */
++static bool
++gpu_postflush(void)
++{
++	static int on = -1;
++	if (on < 0) {
++		on = 1;
++		PE_parse_boot_argn("pandora_gpu_postflush", &on, sizeof(on));
++		if (on) {
++			printf("PANDORA GPU: post-IB cache flush on (pandora_gpu_postflush=1 default; =0 off)\n");
++		}
++	}
++	return on != 0;
++}
++
+ /* One submission as a7xx_submit (Linux) and NativeAdrenoRing frame it: BR, the context entry of
+  * a6xx_set_pagetable on the first one, cache flush and invalidate, THREAD (BR 1 or BOTH 3) and
+  * IFPC off, the IB, then the fence: scratch, CCU invalidates, BV timestamp, BR waits for it,
+@@ -2193,6 +2212,10 @@ gpu_submit(const uint64_t *ib, const uint32_t *dwords, unsigned n, uint32_t thre
+ 		const uint32_t ibp[3] = { (uint32_t)ib[i], (uint32_t)(ib[i] >> 32), dwords[i] };
+ 		ring_put_n(0x3f, ibp, 3);                        /* CP_INDIRECT_BUFFER */
+ 	}
++	if (gpu_postflush()) {
++		v = 0x32; ring_put_n(0x46, &v, 1);               /* CACHE_FLUSH7 */
++		ring_put_n(0x26, NULL, 0);                       /* CP_WAIT_FOR_IDLE */
++	}
+ 	ring_put(pkt4(CP_SCRATCH_GLOBAL2, 1));
+ 	ring_put(seq);
+ 	v = 1; ring_put_n(0x17, &v, 1);
