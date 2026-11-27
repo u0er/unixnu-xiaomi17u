@@ -1,0 +1,74 @@
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -2032,6 +2032,7 @@
+  * window by bytes before any DEAD verdict. Protocol frames, ack_ms, the
+  * 0x19 windows and the 0602/0620 withhold rules are untouched.
+  *
++ * 0622b-A (v2067): the only change is the drain's answer, see D1 below.
+  * pandora_bt_recovery: 0 (default) defers the arm when the stream never
+  * goes quiet; 1/2 are reserved for 0622b's ladder and here only relax that
+  * deferral, because the ladder does not exist in this build.
+@@ -4431,7 +4432,7 @@
+ /* One place for the version the driver prints. It used to be a literal inside the
+  * banner and fell seven levels behind (the log said 20.24 while the code was
+  * 20.35), which makes any post-hoc reading of a log attribute the wrong revision. */
+-#define BT_PERI_VER "20.37"
++#define BT_PERI_VER "20.38A"
+ 
+ /* Level 20.43: drain the line to silence, the way upstream qbt_geni does.
+  *
+@@ -5720,17 +5721,23 @@
+ }
+ 
+ 
+-/* Level 20.69 (v2066, 0622a): D1 bulk drain. 0621's quiesce called
++/* Level 20.70 (v2067, 0622b-A): D1 bulk drain, listen-only. 0621's quiesce called
+  * bt_rx_exact() for one byte and bt_sleep(1000) when empty; bt_sleep takes
+  * microseconds, so an empty poll cost 1 ms (about 1 B/ms) while the ROM
+  * emitted 15,980 B/s. The FIFO never drained and "quiet" was never reached.
+- * This takes the whole RX FIFO word count per read and polls every 50 us. */
++ * This takes the whole RX FIFO word count per read and polls every 50 us.
++ *
++ * 0622b-A removes the drain's answer: every 0xfd is counted and left
++ * unanswered, so the ring can say whether the ROM keeps streaming on its
++ * own (no ACK dependency) or stalls once the FC credit stops. The
++ * post-reset window still answers exactly as 0622a did; only the drain
++ * is listen-only. */
+ static unsigned
+ bt_peri_stream_drain(unsigned max_ms, unsigned quiet_ms, unsigned max_bytes,
+     const char *what, struct bt_peri_stream_obs *obs)
+ {
+-	static const uint8_t ack = 0xfc;
+ 	uint8_t chunk[512];
++	unsigned ack_held = 0;
+ 	uint64_t start = bt_peri_uptime_ms();
+ 	uint64_t last = start;
+ 	unsigned bytes = 0;
+@@ -5758,7 +5765,7 @@
+ 			}
+ 			for (unsigned i = 0u; i < take; i++) {
+ 				if (chunk[i] == 0xfdu) {
+-					(void)bt_uart_tx(&ack, 1u, "stream drain ACK FC");
++					ack_held++;
+ 				}
+ 			}
+ 			bytes += take;
+@@ -5776,6 +5783,8 @@
+ 	    "(cap %u, quiet target %u, byte cap %u), %u B/s%s\n",
+ 	    what, bytes, quiet, elapsed, max_ms, quiet_ms, max_bytes, obs->rate,
+ 	    quiet >= quiet_ms ? "" : ", stream still active");
++	printf("PANDORA BT: %s: stream drain no-ack: %u 0xfd frame(s) left "
++	    "unanswered (listen-only; no ACK FC in the drain)\n", what, ack_held);
+ 	pandora_log_sync();
+ 	return quiet;
+ }
+@@ -6108,7 +6117,7 @@
+ 	    (unsigned)sizeof(pandora_peri_tmel_elf),
+ 	    (unsigned)sizeof(pandora_peri_tmel_mbn),
+ 	    (unsigned)sizeof(pandora_peri_tmel_nvm));
+-	printf("PANDORA BT: map A reset policy %d, recovery %d (v2066 0622a: stream drain, silent gate, wake confirm, post-reset classes)\n",
++	printf("PANDORA BT: map A reset policy %d, recovery %d (v2067 0622b-A: listen-only drain, no ACK FC)\n",
+ 	    bt_map_a_reset_arm, bt_map_a_recovery);
+ 	pandora_log_sync();
+ 	/* Level 20.19: GetVer(00) and ActivateSS now happen in the level-19 chain
