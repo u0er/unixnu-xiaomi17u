@@ -1,0 +1,40 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 052ceb8..18a6cd9 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -192,7 +192,7 @@ sweet_usb_probe(void)
+  * of pages, so no page is shared between two regions.
+  */
+ #define UD_TRB_NCM_RX   0x3000          /* ep4 OUT (NCM bulk OUT) TRB */
+-#define UD_TRB_NCM_TX   0x4000          /* ep9 IN (NCM bulk IN) TRB */
++#define UD_TRB_NCM_TX   0x4000          /* ep5 IN (NCM bulk IN) TRB */
+ #define UD_TRB_NCM_INT  0x5000          /* ep7 IN (NCM notification) TRB */
+ #define UD_NCM_NOTIFY   0x6000          /* 16-byte NCM notification */
+ #define UD_NCM_RX       0x7000          /* one received NTB, 2 KiB */
+@@ -205,7 +205,7 @@ sweet_usb_probe(void)
+ #define EP_INT          5               /* 0x82 interrupt IN */
+ #define EP_NCM_RX       4               /* 0x02 bulk OUT (UD_CARPLAY) */
+ #define EP_NCM_INT      7               /* 0x83 interrupt IN (UD_CARPLAY) */
+-#define EP_NCM_TX       9               /* 0x84 bulk IN (UD_CARPLAY) */
++#define EP_NCM_TX       5               /* 0x82 bulk IN (fallback: ep9 absent) */
+ #define TRBCTL_NORMAL   (1u << 4)
+ 
+ #define UD_TXQ          32
+@@ -474,7 +474,7 @@ static const char *const ud_ncm_strings[] = {
+  *
+  * Endpoint addresses follow the DWC3 2n = OUT / 2n+1 = IN rule, so the physical
+  * endpoints are 0x81 -> ep3 and 0x01 -> ep2 (mux, reused from UD_APPLE) plus
+- * 0x83 -> ep7, 0x84 -> ep9 and 0x02 -> ep4 (NCM, new).  The NCM function gets
++ * 0x83 -> ep7, 0x82 -> ep5 and 0x02 -> ep4 (NCM; ep5 is the fallback).  The NCM function gets
+  * its own TRBs and DMA buffers (UD_TRB_NCM_*, UD_NCM_*) so mux frames and NCM
+  * NTBs can be in flight at the same time without sharing a buffer.
+  */
+@@ -510,7 +510,7 @@ static const uint8_t ud_carplay_cfg_desc[] = {
+ 	7, 5, 0x83, 0x03, 16, 0, 1,                  /* EP 0x83 interrupt IN, 16 bytes, 1 uframe */
+ 	9, 4, 2, 0, 0, 0x0a, 0x00, 0x01, 0,          /* if2 alt0: CDC data, protocol 01h, no endpoints */
+ 	9, 4, 2, 1, 2, 0x0a, 0x00, 0x01, 0,          /* if2 alt1: same, two bulk endpoints */
+-	7, 5, 0x84, 0x02, 0x00, 0x02, 0,             /* EP 0x84 bulk IN 512 */
++	7, 5, 0x82, 0x02, 0x00, 0x02, 0,             /* EP 0x82 bulk IN 512 */
+ 	7, 5, 0x02, 0x02, 0x00, 0x02, 0,             /* EP 0x02 bulk OUT 512 */
+ };
+ /*
