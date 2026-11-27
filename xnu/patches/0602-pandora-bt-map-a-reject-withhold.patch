@@ -1,0 +1,275 @@
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -1994,6 +1994,34 @@
+  * 5000 ms is 10x the measured 0.501 s A tail. The retry path (0593)
+  * re-sends only the final 183-byte frame. B/C and every other phase keep
+  * the shared strict reader and v2060's bytes. */
++
++/* Level 20.67 (v2064, 0602): map A is a stream, not an ACK exchange.
++ *
++ * 0601 kept a 5000 ms sub-06 gate on the 284-frame map A stage and drained the
++ * tail for 500 ms before asking 0x19. This ROM does answer sub-06 ACK for the
++ * level-19 RAM patch and NVM stages (two 12-byte records at 0.929 s and
++ * 0.947 s), so the reader is right; it simply never does for map A, and instead
++ * starts its resident 34 00 ff fc f0 04 readback 171 ms after the last byte at
++ * 144.5 ms per record. The Android trace sends 0x19 54.1 ms after the same
++ * point. The window is therefore tens of milliseconds wide: every wait before
++ * 0x19 is spent inside a window that is closing.
++ *
++ * 0602 sends map A with ack_ms = 0 (SKIP_EVT_VSE_CC, the reference HAL's own
++ * semantics), timestamps the last byte, and asks 0x19 at once with 250 ms then
++ * 1500 ms. Silence is recorded as a rejection of map A with the resident
++ * stream's seq progress and map B is withheld. A reset is never part of the
++ * accept path: pandora_bt_reset=2 runs it only after a silent 0x19 with a BID
++ * answer, and it always replays the whole 284-frame map A before asking 0x19
++ * again. "reset -> 0x19 answered -> map A accepted" is not a valid triple.
++ */
++#define BT_PERI_MAP_A_0X19_FIRST_MS 250u
++#define BT_PERI_MAP_A_0X19_WIDE_MS  1500u
++#define BT_PERI_MAP_A_TAIL_SCAN_MS  150u
++#define BT_PERI_MAP_A_WITHHOLD      0x0c02
++
++static uint64_t bt_map_a_last_tx;
++static int bt_map_a_reset_arm;
++
+ #define BT_PERI_ASEG_LAST_ACK_MS 5000u
+ /* Level 20.64 (v2061, 0593): after a no-ACK timeout, re-send only
+  * the final frame and wait again. Two retries = three waits; an
+@@ -4684,6 +4712,9 @@
+ 			frame[8u + i] = fw[sent + i];
+ 		}
+ 		err = bt_uart_tx_long(frame, len + 8u, what);
++		if (err == 0 && sent + len >= size) {
++			bt_map_a_last_tx = bt_peri_uptime_ms();
++		}
+ 		if (err == 0 && bt_level >= 20) {
+ 			bt_sleep(BT_PERI_TLV_PACE_US);
+ 		}
+@@ -5388,6 +5419,126 @@
+ 	pandora_log_sync();
+ }
+ 
++/* Level 20.67 (v2064, 0602): monotonic milliseconds for the 0x19 delay. */
++static uint64_t
++bt_peri_uptime_ms(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ull;
++}
++
++/* Level 20.67 (v2064, 0602): the map A tail gate.
++ *
++ * Called with the last map A byte already on the wire and its timestamp kept
++ * by bt_peri_tlv_stage(). Everything before 0x19 is either a timestamp read or
++ * the BID identity query the HAL itself does before its map; nothing drains,
++ * nothing waits for an ACK, and no reset happens on this path.
++ *
++ * Return 0 when 0x19 answered inside the two windows (map B may open), or
++ * BT_PERI_MAP_A_WITHHOLD when it stayed silent (map B must not be sent). The
++ * caller logs and returns; a withheld map B is a verdict, not an error to
++ * retry inside the same boot. */
++static int
++bt_peri_map_a_tail_gate(unsigned frames, const char *what)
++{
++	uint16_t bid = 0xffffu;
++	int err;
++	unsigned resident = 0;
++	unsigned seq_step = 0;
++
++	if (bt_map_a_last_tx != 0ull) {
++		unsigned d = (unsigned)(bt_peri_uptime_ms() - bt_map_a_last_tx);
++
++		printf("PANDORA BT: %s: 0x19 at +%u ms after map A last byte (%u frames, ack_ms 0, target <= 60 ms)\n",
++		    what, d, frames);
++	} else {
++		printf("PANDORA BT: %s: 0x19 after map A last byte: timestamp unavailable (%u frames, ack_ms 0)\n",
++		    what, frames);
++	}
++	pandora_log_sync();
++	/* BID is an identity query, not a state change: it can run on either side
++	 * of map A and the HAL asks it before its own map. A non-0000 id means the
++	 * wrong NVM variant and is a reason to stop, not to open B. */
++	(void)bt_peri_board_id_download(&bid);
++	printf("PANDORA BT: %s: BID pre %s (id %04x)\n", what,
++	    bid != 0xffffu ? "answered" : "silent", bid);
++	pandora_log_sync();
++	err = bt_peri_vs_cmd(0x19u, BT_PERI_MAP_A_0X19_FIRST_MS,
++	    "PERI TME-L map A tail 0x19");
++	if (err) {
++		printf("PANDORA BT: %s: 0x19 silent in the %u ms first window (error %d); second window %u ms\n",
++		    what, BT_PERI_MAP_A_0X19_FIRST_MS, err,
++		    BT_PERI_MAP_A_0X19_WIDE_MS);
++		pandora_log_sync();
++		err = bt_peri_vs_cmd(0x19u, BT_PERI_MAP_A_0X19_WIDE_MS,
++		    "PERI TME-L map A tail 0x19 retry");
++	}
++	if (err == 0) {
++		printf("PANDORA BT: %s: VS command 19 answered after map A; map A unproven (no sub-06 ACK), map B open on 0x19 only\n",
++		    what);
++		pandora_log_sync();
++		return 0;
++	}
++	/* Silence. Count what the ROM is doing instead: the resident f0 04
++	 * readback advancing is liveness, and its seq progress is the evidence
++	 * that the stream is the same one 0595 measured. */
++	(void)bt_peri_aseg_last_ack(frames, BT_PERI_MAP_A_TAIL_SCAN_MS,
++	    "PERI TME-L map A resident scan", &resident, &seq_step);
++	printf("PANDORA BT: %s: map A rejected: no sub-06 ACK, 0x19 silent in %u + %u ms, resident f0 04 record(s) %u, seq advanced %u\n",
++	    what, BT_PERI_MAP_A_0X19_FIRST_MS, BT_PERI_MAP_A_0X19_WIDE_MS,
++	    resident, seq_step);
++	pandora_log_sync();
++	(void)bt_peri_board_id_download(&bid);
++	printf("PANDORA BT: %s: BID post %s (id %04x)\n", what,
++	    bid != 0xffffu ? "answered" : "silent", bid);
++	pandora_log_sync();
++	if (bt_map_a_reset_arm >= 2 && bid == 0u) {
++		int r;
++
++		printf("PANDORA BT: %s: reset arm 2: reset -> arbitrate v3 -> version v3 -> GetVer(00) -> BID post -> full map A replay (%u frames) -> 0x19\n",
++		    what, frames);
++		pandora_log_sync();
++		r = bt_peri_reset();
++		if (r == 0) {
++			r = bt_peri_arbitrate_v3();
++		}
++		if (r == 0) {
++			r = bt_peri_version_v3();
++		}
++		if (r == 0) {
++			r = bt_peri_getver_window(700u);
++		}
++		if (r == 0) {
++			r = bt_peri_tlv_stage(pandora_peri_tmel_elf,
++			    sizeof(pandora_peri_tmel_elf),
++			    "PERI TME-L map A replay", 0x03, 0u);
++		}
++		if (r == 0) {
++			r = bt_peri_vs_cmd(0x19u, BT_PERI_MAP_A_0X19_FIRST_MS,
++			    "PERI TME-L map A replay 0x19");
++		}
++		if (r != 0) {
++			r = bt_peri_vs_cmd(0x19u, BT_PERI_MAP_A_0X19_WIDE_MS,
++			    "PERI TME-L map A replay 0x19 retry");
++		}
++		if (r == 0) {
++			printf("PANDORA BT: %s: reset recovered: map A replayed %u frames, 0x19 answered; map B open on the replay\n",
++			    what, frames);
++			pandora_log_sync();
++			return 0;
++		}
++		printf("PANDORA BT: %s: ROM DEAD after reset (chain stopped at error %d); map B stays withheld, needs a reboot\n",
++		    what, r);
++		pandora_log_sync();
++	}
++	printf("PANDORA BT: %s: map B withheld (0x19 silent, BID %04x, resident f0 04 seq advanced %u, %u frames already sent)\n",
++	    what, bid, seq_step, frames);
++	pandora_log_sync();
++	return BT_PERI_MAP_A_WITHHOLD;
++}
++
+ /* Level 20 orchestrator: after the level-19 download chain passes, reset
+  * the PERI, then replay the Android trace's three map phases in order. */
+ static int
+@@ -5425,63 +5576,45 @@
+ 	 * Android's captured map carried no 34-prefixed RX, but our ROM is not
+ 	 * Android's: the v2055-A boot put A's tail at 0.501 s and then lost 0x19
+ 	 * and GetVer altogether. Ask map A first, before interpreting B. */
++	/* Level 20.67 (v2064, 0602): map A is not an ACK gate.
++	 *
++	 * 0601 waited for a sub-06 ACK this ROM does not emit for the 284-frame
++	 * stage (it does emit it for the level-19 RAM patch and NVM stages, so the
++	 * reader is right and the gate is wrong), drained 500 ms, and only then
++	 * asked 0x19 - by which time the resident readback had started and the
++	 * window the trace uses (54 ms) was long gone. 0602 sends map A with
++	 * ack_ms = 0, keeps the last byte's timestamp, and goes straight to the
++	 * 0x19 gate below.
++	 */
+ 	err = bt_peri_tlv_stage(pandora_peri_tmel_elf,
+-	    sizeof(pandora_peri_tmel_elf), "PERI TME-L map A", 0x03,
+-	    BT_PERI_ASEG_LAST_ACK_MS);
+-	if (err == BT_PERI_ASEG_ALIVE_NO_ACK) {
+-		/* Level 20.66 (v2063, 0601): 0595 (3444a14e, 2026-11-27 03:00) proved
+-		 * this ROM does not emit the sub-06 ACK. The handshake answered 0x19, so
+-		 * the stage is accepted and the map B open below - the gate phase B
+-		 * actually needs - decides the rest. */
+-		printf("PANDORA BT: level 20 phase A: map A accepted WITHOUT a sub-06 ACK (ROM alive on 0x19); continuing to the map B open\n");
+-		pandora_log_sync();
+-		err = 0;
+-	}
++	    sizeof(pandora_peri_tmel_elf), "PERI TME-L map A", 0x03, 0u);
+ 	if (err) {
+ 		printf("PANDORA BT: level 20 phase A failed (error %d)\n", err);
+ 		pandora_log_sync();
+ 		bt_peri_raw_dump(2000u, "PERI TME-L map A failure raw");
+ 		return err;
+ 	}
+-	/* Measured from the trace: phase A's last frame to the 0x19 command is
+-	 * 54.1 ms, and phase A produces no ROM traffic, so 60 ms covers a wake
+-	 * request without holding the next command back by the old 150 ms. */
+-	/* Level 20.53: drain map A to silence instead of a fixed 60 ms.
+-	 *
+-	 * Once map A is paced (20.51), its bulk answer arrives later than the 60 ms
+-	 * window allowed: the v2050 log shows "map A: no bulk answer in 60 ms" and then
+-	 * "map B open: no sub 19 CC within 500 ms (7965 byte(s) dropped)" - those 7,965
+-	 * bytes are map A's late answer arriving inside the next command's window and
+-	 * burying it. Pacing fixed the ROM dump but moved the answer past the drain.
+-	 *
+-	 * Silence is the right criterion here for the same reason it was right after
+-	 * phase B: the gap is what tells us the stage is over, not a constant. */
+-	(void)bt_peri_drain_silence(4u, 500u, "PERI TME-L map A tail");
++	err = bt_peri_map_a_tail_gate(
++	    (unsigned)((sizeof(pandora_peri_tmel_elf) + BT_FW_SEG_MAX - 1u) /
++	    BT_FW_SEG_MAX), "PERI TME-L map A");
++	if (err == BT_PERI_MAP_A_WITHHOLD) {
++		printf("PANDORA BT: level 20 phase A ended withheld: map A rejected by a silent 0x19; %u B frame(s) not sent\n",
++		    (unsigned)sizeof(pandora_peri_tmel_mbn));
++		pandora_log_sync();
++		bt_peri_b_open_liveness();
++		bt_peri_vendor_dcdf_dump(2000u, "PERI TME-L map A withheld raw");
++		return err;
++	}
++	if (err) {
++		printf("PANDORA BT: level 20 phase A gate failed (error %d)\n", err);
++		pandora_log_sync();
++		bt_peri_raw_dump(2000u, "PERI TME-L map A gate raw");
++		return err;
++	}
+ 	/* Phase B (trace 10.199460 start command, then 1374 frames to 11.189057):
+ 	 * the 333,868-byte gngbtfw20.mbn as HCI 0xfc00/subcmd 0x1e frames of 243
+ 	 * bytes (last 229). Wire speed: Android's stage spans 0.99 s for 342 KB,
+ 	 * i.e. no artificial pacing - the UART itself is the limiter. */
+-	/* Level 20.60 (v2054): the 0x19 open is the only gate between map A's
+-	 * tail and 333,868 bytes of B frames. v2053 gave it a single 500 ms window,
+-	 * logged "no sub 19 CC within 500 ms (7911 byte(s) dropped)" and then sent
+-	 * all 1,374 B frames anyway - into a ROM that had not answered: 0 Command
+-	 * Complete, last sub 00. Give the open 1500 ms and one explicit retry; if
+-	 * both windows close, withhold the B frames so a failed open is the logged
+-	 * cause instead of a 334 KB stage whose silence has to be interpreted. */
+-	err = bt_peri_vs_cmd(0x19u, 1500u, "PERI TME-L map B open");
+-	if (err) {
+-		printf("PANDORA BT: level 20 phase B open retry after 1500 ms (error %d)\n", err);
+-		pandora_log_sync();
+-		err = bt_peri_vs_cmd(0x19u, 1500u, "PERI TME-L map B open retry");
+-	}
+-	if (err) {
+-		printf("PANDORA BT: level 20 phase B open command unanswered after 2 x 1500 ms (error %d); withholding %u B frame(s)\n",
+-		    err, (unsigned)sizeof(pandora_peri_tmel_mbn));
+-		pandora_log_sync();
+-		bt_peri_b_open_liveness();
+-		bt_peri_vendor_dcdf_dump(2000u, "PERI TME-L map B open failure raw");
+-		return err;
+-	}
+ 	err = bt_peri_hci_stage(pandora_peri_tmel_mbn,
+ 	    sizeof(pandora_peri_tmel_mbn), "PERI TME-L map B", false);
+ 	if (err) {
+@@ -5833,6 +5966,8 @@
+ pandora_bt_init(void)
+ {
+ 	(void)PE_parse_boot_argn("pandora_bt", &bt_level, sizeof(bt_level));
++	(void)PE_parse_boot_argn("pandora_bt_reset", &bt_map_a_reset_arm,
++	    sizeof(bt_map_a_reset_arm));
+ 	if (!bt_level) {
+ 		return;
+ 	}
