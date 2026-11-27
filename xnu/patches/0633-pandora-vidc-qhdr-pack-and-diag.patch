@@ -1,0 +1,237 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -276,9 +276,13 @@
+ /* Exactly the published window: header 456 B + three 1 MiB rings ends at
+  * 0x300000, so the old +64 KiB slack was pure permanent kernel_map waste. */
+ #define VIDC_QTABLE_ALLOC       vidc_qtable_bytes
+ #define IFACEQ_RING_OFFS(i)     (0x001000u + (i) * vidc_ring_bytes)
+-#define IFACEQ_QUEUE_SIZE       (vidc_ring_bytes - 0x001000u)   /* rings stay disjoint */
++/* 0633: 800 KiB of ring data per queue, the vendor's q_size exactly
++ * (0x00032000 words).  The 1 MiB stride is kept so ring i still starts on a
++ * ring_bytes boundary; the unused tail stays inside the published 0x300000
++ * window.  q_size is the queue capacity in WORDS, not bytes. */
++#define IFACEQ_QUEUE_SIZE       0x000C8000u
+ #define IFACEQ_QUEUE_WORDS      (IFACEQ_QUEUE_SIZE / 4u)
+ 
+ #define VIDC_SFR_BYTES          0x00004000u   /* [M] SFR_SIZE = 4 KiB */
+ 
+@@ -288,25 +292,35 @@
+     uint32_t pkt_type;
+ };
+ 
+ /* Queue header, byte-exact layout from struct iris_hfi_queue_header. */
+-/* Byte-exact layout of struct iris_hfi_queue_header [M iris_hfi_queue.h]: every
+- * field is a u32 and header_type is at offset 8, BEFORE queue_type.
++/* 0633: the previous revision packed header_type as a u32 at offset 8 and
++ * queue_type as a u32 at offset 12.  That is NOT the struct the firmware
++ * parses.  The vendor's own queue_init writes prove the real packing
++ * (msm_video.ko venus_hfi_queue_init, 0x5b344-0x5b3fc):
+  *
+- * Getting this wrong is not cosmetic: the boot snapshot printed
+- * `q0 00000001 ff001000 01010000`, i.e. the firmware read word 8 as 0x01010000
+- * instead of the required 0x0101, because an earlier revision had uint16_t
+- * queue_type at 8 and uint16_t header_type at 10 (plus a pkt_drop_cnt field the
+- * upstream header does not have).  The core then re-tried a single bogus
+- * address every poll (SMMU FAR 0xfdffdd7e, 16 times identical) instead of
+- * reporting ready. */
++ *   q+0x00 <- 1                          status
++ *   q+0x04 <- start_addr                 ring start
++ *   q+0x08 <- (0x0101 << 16) | qid       header_type high u16, queue_type low
++ *   q+0x0C <- 0x00032000                 q_size = 204800 words = 800 KiB
++ *   q+0x10 <- 0                           pkt_size
++ *   q+0x14 <- 0                           pkt_drop_cnt
++ *   q+0x18 <- 1  q+0x1C <- 1  q+0x20 <- 1  rx_wm / tx_wm / rx_req
++ *
++ * The live ring shows our side writing word 2 = 0x00000101 and word 3 = 0
++ * (`q0 00000001 ff001000 00000101`), i.e. the firmware reads queue_type =
++ * 0x0101, header_type = 0 and q_size = 0 for every queue.  A parser that
++ * validates header_type/q_size cannot accept that table; this is consistent
++ * with "core released, no ready, no error bits" and is the variable this patch
++ * changes.  Layout: queue_type/header_type are u16 at 8/10, q_size at 12. */
+ struct vidc_queue_header {
+     uint32_t status;        /* bit0 = active */
+     uint32_t start_addr;
+-    uint32_t header_type;   /* [M] IFACEQ_DFLT_QHDR = 0x0101, offset 8 */
+-    uint32_t queue_type;    /* [M] offset 12 */
+-    uint32_t q_size;        /* in u32 WORDS [M] */
+-    uint32_t pkt_size;      /* 0 = variable */
++    uint16_t queue_type;    /* [M] queue id, offset 8 */
++    uint16_t header_type;   /* [M] IFACEQ_DFLT_QHDR = 0x0101, offset 10 */
++    uint32_t q_size;        /* in u32 WORDS [M], offset 12 */
++    uint32_t pkt_size;      /* 0 = variable, offset 16 */
++    uint32_t pkt_drop_cnt;  /* [M] offset 20, always 0 here */
+     uint32_t rx_wm;
+     uint32_t tx_wm;
+     uint32_t rx_req;
+     uint32_t tx_req;
+@@ -316,15 +330,17 @@
+     uint32_t write_idx;     /* in u32 WORDS [M] */
+ };
+ 
+ _Static_assert(sizeof(struct vidc_queue_header) == 56,
+-    "iris_hfi_queue_header is 14 u32 = 56 bytes");
+-_Static_assert(offsetof(struct vidc_queue_header, header_type) == 8,
+-    "header_type must be word 2 of the queue header");
+-_Static_assert(offsetof(struct vidc_queue_header, queue_type) == 12,
+-    "queue_type must be word 3 of the queue header");
+-_Static_assert(offsetof(struct vidc_queue_header, q_size) == 16,
+-    "q_size must be word 4 of the queue header");
++    "iris_hfi_queue_header is 56 bytes");
++_Static_assert(offsetof(struct vidc_queue_header, queue_type) == 8,
++    "queue_type must be the low u16 of word 2");
++_Static_assert(offsetof(struct vidc_queue_header, header_type) == 10,
++    "header_type must be the high u16 of word 2");
++_Static_assert(offsetof(struct vidc_queue_header, q_size) == 12,
++    "q_size must be word 3 of the queue header");
++_Static_assert(offsetof(struct vidc_queue_header, pkt_drop_cnt) == 20,
++    "pkt_drop_cnt must be word 5 of the queue header");
+ _Static_assert(offsetof(struct vidc_queue_header, read_idx) == 48,
+     "read_idx must be word 12 of the queue header");
+ _Static_assert(offsetof(struct vidc_queue_header, write_idx) == 52,
+     "write_idx must be word 13 of the queue header");
+@@ -1007,12 +1023,13 @@
+     for (unsigned i = 0; i < IFACEQ_NUMQ; i++) {
+         struct vidc_queue_header *q = &t->qhdr[i];
+         q->status = 1;                         /* [M] active */
+         q->start_addr = vidc_ring_da(i);        /* device address of the ring */
+-        q->header_type = IFACEQ_DFLT_QHDR;     /* [M] 0x0101, word 2 */
+-        q->queue_type = i;                      /* [M] word 3 */
+-        q->q_size = IFACEQ_QUEUE_WORDS;        /* [M] words, not bytes */
++        q->queue_type = (uint16_t)i;            /* [M] low u16 of word 2 */
++        q->header_type = IFACEQ_DFLT_QHDR;     /* [M] high u16 of word 2 */
++        q->q_size = IFACEQ_QUEUE_WORDS;        /* [M] word 3, words not bytes */
+         q->pkt_size = 0;
++        q->pkt_drop_cnt = 0;
+         q->rx_wm = 1;
+         q->tx_wm = 1;
+         q->rx_req = (i == 2) ? 0 : 1;          /* [M] debug queue differs */
+         q->tx_req = 0;
+@@ -1667,8 +1684,87 @@
+         vidc_rd(0x13448u), vidc_rd(0x13830u), vidc_rd(0x13834u),
+         vidc_rd(0x13838u), vidc_rd(0xA013Cu));
+ }
+ 
++/* 0633: read-only queue-table / UC / SMMU evidence dump.
++ *
++ * vidc9 closed the CORE_CLK arm (NO_READY_KEPT_4F).  This dump prints what the
++ * VPU actually reads, word for word, after the publish verdict:
++ *   - queue table header (version/size/qhdr0/qhdr_size/num_q/device_addr),
++ *   - all 14 words of every queue header (raw, so a wrong pack is visible),
++ *   - the UC descriptor page (word 0 and the raw 0x00..0x5C window),
++ *   - the apps-SMMU context: SCTLR/ACTLR/TCR2/TTBR0/TTBR1/TCR/CB_FSR/CB_FAR
++ *     and the global FSR.  A disabled bank or a real fault decides whether the
++ *     firmware ever translated an address; 0x400 alone is the FORMAT bit.
++ *
++ * Cache: the fill path cleaned these pages before release.  vidc_sync_in() is
++ * clean+invalidate, and a clean CPU line has nothing to write back, so it can
++ * only drop a stale line and reveal a firmware update (read/write idx).  It
++ * runs after the verdict, never between the release write and the ACK poll.
++ * Every register access below is a read; nothing here changes device state.
++ */
++static void
++vidc_diag_dump(const char *when)
++{
++    if (!vidc_qtable_va || !vidc_uc_va) {
++        printf("PANDORA VIDC: diag[%s] no buffers\n", when);
++        return;
++    }
++    struct vidc_queue_table *t = (struct vidc_queue_table *)vidc_qtable_va;
++    vidc_sync_in(0, (unsigned)sizeof(*t));
++    flush_dcache64((addr64_t)vidc_uc_pa, 0x60u, TRUE);
++
++    printf("PANDORA VIDC: diag[%s] table version=%u size=%u qhdr0=%u qhdr_size=%u "
++           "num_q=%u active=%u dev=%08x:%08x name0=%08x%08x%08x%08x\n",
++        when, t->version, t->size, t->qhdr0_offset, t->qhdr_size, t->num_q,
++        t->num_active_q, (uint32_t)(t->device_addr >> 32), (uint32_t)t->device_addr,
++        vidc_qt_rd(32), vidc_qt_rd(36), vidc_qt_rd(40), vidc_qt_rd(44));
++
++    for (unsigned i = 0; i < IFACEQ_NUMQ; i++) {
++        const uint32_t base = t->qhdr0_offset + i * t->qhdr_size;
++        for (unsigned w = 0; w < 14; w += 7)
++            printf("PANDORA VIDC: diag[%s] q%u w%u..%u: %08x %08x %08x %08x "
++                   "%08x %08x %08x\n", when, i, w, w + 6,
++                vidc_qt_rd(base + (w + 0) * 4), vidc_qt_rd(base + (w + 1) * 4),
++                vidc_qt_rd(base + (w + 2) * 4), vidc_qt_rd(base + (w + 3) * 4),
++                vidc_qt_rd(base + (w + 4) * 4), vidc_qt_rd(base + (w + 5) * 4),
++                vidc_qt_rd(base + (w + 6) * 4));
++        const struct vidc_queue_header *q = &t->qhdr[i];
++        printf("PANDORA VIDC: diag[%s] q%u type=%u hdr=%#x start=%08x q_size=%u "
++               "pkt=%u drop=%u rxwm=%u txwm=%u rxreq=%u txreq=%u rxirq=%08x "
++               "txirq=%08x rd=%u wr=%u\n", when, i, q->queue_type, q->header_type,
++            q->start_addr, q->q_size, q->pkt_size, q->pkt_drop_cnt, q->rx_wm,
++            q->tx_wm, q->rx_req, q->tx_req, q->rx_irq_status, q->tx_irq_status,
++            q->read_idx, q->write_idx);
++    }
++
++    {
++        const volatile uint32_t *uc = (const volatile uint32_t *)vidc_uc_va;
++        for (unsigned w = 0; w < 24; w += 8)
++            printf("PANDORA VIDC: diag[%s] uc[%02x..%02x]: %08x %08x %08x %08x "
++                   "%08x %08x %08x %08x\n", when, w * 4, w * 4 + 0x1c,
++                uc[w + 0], uc[w + 1], uc[w + 2], uc[w + 3],
++                uc[w + 4], uc[w + 5], uc[w + 6], uc[w + 7]);
++        printf("PANDORA VIDC: diag[%s] uc pairs %08x/%08x %08x/%08x %08x/%08x "
++               "%08x/%08x %08x/%08x %08x/%08x\n", when,
++            uc[0x2C / 4], uc[0x30 / 4], uc[0x34 / 4], uc[0x38 / 4],
++            uc[0x3C / 4], uc[0x40 / 4], uc[0x44 / 4], uc[0x48 / 4],
++            uc[0x4C / 4], uc[0x50 / 4], uc[0x54 / 4], uc[0x58 / 4]);
++    }
++
++    if (vidc_smmu_on) {
++        const uint32_t cb = (uint32_t)vidc_smmu_cb;
++        const uint64_t ttbr0 = vidc_ld64(vidc_smmu_va, cb + 0x20);
++        const uint64_t ttbr1 = vidc_ld64(vidc_smmu_va, cb + 0x28);
++        printf("PANDORA VIDC: diag[%s] smmu cb=%#x sctlr=%08x actlr=%08x tcr2=%08x "
++               "tcr=%08x ttbr0=%#llx ttbr1=%#llx fsr=%08x far=%08x gfsr=%08x\n",
++            when, cb, vidc_smmu_rd(cb), vidc_smmu_rd(cb + 0x04),
++            vidc_smmu_rd(cb + 0x10), vidc_smmu_rd(cb + 0x30),
++            ttbr0, ttbr1, vidc_smmu_rd(cb + 0x58), vidc_smmu_rd(cb + 0x60),
++            vidc_smmu_rd(0x48));
++    }
++}
++
+ /* Publish qtable/SFR to the firmware and release the VPU core.
+  *
+  * Sequence is byte-for-byte what __boot_firmware_iris4 does [K]:
+  *   0xA0064 <- qtable PA            (32-bit)
+@@ -1826,8 +1922,9 @@
+          * bits authoritative (vendor checks them one call earlier). */
+         if ((s & (1u << 8)) && !(s & 0xEu)) {
+             printf("PANDORA VIDC: pc ready via vendor BIT(8) fast path after %u us "
+                    "(0xA004C=%08x 0xC0010=%08x)\n", i * 100u, s, tz);
++            vidc_diag_dump("ready8");
+             if (s & 1u) {
+                 vidc_apply_canoe_preset();
+                 vidc_wr(R_CPU_H2XSOFTINTEN, 1);
+                 vidc_wr(R_CPU_X2RPMH, 0);
+@@ -1840,8 +1937,9 @@
+         }
+         if ((s & (1u << 30)) && (tz & 1u)) {
+             printf("PANDORA VIDC: pc ready after %u us (0xA004C=%08x 0xC0010=%08x)\n",
+                 i * 100u, s, tz);
++            vidc_diag_dump("ready30");
+             if (s & 1u) {
+                 vidc_apply_canoe_preset();
+                 vidc_wr(R_CPU_H2XSOFTINTEN, 1);
+                 vidc_wr(R_CPU_X2RPMH, 0);
+@@ -1879,8 +1977,9 @@
+             vidc_apply_canoe_preset();
+             vidc_wr(R_CPU_H2XSOFTINTEN, 1);
+             vidc_wr(R_CPU_X2RPMH, 0);
+             printf("PANDORA VIDC: queue table accepted after %u polls (status %08x)\n", i, s);
++            vidc_diag_dump("ready1");
+             printf("PANDORA VIDC: h2x=%08x x2rpmh=%08x core_clk=%08x intr=%08x/%08x\n",
+                 vidc_rd(R_CPU_H2XSOFTINTEN), vidc_rd(R_CPU_X2RPMH),
+                 vidc_rd(R_WRAPPER_CORE_CLK),
+                 vidc_rd(R_WRAPPER_INTR_STATUS), vidc_rd(R_WRAPPER_INTR_MASK));
+@@ -1890,8 +1989,9 @@
+     }
+     printf("PANDORA VIDC: queue table publish TIMEOUT (stat=%08x boot=%08x spare0=%08x)\n",
+         vidc_rd(R_CPU_QUEUE_TABLE_STAT), vidc_rd(R_CPU_BOOT_CTRL),
+         vidc_rd(R_WRAPPER_SPARE_0));
++    vidc_diag_dump("timeout");
+     /* If the core never reports ready, the only way to tell "not executing"
+      * from "executing and stuck" is to read the blocks the core itself would
+      * write.  Dump the CPU block (0xA0000-0xA0070), the TZ wrapper (0xC0000-
+      * 0xC0020) and the outer wrapper (0xB0080-0xB0090) in full: any non-reset
