@@ -1,0 +1,80 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f17db31..a8390ee 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -299,6 +299,58 @@ struct nezha_island_box {
+ 	uint32_t x0, y0, w, h, r;
+ };
+ 
++/*
++ * Patch 0644: the iPhone 18 Pro Max profile, overridable per boot.
++ *
++ * 0572 rewrote this function with 110x32 hard-coded and dropped the boot arguments
++ * 0492 had added, so a rebuilt kernel silently lost the size override. This restores
++ * them and exposes the top edge as well:
++ *
++ *   nezha_island_w   width  in 375-point units (40..375, default 110)
++ *   nezha_island_h   height in 375-point units (10..375, default 32)
++ *   nezha_island_y   top edge in SURFACE PIXELS (0..height-4, default = old formula)
++ *
++ * island7 passes w=125 h=37 y=33: 375x111 px at 375,33 on 1125x2436, i.e. a 125x37 pt
++ * pill 11 pt from the top -- the 16 Pro Max island. The default remains the exact
++ * 110x32 / y=40 geometry the island5 ring measured, so an image without the tokens
++ * draws byte-identical pixels.
++ */
++static uint32_t
++nezha_island_bootarg(const char *name, int lo, int hi, int fallback)
++{
++	int parsed = fallback;
++	if (!PE_parse_boot_argn(name, &parsed, sizeof(parsed))) return (uint32_t)fallback;
++	return (parsed >= lo && parsed <= hi) ? (uint32_t)parsed : (uint32_t)fallback;
++}
++
++static uint32_t
++nezha_island_logical_w(void)
++{
++	static uint32_t value;
++	if (value == 0) value = nezha_island_bootarg("nezha_island_w", 40, 375, 110);
++	return value;
++}
++
++static uint32_t
++nezha_island_logical_h(void)
++{
++	static uint32_t value;
++	if (value == 0) value = nezha_island_bootarg("nezha_island_h", 10, 375, 32);
++	return value;
++}
++
++static uint32_t
++nezha_island_top_px(void)
++{
++	static int32_t value = -1;
++	if (value < 0) {
++		int parsed = -1;
++		value = (PE_parse_boot_argn("nezha_island_y", &parsed, sizeof(parsed)) &&
++		         parsed >= 0 && parsed <= 4096) ? parsed : -1;
++	}
++	return value < 0 ? 0xffffffffu : (uint32_t)value;
++}
++
+ static bool
+ nezha_island_geometry(SweetSurface *s, struct nezha_island_box *b)
+ {
+@@ -308,10 +360,13 @@ nezha_island_geometry(SweetSurface *s, struct nezha_island_box *b)
+ 	    (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
+ 		return false;
+ 	}
+-	b->w = s->width * 110 / 375;
+-	b->h = s->width * 32 / 375;
++	b->w = s->width * nezha_island_logical_w() / 375;
++	b->h = s->width * nezha_island_logical_h() / 375;
+ 	b->x0 = (s->width - b->w) / 2;
+-	b->y0 = s->width * 14 / 375 - (s->width * 2 + 600) / 1200;
++	const uint32_t top = nezha_island_top_px();
++	b->y0 = (top == 0xffffffffu)
++	            ? s->width * 14 / 375 - (s->width * 2 + 600) / 1200
++	            : top;
+ 	b->r = b->h / 2;
+ 	return b->w >= 4 && b->h >= 4 && b->y0 + b->h <= s->height;
+ }
