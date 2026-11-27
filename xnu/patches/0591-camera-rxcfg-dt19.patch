@@ -1,0 +1,133 @@
+diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
+index 791aa9a..f0385f9 100644
+--- a/bsd/dev/pandora_camera.c
++++ b/bsd/dev/pandora_camera.c
+@@ -4379,6 +4379,16 @@ pc_tpg_smmu_map(void)
+ #define PC_RDI_CFG1(rdi)     (PC_RDI_CFG0(rdi) + 0x14u)
+ #define PC_RDI_CTRL_START    PC_BIT(0)
+ 
++/* Next single variable (2026-11-26): RDI0 DT.  camera9 RX status is
++ * 0x10007077 = UNMAPPED_VC_DT (bit28) with CPHY_PH_CRC (bit24) and
++ * PAYLOAD_CRC (bit25) clear: lane94=0x0d fixed the CPHY header, and the
++ * packet VC/DT no longer matches RDI0 hard-coded DT 0x2b.  The 0x890
++ * capture (dt=0x19, wc=5120) and the earlier DT=0x19 mapping hit both
++ * point at 0x19; VC stays 0. */
++#define PC_RDI_CFG0_RAW10_VC0 0x002bf160u
++#define PC_RDI_CFG0_DT19_VC0  0x0019f160u
++#define PC_RDI_CFG0_NEXT      PC_RDI_CFG0_DT19_VC0
++
+ /* TPG is its own aperture (tpg0/1/2 @0x093fd000/0x093fe000/0x093ff000),
+  * not a CSID+0x600 window. TEST_EN = CTRL_CMD(0x1F4) bit4 is the only
+  * frame source on this generation. */
+@@ -4474,6 +4484,7 @@ pc_rdi_irq_report(vm_offset_t csid, const char *tag)
+  * and are not cleared here, so a prior error keeps the gate closed for the
+  * whole stream. */
+ #define PC_RX_IRQ_PAYLOAD_CRC  (1u << 25)
++#define PC_RX_IRQ_UNMAPPED     (1u << 28)  /* UNMAPPED_VC_DT */
+ static int
+ pc_payload_gate(vm_offset_t csid, const char *tag)
+ {
+@@ -4496,12 +4507,13 @@ pc_payload_gate(vm_offset_t csid, const char *tag)
+ 	pass = !(rx0 & PC_RX_IRQ_PAYLOAD_CRC) &&
+ 	    !(rx1 & PC_RX_IRQ_PAYLOAD_CRC) && crc1 == 0u && crc1 == crc0;
+ 	printf("PANDORA PAYLOADGATE: tag=%s csid=%#llx rx_before=%#x "
+-	    "rx_after_clear=%#x rx_settled=%#x bit24=%u bit25=%u "
++	    "rx_after_clear=%#x rx_settled=%#x bit24=%u bit25=%u bit28=%u "
+ 	    "pkts0=%#x pkts1=%#x ecc0=%#x ecc1=%#x crc0=%#x crc1=%#x "
+ 	    "dcrc=%d dpkts=%d gate=%s\n",
+ 	    tag, (unsigned long long)csid, rx_before, rx0, rx1,
+ 	    (rx1 & (1u << 24)) ? 1u : 0u,
+ 	    (rx1 & PC_RX_IRQ_PAYLOAD_CRC) ? 1u : 0u,
++	    (rx1 & PC_RX_IRQ_UNMAPPED) ? 1u : 0u,
+ 	    pkts0, pkts1, ecc0, ecc1, crc0, crc1,
+ 	    (int)(crc1 - crc0), (int)(pkts1 - pkts0),
+ 	    pass ? "PASS" : "FAIL");
+@@ -4976,7 +4988,8 @@ pc_csid_reset_once(vm_offset_t csid)
+  * per mainline camss-csid-gen2.c __csid_configure_rx, so csiphy0 contributes
+  * NO bit20: the earlier 0x00132103 selected csiphy1 and could never see data. */
+ static uint32_t
+-pc_sliceb_arm(vm_offset_t csid0, uint32_t rx_cfg0)
++pc_sliceb_arm_rdi(vm_offset_t csid0, uint32_t rx_cfg0,
++    uint32_t rdi_cfg0)
+ {
+ 	uint32_t rdi_base = PC_RDI_CFG0(0);
+ 	unsigned rst_done = pc_csid_reset_once(csid0);
+@@ -5031,12 +5044,12 @@ pc_sliceb_arm(vm_offset_t csid0, uint32_t rx_cfg0)
+ 	 * The former 0x3080 "lite" probe is not a second instance on this
+ 	 * generation; it only delayed the arm by up to 50 ms. */
+ 	for (unsigned try = 0; try < 50; try++) {
+-		pc_wr(csid0, PC_RDI_CFG0(0), 0x002bf160u);
+-		if (pc_rd(csid0, PC_RDI_CFG0(0)) == 0x002bf160u)
++		pc_wr(csid0, PC_RDI_CFG0(0), rdi_cfg0);
++		if (pc_rd(csid0, PC_RDI_CFG0(0)) == rdi_cfg0)
+ 			break;
+ 		pc_sleep(1);
+ 	}
+-	pc_wr(csid0, PC_RDI_CFG0(0), 0x002bf160u);           /* RAW10 VC0 */
++	pc_wr(csid0, PC_RDI_CFG0(0), rdi_cfg0);               /* DT/VC candidate */
+ 	/* v45: mainline camss-csid-gen3 writes PACKING_FORMAT_MIPI | PIX_STORE
+ 	 * and drop/crop enables. The proven TPG path tolerated 0x8000 alone,
+ 	 * but a real sensor needs PIX_STORE to commit payload; keep this run
+@@ -5054,8 +5067,10 @@ pc_sliceb_arm(vm_offset_t csid0, uint32_t rx_cfg0)
+ 	pc_wr(csid0, 0x11c, 0x1u);         /* RUP_AUP_CMD: RUP_SET */
+ 	pc_wr(csid0, PC_RDI_CTRL(0), PC_RDI_CTRL_START);     /* START_CMD: 1 = start */
+ 	pc_sleep(2);
+-	printf("PANDORA SLICEB: RDI0 armed rx_cfg0=%#x rb=%#x/%#x cfg0=%#x "
+-	    "ctrl=%#x\n", rx_cfg0, pc_rd(csid0, 0x880u), pc_rd(csid0, 0x884u),
++	printf("PANDORA SLICEB: RDI0 armed rx_cfg0=%#x rdi_cfg0=%#x "
++	    "dt=%#x vc=%u rb=%#x/%#x cfg0=%#x ctrl=%#x\n", rx_cfg0, rdi_cfg0,
++	    (rdi_cfg0 >> 16) & 0x3fu, (rdi_cfg0 >> 22) & 0x1fu,
++	    pc_rd(csid0, 0x880u), pc_rd(csid0, 0x884u),
+ 	    pc_rd(csid0, PC_RDI_CFG0(0)), pc_rd(csid0, PC_RDI_CTRL(0)));
+ 	pc_rx_cfg0_report(csid0, "sliceb-arm");
+ 	pc_rdi_irq_report(csid0, "sliceb-arm");
+@@ -5063,6 +5078,12 @@ pc_sliceb_arm(vm_offset_t csid0, uint32_t rx_cfg0)
+ 	return PC_RDI_CFG0(0);
+ }
+ 
++static uint32_t
++pc_sliceb_arm(vm_offset_t csid0, uint32_t rx_cfg0)
++{
++	return pc_sliceb_arm_rdi(csid0, rx_cfg0, PC_RDI_CFG0_RAW10_VC0);
++}
++
+ /* Poll the input-side state for iters ms. CSID 1080 completion evidence is
+  * BUF_DONE (VC0) only: VFE has no frame-done IRQ on this generation and
+  * SOF/EOF are input-side boundary events, not frame completion. BUF_DONE is
+@@ -6888,7 +6909,7 @@ pc_sliceb_cphytest(void)
+ 	 * Adopt 0x01102102 = PHY_NUM_SEL 1 + PHY_TYPE_SEL 1 (C-PHY). */
+ 	if (pc_camera_abort("cphytest csid arm"))
+ 		return;
+-	base = pc_sliceb_arm(csid2, 0x01102102u);
++	base = pc_sliceb_arm_rdi(csid2, 0x01102102u, PC_RDI_CFG0_NEXT);
+ 	pc_rx_cfg0_report(csid2, "cphytest post-arm");
+ 	pc_rdi_irq_report(csid2, "cphytest post-arm");
+ 	/* v42: arm the paired VFE2 WM before the sensor table reaches its
+@@ -7023,7 +7044,7 @@ pc_sliceb_cphytest(void)
+ 		 * RX IRQ immediately before the sampler so any error seen there is
+ 		 * generated by the post-stream configuration, not by the 6 s idle
+ 		 * window. */
+-		base = pc_sliceb_arm(csid2, 0x01102102u);
++		base = pc_sliceb_arm_rdi(csid2, 0x01102102u, PC_RDI_CFG0_NEXT);
+ 		if (base) {
+ 			pc_wr(csid2, 0x1b8u, 0xffffffffu); /* RX IRQ clear */
+ 			pc_wr(csid2, 0x1a8u, 0x10000u);    /* RDI0 BUF_DONE clear */
+@@ -7202,7 +7223,7 @@ pc_sliceb_cphytest(void)
+ 			(void)pandora_log_sync();
+ 			if (!down && up) {
+ 				pc_sensor_apply_wide_v34("wide-v92-retry", 0u);
+-				base = pc_sliceb_arm(csid2, 0x01102102u);
++				base = pc_sliceb_arm_rdi(csid2, 0x01102102u, PC_RDI_CFG0_NEXT);
+ 				if (base) {
+ 					pc_wr(csid2, 0x1b8u, 0xffffffffu);
+ 					pc_wr(csid2, 0x1a8u, 0x10000u);
+@@ -7296,7 +7317,8 @@ pc_sliceb_cphytest(void)
+ 			};
+ 
+ 			for (unsigned i = 0; i < 6; i++) {
+-				uint32_t b = pc_sliceb_arm(csid2, cands[i].cfg);
++				uint32_t b = pc_sliceb_arm_rdi(csid2, cands[i].cfg,
++				    PC_RDI_CFG0_NEXT);
+ 
+ 				if (!b) {
+ 					printf("PANDORA SLICEB: v24 %s arm FAILED (rst_done=0)\n",
