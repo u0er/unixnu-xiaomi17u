@@ -1,0 +1,93 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -1609,6 +1609,65 @@ vidc_power_up(void)
+     return failed ? -1 : 0;
+ }
+ 
++/* vidc8: vendor canoe preset table, 15 rows / 120 B ----------------------
++ * Port of R80 2.10: the kernel must carry the same 120 B the vendor's
++ * __set_registers walks.  Source of truth is the vendor table itself
++ * (msm_video.ko .rodata +0x1b008, descriptor +0x1b3a0 count 0xf, mask
++ * 0xffffffff on every row, so __write_register_masked == plain write)
++ * [docs/VIDC_R80_REVIEW_2026-11-24.md 2.1-2.4, 2.10].
++ * PLACEMENT IS LOAD-BEARING: row 0 is 0xB0088 (WRAPPER_CORE_CLK) <- 0, the
++ * same register the power stage just configured, so the table may only run on
++ * the 0xA004C bit0 (ready) side of the gate.  The vendor gets that ordering for
++ * free because __boot_firmware_iris4 polls bit0 internally before returning and
++ * only then calls __set_registers (0x16338), __interrupt_init_iris4 (0x16340)
++ * and enable_irq (0x16350).  Our port writes 0xA0048 and polls in the same
++ * function, so the calls below sit inside each `s & 1u` branch instead of after
++ * the release write.
++ * Function-scope static keeps the exact size the R80 check measures:
++ * 15 * 8 = 120 B (symbol <this function>.canoe).
++ * Row readback is DIAGNOSTIC ONLY: on this path 0x13xxx reads 0 even after a
++ * landed write and 0xA013C reads 0x99, so a zero does not prove a dropped write
++ * [docs/VIDC_R80_REVIEW_2026-11-24.md 8]. */
++static void
++vidc_apply_canoe_preset(void)
++{
++    static const struct { uint32_t off; uint32_t val; } canoe[] = {
++        { 0xB0088u, 0x00000000u },  /* WRAPPER_CORE_CLK, vendor row 0 */
++        { 0x13030u, 0x33332211u },
++        { 0x13034u, 0x44444444u },
++        { 0x13038u, 0x00001001u },
++        { 0x13040u, 0x00000000u },
++        { 0x13048u, 0x0000ffffu },
++        { 0x13430u, 0x33332211u },
++        { 0x13434u, 0x44444444u },
++        { 0x13438u, 0x00001001u },
++        { 0x13440u, 0x00000000u },
++        { 0x13448u, 0x0000ffffu },
++        { 0x13830u, 0x33332211u },
++        { 0x13834u, 0x44444444u },
++        { 0x13838u, 0x00001010u },  /* R80 2.10 calls this one out */
++        { 0xA013Cu, 0x00000099u },  /* never read back by the vendor */
++    };
++    const unsigned n = (unsigned)(sizeof(canoe) / sizeof(canoe[0]));
++
++    for (unsigned i = 0; i < n; i++)
++        vidc_wr(canoe[i].off, canoe[i].val);
++    __asm__ volatile ("dsb sy" ::: "memory");
++    printf("PANDORA VIDC: canoe preset %u rows applied (%u B): "
++           "13030=%08x 13430=%08x 13830=%08x A013C=%08x\n",
++        n, n * (unsigned)sizeof(canoe[0]),
++        vidc_rd(0x13030u), vidc_rd(0x13430u), vidc_rd(0x13830u), vidc_rd(0xA013Cu));
++    printf("PANDORA VIDC: preset 13030=%08x 13034=%08x 13038=%08x 13040=%08x "
++           "13048=%08x 13430=%08x\n",
++        vidc_rd(0x13030u), vidc_rd(0x13034u), vidc_rd(0x13038u),
++        vidc_rd(0x13040u), vidc_rd(0x13048u), vidc_rd(0x13430u));
++    printf("PANDORA VIDC: preset 13434=%08x 13438=%08x 13440=%08x 13448=%08x "
++           "13830=%08x 13834=%08x 13838=%08x A013C=%08x\n",
++        vidc_rd(0x13434u), vidc_rd(0x13438u), vidc_rd(0x13440u),
++        vidc_rd(0x13448u), vidc_rd(0x13830u), vidc_rd(0x13834u),
++        vidc_rd(0x13838u), vidc_rd(0xA013Cu));
++}
++
+ /* Publish qtable/SFR to the firmware and release the VPU core.
+  *
+  * Sequence is byte-for-byte what __boot_firmware_iris4 does [K]:
+@@ -1769,6 +1828,7 @@ vidc_publish_queues(void)
+             printf("PANDORA VIDC: pc ready via vendor BIT(8) fast path after %u us "
+                    "(0xA004C=%08x 0xC0010=%08x)\n", i * 100u, s, tz);
+             if (s & 1u) {
++                vidc_apply_canoe_preset();
+                 vidc_wr(R_CPU_H2XSOFTINTEN, 1);
+                 vidc_wr(R_CPU_X2RPMH, 0);
+             }
+@@ -1782,6 +1842,7 @@ vidc_publish_queues(void)
+             printf("PANDORA VIDC: pc ready after %u us (0xA004C=%08x 0xC0010=%08x)\n",
+                 i * 100u, s, tz);
+             if (s & 1u) {
++                vidc_apply_canoe_preset();
+                 vidc_wr(R_CPU_H2XSOFTINTEN, 1);
+                 vidc_wr(R_CPU_X2RPMH, 0);
+             }
+@@ -1815,6 +1876,7 @@ vidc_publish_queues(void)
+             return -1;
+         }
+         if (s & 1u) {
++            vidc_apply_canoe_preset();
+             vidc_wr(R_CPU_H2XSOFTINTEN, 1);
+             vidc_wr(R_CPU_X2RPMH, 0);
+             printf("PANDORA VIDC: queue table accepted after %u polls (status %08x)\n", i, s);
