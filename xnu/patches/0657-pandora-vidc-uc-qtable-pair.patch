@@ -1,0 +1,43 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+index 098946b..8187ec0 100644
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -1040,20 +1040,30 @@
+     }
+     *(volatile uint32_t *)vidc_sfr_va = VIDC_SFR_BYTES;   /* [M] first word = SFR size */
+     /* iris_vpu_common.c maps the UC region as its own 4 KiB page, zero-fills
+      * it and sets word 0 to 1; the core reads that page through 0xA0060.  It
+-     * then fills a {DA,size} region list at page+0x2C..0x58.  0529 put the
+-     * queue-table DA/window in the first pair; 0539 stages the DT-declared
+-     * video_region@9A600000 (8 MiB) instead -- the only DDR region this
+-     * non-CP session owns.  The other three pairs stay zero because their
+-     * core fields are never written. */
++     * then fills a {DA,size} region list at page+0x2C..0x58.
++     *
++     * 0657 single variable: the first pair described the DT video_region
++     * (0x9A600000/0x00800000), while the qtable and its three rings live in
++     * the apps-SMMU window 0xFF000000 + 0x300000 -- the same 0x300000 the
++     * vendor publishes as UC_REGION_SIZE.  vidc21 proved the qhdr pack reaches
++     * the core (word2/word3 read back by diag) yet publish still TIMEOUTed
++     * with no accept, so the next untested half of the UC contract is its
++     * content.  0529 used the qtable pair, but on a stack whose qhdr pack and
++     * CORE_CLK arm were both different; this arm restores that pair on today's
++     * stack and changes nothing else.  The other five pairs stay zero because
++     * their core fields are never written. */
+     memset((void *)vidc_uc_va, 0, VIDC_UC_BYTES);
+     {
+         volatile uint32_t *uc = (volatile uint32_t *)vidc_uc_va;
+         uc[0] = 1;
+-        uc[0x2C / 4] = VIDEO_REGION_PA;      /* 0x9A600000 video_region start */
+-        uc[0x30 / 4] = VIDEO_REGION_SIZE;    /* 0x00800000, 8 MiB */
+-    }
++        uc[0x2C / 4] = vidc_qtable_da();     /* 0xFF000000: qtable + rings */
++        uc[0x30 / 4] = VIDC_QTABLE_BYTES;    /* 0x300000 published window */
++    }
++    printf("PANDORA VIDC: UC pair0 qtable DA=%08x size=%08x (0657 arm; was "
++           "video_region %08x/%08x)\n", vidc_qtable_da(), VIDC_QTABLE_BYTES,
++        VIDEO_REGION_PA, VIDEO_REGION_SIZE);
+ 
+     /* One clean for the header and every ring header the VPU will read. */
+     vidc_sync_out(0, (unsigned)sizeof(*t));
+     __asm__ volatile ("dmb oshst" ::: "memory");
