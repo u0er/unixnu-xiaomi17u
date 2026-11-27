@@ -1,0 +1,782 @@
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -2019,9 +2019,48 @@
+ #define BT_PERI_MAP_A_TAIL_SCAN_MS  150u
+ #define BT_PERI_MAP_A_WITHHOLD      0x0c02
+ 
++/* Level 20.69 (v2066, 0622a): stream-first reset, recovery 0.
++ *
++ * Lane14 measured the bt2064 failure in the driver, not the chip: the reset
++ * and arbitrate waits aborted on the first resident stream byte (EPROTO 100
++ * at 0.0 ms, so their 300/1000 ms windows never ran), the 0621 quiesce read
++ * one byte per bt_sleep(1000) poll (1,765 B/s against a 15,980 B/s stream,
++ * a 9.05x deficit) and the wake loop burned 32 bytes in 2 ms while still
++ * returning success. 0622a changes only the arm's timing and evidence:
++ * bulk-drain to silence, defer before spending the one-shot, confirm the
++ * wake, tolerate stream bytes inside the arm, and classify the post-reset
++ * window by bytes before any DEAD verdict. Protocol frames, ack_ms, the
++ * 0x19 windows and the 0602/0620 withhold rules are untouched.
++ *
++ * pandora_bt_recovery: 0 (default) defers the arm when the stream never
++ * goes quiet; 1/2 are reserved for 0622b's ladder and here only relax that
++ * deferral, because the ladder does not exist in this build.
++ */
++#define BT_PERI_MAP_A_DEFERRED      0x0c07
++#define BT_PERI_MAP_A_RECOVERY_OFF  0
++#define BT_PERI_MAP_A_RECOVERY_ON   1
++#define BT_PERI_MAP_A_RECOVERY_FULL 2
++#define BT_STREAM_MAX_MS            6000u
++#define BT_STREAM_QUIET_MS          200u
++#define BT_STREAM_MAX_BYTES         131072u
++#define BT_STREAM_ALIVE_MIN_BYTES   1024u
++#define BT_STREAM_ALIVE_MIN_SPAN_MS 300u
++#define BT_POST_RESET_WINDOW_MS     500u
++#define BT_PERI_WAKE_DISCARD_MAX    4096u
++#define BT_PERI_HEAD_KEEP           512u
++
++struct bt_peri_stream_obs {
++	unsigned bytes;
++	unsigned elapsed;
++	unsigned rate;
++	unsigned records;
++	unsigned seq;
++};
++
+ static uint64_t bt_map_a_last_tx;
+ static int bt_map_a_reset_arm;
+ static int bt_map_a_reset_spent;
++static int bt_map_a_recovery;
+ /* 0602 calls this from bt_peri_tlv_stage() ~700 lines before its
+  * definition; clang 16 makes the implicit declaration a hard error,
+  * so the forward declaration is what lets the stack build at all.
+@@ -2466,6 +2505,97 @@
+ 	}
+ }
+ 
++
++/* Level 20.69 (v2066, 0622a): the arm's tolerant subcommand wait.
++ *
++ * Same 34 00 ff <plen> framing as bt_peri_wait_sub, but a non-event byte is
++ * charged to the stream instead of aborting with EPROTO: that abort is what
++ * ended bt2064 at 0.0 ms twice. FD is still answered with FC, FC/FE/FF are
++ * still ignorable padding, and the caller only ever sees ETIMEDOUT at the
++ * deadline. Used exclusively by *_stream mode functions called from the
++ * reset arm; the download phases keep the strict reader above. */
++static int
++bt_peri_wait_sub_stream(uint8_t *rx, unsigned cap, unsigned *got,
++    uint64_t deadline, uint8_t want_sub, const char *what, unsigned *dropped)
++{
++	static const uint8_t ack = 0xfc;
++	unsigned discards = 0;
++	int err = ETIMEDOUT;
++
++	*got = 0;
++	while (mach_absolute_time() < deadline) {
++		uint32_t st = bt_rd(BT_W_SE, SE_RX_FIFO_ST);
++		unsigned words = st & 0x1ffffffu;
++		uint8_t b;
++
++		if (!words) {
++			bt_sleep(50);
++			continue;
++		}
++		b = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++		if (b != 0x34u) {
++			if (b == 0xfdu) {
++				(void)bt_uart_tx(&ack, 1u, "PERI arm wait ACK FC");
++				continue;
++			}
++			if (b == 0xfcu || b == 0xfeu || b == 0xffu) {
++				continue;
++			}
++			discards++;
++			continue;
++		}
++		/* One whole 34 00 ff <plen> record; it is an ACK only if the subcmd
++		 * byte lands at offset 10 with the expected value. */
++		rx[0] = b;
++		for (unsigned i = 1u; i < 4u; i++) {
++			while (!(bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
++				if (mach_absolute_time() >= deadline) {
++					goto out;
++				}
++				bt_sleep(50);
++			}
++			rx[i] = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++		}
++		if (rx[1] != 0x00u || rx[2] != 0xffu) {
++			discards += 4u;
++			continue;
++		}
++		{
++			unsigned plen = rx[3];
++			unsigned n = 4u;
++
++			while (n < 4u + plen) {
++				while (!(bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
++					if (mach_absolute_time() >= deadline) {
++						goto out;
++					}
++					bt_sleep(50);
++				}
++				if (n < cap) {
++					rx[n] = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++				} else {
++					(void)bt_rd(BT_W_SE, SE_RX_FIFO);
++				}
++				n++;
++			}
++			*got = n;
++			if (n >= 11u && rx[10] == want_sub) {
++				err = 0;
++				break;
++			}
++			discards += n;
++		}
++	}
++out:
++	if (discards != 0u) {
++		printf("PANDORA BT: %s: discarded %u stream byte(s) while waiting for subcmd %u\n",
++		    what, discards, want_sub);
++		pandora_log_sync();
++	}
++	*dropped = discards;
++	return err;
++}
++
+ /* Arbitrate: PeriSocInit's ArbitrateEv frame, sent after the 4 Mbps
+  * switch and before the ram patch (trace t=9.801908 TX, t=9.802157 the
+  * 12-byte ACK). Frame 31 00 f0 ff 03 08 00 00; the ACK echoes subcommand
+@@ -3157,8 +3287,9 @@
+  * but never the GetVer that precedes it in the Android sequence; this is
+  * the remaining PERI-session frame. Observation only. */
+ static int
+-bt_peri_getver_window(unsigned window_ms)
+-{
++bt_peri_getver_window_mode(unsigned window_ms, bool stream)
++{
++	unsigned dropped = 0;
+ 	static const uint8_t request[] = { 0x31, 0x00, 0xf0, 0xff, 0x02, 0x05, 0x00 };
+ 	uint8_t rx[BT_PERI_EVT_MAX] = {0};
+ 	unsigned got = 0;
+@@ -3173,8 +3304,13 @@
+ 	 * liveness probe can ask the same question with 400 ms; the level-19
+ 	 * caller below keeps the 700 ms it has always used. */
+ 	clock_interval_to_deadline(window_ms, NSEC_PER_MSEC, &deadline);
+-	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x05,
+-	    "PERI GetVer(00)");
++	if (stream) {
++		err = bt_peri_wait_sub_stream(rx, sizeof(rx), &got, deadline, 0x05,
++		    "PERI GetVer(00)", &dropped);
++	} else {
++		err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x05,
++		    "PERI GetVer(00)");
++	}
+ 	if (err) {
+ 		printf("PANDORA BT: GetVer(00): no reply (error %d, %u bytes); continuing\n",
+ 		    err, got);
+@@ -3188,6 +3324,18 @@
+ 	bt_dump("PERI GetVer(00) reply", rx, got);
+ 	pandora_log_sync();
+ 	return 0;
++}
++
++static int
++bt_peri_getver_window(unsigned window_ms)
++{
++	return bt_peri_getver_window_mode(window_ms, false);
++}
++
++static int
++bt_peri_getver_window_stream(unsigned window_ms)
++{
++	return bt_peri_getver_window_mode(window_ms, true);
+ }
+ 
+ /* The level-19 chain keeps its 700 ms window and its continue-on-silence
+@@ -3236,6 +3384,106 @@
+ 	return 0;
+ }
+ 
++
++/* Level 20.69 (v2066, 0622a): D3 reset with a wake verdict.
++ *
++ * 0620 (and 0621) returned 0 once the 6-byte frame was on the wire, so the
++ * arm could not tell "TX accepted" from "ROM heard it"; bt2064's wake loop
++ * burned 32 stream bytes in 2 ms, printed no answer, and still returned 0.
++ * This sends reset and fd together (the trace's order), then spends one
++ * 300 ms window: a 34 00 ff event or fc/fe/ff is "answered", every other byte
++ * is stream and is charged to a 4 KiB budget instead of EPROTO. The out
++ * parameter is the wake state, the return value is the TX result only. */
++static int
++bt_peri_reset_ex(unsigned *wake_out)
++{
++	static const uint8_t request[] = { 0x31, 0x00, 0xf1, 0xff, 0x01, 0x03 };
++	static const uint8_t wake = 0xfd;
++	static const uint8_t ack = 0xfc;
++	uint8_t rx[8];
++	unsigned dropped = 0;
++	unsigned heard = 0;
++	uint64_t start;
++	uint64_t deadline;
++	int err;
++
++	*wake_out = 0u;
++	err = bt_uart_tx(request, sizeof(request), "PERI reset request");
++	if (err) {
++		return err;
++	}
++	start = bt_peri_uptime_ms();
++	err = bt_uart_tx(&wake, 1u, "PERI wake FD");
++	if (err) {
++		return err;
++	}
++	clock_interval_to_deadline(300, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline &&
++	    dropped < BT_PERI_WAKE_DISCARD_MAX) {
++		uint32_t st = bt_rd(BT_W_SE, SE_RX_FIFO_ST);
++		unsigned words = st & 0x1ffffffu;
++		uint8_t b;
++
++		if (!words) {
++			bt_sleep(50);
++			continue;
++		}
++		b = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++		if (b == 0xfdu) {
++			(void)bt_uart_tx(&ack, 1u, "PERI reset wake ACK FC");
++			continue;
++		}
++		if (b == 0x34u) {
++			unsigned n = 1u;
++			unsigned plen;
++			unsigned k = 0u;
++
++			rx[0] = b;
++			while (n < 4u && mach_absolute_time() < deadline) {
++				if (!(bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
++					bt_sleep(50);
++					continue;
++				}
++				rx[n++] = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++			}
++			if (n < 4u || rx[1] != 0x00u || rx[2] != 0xffu) {
++				dropped += n;
++				continue;
++			}
++			plen = rx[3];
++			while (k < plen && mach_absolute_time() < deadline) {
++				if (!(bt_rd(BT_W_SE, SE_RX_FIFO_ST) & 0x1ffffffu)) {
++					bt_sleep(50);
++					continue;
++				}
++				(void)bt_rd(BT_W_SE, SE_RX_FIFO);
++				k++;
++			}
++			heard = 0x34u;
++			break;
++		}
++		if (b == 0xfcu || b == 0xfeu || b == 0xffu) {
++			heard = b;
++			break;
++		}
++		dropped++;
++	}
++	if (heard != 0u) {
++		printf("PANDORA BT: PERI reset: wake answered in %u ms "
++		    "(%u stream byte(s) discarded)%s\n",
++		    (unsigned)(bt_peri_uptime_ms() - start), dropped,
++		    heard == 0x34u ? " by a 34 00 ff event" : "");
++	} else {
++		printf("PANDORA BT: PERI reset: wake unanswered in %u ms "
++		    "(%u stream byte(s) discarded, budget %u)\n",
++		    (unsigned)(bt_peri_uptime_ms() - start), dropped,
++		    BT_PERI_WAKE_DISCARD_MAX);
++	}
++	pandora_log_sync();
++	*wake_out = heard;
++	return 0;
++}
++
+ static int
+ bt_peri_reset(void)
+ {
+@@ -3330,8 +3578,9 @@
+  * verbatim: 31 00 f0 ff 03 08 03 00 (subcmd 8, the v3 flag byte 03 at
+  * offset 7) and 31 00 f0 ff 02 05 03 (version family, flag 03). */
+ static int
+-bt_peri_arbitrate_v3(void)
+-{
++bt_peri_arbitrate_v3_mode(bool stream)
++{
++	unsigned dropped = 0;
+ 	static const uint8_t request[] = { 0x31, 0x00, 0xf0, 0xff, 0x03, 0x08, 0x03, 0x00 };
+ 	static const uint8_t identity[] = { 0xf0, 0x01, 0x01, 0xf0, 0xff };
+ 	uint8_t rx[BT_PERI_EVT_MAX] = {0};
+@@ -3344,8 +3593,13 @@
+ 		return err;
+ 	}
+ 	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
+-	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x08,
+-	    "PERI arbitrate v3");
++	if (stream) {
++		err = bt_peri_wait_sub_stream(rx, sizeof(rx), &got, deadline, 0x08,
++		    "PERI arbitrate v3", &dropped);
++	} else {
++		err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x08,
++		    "PERI arbitrate v3");
++	}
+ 	if (err) {
+ 		printf("PANDORA BT: arbitrate v3: no ACK (error %d)\n", err);
+ 		bt_dump("PERI arbitrate v3 raw", rx, got);
+@@ -3372,6 +3626,18 @@
+ 	return 0;
+ }
+ 
++static int
++bt_peri_arbitrate_v3(void)
++{
++	return bt_peri_arbitrate_v3_mode(false);
++}
++
++static int
++bt_peri_arbitrate_v3_stream(void)
++{
++	return bt_peri_arbitrate_v3_mode(true);
++}
++
+ /* Version re-check after the reset, verbatim t=9.930829:
+  * 31 00 f0 ff 02 05 03. The 2026-11-18 12:0x level-20 run skipped this
+  * frame and the ROM rejected the TME-L segments with status 2
+@@ -3379,8 +3645,9 @@
+  * reply is the version family (subcmd 5 at offset 10, like the
+  * 115200-phase version exchange). */
+ static int
+-bt_peri_version_v3(void)
+-{
++bt_peri_version_v3_mode(bool stream)
++{
++	unsigned dropped = 0;
+ 	static const uint8_t request[] = { 0x31, 0x00, 0xf0, 0xff, 0x02, 0x05, 0x03 };
+ 	uint8_t rx[BT_PERI_EVT_MAX] = {0};
+ 	unsigned got = 0;
+@@ -3392,8 +3659,13 @@
+ 		return err;
+ 	}
+ 	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
+-	err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x05,
+-	    "PERI version v3");
++	if (stream) {
++		err = bt_peri_wait_sub_stream(rx, sizeof(rx), &got, deadline, 0x05,
++		    "PERI version v3", &dropped);
++	} else {
++		err = bt_peri_wait_sub(rx, sizeof(rx), &got, deadline, 0x05,
++		    "PERI version v3");
++	}
+ 	if (err) {
+ 		printf("PANDORA BT: version v3: no reply (error %d, %u bytes)\n", err, got);
+ 		bt_dump("PERI version v3 raw", rx, got);
+@@ -3411,6 +3683,18 @@
+ 	bt_dump("PERI version v3 reply", rx, got);
+ 	pandora_log_sync();
+ 	return 0;
++}
++
++static int
++bt_peri_version_v3(void)
++{
++	return bt_peri_version_v3_mode(false);
++}
++
++static int
++bt_peri_version_v3_stream(void)
++{
++	return bt_peri_version_v3_mode(true);
+ }
+ 
+ /* Level 20.13: one observation window that understands both framings the
+@@ -4147,7 +4431,7 @@
+ /* One place for the version the driver prints. It used to be a literal inside the
+  * banner and fell seven levels behind (the log said 20.24 while the code was
+  * 20.35), which makes any post-hoc reading of a log attribute the wrong revision. */
+-#define BT_PERI_VER "20.35"
++#define BT_PERI_VER "20.37"
+ 
+ /* Level 20.43: drain the line to silence, the way upstream qbt_geni does.
+  *
+@@ -5435,6 +5719,284 @@
+ 	return ns / 1000000ull;
+ }
+ 
++
++/* Level 20.69 (v2066, 0622a): D1 bulk drain. 0621's quiesce called
++ * bt_rx_exact() for one byte and bt_sleep(1000) when empty; bt_sleep takes
++ * microseconds, so an empty poll cost 1 ms (about 1 B/ms) while the ROM
++ * emitted 15,980 B/s. The FIFO never drained and "quiet" was never reached.
++ * This takes the whole RX FIFO word count per read and polls every 50 us. */
++static unsigned
++bt_peri_stream_drain(unsigned max_ms, unsigned quiet_ms, unsigned max_bytes,
++    const char *what, struct bt_peri_stream_obs *obs)
++{
++	static const uint8_t ack = 0xfc;
++	uint8_t chunk[512];
++	uint64_t start = bt_peri_uptime_ms();
++	uint64_t last = start;
++	unsigned bytes = 0;
++	unsigned elapsed;
++	unsigned quiet;
++
++	memset(obs, 0, sizeof(*obs));
++	while ((unsigned)(bt_peri_uptime_ms() - start) < max_ms &&
++	    bytes < max_bytes) {
++		uint32_t st = bt_rd(BT_W_SE, SE_RX_FIFO_ST);
++		unsigned words = st & 0x1ffffffu;
++		unsigned n = 0;
++
++		if (words > sizeof(chunk)) {
++			words = sizeof(chunk);
++		}
++		while (n < words) {
++			chunk[n++] = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++		}
++		if (n != 0u) {
++			unsigned take = n;
++
++			if (bytes + take > max_bytes) {
++				take = max_bytes - bytes;
++			}
++			for (unsigned i = 0u; i < take; i++) {
++				if (chunk[i] == 0xfdu) {
++					(void)bt_uart_tx(&ack, 1u, "stream drain ACK FC");
++				}
++			}
++			bytes += take;
++			last = bt_peri_uptime_ms();
++		} else {
++			bt_sleep(50);
++		}
++	}
++	elapsed = (unsigned)(bt_peri_uptime_ms() - start);
++	quiet = (unsigned)(bt_peri_uptime_ms() - last);
++	obs->bytes = bytes;
++	obs->elapsed = elapsed;
++	obs->rate = bytes * 1000u / (elapsed != 0u ? elapsed : 1u);
++	printf("PANDORA BT: %s: stream drain: %u byte(s), %u ms quiet in %u ms "
++	    "(cap %u, quiet target %u, byte cap %u), %u B/s%s\n",
++	    what, bytes, quiet, elapsed, max_ms, quiet_ms, max_bytes, obs->rate,
++	    quiet >= quiet_ms ? "" : ", stream still active");
++	pandora_log_sync();
++	return quiet;
++}
++
++/* Level 20.69 (v2066, 0622a): D5 post-reset byte classification.
++ * Counts everything the ROM sends in a fixed window; the first 512 bytes are
++ * parsed for 34 00 ff / f0 04 records so the seq progress is evidence, not a
++ * claim. Only a 0-byte window may reach the DEAD literal in the arm. */
++static void
++bt_peri_post_reset_stream(unsigned window_ms, const char *what,
++    struct bt_peri_stream_obs *obs)
++{
++	static const uint8_t ack = 0xfc;
++	uint8_t head[BT_PERI_HEAD_KEEP];
++	unsigned n = 0;
++	uint64_t start = bt_peri_uptime_ms();
++	uint64_t deadline;
++
++	memset(obs, 0, sizeof(*obs));
++	clock_interval_to_deadline(window_ms, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		uint32_t st = bt_rd(BT_W_SE, SE_RX_FIFO_ST);
++		unsigned words = st & 0x1ffffffu;
++
++		if (!words) {
++			bt_sleep(50);
++			continue;
++		}
++		while (words-- != 0u) {
++			uint8_t b = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++
++			if (b == 0xfdu) {
++				(void)bt_uart_tx(&ack, 1u, "post-reset stream ACK FC");
++			}
++			obs->bytes++;
++			if (n < sizeof(head)) {
++				head[n++] = b;
++			}
++		}
++	}
++	obs->elapsed = (unsigned)(bt_peri_uptime_ms() - start);
++	obs->rate = obs->bytes * 1000u /
++	    (obs->elapsed != 0u ? obs->elapsed : 1u);
++	for (unsigned i = 0u; i + 4u <= n; ) {
++		unsigned plen;
++
++		if (head[i] != 0x34u || head[i + 1u] != 0x00u ||
++		    head[i + 2u] != 0xffu) {
++			i++;
++			continue;
++		}
++		plen = head[i + 3u];
++		if (i + 4u + plen > n) {
++			break;
++		}
++		if (plen >= 7u && head[i + 4u] == 0xf0u &&
++		    head[i + 5u] == 0x04u) {
++			obs->records++;
++			obs->seq = head[i + 6u];
++		}
++		i += 4u + plen;
++	}
++	printf("PANDORA BT: %s: post-reset stream: %u byte(s) in %u ms (%u B/s), "
++	    "%u f0 04 record(s) in the first %u byte(s), last seq %02x -> %s\n",
++	    what, obs->bytes, obs->elapsed, obs->rate, obs->records, n, obs->seq,
++	    obs->bytes == 0u ? "ROM SILENT" :
++	    (obs->bytes >= BT_STREAM_ALIVE_MIN_BYTES ? "ROM STILL STREAMING" :
++	    "BELOW LIVENESS FLOOR"));
++	pandora_log_sync();
++}
++
++/* Level 20.69 (v2066, 0622a): the one DEAD verdict, reachable only from a
++ * 0-byte post-reset window (the arm returns before this on any byte). */
++static void
++bt_peri_reset_dead(const char *what, const char *stage, int err)
++{
++	printf("PANDORA BT: %s: reset verdict: DEAD_CONFIRMED; ROM DEAD after reset: %s silent (error %d); no replay\n",
++	    what, stage, err);
++	pandora_log_sync();
++}
++
++/* Level 20.69 (v2066, 0622a): the reset arm, stream-first.
++ *
++ * Order is the whole experiment: drain to a real 200 ms silence (D1), then
++ * and only then decide whether to spend the once-per-boot reset (D2). If the
++ * stream never quiets the arm returns BT_PERI_MAP_A_DEFERRED with the
++ * one-shot untouched, so a later boot still owns it. With the line quiet the
++ * 6-byte reset and the fd wake go out together; a 300 ms single window counts
++ * any 34 00 ff event or fc/fe/ff as "ROM heard it" and charges every other
++ * byte to the stream (D3). The next 500 ms are classified by bytes before any
++ * protocol judgement (D5): >=1024 B and >=300 ms is NOT_LANDED and no DEAD
++ * literal is printed; 1..1023 B is INCONCLUSIVE; only 0 B re-enters the
++ * 0620 chain (arbitrate/version/GetVer/replay/0x19), whose waits alone are
++ * the tolerant ones (D4). */
++static int
++bt_peri_map_a_reset_run(unsigned frames, uint16_t *bid_io, const char *what)
++{
++	struct bt_peri_stream_obs drain;
++	struct bt_peri_stream_obs post;
++	uint16_t bid = *bid_io;
++	uint16_t bid_after = 0xffffu;
++	unsigned quiet;
++	unsigned wake = 0u;
++	int identity_silent = (bid == 0xffffu);
++	int r;
++
++	printf("PANDORA BT: %s: reset arm: %s; one reset + full map A replay + 0x19 "
++	    "(one-shot, policy %d)\n", what, identity_silent ?
++	    "BID post ffff (identity path silent)" :
++	    "BID post 0000 (ROM alive, map A rejected)", bt_map_a_reset_arm);
++	pandora_log_sync();
++	quiet = bt_peri_stream_drain(BT_STREAM_MAX_MS, BT_STREAM_QUIET_MS,
++	    BT_STREAM_MAX_BYTES, what, &drain);
++	if (quiet < BT_STREAM_QUIET_MS &&
++	    bt_map_a_recovery == BT_PERI_MAP_A_RECOVERY_OFF) {
++		printf("PANDORA BT: %s: reset arm deferred: stream still active "
++		    "(%u byte(s) drained, %u ms quiet in %u ms); one-shot NOT spent, "
++		    "no reset TX\n", what, drain.bytes, quiet, drain.elapsed);
++		pandora_log_sync();
++		return BT_PERI_MAP_A_DEFERRED;
++	}
++	bt_map_a_reset_spent = 1;
++	printf("PANDORA BT: %s: reset arm: chain reset -> arbitrate v3 -> version v3 "
++	    "-> GetVer(00) -> full map A replay (%u frames) -> 0x19 -> BID\n",
++	    what, frames);
++	pandora_log_sync();
++	r = bt_peri_reset_ex(&wake);
++	if (r != 0) {
++		printf("PANDORA BT: %s: reset arm: reset TX failed (error %d); "
++		    "one-shot spent, map B withheld\n", what, r);
++		pandora_log_sync();
++		return r;
++	}
++	bt_peri_post_reset_stream(BT_POST_RESET_WINDOW_MS, what, &post);
++	if (post.bytes >= BT_STREAM_ALIVE_MIN_BYTES &&
++	    post.elapsed >= BT_STREAM_ALIVE_MIN_SPAN_MS) {
++		printf("PANDORA BT: %s: reset verdict: NOT_LANDED (reset TX sent, "
++		    "%u byte(s) still streaming at %u B/s over %u ms; wake %s); "
++		    "map B withheld, no replay\n", what, post.bytes, post.rate,
++		    post.elapsed, wake != 0u ? "answered" : "unanswered");
++		pandora_log_sync();
++		return BT_PERI_MAP_A_WITHHOLD;
++	}
++	if (post.bytes != 0u) {
++		printf("PANDORA BT: %s: reset verdict: INCONCLUSIVE (%u byte(s) in "
++		    "%u ms after the reset, below the %u byte liveness floor); "
++		    "map B withheld, no replay\n", what, post.bytes, post.elapsed,
++		    BT_STREAM_ALIVE_MIN_BYTES);
++		pandora_log_sync();
++		return BT_PERI_MAP_A_WITHHOLD;
++	}
++	printf("PANDORA BT: %s: reset verdict: ROM SILENT (0 byte(s) in %u ms); "
++	    "wake %s, entering the replay chain\n", what, post.elapsed,
++	    wake != 0u ? "answered" : "unanswered");
++	pandora_log_sync();
++	r = bt_peri_arbitrate_v3_stream();
++	if (r != 0) {
++		bt_peri_reset_dead(what, "arbitrate v3", r);
++		return r;
++	}
++	r = bt_peri_version_v3_stream();
++	if (r != 0) {
++		bt_peri_reset_dead(what, "version v3", r);
++		return r;
++	}
++	r = bt_peri_getver_window_stream(700u);
++	if (r != 0) {
++		bt_peri_reset_dead(what, "GetVer(00)", r);
++		return r;
++	}
++	(void)bt_peri_board_id_download(&bid_after);
++	printf("PANDORA BT: %s: BID after reset %s (id %04x)\n", what,
++	    bid_after != 0xffffu ? "answered" : "silent", bid_after);
++	pandora_log_sync();
++	if (bid_after != 0u && bid_after != 0xffffu) {
++		printf("PANDORA BT: %s: reset verdict: INCONCLUSIVE; variant changed to "
++		    "%04x; not replaying\n", what, bid_after);
++		pandora_log_sync();
++		return ETIMEDOUT;
++	}
++	r = bt_peri_tlv_stage(pandora_peri_tmel_elf,
++	    sizeof(pandora_peri_tmel_elf), "PERI TME-L map A replay", 0x03, 0u);
++	if (r != 0) {
++		printf("PANDORA BT: %s: reset arm: map A replay TX failed (error %d); "
++		    "map B stays withheld\n", what, r);
++		pandora_log_sync();
++		return r;
++	}
++	r = bt_peri_vs_cmd(0x19u, BT_PERI_MAP_A_0X19_FIRST_MS,
++	    "PERI TME-L map A replay 0x19");
++	if (r != 0) {
++		r = bt_peri_vs_cmd(0x19u, BT_PERI_MAP_A_0X19_WIDE_MS,
++		    "PERI TME-L map A replay 0x19 retry");
++	}
++	(void)bt_peri_board_id_download(&bid_after);
++	*bid_io = bid_after;
++	printf("PANDORA BT: %s: replay result: 0x19 %s, BID after replay %s "
++	    "(id %04x)%s\n", what, r == 0 ? "answered" : "silent",
++	    bid_after != 0xffffu ? "answered" : "silent", bid_after,
++	    identity_silent ? "; map B stays withheld (pre-reset identity was ffff)" : "");
++	pandora_log_sync();
++	if (r == 0 && !identity_silent) {
++		printf("PANDORA BT: %s: reset recovered: 0x19 answered after the replay; "
++		    "map A unproven, map B open on the replay only\n", what);
++		pandora_log_sync();
++		return 0;
++	}
++	if (r == 0) {
++		printf("PANDORA BT: %s: reset recovered liveness only: replay 0x19 "
++		    "answered but the identity stayed unknown (BID %04x); map B withheld\n",
++		    what, bid_after);
++		pandora_log_sync();
++		return BT_PERI_MAP_A_WITHHOLD;
++	}
++	printf("PANDORA BT: %s: reset verdict: REPLAY_0X19_SILENT; map A rejected "
++	    "after the replay (0x19 silent, error %d); map B stays withheld, needs a reboot\n",
++	    what, r);
++	pandora_log_sync();
++	return r;
++}
++
+ /* Level 20.67 (v2064, 0602): the map A tail gate.
+  *
+  * Called with the last map A byte already on the wire and its timestamp kept
+@@ -5519,61 +6081,13 @@
+ 	 * never identified. Only the 0000 entry may open map B on the replay. */
+ 	if (bt_map_a_reset_arm >= 2 && !bt_map_a_reset_spent &&
+ 	    (bid == 0u || bid == 0xffffu)) {
+-		int r;
+-		int identity_silent = (bid == 0xffffu);
+-		uint16_t bid_after = 0xffffu;
+-
+-		bt_map_a_reset_spent = 1;
+-		printf("PANDORA BT: %s: reset arm 2 (%s BID %04x, one reset this boot): reset -> arbitrate v3 -> version v3 -> GetVer(00) -> full map A replay (%u frames) -> 0x19 -> BID\n",
+-		    what, identity_silent ? "silent" : "answered", bid, frames);
+-		pandora_log_sync();
+-		r = bt_peri_reset();
++		int r = bt_peri_map_a_reset_run(frames, &bid, what);
++
+ 		if (r == 0) {
+-			r = bt_peri_arbitrate_v3();
+-		}
+-		if (r == 0) {
+-			r = bt_peri_version_v3();
+-		}
+-		if (r == 0) {
+-			r = bt_peri_getver_window(700u);
+-		}
+-		if (r == 0) {
+-			r = bt_peri_tlv_stage(pandora_peri_tmel_elf,
+-			    sizeof(pandora_peri_tmel_elf),
+-			    "PERI TME-L map A replay", 0x03, 0u);
+-		}
+-		if (r == 0) {
+-			r = bt_peri_vs_cmd(0x19u, BT_PERI_MAP_A_0X19_FIRST_MS,
+-			    "PERI TME-L map A replay 0x19");
+-		}
+-		if (r != 0) {
+-			r = bt_peri_vs_cmd(0x19u, BT_PERI_MAP_A_0X19_WIDE_MS,
+-			    "PERI TME-L map A replay 0x19 retry");
+-		}
+-		/* The identity is asked again after the replay's own 0x19: the
+-		 * pre-reset answer is the reason this arm ran, the post-replay one is
+-		 * the reason map B may or may not open. */
+-		(void)bt_peri_board_id_download(&bid_after);
+-		printf("PANDORA BT: %s: replay result: 0x19 %s, BID after replay %s (id %04x)%s\n",
+-		    what, r == 0 ? "answered" : "silent",
+-		    bid_after != 0xffffu ? "answered" : "silent", bid_after,
+-		    identity_silent ? "; map B stays withheld (pre-reset identity was ffff)" : "");
+-		pandora_log_sync();
+-		bid = bid_after;
+-		if (r == 0 && !identity_silent) {
+-			printf("PANDORA BT: %s: reset recovered: map A replayed %u frames, 0x19 answered; map B open on the replay\n",
+-			    what, frames);
++			printf("PANDORA BT: %s: reset arm recovered map A on the replay; map B may open\n",
++			    what);
+ 			pandora_log_sync();
+ 			return 0;
+-		}
+-		if (r == 0) {
+-			printf("PANDORA BT: %s: reset recovered liveness only: replay 0x19 answered but the identity stayed unknown (BID %04x); map B withheld\n",
+-			    what, bid_after);
+-			pandora_log_sync();
+-		} else {
+-			printf("PANDORA BT: %s: ROM DEAD after reset (chain stopped at error %d); map B stays withheld, needs a reboot\n",
+-			    what, r);
+-			pandora_log_sync();
+ 		}
+ 	}
+ 	printf("PANDORA BT: %s: map B withheld (0x19 silent, BID %04x, resident f0 04 seq advanced %u, %u frames already sent)\n",
+@@ -5594,6 +6108,8 @@
+ 	    (unsigned)sizeof(pandora_peri_tmel_elf),
+ 	    (unsigned)sizeof(pandora_peri_tmel_mbn),
+ 	    (unsigned)sizeof(pandora_peri_tmel_nvm));
++	printf("PANDORA BT: map A reset policy %d, recovery %d (v2066 0622a: stream drain, silent gate, wake confirm, post-reset classes)\n",
++	    bt_map_a_reset_arm, bt_map_a_recovery);
+ 	pandora_log_sync();
+ 	/* Level 20.19: GetVer(00) and ActivateSS now happen in the level-19 chain
+ 	 * (trace order), so the TME-L phase starts with the same three frames
+@@ -6011,6 +6527,14 @@
+ 	(void)PE_parse_boot_argn("pandora_bt", &bt_level, sizeof(bt_level));
+ 	(void)PE_parse_boot_argn("pandora_bt_reset", &bt_map_a_reset_arm,
+ 	    sizeof(bt_map_a_reset_arm));
++	(void)PE_parse_boot_argn("pandora_bt_recovery", &bt_map_a_recovery,
++	    sizeof(bt_map_a_recovery));
++	if (bt_map_a_recovery < BT_PERI_MAP_A_RECOVERY_OFF ||
++	    bt_map_a_recovery > BT_PERI_MAP_A_RECOVERY_FULL) {
++		printf("PANDORA BT: pandora_bt_recovery=%d out of range, using %d\n",
++		    bt_map_a_recovery, BT_PERI_MAP_A_RECOVERY_OFF);
++		bt_map_a_recovery = BT_PERI_MAP_A_RECOVERY_OFF;
++	}
+ 	if (!bt_level) {
+ 		return;
+ 	}

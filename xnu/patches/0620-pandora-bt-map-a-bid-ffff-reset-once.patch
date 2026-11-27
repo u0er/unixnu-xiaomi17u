@@ -1,0 +1,89 @@
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+index 37354f5..253607c 100644
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -2021,6 +2021,12 @@ done:
+ 
+ static uint64_t bt_map_a_last_tx;
+ static int bt_map_a_reset_arm;
++static int bt_map_a_reset_spent;
++/* 0602 calls this from bt_peri_tlv_stage() ~700 lines before its
++ * definition; clang 16 makes the implicit declaration a hard error,
++ * so the forward declaration is what lets the stack build at all.
++ * No behaviour change. */
++static uint64_t bt_peri_uptime_ms(void);
+ 
+ #define BT_PERI_ASEG_LAST_ACK_MS 5000u
+ /* Level 20.64 (v2061, 0593): after a no-ACK timeout, re-send only
+@@ -5494,11 +5500,32 @@ bt_peri_map_a_tail_gate(unsigned frames, const char *what)
+ 	printf("PANDORA BT: %s: BID post %s (id %04x)\n", what,
+ 	    bid != 0xffffu ? "answered" : "silent", bid);
+ 	pandora_log_sync();
+-	if (bt_map_a_reset_arm >= 2 && bid == 0u) {
++		/* Level 20.68 (v2065, 0620): BID ffff gets the same one reset, and a
++	 * replay that answers still withholds map B.
++	 *
++	 * 0602 opened its reset arm only on a 0000 BID post. bt2063b (ring
++	 * 1795757994, 2026-11-27 13:39) answered 0000 before map A and ffff after
++	 * the silent 0x19: the board-id path stops answering while the resident
++	 * f0 04 stream keeps flowing, so the "reset only on a live identity" rule
++	 * left the ROM unprobed exactly when a reset was the next question. ffff is
++	 * not a wrong-NVM id, it is no answer at all, so it spends the same single
++	 * reset; a live non-default id (anything other than 0000/ffff) still vetoes.
++	 *
++	 * One reset per boot: bt_map_a_reset_spent is set before the chain starts,
++	 * so a second silence cannot spend it twice. The arm replays the whole
++	 * 284-frame map A with ack_ms 0, asks 0x19 (250 + 1500 ms), then asks BID
++	 * again. When the pre-reset identity was ffff, an answered replay 0x19
++	 * proves liveness only: map B stays withheld because the NVM variant was
++	 * never identified. Only the 0000 entry may open map B on the replay. */
++	if (bt_map_a_reset_arm >= 2 && !bt_map_a_reset_spent &&
++	    (bid == 0u || bid == 0xffffu)) {
+ 		int r;
++		int identity_silent = (bid == 0xffffu);
++		uint16_t bid_after = 0xffffu;
+ 
+-		printf("PANDORA BT: %s: reset arm 2: reset -> arbitrate v3 -> version v3 -> GetVer(00) -> BID post -> full map A replay (%u frames) -> 0x19\n",
+-		    what, frames);
++		bt_map_a_reset_spent = 1;
++		printf("PANDORA BT: %s: reset arm 2 (%s BID %04x, one reset this boot): reset -> arbitrate v3 -> version v3 -> GetVer(00) -> full map A replay (%u frames) -> 0x19 -> BID\n",
++		    what, identity_silent ? "silent" : "answered", bid, frames);
+ 		pandora_log_sync();
+ 		r = bt_peri_reset();
+ 		if (r == 0) {
+@@ -5523,15 +5550,31 @@ bt_peri_map_a_tail_gate(unsigned frames, const char *what)
+ 			r = bt_peri_vs_cmd(0x19u, BT_PERI_MAP_A_0X19_WIDE_MS,
+ 			    "PERI TME-L map A replay 0x19 retry");
+ 		}
+-		if (r == 0) {
++		/* The identity is asked again after the replay's own 0x19: the
++		 * pre-reset answer is the reason this arm ran, the post-replay one is
++		 * the reason map B may or may not open. */
++		(void)bt_peri_board_id_download(&bid_after);
++		printf("PANDORA BT: %s: replay result: 0x19 %s, BID after replay %s (id %04x)%s\n",
++		    what, r == 0 ? "answered" : "silent",
++		    bid_after != 0xffffu ? "answered" : "silent", bid_after,
++		    identity_silent ? "; map B stays withheld (pre-reset identity was ffff)" : "");
++		pandora_log_sync();
++		bid = bid_after;
++		if (r == 0 && !identity_silent) {
+ 			printf("PANDORA BT: %s: reset recovered: map A replayed %u frames, 0x19 answered; map B open on the replay\n",
+ 			    what, frames);
+ 			pandora_log_sync();
+ 			return 0;
+ 		}
+-		printf("PANDORA BT: %s: ROM DEAD after reset (chain stopped at error %d); map B stays withheld, needs a reboot\n",
+-		    what, r);
+-		pandora_log_sync();
++		if (r == 0) {
++			printf("PANDORA BT: %s: reset recovered liveness only: replay 0x19 answered but the identity stayed unknown (BID %04x); map B withheld\n",
++			    what, bid_after);
++			pandora_log_sync();
++		} else {
++			printf("PANDORA BT: %s: ROM DEAD after reset (chain stopped at error %d); map B stays withheld, needs a reboot\n",
++			    what, r);
++			pandora_log_sync();
++		}
+ 	}
+ 	printf("PANDORA BT: %s: map B withheld (0x19 silent, BID %04x, resident f0 04 seq advanced %u, %u frames already sent)\n",
+ 	    what, bid, seq_step, frames);
