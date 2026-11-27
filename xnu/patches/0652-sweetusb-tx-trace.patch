@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 052ceb8..cdd4979 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -961,8 +961,14 @@ ud_configure(void)
+ 			printf("SWEET USB: composite endpoints setup failed\n");
+ 			return;
+ 		}
+-		dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) |
+-		    (1u << EP_NCM_RX) | (1u << EP_NCM_TX) | (1u << EP_NCM_INT));
++		{
++			uint32_t ale = dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) |
++			    (1u << EP_NCM_RX) | (1u << EP_NCM_TX) | (1u << EP_NCM_INT);
++
++			dwc_wr(DALEPENA, ale);
++			printf("SWEET USB: carplay DALEPENA 0x%08x read 0x%08x want 0x%08x\n",
++			    ale, dwc_rd(DALEPENA), ale);
++		}
+ 		ud.configured = true;
+ 		/* NCM reset state (NCM 1.1 section 6.3.4), as in the UD_NCM path. */
+ 		ud_ncm_sequence = 0;
+@@ -1382,6 +1388,8 @@ ud_tx_kick_locked(void)
+ 		}
+ 		*busy = true;
+ 		ud.tx_frames++;
++		printf("SWEET NCM: tx submit %u B ep%u trb 0x%x buf 0x%x busy 1\n",
++		    n, ep, trb, buf);
+ 		ud_start_trb(ep, trb, buf, n, TRBCTL_NORMAL);
+ 		return;
+ 	}
+@@ -1783,6 +1791,8 @@ iap2_write(dev_t dev __unused, struct uio *uio, int ioflag __unused)
+ 			memcpy((void *)(ud.dma + UD_TX), ia.stage_tx, n);
+ 			ud.tx_busy = true;
+ 			ia.out_bytes += n;
++			printf("SWEET IAP2: tx submit %u B ep%u trb 0x%x buf 0x%x busy 1\n",
++			    n, EP_TX, UD_TRB_TX, UD_TX);
+ 			ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, n, TRBCTL_NORMAL);
+ 		}
+ 		lck_mtx_unlock(ia.lock);
+@@ -1929,6 +1939,8 @@ ud_event(uint32_t ev)
+ 	if (ep == EP_TX && type == 1) {
+ 		if (ud_has_mux()) {
+ 			if (ud.personality == UD_IAP2) {
++				printf("SWEET IAP2: tx complete ep%u status %u in %llu out %llu\n",
++				    ep, status, ia.in_bytes, ia.out_bytes);
+ 				lck_mtx_lock(ia.lock);
+ 				ud.tx_busy = false;
+ 				lck_mtx_unlock(ia.lock);
+@@ -1957,6 +1969,8 @@ ud_event(uint32_t ev)
+ 		return;
+ 	}
+ 	if (ep == EP_NCM_TX && type == 1) {
++		printf("SWEET NCM: tx complete ep%u status %u frames %llu\n",
++		    ep, status, ud.tx_frames);
+ 		lck_mtx_lock(ud.lock);
+ 		ud.ncm_tx_busy = false;
+ 		ud_tx_kick_locked();
