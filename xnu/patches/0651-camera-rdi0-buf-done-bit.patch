@@ -1,0 +1,31 @@
+diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
+index 9fb1164..95a63d7 100644
+--- a/bsd/dev/pandora_camera.c
++++ b/bsd/dev/pandora_camera.c
+@@ -6625,18 +6625,19 @@ pc_sliceb_vfe2_arm(vm_offset_t vfe2)
+ 	pc_sliceb_vfe2_arm_at(vfe2, 0x2c00u);
+ }
+ 
+-/* VC-aware completion poll (camera15). pc_sliceb_poll is hard-wired to the
+- * VC0 completion bit, so an RDI0 (DT,VC) matrix cannot reuse it. Read bit
+- * (16 + vc) from BUF_DONE_IRQ_STATUS and count rising edges. 0x1a4 is the
+- * interrupt mask, not the mapping table: status latches independently, but
+- * the matrix unmasks all four VC lines anyway so an IRQ consumer sees the
+- * same completion the poll records. */
++/* RDI0 completion poll (camera15; bit fixed by camera16). BUF_DONE_IRQ_STATUS
++ * is indexed per RDI (BUF_DONE_IRQ_STATUS_RDI_OFFSET + rdi), not per virtual
++ * channel: the matrix always arms RDI0, so every (DT,VC) arm completes on
++ * bit 16. Polling (16 + vc) would read RDI1..3, which are never armed, and a
++ * real VC1..3 hit would be recorded as buf=0/frames=0. 0x1a4 is the interrupt
++ * mask, not the mapping table: status latches independently, and the matrix
++ * unmasks all four RDI lines anyway. */
+ static uint32_t
+ pc_sliceb_poll_vc(vm_offset_t csid, unsigned iters, unsigned vc,
+     uint32_t *buf_out, uint32_t *rx_out, unsigned *frames_out)
+ {
+ 	uint32_t seen_rdi = 0, seen_rx = 0, seen_buf = 0;
+-	uint32_t bit = 1u << (16u + vc);
++	uint32_t bit = 1u << 16;	/* BUF_DONE is per RDI: RDI0 is bit 16 */
+ 	unsigned frames = 0, last = 0;
+ 
+ 	for (unsigned i = 0; i < iters; i++) {
