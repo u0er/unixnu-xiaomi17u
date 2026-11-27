@@ -1,0 +1,92 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+index 8187ec0..110285d 100644
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -467,8 +467,9 @@
+  * vidc_probe() for why the register windows now live on kernel_map. */
+ static int      vidc_defer_ms = 0;
+ static bool     vc_smmu_faults_done;
+ static unsigned vc_smmu_faults;
++static uint32_t vc_first_far;           /* 0658: first faulted VA of this boot */
+ 
+ /* Verdict accumulator: one line per stage so a single boot returns the ladder. */
+ static uint32_t vidc_pass_mask;
+ #define VIDC_STAGE_PROBE    (1u << 0)
+@@ -788,8 +789,19 @@
+                        "bank=%u type=%u\n", sl, sidv, smr, s2cr, s2cr & 0xffu,
+                     (s2cr >> 16) & 3u);
+             }
+         }
++    }
++    /* 0658 diagnostic: the probe above only prints a slot when its SMR names
++     * one of the seven DT video SIDs, and on this board the bootloader leaves
++     * none of them assigned -- so no capture records which bank the
++     * unattachable 4th non-secure stream (0x1943) would land in.  Dump every
++     * slot unconditionally (bounded), read-only. */
++    for (unsigned sl = 0; sl < slots && sl < 24; sl++) {
++        const uint32_t s2cr = vidc_smmu_rd(0xC00u + 4u * sl);
++        printf("PANDORA VIDC: smmr[%u] sid=%#06x smr=%08x s2cr=%08x type=%u bank=%u\n",
++            sl, vidc_smmu_rd(0x800u + 4u * sl) & 0xffffu,
++            vidc_smmu_rd(0x800u + 4u * sl), s2cr, (s2cr >> 16) & 3u, s2cr & 0xffu);
+     }
+     unsigned nroute = 0;
+     bool used[128] = {false}, asid_used[256] = {false};
+     bool slot_taken[3] = {false, false, false};
+@@ -1872,8 +1884,9 @@
+     printf("PANDORA VIDC: X2RPMH left at %08x (vendor writes it only on success/power-off)\n",
+         vidc_rd(R_CPU_X2RPMH));
+     vc_smmu_faults = 0;
+     vc_smmu_faults_done = false;
++    vc_first_far = 0;
+     /* Drop any fault latched during table build/attach so the capture below
+      * only ever shows faults this boot produced. */
+     if (vidc_smmu_on) {
+         const uint32_t stale = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
+@@ -1968,8 +1981,16 @@
+             const uint32_t fsr = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
+             if (fsr != 0) {
+                 const uint32_t far = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x60));
+                 if (vc_smmu_faults < 16) {
++                    if (vc_smmu_faults == 0) {
++                        const uint32_t sc = vidc_smmu_rd(vidc_smmu_cb);
++                        vc_first_far = far;
++                        printf("PANDORA VIDC: smmu fault mode sctlr=%08x cfcfg=%u "
++                               "cfie=%u (cfcfg=1 stalls the access until FSR is "
++                               "written, which is exactly what the ladder does)\n",
++                            sc, (sc >> 1) & 1u, (sc >> 6) & 1u);
++                    }
+                     printf("PANDORA VIDC: fault[%u] t=%u fsr=%08x far=%08x\n",
+                         vc_smmu_faults, i, fsr, far);
+                     vc_smmu_faults++;
+                 }
+@@ -2047,8 +2068,30 @@
+          * this diagnostic printed "the VPU did run and was mistranslated" for
+          * it, which was a false positive worth remembering. */
+         printf("PANDORA VIDC: smmu gfsr=%08x fsr=%08x far=%08x sctlr=%08x fault=%s\n",
+             gfsr, fsr, far, sctlr, (fsr & 0xc00001feu) ? "YES" : "no(0x400 is not a fault)");
++        /* 0658: the ladder stops clearing FSR after the 16th sample, so a
++         * still-set FSR at timeout is ambiguous between "one access still
++         * stalled" and "the core re-issues the same VA in a loop".  Clear it
++         * ONCE (the same W1C the ladder already performs) and look again 1 ms
++         * later: a re-latch with the same VA means the master is still issuing
++         * it, no re-latch means the access was terminated and nothing retried.
++         * This is the execution-evidence probe vidc15 asked for. */
++        {
++            const uint32_t fsr2 = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
++            const uint32_t far2 = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x60));
++            printf("PANDORA VIDC: smmu post-timeout fsr=%08x far=%08x first_far=%08x\n",
++                fsr2, far2, vc_first_far);
++            if (fsr2) vidc_smmu_wr((uint32_t)(vidc_smmu_cb + 0x58), fsr2);
++            delay(1000);                       /* 1 ms after a single clear */
++            {
++                const uint32_t fsr3 = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
++                const uint32_t far3 = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x60));
++                printf("PANDORA VIDC: smmu post-clear fsr=%08x far=%08x %s\n",
++                    fsr3, far3, !fsr3 ? "terminated-single-access" :
++                    (far3 == far2 ? "re-issued-same-va" : "re-issued-new-va"));
++            }
++        }
+     }
+     return -1;
+ }
+ 
