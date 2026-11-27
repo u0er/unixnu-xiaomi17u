@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
+index b5f0715..a66a1d4 100644
+--- a/bsd/dev/pandora_camera.c
++++ b/bsd/dev/pandora_camera.c
+@@ -4399,8 +4399,14 @@ pc_tpg_smmu_map(void)
+  * single field is RAW10 type 0x2A.  Only the four cphytest calls
+  * move; every other caller keeps the RAW10 VC0 wrapper default
+  * 0x002bf160 below. */
+-#define PC_RDI_CFG0_DT2A_VC0  0x002af160u
+-#define PC_RDI_CFG0_NEXT      PC_RDI_CFG0_DT2A_VC0
++/* Ladder step 4 (camera13, 2026-11-27): camera12 ran DT 0x2A on the
++ * same lane94 RDI0 and still committed no BUF_DONE/EOF (buf_done=0,
++ * EOF bit unset) while UNMAPPED_VC_DT stayed clear, so the next
++ * single field is data type 0x2E.  Only the four cphytest calls
++ * move; every other caller keeps the RAW10 VC0 wrapper default
++ * 0x002bf160 below. */
++#define PC_RDI_CFG0_DT2E_VC0  0x002ef160u
++#define PC_RDI_CFG0_NEXT      PC_RDI_CFG0_DT2E_VC0
+ 
+ /* TPG is its own aperture (tpg0/1/2 @0x093fd000/0x093fe000/0x093ff000),
+  * not a CSID+0x600 window. TEST_EN = CTRL_CMD(0x1F4) bit4 is the only

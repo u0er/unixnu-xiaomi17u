@@ -1,0 +1,19 @@
+diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
+index f0385f9..f27437d 100644
+--- a/bsd/dev/pandora_camera.c
++++ b/bsd/dev/pandora_camera.c
+@@ -4387,7 +4387,13 @@ pc_tpg_smmu_map(void)
+  * point at 0x19; VC stays 0. */
+ #define PC_RDI_CFG0_RAW10_VC0 0x002bf160u
+ #define PC_RDI_CFG0_DT19_VC0  0x0019f160u
+-#define PC_RDI_CFG0_NEXT      PC_RDI_CFG0_DT19_VC0
++/* Ladder step 2 (camera11, 2026-11-27): camera10 ran DT 0x19 and
++ * settled RX 0x7077 -- UNMAPPED_VC_DT cleared -- yet committed no
++ * BUF_DONE/EOF, so the next single field is the plain RAW10 type
++ * 0x2C.  Only the four cphytest calls move; every other caller keeps
++ * the RAW10 VC0 wrapper default 0x002bf160 below. */
++#define PC_RDI_CFG0_DT2C_VC0  0x002cf160u
++#define PC_RDI_CFG0_NEXT      PC_RDI_CFG0_DT2C_VC0
+ 
+ /* TPG is its own aperture (tpg0/1/2 @0x093fd000/0x093fe000/0x093ff000),
+  * not a CSID+0x600 window. TEST_EN = CTRL_CMD(0x1F4) bit4 is the only
