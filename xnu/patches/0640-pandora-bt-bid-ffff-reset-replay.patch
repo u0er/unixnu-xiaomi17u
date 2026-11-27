@@ -1,0 +1,139 @@
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+index 37354f5..ae682bd 100644
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -2013,6 +2013,15 @@ done:
+  * accept path: pandora_bt_reset=2 runs it only after a silent 0x19 with a BID
+  * answer, and it always replays the whole 284-frame map A before asking 0x19
+  * again. "reset -> 0x19 answered -> map A accepted" is not a valid triple.
++ *
++ * Level 20.70 (v2064, 0640): the bt2063b ring (1795757994) landed on the
++ * state 0602 withheld on - 0x19 silent and BID post ffff - and 0602's only
++ * reset arm needed BID 0000, so the ROM was never probed. BID ffff means the
++ * command path went quiet with map A already unproven and map B withheld, so
++ * one reset loses nothing; it arms the single reset at the default mode 0.
++ * A live non-default id still vetoes, mode 1 never resets, mode 2 takes 0000
++ * or ffff. One reset per boot, and the replay's own 0x19 is the only
++ * evidence that counts.
+  */
+ #define BT_PERI_MAP_A_0X19_FIRST_MS 250u
+ #define BT_PERI_MAP_A_0X19_WIDE_MS  1500u
+@@ -2021,6 +2030,14 @@ done:
+ 
+ static uint64_t bt_map_a_last_tx;
+ static int bt_map_a_reset_arm;
++static bool bt_map_a_reset_used;
++
++/* Level 20.70 (v2064, 0640): 0602 called bt_peri_uptime_ms() in
++ * bt_peri_tlv_stage() ~700 lines before its static definition; clang 16 makes
++ * the implicit declaration a hard error, so 0602's CI run 45898002745 never
++ * built. Forward-declare it here - no behaviour change - so the 0602 protocol
++ * can actually be compiled and tested. */
++static uint64_t bt_peri_uptime_ms(void);
+ 
+ #define BT_PERI_ASEG_LAST_ACK_MS 5000u
+ /* Level 20.64 (v2061, 0593): after a no-ACK timeout, re-send only
+@@ -5494,44 +5511,69 @@ bt_peri_map_a_tail_gate(unsigned frames, const char *what)
+ 	printf("PANDORA BT: %s: BID post %s (id %04x)\n", what,
+ 	    bid != 0xffffu ? "answered" : "silent", bid);
+ 	pandora_log_sync();
+-	if (bt_map_a_reset_arm >= 2 && bid == 0u) {
++	/* Level 20.70 (v2064, 0640): see the block comment above. ffff is the
++	 * lost-command-path state, so mode 0 spends the one reset on it; 0000
++	 * keeps requiring the explicit mode 2 because a ROM that still answers
++	 * the board id may still hold the staged map A. */
++	if ((bt_map_a_reset_arm == 0 && bid == 0xffffu) ||
++	    (bt_map_a_reset_arm >= 2 && (bid == 0u || bid == 0xffffu))) {
++		uint16_t bid_reset = 0xffffu;
++		uint16_t bid_after = 0xffffu;
+ 		int r;
+ 
+-		printf("PANDORA BT: %s: reset arm 2: reset -> arbitrate v3 -> version v3 -> GetVer(00) -> BID post -> full map A replay (%u frames) -> 0x19\n",
+-		    what, frames);
+-		pandora_log_sync();
+-		r = bt_peri_reset();
+-		if (r == 0) {
+-			r = bt_peri_arbitrate_v3();
+-		}
+-		if (r == 0) {
+-			r = bt_peri_version_v3();
+-		}
+-		if (r == 0) {
+-			r = bt_peri_getver_window(700u);
+-		}
+-		if (r == 0) {
+-			r = bt_peri_tlv_stage(pandora_peri_tmel_elf,
+-			    sizeof(pandora_peri_tmel_elf),
+-			    "PERI TME-L map A replay", 0x03, 0u);
+-		}
+-		if (r == 0) {
+-			r = bt_peri_vs_cmd(0x19u, BT_PERI_MAP_A_0X19_FIRST_MS,
+-			    "PERI TME-L map A replay 0x19");
+-		}
+-		if (r != 0) {
+-			r = bt_peri_vs_cmd(0x19u, BT_PERI_MAP_A_0X19_WIDE_MS,
+-			    "PERI TME-L map A replay 0x19 retry");
+-		}
+-		if (r == 0) {
+-			printf("PANDORA BT: %s: reset recovered: map A replayed %u frames, 0x19 answered; map B open on the replay\n",
+-			    what, frames);
++		if (bt_map_a_reset_used) {
++			printf("PANDORA BT: %s: map A reset already used this boot; map B stays withheld\n",
++			    what);
++			pandora_log_sync();
++		} else {
++			bt_map_a_reset_used = true;
++			printf("PANDORA BT: %s: reset arm %s: reset -> arbitrate v3 -> version v3 -> GetVer(00) -> BID post -> full map A replay (%u frames) -> 0x19\n",
++			    what, bid == 0xffffu ? "ffff" : "2", frames);
++			pandora_log_sync();
++			r = bt_peri_reset();
++			if (r == 0) {
++				r = bt_peri_arbitrate_v3();
++			}
++			if (r == 0) {
++				r = bt_peri_version_v3();
++			}
++			if (r == 0) {
++				r = bt_peri_getver_window(700u);
++			}
++			if (r == 0) {
++				(void)bt_peri_board_id_download(&bid_reset);
++				printf("PANDORA BT: %s: BID post-reset %s (id %04x)\n", what,
++				    bid_reset != 0xffffu ? "answered" : "silent", bid_reset);
++				pandora_log_sync();
++			}
++			if (r == 0) {
++				r = bt_peri_tlv_stage(pandora_peri_tmel_elf,
++				    sizeof(pandora_peri_tmel_elf),
++				    "PERI TME-L map A replay", 0x03, 0u);
++			}
++			if (r == 0) {
++				r = bt_peri_vs_cmd(0x19u, BT_PERI_MAP_A_0X19_FIRST_MS,
++				    "PERI TME-L map A replay 0x19");
++			}
++			if (r != 0) {
++				r = bt_peri_vs_cmd(0x19u, BT_PERI_MAP_A_0X19_WIDE_MS,
++				    "PERI TME-L map A replay 0x19 retry");
++			}
++			if (r == 0) {
++				printf("PANDORA BT: %s: reset recovered: map A replayed %u frames, 0x19 answered; map B open on the replay\n",
++				    what, frames);
++				pandora_log_sync();
++				return 0;
++			}
++			/* Closing BID read belongs to the failure path only: when
++			 * 0x19 answered the ROM is waiting for the map B stage, and
++			 * a 31 00 f0 ff 01 0a request there is the one frame
++			 * Android never sends. */
++			(void)bt_peri_board_id_download(&bid_after);
++			printf("PANDORA BT: %s: BID post-replay %04x (reset chain error %d); map B stays withheld\n",
++			    what, bid_after, r);
+ 			pandora_log_sync();
+-			return 0;
+ 		}
+-		printf("PANDORA BT: %s: ROM DEAD after reset (chain stopped at error %d); map B stays withheld, needs a reboot\n",
+-		    what, r);
+-		pandora_log_sync();
+ 	}
+ 	printf("PANDORA BT: %s: map B withheld (0x19 silent, BID %04x, resident f0 04 seq advanced %u, %u frames already sent)\n",
+ 	    what, bid, seq_step, frames);
