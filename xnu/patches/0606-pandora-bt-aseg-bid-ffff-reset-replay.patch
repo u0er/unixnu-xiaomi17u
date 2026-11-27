@@ -1,0 +1,111 @@
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+index 7ec01bb..2ac7e16 100644
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -5419,16 +5419,25 @@ bt_peri_map_a_open(uint64_t last_tx_at, const char *what, const char *anchor)
+ 
+ /* Level 20.67 (v2063B, 0603): the only reset in the map A path.
+  *
+- * Entered only when both 0x19 windows were silent AND BID-post still answered
+- * 0000 - i.e. the ROM is alive and its command path works, so the reset is a
+- * controlled experiment rather than a guess. A reset can drop the staged map
+- * A, so the whole 284-frame stage is replayed; the replay's own 0x19 is the
+- * acceptance evidence, never the reset's wake. */
++ * A reset can drop the staged map A, so the whole 284-frame stage is replayed;
++ * the replay's own 0x19 is the acceptance evidence, never the reset's wake.
++ *
++ * Level 20.68 (v2064, 0606): the 0603 gate required BID-post 0000, and the
++ * first boot built for it answered 0000 before map A but ffff after the
++ * silent 0x19 (ring 1795757994: "BID post ffff; not resetting (reset arm
++ * needs BID 0000)"), so the arm never ran. ffff is the board-id path going
++ * silent - the same state the successful pre-A read had just left - not the
++ * ROM dying: GetVer(00) inside this arm is the liveness proof. v2064 spends
++ * the one reset on 0000 or ffff alike, replays the full 284-frame map A,
++ * opens 0x19, and records BID once more after a failed 0x19. A non-zero,
++ * non-ffff BID still stops the arm: that is a real non-default NVM variant,
++ * not an unknown state. */
+ static int
+ bt_peri_map_a_reset_replay(uint64_t *last_tx_at)
+ {
+ 	uint16_t bid = 0xffff;
+ 	int err;
++	bool bid_silent;
+ 
+ 	err = bt_peri_reset();
+ 	if (err) {
+@@ -5451,12 +5460,21 @@ bt_peri_map_a_reset_replay(uint64_t *last_tx_at)
+ 	err = bt_peri_board_id_download(&bid);
+ 	printf("PANDORA BT: BID post-reset %04x\n", bid);
+ 	pandora_log_sync();
+-	if (err || bid != 0u) {
++	/* Level 20.68 (v2064, 0606): ffff means the board-id request went
++	 * unanswered, exactly what BID-post did before the reset; it is not a
++	 * death certificate while GetVer(00) above still answered. Only a real
++	 * non-default id (neither 0000 nor ffff) vetoes the replay. */
++	bid_silent = (bid == 0xffffu);
++	if (err || (bid != 0u && !bid_silent)) {
+ 		printf("PANDORA BT: ROM DEAD after reset: BID post-reset %04x (error %d); not replaying\n",
+ 		    bid, err);
+ 		pandora_log_sync();
+ 		return ETIMEDOUT;
+ 	}
++	if (bid_silent) {
++		printf("PANDORA BT: BID post-reset ffff (board-id path silent, GetVer proved the ROM); replaying the one controlled experiment\n");
++		pandora_log_sync();
++	}
+ 	printf("PANDORA BT: reset ok; replaying map A (284 frames, full stage)\n");
+ 	pandora_log_sync();
+ 	err = bt_peri_tlv_stage(pandora_peri_tmel_elf,
+@@ -5469,8 +5487,24 @@ bt_peri_map_a_reset_replay(uint64_t *last_tx_at)
+ 	}
+ 	printf("PANDORA BT: map A replay 284 frames sent; opening 0x19\n");
+ 	pandora_log_sync();
+-	return bt_peri_map_a_open(*last_tx_at, "PERI TME-L map B open replay",
++	err = bt_peri_map_a_open(*last_tx_at, "PERI TME-L map B open replay",
+ 	    "map A replay last byte");
++	if (err) {
++		/* Level 20.68 (v2064, 0606): the closing BID read belongs to the
++		 * failure path only. When 0x19 answers, the ROM is waiting for the
++		 * map B stage and a 31 00 f0 ff 01 0a request there would be the one
++		 * frame Android never sends; the post-reset BID stays the record. */
++		uint16_t bid_after = 0xffff;
++
++		(void)bt_peri_board_id_download(&bid_after);
++		printf("PANDORA BT: BID post-replay %04x (0x19 error %d); map B stays withheld\n",
++		    bid_after, err);
++		pandora_log_sync();
++		return err;
++	}
++	printf("PANDORA BT: map A replay recovered: 0x19 answered after the reset and the 284 frames\n");
++	pandora_log_sync();
++	return 0;
+ }
+ 
+ /* Level 20 orchestrator: after the level-19 download chain passes, reset
+@@ -5542,8 +5576,15 @@ bt_peri_level20(void)
+ 		(void)bt_peri_board_id_download(&bid_post);
+ 		printf("PANDORA BT: BID post %04x\n", bid_post);
+ 		pandora_log_sync();
+-		if (bid_post == 0u) {
+-			printf("PANDORA BT: 0x19 silent but BID post 0000; entering the reset+replay arm\n");
++		/* Level 20.68 (v2064, 0606): ffff is the board-id path silent after
++		 * map A - the exact state the 0603 ring recorded - and is not
++		 * evidence the ROM died. Both 0000 and ffff spend the one reset;
++		 * a real non-default BID keeps the ROM untouched. */
++		if (bid_post == 0u || bid_post == 0xffffu) {
++			printf("PANDORA BT: 0x19 silent but BID post %04x (%s); entering the single reset+replay arm\n",
++			    bid_post,
++			    bid_post == 0u ? "ROM alive on the board-id path" :
++			    "board-id path silent, GetVer decides");
+ 			pandora_log_sync();
+ 			reset_arm = true;
+ 			err = bt_peri_map_a_reset_replay(&map_a_last);
+@@ -5552,7 +5593,7 @@ bt_peri_level20(void)
+ 				pandora_log_sync();
+ 			}
+ 		} else {
+-			printf("PANDORA BT: 0x19 silent and BID post %04x; not resetting (reset arm needs BID 0000)\n",
++			printf("PANDORA BT: 0x19 silent and BID post %04x; not resetting (reset arm takes BID 0000 or ffff, not a live non-default id)\n",
+ 			    bid_post);
+ 			pandora_log_sync();
+ 		}
