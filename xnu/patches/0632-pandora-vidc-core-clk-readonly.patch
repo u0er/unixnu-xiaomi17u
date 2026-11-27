@@ -1,0 +1,27 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -1477,13 +1477,16 @@ vidc_power_up(void)
+      * A halted wrapper clock would leave the Xtensa unable to fetch, which is
+      * exactly "no ready bit, no interrupts, no SMMU traffic". */
+     uint32_t clk_cfg = vidc_rd(R_WRAPPER_CORE_CLK);
+-    if (clk_cfg != 0) {
+-        vidc_wr(R_WRAPPER_CORE_CLK, 0);
+-        __asm__ volatile ("dsb sy" ::: "memory");
+-        printf("PANDORA VIDC: core clock config %08x -> %08x (CORE_CLK_RUN=0)\n",
+-            clk_cfg, vidc_rd(R_WRAPPER_CORE_CLK));
+-        clk_cfg = vidc_rd(R_WRAPPER_CORE_CLK);
+-    }
++    /* vidc15 (0632): READ-ONLY by design.  0x4f is the value the power stage
++     * hands over; every earlier VIDC image cleared it to 0 right here (0.174 s,
++     * before the release write) and never saw 0xA004C bit0.  This run removes
++     * exactly that one write so 0x4f survives the whole ready poll.  Nothing
++     * below touches WRAPPER_CORE_CLK; the only later writer is 0631's table
++     * row 0, which runs on the bit0 side of the gate -- so the final
++     * "core clk=" line reading 0x4f also proves the table never ran.
++     * [docs/OPT_VIDC15_2026-11-27.md] */
++    printf("PANDORA VIDC: core clock config %08x left intact (read-only, "
++        "CORE_CLK_RUN not cleared)\n", clk_cfg);
+     printf("PANDORA VIDC: videocc powered (%d/5 GDSC failed), CORE_PWR=%08x CORE_CLK=%08x\n",
+         failed, vidc_rd(R_WRAPPER_CORE_PWR), clk_cfg);
+     vidc_snap("after power");
