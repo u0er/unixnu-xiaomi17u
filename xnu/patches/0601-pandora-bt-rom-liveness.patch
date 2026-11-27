@@ -1,0 +1,259 @@
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+index 630028b..5346d53 100644
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -2010,6 +2010,30 @@ done:
+  * are unchanged. Only the tail reader's verdict on a misaligned 0x34 moved:
+  * it is skipped as noise and the reader re-acquires the next 34 00 ff record
+  * instead of returning EPROTO. */
++/* Level 20.66 (v2063, 0601): the sub-06 ACK is not universal.
++ *
++ * The 2026-11-27 03:00 boot of 0595 (image 3444a14e) both proved the tail
++ * reader and refuted its gate. Map A's final frame was re-sent twice and
++ * waited on three times across 15.6 s, and the ROM answered with 101 records
++ * of 34 00 ff fc f0 04 <seq> 00 00 - 256 B each, ~144.5 ms apart, seq 6e->71
++ * over four consecutive records - from 2.308 s to 17.613 s. It never sent the
++ * 12-byte EDL identity 34 00 ff 08 f0 01 01 f0 ff 00 06. That stream is this
++ * ROM's resident notification channel (v213 logged 817 of them, plen 252,
++ * ~144.7 ms apart), so its presence proves the ROM is alive and says nothing
++ * about map A having committed.
++ *
++ * v2063 therefore stops treating "no ACK" as "phase A failed on its own":
++ *   - an ACK still passes, and only the EDL identity may be read as ACK/NAK;
++ *   - a timeout whose resident stream advanced runs the PERI liveness
++ *     handshake below and, when 0x19 answers, accepts the stage and lets the
++ *     map B open - the gate this chain actually needs - decide;
++ *   - a timeout with no advancing stream keeps v2062's probe + two re-sends.
++ */
++#define BT_PERI_ASEG_ALIVE_NO_ACK 0x0c01
++
++/* v2063 (0601): defined after bt_peri_vs_cmd, which the 0x19 leg sends through. */
++static int bt_peri_rom_alive_probe(const char *what);
++
+ #define BT_PERI_NVM_LAST_ACK_MS 3000u
+ /* Level 20.3/20.4: observation window after the TME-L map download. The ROM's
+  * 63-byte status-2 event arrived ~185 ms into the phase in both earlier runs,
+@@ -4385,9 +4409,17 @@ bt_peri_aseg_next_event(uint8_t *rx, unsigned cap, unsigned *got, uint64_t deadl
+  *
+  * v2062 (0595) keeps all of the above; the reader now also re-acquires the
+  * 34 00 ff boundary after an unaligned 0x34 (v2061 died EPROTO there), so a
+- * timeout is the only path into the existing probe and the two re-sends. */
++ * timeout is the only path into the existing probe and the two re-sends.
++ *
++ * v2063 (0601) keeps the reader and the budget, and changes three things the
++ * 03:00 run made necessary: ACK and NAK are gated on the EDL identity (a
++ * resident record carrying 0x06 at byte 10 used to be read as a NAK), the
++ * resident f0 04 stream is characterised by its seq byte instead of counted
++ * as an anonymous event, and the two out-parameters let the caller tell a
++ * stalled ROM from a ROM that simply has no sub-06 ACK. */
+ static int
+-bt_peri_aseg_last_ack(unsigned seg, unsigned ack_ms, const char *what)
++bt_peri_aseg_last_ack(unsigned seg, unsigned ack_ms, const char *what,
++    unsigned *resident, unsigned *seq_step)
+ {
+ 	static const uint8_t identity[] = { 0xf0, 0x01, 0x01, 0xf0, 0xff };
+ 	uint8_t rx[512] = {0};
+@@ -4395,9 +4427,13 @@ bt_peri_aseg_last_ack(unsigned seg, unsigned ack_ms, const char *what)
+ 	unsigned rawlen = 0;
+ 	unsigned got = 0;
+ 	unsigned oversized = 0;
++	unsigned last_seq = 0;
++	bool have_seq = false;
+ 	uint64_t deadline;
+ 	int err;
+ 
++	*resident = 0u;
++	*seq_step = 0u;
+ 	clock_interval_to_deadline(ack_ms, NSEC_PER_MSEC, &deadline);
+ 	for (;;) {
+ 		err = bt_peri_aseg_next_event(rx, sizeof(rx), &got, deadline,
+@@ -4415,41 +4451,64 @@ bt_peri_aseg_last_ack(unsigned seg, unsigned ack_ms, const char *what)
+ 		if (err) {
+ 			break;
+ 		}
+-		if (got >= 11u && rx[10] == 0x06) {
+-			if (!memcmp(rx + 4, identity, sizeof(identity)) && rx[9] == 0) {
++		/* Level 20.66 (v2063, 0601): only the EDL identity f0 01 01 f0 ff may
++		 * be read as an ACK or a NAK. v2062 tested rx[10] == 6 first and took the
++		 * status byte from any record that happened to carry 0x06 there; the
++		 * 03:00 resident stream kept byte 10 at 0x00 and survived by luck. One
++		 * payload byte equal to 0x06 would have been read as "ACK rejected" and
++		 * ended phase A inside the wait. */
++		if (got >= 11u && rx[10] == 0x06u &&
++		    !memcmp(rx + 4, identity, sizeof(identity))) {
++			if (rx[9] == 0u) {
+ 				printf("PANDORA BT: %s: last segment %u ACK status 0 subcmd 6 (%u bytes, %u ms budget)\n",
+ 				    what, seg, got, ack_ms);
+ 				pandora_log_sync();
+ 				return 0;
+ 			}
+-			if (got >= 6u && rx[0] == 0x34 && rx[1] == 0 && rx[2] == 0xff &&
+-			    memcmp(rx + 4, identity, sizeof(identity))) {
+-				printf("PANDORA BT: %s: last segment %u: event is not a TLV ACK (plen %u, class %02x %02x), %u bytes\n",
+-				    what, seg, (unsigned)rx[3], (unsigned)rx[4],
+-				    (unsigned)rx[5], got);
+-			} else {
+-				printf("PANDORA BT: %s: last segment %u ACK rejected: status %u (%s) subcmd %u, %u bytes\n",
+-				    what, seg, (unsigned)(got >= 10u ? rx[9] : 0xffu),
+-				    got >= 10u && rx[9] ? bt_peri_edl_status_name(rx[9]) : "-",
+-				    (unsigned)(got >= 11u ? rx[10] : 0xffu), got);
+-			}
++			printf("PANDORA BT: %s: last segment %u ACK rejected: status %u (%s) subcmd %u, %u bytes\n",
++			    what, seg, (unsigned)(got >= 10u ? rx[9] : 0xffu),
++			    got >= 10u && rx[9] ? bt_peri_edl_status_name(rx[9]) : "-",
++			    (unsigned)(got >= 11u ? rx[10] : 0xffu), got);
+ 			bt_dump("PERI map A last-segment ACK", rx, got);
+ 			pandora_log_sync();
+ 			return EPROTO;
+ 		}
++		/* Level 20.66 (v2063, 0601): the resident f0 04 stream is the ROM's own
++		 * notification channel. Count it, follow its seq byte, and keep the whole
++		 * 256-byte record for the first three plus every 32nd: the v2062 raw dump
++		 * keeps 84-byte slices at a 252-byte stride, which cannot be reassembled
++		 * offline, and one identical line per record proved arrival but not
++		 * progress. */
++		if (got >= 8u && rx[0] == 0x34u && rx[1] == 0x00u && rx[2] == 0xffu &&
++		    rx[3] == 0xfcu && rx[4] == 0xf0u && rx[5] == 0x04u) {
++			(*resident)++;
++			if (!have_seq) {
++				have_seq = true;
++				last_seq = rx[6];
++			} else if (rx[6] != last_seq) {
++				(*seq_step)++;
++				last_seq = rx[6];
++			}
++			if (*resident <= 3u || (*resident % 32u) == 0u) {
++				printf("PANDORA BT: %s: last segment %u: resident f0 04 record %u, seq %02x, advanced %u, %u byte(s)\n",
++				    what, seg, *resident, (unsigned)rx[6], *seq_step, got);
++				bt_dump_wide("PERI resident f0 04 record", rx, got);
++				pandora_log_sync();
++			}
++			continue;
++		}
+ 		printf("PANDORA BT: %s: last segment %u: event is not a TLV ACK (plen %u, class %02x %02x), %u bytes\n",
+ 		    what, seg, got >= 4u ? (unsigned)rx[3] : 0u,
+ 		    got >= 5u ? (unsigned)rx[4] : 0u,
+ 		    got >= 6u ? (unsigned)rx[5] : 0u, got);
+ 		pandora_log_sync();
+ 	}
+-	printf("PANDORA BT: %s: last segment %u no ACK within %u ms (error %d, %u byte(s)); A stage unacknowledged\n",
+-	    what, seg, ack_ms, err, rawlen);
++	printf("PANDORA BT: %s: last segment %u no ACK within %u ms (error %d, %u byte(s)); A stage unacknowledged; resident f0 04 record(s) %u, seq advanced %u time(s)\n",
++	    what, seg, ack_ms, err, rawlen, *resident, *seq_step);
+ 	bt_dump("PERI map A last-segment raw", raw, rawlen);
+ 	pandora_log_sync();
+ 	return err;
+ }
+-
+ /* Level 20.64 (v2061, 0593): re-send only map A's final frame.
+  *
+  * The 284th frame is 183 bytes and the only thing the ACK gate can attribute
+@@ -4657,7 +4716,31 @@ bt_peri_tlv_stage(const uint8_t *fw, unsigned size, const char *what, uint8_t su
+ 		unsigned probed = 0;
+ 
+ 		for (;;) {
+-			err = bt_peri_aseg_last_ack(seg, last_ack_ms, what);
++			unsigned resident = 0;
++			unsigned seq_step = 0;
++
++			err = bt_peri_aseg_last_ack(seg, last_ack_ms, what,
++			    &resident, &seq_step);
++			if (err == ETIMEDOUT && resident > 0u && seq_step > 0u) {
++				/* Level 20.66 (v2063, 0601): the ROM answered this stage with its
++				 * resident f0 04 stream and no sub-06 ACK. Two more 5 s waits and two
++				 * more re-sends cannot produce an ACK this ROM does not emit; the
++				 * question that decides the phase is whether the ROM still answers a
++				 * command at all, and the handshake's 0x19 leg is the exact command
++				 * phase B needs. */
++				printf("PANDORA BT: %s: last segment %u: no sub-06 ACK but %u resident f0 04 record(s) advanced %u time(s) in %u ms; probing ROM liveness instead of re-sending\n",
++				    what, seg, resident, seq_step, last_ack_ms);
++				pandora_log_sync();
++				if (bt_peri_rom_alive_probe(what) == 0) {
++					printf("PANDORA BT: %s: last segment %u: 0x19 answered after the resident stream; map A accepted WITHOUT a sub-06 ACK (%d)\n",
++					    what, seg, BT_PERI_ASEG_ALIVE_NO_ACK);
++					pandora_log_sync();
++					return BT_PERI_ASEG_ALIVE_NO_ACK;
++				}
++				printf("PANDORA BT: %s: last segment %u: ROM stalled in the liveness handshake; keeping the re-send path\n",
++				    what, seg);
++				pandora_log_sync();
++			}
+ 			if (err == 0 || err != ETIMEDOUT ||
+ 			    retry >= BT_PERI_ASEG_ACK_RETRIES) {
+ 				break;
+@@ -5129,6 +5212,38 @@ bt_peri_vs_cmd(uint8_t sub, unsigned window_ms, const char *what)
+ 	return 0;
+ }
+ 
++/* Level 20.66 (v2063, 0601): non-destructive ROM liveness handshake.
++ *
++ * Called only when a stage's tail timed out although the resident f0 04 stream
++ * was advancing. The order is the trace's own PERI order (9.766-9.930 s):
++ * reset 31 00 f1 ff 01 03 with the fd/fc wake, arbitrate v3, GetVer(00),
++ * TMEPatchVerReq v3, then 0x19 - the vendor command phase B opens with.
++ *
++ * The verdict is 0x19's answer, not the probe's own byte count: 0x19 is the
++ * gate the next stage needs, so an answer here is worth more than any number
++ * of records we did not ask for. A silent 0x19 leaves the caller on the old
++ * failure path, with the handshake's four anchors in the log as the reason.
++ *
++ * Stated once: a reset here could drop staged state in the ROM. It is the same
++ * reset Android sends 21 ms before its map stages, and the alternative is a
++ * phase that cannot pass on any ROM that does not implement the sub-06 ACK. */
++static int
++bt_peri_rom_alive_probe(const char *what)
++{
++	int rerr = bt_peri_reset();
++	int aerr = bt_peri_arbitrate_v3();
++	int gerr = bt_peri_getver_window(700u);
++	int verr = bt_peri_version_v3();
++	int oerr = bt_peri_vs_cmd(0x19u, 400u, "PERI ROM liveness 0x19");
++
++	printf("PANDORA BT: %s: ROM liveness handshake: reset %s (%d), arbitrate v3 %s (%d), GetVer(00) %s (%d), version v3 %s (%d), 0x19 %s (%d) -> %s\n",
++	    what, rerr ? "failed" : "ok", rerr, aerr ? "silent" : "ok", aerr,
++	    gerr ? "silent" : "ok", gerr, verr ? "silent" : "ok", verr,
++	    oerr ? "silent" : "answered", oerr,
++	    oerr ? "ROM STALLED" : "ROM ALIVE");
++	pandora_log_sync();
++	return oerr ? ETIMEDOUT : 0;
++}
+ /* Level 20.61 (v2055-A): both 0x19 windows closed and the B stage was
+  * withheld. Two states produce that log and the fix differs: the ROM
+  * stopped answering, or it still lives and only the 0x19 open is rejected.
+@@ -5313,6 +5428,15 @@ bt_peri_level20(void)
+ 	err = bt_peri_tlv_stage(pandora_peri_tmel_elf,
+ 	    sizeof(pandora_peri_tmel_elf), "PERI TME-L map A", 0x03,
+ 	    BT_PERI_ASEG_LAST_ACK_MS);
++	if (err == BT_PERI_ASEG_ALIVE_NO_ACK) {
++		/* Level 20.66 (v2063, 0601): 0595 (3444a14e, 2026-11-27 03:00) proved
++		 * this ROM does not emit the sub-06 ACK. The handshake answered 0x19, so
++		 * the stage is accepted and the map B open below - the gate phase B
++		 * actually needs - decides the rest. */
++		printf("PANDORA BT: level 20 phase A: map A accepted WITHOUT a sub-06 ACK (ROM alive on 0x19); continuing to the map B open\n");
++		pandora_log_sync();
++		err = 0;
++	}
+ 	if (err) {
+ 		printf("PANDORA BT: level 20 phase A failed (error %d)\n", err);
+ 		pandora_log_sync();
+@@ -5401,6 +5525,20 @@ bt_peri_level20(void)
+ 		printf("PANDORA BT: post-B liveness: 0x19 %s (error %d)\n",
+ 		    lerr == 0 ? "answered" : "silent", lerr);
+ 		pandora_log_sync();
++		if (lerr) {
++			/* Level 20.66 (v2063, 0601): the BID/ROM-reset experiment. Two boots
++			 * measured ~165 KB of unstructured RX and six ROM diagnostic dumps
++			 * after phase B and no 0x23 answer. If only the PERI reset re-opens
++			 * the command path, this says so in the same boot instead of costing
++			 * another 45 s trial; the 0x23 request below still runs either way,
++			 * so the experiment cannot mask the BID result. */
++			int rec = bt_peri_rom_alive_probe("PERI post-B ROM reset");
++
++			printf("PANDORA BT: post-B recovery: reset+GetVer+0x19 %s\n",
++			    rec == 0 ? "answered (ROM recoverable without a reboot)"
++			    : "silent (ROM needs a reboot)");
++			pandora_log_sync();
++		}
+ 	}
+ 	/* Level 20.58: the baud scan used to sit here, between the liveness probe and
+ 	 * the 0x23 request. It reconfigures the SE six times, so putting a diagnostic
