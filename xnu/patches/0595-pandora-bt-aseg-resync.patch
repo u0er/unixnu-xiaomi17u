@@ -1,0 +1,185 @@
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+index c0773ae..630028b 100644
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -2006,6 +2006,10 @@ done:
+  * from "stopped" without touching map A, flushing, or resetting the ROM. */
+ #define BT_PERI_ASEG_PROBE_MS 300u
+ #define BT_PERI_ASEG_RECORD_MS 500u
++/* Level 20.65 (v2062, 0595): the budget, the two re-sends and the probe above
++ * are unchanged. Only the tail reader's verdict on a misaligned 0x34 moved:
++ * it is skipped as noise and the reader re-acquires the next 34 00 ff record
++ * instead of returning EPROTO. */
+ #define BT_PERI_NVM_LAST_ACK_MS 3000u
+ /* Level 20.3/20.4: observation window after the TME-L map download. The ROM's
+  * 63-byte status-2 event arrived ~185 ms into the phase in both earlier runs,
+@@ -4219,56 +4223,135 @@ bt_peri_baud_probe(void)
+ 	pandora_log_sync();
+ }
+ 
+-/* Level 20.63 (v2061): map A's tail reader - one TLV event, line noise tolerated.
++/* Level 20.65 (v2062, 0595): map A's tail reader - one TLV event, line noise
++ * tolerated, and the 34 00 ff boundary re-acquired after a stray 0x34.
+  *
+  * The shared bt_peri_wait_sub path treats any byte other than fd/fc/fe/ff as
+  * EPROTO. On the A tail the ROM emits 0xf9 as the last byte of the write
+  * (v2060 kernel @2.147: exactly one byte f9, one ms after the 284th frame),
+- * so the strict reader returned before the 1500 ms budget could apply. This
+- * reader is used by the A-tail gate only: unknown bytes are logged into the
+- * raw dump and ignored, fd still gets fc, and a 34 00 ff record is assembled
+- * normally. Silence stays bounded by the caller's deadline. */
++ * so the strict reader returned before the 1500 ms budget could apply. v2061
++ * tolerated a lone noise byte but still returned EPROTO when that byte was
++ * 0x34: the next three bytes were read as a 00 ff <len> header and the phase
++ * ended (v2061 kernel @7.684: error 100, 22 ms after the re-send, inside a
++ * 62-byte high-entropy burst; retry 2/2 never ran, yet the ROM was alive).
++ * v2062 keeps a three-byte match state and treats every failed 34 / 34 00
++ * prefix as noise, so only the deadline, a TX error or a real 34 00 ff record
++ * leave this reader: an unaligned 0x34 can no longer kill the phase, and the
++ * next record boundary is re-acquired. */
++static int
++bt_peri_aseg_noise(uint8_t b, uint8_t *raw, unsigned raw_cap, unsigned *raw_len)
++{
++	if (*raw_len < raw_cap) {
++		raw[(*raw_len)++] = b;
++	}
++	printf("PANDORA BT: PERI TME-L map A last segment: between-frame byte %#x tolerated (%u byte(s))\n",
++	    b, *raw_len);
++	if (b == 0xfd) {
++		const uint8_t ack = 0xfc;
++
++		return bt_uart_tx(&ack, 1, "PERI download wake ACK FC");
++	}
++	return 0;
++}
++
+ static int
+ bt_peri_aseg_next_event(uint8_t *rx, unsigned cap, unsigned *got, uint64_t deadline,
+     uint8_t *raw, unsigned raw_cap, unsigned *raw_len)
+ {
++	uint8_t pfx[3] = {0};
++	unsigned prefix = 0, skipped = 0;
+ 	unsigned field = 0;
+ 	int err;
+ 
+ 	*got = 0;
+ 	for (;;) {
+-		err = bt_rx_exact(rx, 1, &field, deadline);
++		uint8_t b;
++
++		err = bt_rx_exact(&b, 1, &field, deadline);
+ 		if (err) {
++			/* A pending 34 / 34 00 at the deadline still belongs in the
++			 * dump: consume nothing else, but do not lose the evidence. */
++			for (unsigned i = 0; i < prefix; i++) {
++				if (*raw_len < raw_cap) {
++					raw[(*raw_len)++] = pfx[i];
++				}
++			}
+ 			return err;
+ 		}
+-		*got = field;
+-		if (rx[0] == 0x34) {
++		if (prefix == 0) {
++			if (b == 0x34) {
++				pfx[0] = b;
++				prefix = 1;
++				continue;
++			}
++			err = bt_peri_aseg_noise(b, raw, raw_cap, raw_len);
++			if (err) {
++				return err;
++			}
++			pandora_log_sync();
++			continue;
++		}
++		if (prefix == 1) {
++			if (b == 0x00) {
++				pfx[1] = b;
++				prefix = 2;
++				continue;
++			}
++			/* 34 <non-00>: the 34 was noise; b may start the next one. */
++			err = bt_peri_aseg_noise(pfx[0], raw, raw_cap, raw_len);
++			if (err) {
++				return err;
++			}
++			printf("PANDORA BT: PERI TME-L map A last segment: unaligned 0x34 skipped, resyncing on 34 00 ff (%u byte(s), skip %u)\n",
++			    *raw_len, ++skipped);
++			if (b == 0x34) {
++				pfx[0] = b;
++				prefix = 1;
++			} else {
++				err = bt_peri_aseg_noise(b, raw, raw_cap, raw_len);
++				if (err) {
++					return err;
++				}
++				prefix = 0;
++			}
++			pandora_log_sync();
++			continue;
++		}
++		/* prefix == 2: 34 00 matched, ff closes the record boundary. */
++		if (b == 0xff) {
++			rx[0] = pfx[0];
++			rx[1] = pfx[1];
++			rx[2] = b;
+ 			break;
+ 		}
+-		if (*raw_len < raw_cap) {
+-			raw[(*raw_len)++] = rx[0];
++		err = bt_peri_aseg_noise(pfx[0], raw, raw_cap, raw_len);
++		if (err) {
++			return err;
+ 		}
+-		printf("PANDORA BT: PERI TME-L map A last segment: between-frame byte %#x tolerated (%u byte(s))\n",
+-		    rx[0], *raw_len);
+-		if (rx[0] == 0xfd) {
+-			const uint8_t ack = 0xfc;
+-
+-			err = bt_uart_tx(&ack, 1, "PERI download wake ACK FC");
++		err = bt_peri_aseg_noise(pfx[1], raw, raw_cap, raw_len);
++		if (err) {
++			return err;
++		}
++		printf("PANDORA BT: PERI TME-L map A last segment: unaligned 0x34 skipped, resyncing on 34 00 ff (%u byte(s), skip %u)\n",
++		    *raw_len, ++skipped);
++		if (b == 0x34) {
++			pfx[0] = b;
++			prefix = 1;
++		} else {
++			err = bt_peri_aseg_noise(b, raw, raw_cap, raw_len);
+ 			if (err) {
+ 				return err;
+ 			}
++			prefix = 0;
+ 		}
+ 		pandora_log_sync();
+-		*got = 0;
+ 	}
+-	err = bt_rx_exact(rx + 1, 3, &field, deadline);
++	*got = 3;
++	err = bt_rx_exact(rx + 3, 1, &field, deadline);
+ 	*got += field;
+ 	if (err) {
+ 		return err;
+ 	}
+-	if (rx[1] != 0 || rx[2] != 0xff) {
+-		return EPROTO;
+-	}
+ 	if ((unsigned)rx[3] > cap - 4u) {
+ 		return EMSGSIZE;
+ 	}
+@@ -4298,7 +4381,11 @@ bt_peri_aseg_next_event(uint8_t *rx, unsigned cap, unsigned *got, uint64_t deadl
+  * bt_peri_aseg_next_event() so a 0xf9 trailer cannot cut the budget short.
+  * A non-6 TLV event is logged and skipped (the ROM can still be committing);
+  * an explicit status/subcmd 6 NAK stays terminal, so phase A still
+- * fails where it failed. */
++ * fails where it failed.
++ *
++ * v2062 (0595) keeps all of the above; the reader now also re-acquires the
++ * 34 00 ff boundary after an unaligned 0x34 (v2061 died EPROTO there), so a
++ * timeout is the only path into the existing probe and the two re-sends. */
+ static int
+ bt_peri_aseg_last_ack(unsigned seg, unsigned ack_ms, const char *what)
+ {
