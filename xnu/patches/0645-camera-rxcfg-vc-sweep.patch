@@ -1,0 +1,118 @@
+diff --git a/bsd/dev/pandora_camera.c b/bsd/dev/pandora_camera.c
+index b5f071514b4b..9fb1164826b7 100644
+--- a/bsd/dev/pandora_camera.c
++++ b/bsd/dev/pandora_camera.c
+@@ -6625,6 +6625,50 @@
+ 	pc_sliceb_vfe2_arm_at(vfe2, 0x2c00u);
+ }
+ 
++/* VC-aware completion poll (camera15). pc_sliceb_poll is hard-wired to the
++ * VC0 completion bit, so an RDI0 (DT,VC) matrix cannot reuse it. Read bit
++ * (16 + vc) from BUF_DONE_IRQ_STATUS and count rising edges. 0x1a4 is the
++ * interrupt mask, not the mapping table: status latches independently, but
++ * the matrix unmasks all four VC lines anyway so an IRQ consumer sees the
++ * same completion the poll records. */
++static uint32_t
++pc_sliceb_poll_vc(vm_offset_t csid, unsigned iters, unsigned vc,
++    uint32_t *buf_out, uint32_t *rx_out, unsigned *frames_out)
++{
++	uint32_t seen_rdi = 0, seen_rx = 0, seen_buf = 0;
++	uint32_t bit = 1u << (16u + vc);
++	unsigned frames = 0, last = 0;
++
++	for (unsigned i = 0; i < iters; i++) {
++		if (pc_wd_fired)
++			break;
++		uint32_t buf = pc_rd(csid, 0x1a0);
++		unsigned hit = (buf & bit) ? 1u : 0u;
++
++		if (hit) {
++			seen_buf |= buf;
++			if (!last) {
++				frames++;
++				pc_wr(csid, 0x1a8, bit);
++			}
++		}
++		last = hit;
++		seen_rdi |= pc_rd(csid, PC_RDIN_IRQ(0));
++		seen_rx |= pc_rd(csid, 0x1b0);
++		pc_sleep(1);
++	}
++	if (buf_out)
++		*buf_out = seen_buf;
++	if (rx_out)
++		*rx_out = seen_rx;
++	if (frames_out)
++		*frames_out = frames;
++	printf("PANDORA SLICEB: poll-vc%u frames=%u buf=%#x rdin=%#x rx=%#x\n",
++	    vc, frames, seen_buf, seen_rdi, seen_rx);
++	(void)pandora_log_sync();
++	return seen_rdi;
++}
++
+ static void
+ pc_sliceb_cphytest(void)
+ {
+@@ -7346,6 +7390,62 @@
+ 				    pc_rd(csid2, 0x1b0u), pc_rd(csid2, 0x224u));
+ 				(void)pandora_log_sync();
+ 			}
++		}
++		/* (DT,VC) matrix diagnostic (camera15, host-built; unflown).  Every DT
++		 * rung on this lane (0x19/0x2A/0x2B/0x2C/0x2E) settled RX with
++		 * UNMAPPED_VC_DT set, no BUF_DONE/EOF and an untouched frame window
++		 * while total_pkts_rcvd advanced with ECC/CRC at zero.  The data type
++		 * is therefore not the only unmatched field: sweep the other half of
++		 * the RDI0 match key, the virtual channel, over the RAW types the
++		 * ladder already covered.  Diagnostic only: every arm differs from
++		 * its neighbour in one field, all 16 arms run (no early stop) so the
++		 * whole key space is on record, and a hit is re-confirmed by a
++		 * single-variable build before it is treated as attribution.  0x2F is
++		 * deliberately not in this set: it is camera14's separate DT rung,
++		 * not a second variable in the VC diagnostic. */
++		{
++			static const uint32_t dts[] = { 0x002bf160u, 0x002cf160u,
++			    0x002af160u, 0x002ef160u };
++			static const unsigned vcs[] = { 0u, 1u, 2u, 3u };
++			unsigned hits = 0, idle = 0;
++
++			for (unsigned d = 0; d < 4u; d++) {
++				for (unsigned v = 0; v < 4u; v++) {
++					uint32_t cfg = dts[d] | (vcs[v] << 22);
++					uint32_t b, seen, buf = 0, rx = 0, pkt0, pkt1;
++					unsigned frames = 0;
++
++					b = pc_sliceb_arm_rdi(csid2, 0x01102102u, cfg);
++					if (!b) {
++						printf("PANDORA SLICEB: matrix dt%#x vc%u "
++						    "arm FAILED (rst_done=0)\n",
++						    (cfg >> 16) & 0x3fu, vcs[v]);
++						continue;
++					}
++					pc_wr(csid2, 0x1a4u, 0xf0000u);	/* unmask VC0..VC3 */
++					pc_wr(csid2, 0x1a8u, 0xf0000u);	/* clear VC0..VC3 */
++					pkt0 = pc_rd(csid2, 0x8c0u);
++					seen = pc_sliceb_poll_vc(csid2, 300, vcs[v],
++					    &buf, &rx, &frames);
++					pkt1 = pc_rd(csid2, 0x8c0u);
++					printf("PANDORA SLICEB: matrix dt%#x vc%u "
++					    "rdi=%#x sof=%u eof=%u rx=%#x rdin=%#x "
++					    "pkt=%#x->%#x d=%u frames=%u buf=%#x\n",
++					    (cfg >> 16) & 0x3fu, vcs[v], seen,
++					    (seen & PC_RDIN_INPUT_SOF) ? 1u : 0u,
++					    (seen & PC_RDIN_INPUT_EOF) ? 1u : 0u,
++					    rx, pc_rd(csid2, 0x224u), pkt0, pkt1,
++					    pkt1 - pkt0, frames, buf);
++					(void)pandora_log_sync();
++					if (pkt1 == pkt0)
++						idle++;
++					if (buf || (seen & PC_RDIN_INPUT_EOF))
++						hits++;
++				}
++			}
++			printf("PANDORA SLICEB: matrix done hits=%u idle=%u/%u\n",
++			    hits, idle, 16u);
++			(void)pandora_log_sync();
+ 		}
+ 	}
+ 	pc_sliceb_cphy_phy_status(phy0, "after-poll");
