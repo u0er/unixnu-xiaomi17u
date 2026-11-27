@@ -1,0 +1,62 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -1724,6 +1724,34 @@ vidc_publish_queues(void)
+         vidc_rd(R_CPU_QUEUE_TABLE_STAT));
+     vidc_snap("after boot");
+ 
++    /* 0603 (prepared host-only; NOT built/booted by this lane): Xtensa side of
++     * the bring-up.  Vendor calls __set_registers (15-entry runtime preset
++     * table, core[0xf48]+0x90) then __interrupt_init_iris4 (0xB0010 masked)
++     * between the firmware release and __prepare_pc [docs/VIDC_R80_REVIEW_
++     * 2026-11-24.md 2.3].  We own no preset table, and 0xB0010 reads 0 here, so
++     * the masked write is a no-op [docs/VIDC_REUSE_ONLINE_2026-11-24.md 0.1].
++     * What is left is the CPU interrupt latch the host must own before the
++     * core can answer:
++     *   - 0xA001C (A2HSOFTINTCLR) is W1C: writing back the value just read
++     *     drops whatever the previous Xtensa left latched.
++     *   - 0xA0148 (H2XSOFTINTEN) = 1 unmasks the host->Xtensa doorbell.  The
++     *     vendor writes it only *after* 0xA004C bit0 [docs/VIDC_BOOT_SEQUENCE_
++     *     IRIS4_2026-11-23.md 0x15cd0], so writing it here is a deliberate
++     *     deviation: if the firmware gates its ACK on the doorbell being
++     *     unmasked, waiting for bit0 first can never succeed.
++     *   - 0xA0150 (SOFTINT) is read, not written: vendor __raise_interrupt
++     *     rings it per message, and a spurious host doorbell before the
++     *     firmware published its owning queue would be a second variable.
++     * Single ordered change set for the 0603 boot; nothing else in this file
++     * differs from the 0602 tree. */
++    {
++        const uint32_t a2h = vidc_rd(R_CPU_A2HSOFTINTCLR);
++        vidc_wr(R_CPU_A2HSOFTINTCLR, a2h);
++        vidc_wr(R_CPU_H2XSOFTINTEN, 1);
++        printf("PANDORA VIDC: 0603 xtensa boot a2h=%08x softint=%08x h2x=%08x\n",
++            a2h, vidc_rd(R_CPU_SOFTINT), vidc_rd(R_CPU_H2XSOFTINTEN));
++    }
++
+     /* Vendor gate [K __prepare_pc_iris4 0x15e64-0x1602c]: proceed only when
+      *   (0xA004C & BIT(30)) && (0xC0010 & BIT(0))
+      * and then poll 0xC0010 bit0 with `read_register_with_poll_timeout(..., 250, 2500)`
+@@ -1733,6 +1761,23 @@ vidc_publish_queues(void)
+     for (unsigned i = 0; i < 25000; i++) {
+         uint32_t s = vidc_rd(R_CPU_QUEUE_TABLE_STAT);
+         const uint32_t tz = vidc_rd(0xC0010u);
++        /* Vendor __prepare_pc_iris4 0x15ea4: `tbnz w20,#8` returns 0 without
++         * requiring BIT30/0xC0010.  Our gate ignored BIT(8), so a firmware
++         * that only sets it would be reported as TIMEOUT.  Keep the error
++         * bits authoritative (vendor checks them one call earlier). */
++        if ((s & (1u << 8)) && !(s & 0xEu)) {
++            printf("PANDORA VIDC: pc ready via vendor BIT(8) fast path after %u us "
++                   "(0xA004C=%08x 0xC0010=%08x)\n", i * 100u, s, tz);
++            if (s & 1u) {
++                vidc_wr(R_CPU_H2XSOFTINTEN, 1);
++                vidc_wr(R_CPU_X2RPMH, 0);
++            }
++            return 0;
++        }
++        if (i == 999u) {
++            printf("PANDORA VIDC: 0603 level-1 100 ms: 0xA004C bit0=%u stat=%08x "
++                   "(vendor budget 1000 x 50-100 us)\n", s & 1u, s);
++        }
+         if ((s & (1u << 30)) && (tz & 1u)) {
+             printf("PANDORA VIDC: pc ready after %u us (0xA004C=%08x 0xC0010=%08x)\n",
+                 i * 100u, s, tz);
