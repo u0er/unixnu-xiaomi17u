@@ -1,0 +1,22 @@
+--- a/bsd/dev/pandora_vidc.c	2026-11-27 05:16:44.236578400 +0800
++++ b/bsd/dev/pandora_vidc.c	2026-11-27 05:16:58.495355800 +0800
+@@ -1869,7 +1869,18 @@
+         /* Vendor parity: even with no CP region the video driver tells TZ the
+          * (empty) protected range.  That SCM call is the only vendor step our
+          * path never made; see pandora_scm_mem_protect_video_var(). */
+-        (void)pandora_scm_mem_protect_video_var(0, 0, 0, 0);
++        /* 0602 single variable (prepared host-only; not built/booted here):
++         * the vendor does NOT send four zeros.  Its own msm_vidc.ko builds the
++         * tuple from canoe_context_bank_table (flags BIT(1) -> cp_size,
++         * BIT(4) -> nonpixel start/size) and calls
++         * qcom_scm_mem_protect_video_var(0, 0x25800000, 0x01000000,
++         * 0x24800000), the same values as mainline sm8750_data.tz_cp_config
++         * [docs/VIDC_REUSE_ONLINE_2026-11-24.md section F].  vidc3 and vidc5
++         * both sent zeros: TZ answered a0=0, so the encoding was accepted but
++         * no region was registered.  Only the payload changes. */
++        int rc_vv = pandora_scm_mem_protect_video_var(0, 0x25800000u,
++            0x01000000u, 0x24800000u);
++        printf("PANDORA VIDC: TZ video_var rc=%d (vendor CP tuple)\n", rc_vv);
+         /* 0538 (single variable): the vendor's video PIL also programs the
+          * video DDR regions into TZ after the PAS auth, via
+          * qcom_scm_mem_protect_region_id (hyp_log:
