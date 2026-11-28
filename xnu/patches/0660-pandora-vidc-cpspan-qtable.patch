@@ -1,0 +1,40 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+index c9b1553..40f42d5 100644
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -1858,20 +1858,23 @@
+         vidc_rd(R_CPU_QUEUE_TABLE_DA2), vidc_rd(R_CPU_QUEUE_TABLE_EN),
+         vidc_rd(R_CPU_QUEUE_TABLE_ADDR2));
+ 
+-    /* Round 26 single variable: 0xA0024/0xA0028 are the CP span the vendor
+-     * derives from its device-region table -- a = min(size), b =
+-     * max(start+size) - a [K 0x173d4 / 0x15b34].  Our port owns no res table,
+-     * so the single video_region entry is staged directly:
+-     * start = VIDEO_REGION_PA, size = VIDEO_REGION_SIZE -> a = 8 MiB,
+-     * b = start.  The TZ SCM call in vidc_auth_reset is deliberately left
+-     * unchanged (a separate variable).  Previous revisions skipped both
+-     * writes because the vendor skips them when its table is empty; this
+-     * round tests whether a non-zero span changes the firmware ACK. */
+-    vidc_wr(R_CPU_CP_SPAN_A, VIDEO_REGION_SIZE);
+-    vidc_wr(R_CPU_CP_SPAN_B, VIDEO_REGION_PA);
++    /* 0660 single variable: the CP span now names the published qtable
++     * window instead of video_region.  The UC pair0 carries
++     * vidc_qtable_da()/VIDC_QTABLE_BYTES (0657), so this is the only
++     * untested permutation left after 0659: both "skip" (pre-R26) and
++     * "video_region 8 MiB" (R26..0659) already ended in publish TIMEOUT.
++     * Values stay in the vendor's (a,b) form: a = min(size), b =
++     * max(start+size) - a [K 0x173d4 / 0x15b34]; one qtable entry gives
++     * a = 0x300000 and b = vidc_qtable_da().  A qtable PA cannot be used:
++     * vidc_qtable_pa is above 4 GiB (ring: 0x8cda7e000) while both
++     * registers are 32-bit writes, so the SMMU IOVA is the only
++     * representable address.  The 0xA005C-before-CP-span order and the TZ
++     * SCM tuple in vidc_auth_reset are deliberately unchanged. */
++    vidc_wr(R_CPU_CP_SPAN_A, VIDC_QTABLE_BYTES);
++    vidc_wr(R_CPU_CP_SPAN_B, vidc_qtable_da());
+     __asm__ volatile ("dsb sy" ::: "memory");
+     printf("PANDORA VIDC: SFR 0xA005C=%08x (sfr+core_arch) and UC page "
+-           "0xA0060=%08x; CP span 0xA0024=%08x 0xA0028=%08x (video_region 8 MiB)\n",
++           "0xA0060=%08x; CP span 0xA0024=%08x 0xA0028=%08x (qtable window)\n",
+         vidc_rd(R_CPU_SFR_ADDR), vidc_rd(R_CPU_QUEUE_TABLE_ADDR2),
+         vidc_rd(R_CPU_CP_SPAN_A), vidc_rd(R_CPU_CP_SPAN_B));
+ 
