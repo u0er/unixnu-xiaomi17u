@@ -1,0 +1,675 @@
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+index ba9bfce..47e4d2c 100644
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -2034,9 +2034,19 @@ done:
+  *
+  * 0622b-D (v2070): C plus inter-byte gap observation only; the budget,
+  * the ACK path and the arm condition are byte-identical to C. See D1 below.
++ *
++ * 0627 (v2071, 20.41E): freshness + E. The drain now parses the stream it
++ * was already consuming, so pre-reset f0 04 seq exists as evidence instead
++ * of an inference. Before the one-shot is spent, recovery=1 requires at
++ * least 64 f0 04 records in the drain; otherwise it defers and keeps the
++ * one-shot. After the reset the same parser runs over the full 500 ms post
++ * window plus a 500 ms grace window, and the arm classifies hole (first
++ * post-reset byte, ms) x seq (16-bit continuity). The drain budget, the
++ * ACK path, the arm condition and the 0602/0620 withhold rules are
++ * unchanged; only observation and classification are added.
+  * pandora_bt_recovery: 0 (default) defers the arm when the stream never
+- * goes quiet; 1/2 are reserved for 0622b's ladder and here only relax that
+- * deferral, because the ladder does not exist in this build.
++ * goes quiet; 1 applies the freshness gate then relaxes that deferral;
++ * 2 is the timing-only arm (no seq gate).
+  */
+ #define BT_PERI_MAP_A_DEFERRED      0x0c07
+ #define BT_PERI_MAP_A_RECOVERY_OFF  0
+@@ -2050,6 +2060,167 @@ done:
+ #define BT_POST_RESET_WINDOW_MS     500u
+ #define BT_PERI_WAKE_DISCARD_MAX    4096u
+ #define BT_PERI_HEAD_KEEP           512u
++/* 0627 (v2071): freshness thresholds. 20 ms is 10x D's observed max gap
++ * (2 ms); 3 records is the most a reset TX + wake break can swallow at
++ * 8.9 ms/record; 64 records is ~0.57 s of seq source; 9/10 is the minimum
++ * +1 ratio for a post window to be trusted as one continuous seq run. */
++#define BT_FRESH_HOLE_MIN_MS        20u
++#define BT_FRESH_CONT_DELTA_MAX     3u
++#define BT_FRESH_MIN_PRE_F004       64u
++#define BT_FRESH_POST_STEP_NUM      9u
++#define BT_FRESH_POST_STEP_DEN      10u
++#define BT_POST_RESET_GRACE_MS      500u
++
++/* 0627 (v2071): O(1) parser for the 34 00 ff record stream. Fed one byte at
++ * a time from the same bytes the drain/post/grace windows already consume;
++ * no second pass, no buffer growth, and no ACK decision depends on it.
++ *
++ *   record := 34 00 ff <plen> <body[plen]>
++ *   body[0..1] == f0 04 -> seq = body[2] | (body[3] << 8)
++ *
++ * A mismatch re-enters at the current byte when it is 0x34, else at HUNT.
++ * resync counts bytes discarded by that rule; plen_bad counts records whose
++ * plen is not the ROM's 252; truncated is set when a window ends inside a
++ * record. */
++struct bt_peri_record_scan {
++	unsigned state;		/* 0 hunt, 1 b1, 2 b2, 3 plen, 4 body */
++	unsigned plen;
++	unsigned need;
++	unsigned idx;
++	unsigned char body[4];
++	unsigned records;
++	unsigned f004;
++	unsigned f005;
++	unsigned other;
++	unsigned nonf0;
++	unsigned zero_plen;
++	unsigned plen_bad;
++	unsigned resync;
++	unsigned truncated;
++	unsigned first_seq;
++	unsigned last_seq;
++	unsigned have_seq;
++	unsigned step1;
++	unsigned step_total;
++};
++
++static void
++bt_peri_record_scan_reset(struct bt_peri_record_scan *r)
++{
++	memset(r, 0, sizeof(*r));
++}
++
++static void
++bt_peri_record_scan_classify(struct bt_peri_record_scan *r)
++{
++	unsigned seq;
++
++	r->records++;
++	if (r->plen != 252u) {
++		r->plen_bad++;
++	}
++	if (r->body[0] != 0xf0u) {
++		r->nonf0++;
++		return;
++	}
++	if (r->body[1] == 0x05u) {
++		r->f005++;
++		return;
++	}
++	if (r->body[1] != 0x04u) {
++		r->other++;
++		return;
++	}
++	r->f004++;
++	seq = (unsigned)r->body[2] | ((unsigned)r->body[3] << 8);
++	if (!r->have_seq) {
++		r->first_seq = seq;
++		r->have_seq = 1u;
++	} else {
++		unsigned d = (seq - r->last_seq) & 0xffffu;
++
++		r->step_total++;
++		if (d == 1u) {
++			r->step1++;
++		}
++	}
++	r->last_seq = seq;
++}
++
++static void
++bt_peri_record_scan_feed(struct bt_peri_record_scan *r, unsigned char b)
++{
++	switch (r->state) {
++	case 0u:
++		if (b == 0x34u) {
++			r->state = 1u;
++		} else {
++			r->resync++;
++		}
++		break;
++	case 1u:
++		if (b == 0x00u) {
++			r->state = 2u;
++		} else if (b == 0x34u) {
++			r->resync++;
++		} else {
++			r->resync += 2u;
++			r->state = 0u;
++		}
++		break;
++	case 2u:
++		if (b == 0xffu) {
++			r->state = 3u;
++		} else if (b == 0x34u) {
++			r->resync += 2u;
++			r->state = 1u;
++		} else {
++			r->resync += 3u;
++			r->state = 0u;
++		}
++		break;
++	case 3u:
++		if (b == 0u) {
++			r->zero_plen++;
++			r->state = 0u;
++		} else {
++			r->plen = b;
++			r->need = b;
++			r->idx = 0u;
++			r->state = 4u;
++		}
++		break;
++	default:
++		if (r->idx < 4u) {
++			r->body[r->idx] = b;
++		}
++		r->idx++;
++		if (--r->need == 0u) {
++			bt_peri_record_scan_classify(r);
++			r->state = 0u;
++		}
++		break;
++	}
++}
++
++static void
++bt_peri_record_scan_finish(struct bt_peri_record_scan *r)
++{
++	if (r->state != 0u) {
++		r->truncated++;
++	}
++}
++
++static void
++bt_peri_records_line(const char *what, const struct bt_peri_record_scan *r)
++{
++	printf("PANDORA BT: %s: stream records: %u record(s), %u f0 04, "
++	    "seq %04x..%04x, step +1 %u/%u, resync %u, plen!=252 %u\n",
++	    what, r->records, r->f004, r->have_seq ? r->first_seq : 0u,
++	    r->have_seq ? r->last_seq : 0u, r->step1, r->step_total,
++	    r->resync, r->plen_bad);
++	pandora_log_sync();
++}
+ 
+ struct bt_peri_stream_obs {
+ 	unsigned bytes;
+@@ -2062,6 +2233,7 @@ struct bt_peri_stream_obs {
+ 	unsigned first_ms;	/* first data byte, ms from drain start */
+ 	unsigned last_ms;	/* last data byte, ms from drain start */
+ 	unsigned data_reads;	/* non-empty FIFO reads */
++	struct bt_peri_record_scan scan;
+ };
+ 
+ static uint64_t bt_map_a_last_tx;
+@@ -3401,8 +3573,24 @@ bt_peri_activate_ss(void)
+  * 300 ms window: a 34 00 ff event or fc/fe/ff is "answered", every other byte
+  * is stream and is charged to a 4 KiB budget instead of EPROTO. The out
+  * parameter is the wake state, the return value is the TX result only. */
++/* 0627 (v2071): the wake window's own observation. discarded counts every
++ * byte the 300 ms window consumed (including a record body), first_ms is the
++ * first non-0xfd byte from reset TX, and first_seq is the first f0 04 read
++ * there. This is the only honest source for a hole smaller than the window:
++ * post.first_ms is measured from the post window's start, not from reset. */
++struct bt_peri_wake_obs {
++	unsigned heard;
++	unsigned ms;
++	unsigned discarded;
++	unsigned first_ms;
++	unsigned have_first;
++	unsigned first_seq;
++	unsigned have_seq;
++	unsigned request_sent;
++};
++
+ static int
+-bt_peri_reset_ex(unsigned *wake_out)
++bt_peri_reset_ex(struct bt_peri_wake_obs *w)
+ {
+ 	static const uint8_t request[] = { 0x31, 0x00, 0xf1, 0xff, 0x01, 0x03 };
+ 	static const uint8_t wake = 0xfd;
+@@ -3414,11 +3602,12 @@ bt_peri_reset_ex(unsigned *wake_out)
+ 	uint64_t deadline;
+ 	int err;
+ 
+-	*wake_out = 0u;
++	memset(w, 0, sizeof(*w));
+ 	err = bt_uart_tx(request, sizeof(request), "PERI reset request");
+ 	if (err) {
+ 		return err;
+ 	}
++	w->request_sent = 1u;
+ 	start = bt_peri_uptime_ms();
+ 	err = bt_uart_tx(&wake, 1u, "PERI wake FD");
+ 	if (err) {
+@@ -3440,10 +3629,15 @@ bt_peri_reset_ex(unsigned *wake_out)
+ 			(void)bt_uart_tx(&ack, 1u, "PERI reset wake ACK FC");
+ 			continue;
+ 		}
++		if (!w->have_first) {
++			w->first_ms = (unsigned)(bt_peri_uptime_ms() - start);
++			w->have_first = 1u;
++		}
+ 		if (b == 0x34u) {
+ 			unsigned n = 1u;
+ 			unsigned plen;
+ 			unsigned k = 0u;
++			unsigned char body[4] = { 0, 0, 0, 0 };
+ 
+ 			rx[0] = b;
+ 			while (n < 4u && mach_absolute_time() < deadline) {
+@@ -3463,31 +3657,60 @@ bt_peri_reset_ex(unsigned *wake_out)
+ 					bt_sleep(50);
+ 					continue;
+ 				}
+-				(void)bt_rd(BT_W_SE, SE_RX_FIFO);
++				b = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++				if (k < 4u) {
++					body[k] = b;
++				}
+ 				k++;
+ 			}
++			dropped += n + k;
++			if (plen >= 4u && body[0] == 0xf0u &&
++			    body[1] == 0x04u && !w->have_seq) {
++				w->first_seq =
++				    (unsigned)body[2] | ((unsigned)body[3] << 8);
++				w->have_seq = 1u;
++			}
+ 			heard = 0x34u;
+ 			break;
+ 		}
+ 		if (b == 0xfcu || b == 0xfeu || b == 0xffu) {
++			dropped++;
+ 			heard = b;
+ 			break;
+ 		}
+ 		dropped++;
+ 	}
++	w->heard = heard;
++	w->discarded = dropped;
++	w->ms = (unsigned)(bt_peri_uptime_ms() - start);
+ 	if (heard != 0u) {
+-		printf("PANDORA BT: PERI reset: wake answered in %u ms "
+-		    "(%u stream byte(s) discarded)%s\n",
+-		    (unsigned)(bt_peri_uptime_ms() - start), dropped,
+-		    heard == 0x34u ? " by a 34 00 ff event" : "");
++		if (w->have_seq) {
++			printf("PANDORA BT: PERI reset: wake answered in %u ms "
++			    "(%u stream byte(s) discarded)%s; first byte %u ms, "
++			    "%u byte(s) consumed, first record f0 04 seq %04x\n",
++			    w->ms, dropped,
++			    heard == 0x34u ? " by a 34 00 ff event" : "",
++			    w->first_ms, dropped, w->first_seq);
++		} else {
++			printf("PANDORA BT: PERI reset: wake answered in %u ms "
++			    "(%u stream byte(s) discarded)%s; first byte %u ms, "
++			    "%u byte(s) consumed, first record none\n",
++			    w->ms, dropped,
++			    heard == 0x34u ? " by a 34 00 ff event" : "",
++			    w->first_ms, dropped);
++		}
++	} else if (w->have_first) {
++		printf("PANDORA BT: PERI reset: wake unanswered in %u ms "
++		    "(%u stream byte(s) discarded); first byte %u ms, "
++		    "%u byte(s) consumed, first record none\n",
++		    w->ms, dropped, w->first_ms, dropped);
+ 	} else {
+ 		printf("PANDORA BT: PERI reset: wake unanswered in %u ms "
+-		    "(%u stream byte(s) discarded, budget %u)\n",
+-		    (unsigned)(bt_peri_uptime_ms() - start), dropped,
+-		    BT_PERI_WAKE_DISCARD_MAX);
++		    "(%u stream byte(s) discarded); first byte none ms, "
++		    "%u byte(s) consumed, first record none\n",
++		    w->ms, dropped, dropped);
+ 	}
+ 	pandora_log_sync();
+-	*wake_out = heard;
+ 	return 0;
+ }
+ 
+@@ -3500,7 +3723,7 @@ bt_peri_reset(void)
+ 	uint64_t deadline;
+ 	int err;
+ 
+-	err = bt_uart_tx(request, sizeof(request), "PERI reset request");
++	err = bt_uart_tx(request, sizeof(request), "pre-arm PERI reset request");
+ 	if (err) {
+ 		return err;
+ 	}
+@@ -4438,7 +4661,7 @@ bt_peri_cc_read(unsigned window_ms, uint8_t *ev, unsigned cap, unsigned *got,
+ /* One place for the version the driver prints. It used to be a literal inside the
+  * banner and fell seven levels behind (the log said 20.24 while the code was
+  * 20.35), which makes any post-hoc reading of a log attribute the wrong revision. */
+-#define BT_PERI_VER "20.40D"
++#define BT_PERI_VER "20.41E"
+ 
+ /* Level 20.43: drain the line to silence, the way upstream qbt_geni does.
+  *
+@@ -5751,6 +5974,7 @@ bt_peri_stream_drain(unsigned max_ms, unsigned quiet_ms, unsigned max_bytes,
+ 	uint64_t first = 0;
+ 
+ 	memset(obs, 0, sizeof(*obs));
++	bt_peri_record_scan_reset(&obs->scan);
+ 	while ((unsigned)(bt_peri_uptime_ms() - start) < max_ms &&
+ 	    bytes < max_bytes) {
+ 		uint32_t st = bt_rd(BT_W_SE, SE_RX_FIFO_ST);
+@@ -5787,6 +6011,7 @@ bt_peri_stream_drain(unsigned max_ms, unsigned quiet_ms, unsigned max_bytes,
+ 				if (chunk[i] == 0xfdu) {
+ 					(void)bt_uart_tx(&ack, 1u, "stream drain ACK FC");
+ 				}
++				bt_peri_record_scan_feed(&obs->scan, chunk[i]);
+ 			}
+ 			bytes += take;
+ 		} else {
+@@ -5803,6 +6028,7 @@ bt_peri_stream_drain(unsigned max_ms, unsigned quiet_ms, unsigned max_bytes,
+ 	obs->first_ms = first != 0u ? (unsigned)(first - start) : 0u;
+ 	obs->last_ms = data_reads != 0u ? (unsigned)(last - start) : 0u;
+ 	obs->data_reads = data_reads;
++	bt_peri_record_scan_finish(&obs->scan);
+ 	printf("PANDORA BT: %s: stream drain: %u byte(s), %u ms quiet in %u ms "
+ 	    "(cap %u, quiet target %u, byte cap %u), %u B/s%s\n",
+ 	    what, bytes, quiet, elapsed, max_ms, quiet_ms, max_bytes, obs->rate,
+@@ -5811,7 +6037,7 @@ bt_peri_stream_drain(unsigned max_ms, unsigned quiet_ms, unsigned max_bytes,
+ 	    "first byte %u ms, last byte %u ms, %u data read(s)\n",
+ 	    what, max_gap, quiet_ms, gaps_ge_quiet, obs->first_ms,
+ 	    obs->last_ms, data_reads);
+-	pandora_log_sync();
++	bt_peri_records_line(what, &obs->scan);
+ 	return quiet;
+ }
+ 
+@@ -5824,12 +6050,13 @@ bt_peri_post_reset_stream(unsigned window_ms, const char *what,
+     struct bt_peri_stream_obs *obs)
+ {
+ 	static const uint8_t ack = 0xfc;
+-	uint8_t head[BT_PERI_HEAD_KEEP];
+-	unsigned n = 0;
+ 	uint64_t start = bt_peri_uptime_ms();
+ 	uint64_t deadline;
++	uint64_t last = 0;
++	unsigned reads = 0;
+ 
+ 	memset(obs, 0, sizeof(*obs));
++	bt_peri_record_scan_reset(&obs->scan);
+ 	clock_interval_to_deadline(window_ms, NSEC_PER_MSEC, &deadline);
+ 	while (mach_absolute_time() < deadline) {
+ 		uint32_t st = bt_rd(BT_W_SE, SE_RX_FIFO_ST);
+@@ -5841,44 +6068,113 @@ bt_peri_post_reset_stream(unsigned window_ms, const char *what,
+ 		}
+ 		while (words-- != 0u) {
+ 			uint8_t b = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++			uint64_t now;
+ 
+ 			if (b == 0xfdu) {
+ 				(void)bt_uart_tx(&ack, 1u, "post-reset stream ACK FC");
+ 			}
+-			obs->bytes++;
+-			if (n < sizeof(head)) {
+-				head[n++] = b;
++			now = bt_peri_uptime_ms();
++			if (reads == 0u) {
++				obs->first_ms = (unsigned)(now - start);
++			} else {
++				unsigned gap = (unsigned)(now - last);
++
++				if (gap > obs->max_gap_ms) {
++					obs->max_gap_ms = gap;
++				}
+ 			}
++			reads++;
++			last = now;
++			obs->bytes++;
++			bt_peri_record_scan_feed(&obs->scan, b);
+ 		}
+ 	}
++	bt_peri_record_scan_finish(&obs->scan);
+ 	obs->elapsed = (unsigned)(bt_peri_uptime_ms() - start);
+ 	obs->rate = obs->bytes * 1000u /
+ 	    (obs->elapsed != 0u ? obs->elapsed : 1u);
+-	for (unsigned i = 0u; i + 4u <= n; ) {
+-		unsigned plen;
++	obs->data_reads = reads;
++	if (obs->bytes == 0u) {
++		printf("PANDORA BT: %s: post-reset stream: 0 byte(s) in %u ms "
++		    "(0 B/s), 0 record(s), 0 f0 04, seq ----.----, step +1 0/0, "
++		    "first byte none ms, max gap 0 ms\n", what, obs->elapsed);
++	} else if (obs->scan.f004 != 0u) {
++		printf("PANDORA BT: %s: post-reset stream: %u byte(s) in %u ms "
++		    "(%u B/s), %u record(s), %u f0 04, seq %04x..%04x, "
++		    "step +1 %u/%u, first byte %u ms, max gap %u ms\n",
++		    what, obs->bytes, obs->elapsed, obs->rate, obs->scan.records,
++		    obs->scan.f004, obs->scan.first_seq, obs->scan.last_seq,
++		    obs->scan.step1, obs->scan.step_total, obs->first_ms,
++		    obs->max_gap_ms);
++	} else {
++		printf("PANDORA BT: %s: post-reset stream: %u byte(s) in %u ms "
++		    "(%u B/s), %u record(s), 0 f0 04, seq ----.----, "
++		    "step +1 0/0, first byte %u ms, max gap %u ms\n",
++		    what, obs->bytes, obs->elapsed, obs->rate, obs->scan.records,
++		    obs->first_ms, obs->max_gap_ms);
++	}
++	pandora_log_sync();
++}
+ 
+-		if (head[i] != 0x34u || head[i + 1u] != 0x00u ||
+-		    head[i + 2u] != 0xffu) {
+-			i++;
++/* 0627 (v2071): a second 500 ms window after the post window. The ROM must
++ * be given time to come back; a stream that resumes at 900 ms would otherwise
++ * look like "ROM SILENT" and hand the line to the replay chain while the
++ * resident dump is still starting. Bytes are counted and parsed, ACKed the
++ * same way, and never trigger a second reset. */
++static void
++bt_peri_post_reset_grace(unsigned window_ms, const char *what,
++    struct bt_peri_stream_obs *obs)
++{
++	static const uint8_t ack = 0xfc;
++	uint64_t start = bt_peri_uptime_ms();
++	uint64_t deadline;
++	unsigned reads = 0;
++
++	memset(obs, 0, sizeof(*obs));
++	bt_peri_record_scan_reset(&obs->scan);
++	clock_interval_to_deadline(window_ms, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		uint32_t st = bt_rd(BT_W_SE, SE_RX_FIFO_ST);
++		unsigned words = st & 0x1ffffffu;
++
++		if (!words) {
++			bt_sleep(50);
+ 			continue;
+ 		}
+-		plen = head[i + 3u];
+-		if (i + 4u + plen > n) {
+-			break;
+-		}
+-		if (plen >= 7u && head[i + 4u] == 0xf0u &&
+-		    head[i + 5u] == 0x04u) {
+-			obs->records++;
+-			obs->seq = head[i + 6u];
++		while (words-- != 0u) {
++			uint8_t b = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
++
++			if (b == 0xfdu) {
++				(void)bt_uart_tx(&ack, 1u, "post-reset grace ACK FC");
++			}
++			if (reads == 0u) {
++				obs->first_ms =
++				    (unsigned)(bt_peri_uptime_ms() - start);
++			}
++			reads++;
++			obs->bytes++;
++			bt_peri_record_scan_feed(&obs->scan, b);
+ 		}
+-		i += 4u + plen;
+ 	}
+-	printf("PANDORA BT: %s: post-reset stream: %u byte(s) in %u ms (%u B/s), "
+-	    "%u f0 04 record(s) in the first %u byte(s), last seq %02x -> %s\n",
+-	    what, obs->bytes, obs->elapsed, obs->rate, obs->records, n, obs->seq,
+-	    obs->bytes == 0u ? "ROM SILENT" :
+-	    (obs->bytes >= BT_STREAM_ALIVE_MIN_BYTES ? "ROM STILL STREAMING" :
+-	    "BELOW LIVENESS FLOOR"));
++	bt_peri_record_scan_finish(&obs->scan);
++	obs->elapsed = (unsigned)(bt_peri_uptime_ms() - start);
++	obs->data_reads = reads;
++	if (obs->bytes == 0u) {
++		printf("PANDORA BT: %s: post-reset grace: 0 byte(s) in %u ms, "
++		    "first byte none ms, 0 record(s), 0 f0 04, seq ----.----\n",
++		    what, obs->elapsed);
++	} else if (obs->scan.f004 != 0u) {
++		printf("PANDORA BT: %s: post-reset grace: %u byte(s) in %u ms, "
++		    "first byte %u ms, %u record(s), %u f0 04, seq %04x..%04x\n",
++		    what, obs->bytes, obs->elapsed, obs->first_ms,
++		    obs->scan.records, obs->scan.f004, obs->scan.first_seq,
++		    obs->scan.last_seq);
++	} else {
++		printf("PANDORA BT: %s: post-reset grace: %u byte(s) in %u ms, "
++		    "first byte %u ms, %u record(s), 0 f0 04, seq ----.----\n",
++		    what, obs->bytes, obs->elapsed, obs->first_ms,
++		    obs->scan.records);
++	}
+ 	pandora_log_sync();
+ }
+ 
+@@ -5910,10 +6206,15 @@ bt_peri_map_a_reset_run(unsigned frames, uint16_t *bid_io, const char *what)
+ {
+ 	struct bt_peri_stream_obs drain;
+ 	struct bt_peri_stream_obs post;
++	struct bt_peri_stream_obs grace;
++	struct bt_peri_wake_obs wk;
+ 	uint16_t bid = *bid_io;
+ 	uint16_t bid_after = 0xffffu;
++	uint16_t pre_seq, post_seq;
+ 	unsigned quiet;
+-	unsigned wake = 0u;
++	unsigned hole, delta;
++	int have_hole, have_pre, have_post, step_ok;
++	const char *verdict;
+ 	int identity_silent = (bid == 0xffffu);
+ 	int r;
+ 
+@@ -5924,6 +6225,19 @@ bt_peri_map_a_reset_run(unsigned frames, uint16_t *bid_io, const char *what)
+ 	pandora_log_sync();
+ 	quiet = bt_peri_stream_drain(BT_STREAM_MAX_MS, BT_STREAM_QUIET_MS,
+ 	    BT_STREAM_MAX_BYTES, what, &drain);
++	if (bt_map_a_recovery == BT_PERI_MAP_A_RECOVERY_ON &&
++	    drain.scan.f004 < BT_FRESH_MIN_PRE_F004) {
++		printf("PANDORA BT: %s: reset arm deferred: freshness insufficient "
++		    "(f0 04 %u < %u in %u record(s)); one-shot NOT spent, no reset TX\n",
++		    what, drain.scan.f004, BT_FRESH_MIN_PRE_F004,
++		    drain.scan.records);
++		printf("PANDORA BT: %s: reset verdict: E_FRESHNESS_GATE_DEFERRED "
++		    "(pre f0 04 %u < %u in %u record(s); one-shot kept)\n",
++		    what, drain.scan.f004, BT_FRESH_MIN_PRE_F004,
++		    drain.scan.records);
++		pandora_log_sync();
++		return BT_PERI_MAP_A_DEFERRED;
++	}
+ 	if (quiet < BT_STREAM_QUIET_MS &&
+ 	    bt_map_a_recovery == BT_PERI_MAP_A_RECOVERY_OFF) {
+ 		printf("PANDORA BT: %s: reset arm deferred: stream still active "
+@@ -5933,39 +6247,73 @@ bt_peri_map_a_reset_run(unsigned frames, uint16_t *bid_io, const char *what)
+ 		return BT_PERI_MAP_A_DEFERRED;
+ 	}
+ 	bt_map_a_reset_spent = 1;
+-	printf("PANDORA BT: %s: reset arm: chain reset -> arbitrate v3 -> version v3 "
++	printf("PANDORA BT: %s: reset arm chain: reset -> arbitrate v3 -> version v3 "
+ 	    "-> GetVer(00) -> full map A replay (%u frames) -> 0x19 -> BID\n",
+ 	    what, frames);
+ 	pandora_log_sync();
+-	r = bt_peri_reset_ex(&wake);
+-	if (r != 0) {
+-		printf("PANDORA BT: %s: reset arm: reset TX failed (error %d); "
+-		    "one-shot spent, map B withheld\n", what, r);
++	r = bt_peri_reset_ex(&wk);
++	bt_peri_post_reset_stream(BT_POST_RESET_WINDOW_MS, what, &post);
++	bt_peri_post_reset_grace(BT_POST_RESET_GRACE_MS, what, &grace);
++	if (r != 0 && !wk.request_sent) {
++		printf("PANDORA BT: %s: reset verdict: E_RESET_TX_FAILED "
++		    "(reset TX error %d; one-shot spent, map B withheld)\n",
++		    what, r);
+ 		pandora_log_sync();
+ 		return r;
+ 	}
+-	bt_peri_post_reset_stream(BT_POST_RESET_WINDOW_MS, what, &post);
+-	if (post.bytes >= BT_STREAM_ALIVE_MIN_BYTES &&
+-	    post.elapsed >= BT_STREAM_ALIVE_MIN_SPAN_MS) {
+-		printf("PANDORA BT: %s: reset verdict: NOT_LANDED (reset TX sent, "
+-		    "%u byte(s) still streaming at %u B/s over %u ms; wake %s); "
+-		    "map B withheld, no replay\n", what, post.bytes, post.rate,
+-		    post.elapsed, wake != 0u ? "answered" : "unanswered");
+-		pandora_log_sync();
+-		return BT_PERI_MAP_A_WITHHOLD;
++	if (wk.have_first) {
++		hole = wk.first_ms;
++		have_hole = 1;
++	} else if (post.bytes != 0u) {
++		hole = wk.ms + post.first_ms;
++		have_hole = 1;
++	} else if (grace.bytes != 0u) {
++		hole = wk.ms + BT_POST_RESET_WINDOW_MS + grace.first_ms;
++		have_hole = 1;
++	} else {
++		hole = 0u;
++		have_hole = 0;
++	}
++	have_pre = drain.scan.f004 != 0u;
++	have_post = post.scan.f004 != 0u || grace.scan.f004 != 0u;
++	pre_seq = drain.scan.have_seq ? drain.scan.last_seq : 0u;
++	post_seq = post.scan.f004 != 0u ? post.scan.first_seq :
++	    (grace.scan.f004 != 0u ? grace.scan.first_seq : 0u);
++	delta = (have_pre && have_post) ?
++	    (unsigned)((post_seq - pre_seq) & 0xffffu) : 0u;
++	step_ok = post.scan.step_total != 0u &&
++	    post.scan.step1 * BT_FRESH_POST_STEP_DEN >=
++	    post.scan.step_total * BT_FRESH_POST_STEP_NUM;
++	if (!have_hole) {
++		verdict = "E_RESET_LANDED_ROM_SILENT";
++	} else if (hole < BT_FRESH_HOLE_MIN_MS) {
++		verdict = (have_pre && have_post &&
++		    delta > BT_FRESH_CONT_DELTA_MAX) ?
++		    "E_INCONCLUSIVE_SEQ_DESYNC" : "E_RESET_NOT_LANDED_STALE";
++	} else if (!have_pre || !have_post) {
++		verdict = (bt_map_a_recovery == BT_PERI_MAP_A_RECOVERY_FULL ||
++		    !have_pre) ? "E_RESET_LANDED_TIMING_ONLY" :
++		    "E_INCONCLUSIVE_SEQ_MISSING";
++	} else if (!step_ok) {
++		verdict = "E_INCONCLUSIVE_SEQ_DESYNC";
++	} else if (delta <= BT_FRESH_CONT_DELTA_MAX) {
++		verdict = "E_RESET_LANDED_PAUSE_ONLY";
++	} else {
++		verdict = "E_RESET_LANDED_STREAM_RESUMED";
+ 	}
+-	if (post.bytes != 0u) {
+-		printf("PANDORA BT: %s: reset verdict: INCONCLUSIVE (%u byte(s) in "
+-		    "%u ms after the reset, below the %u byte liveness floor); "
+-		    "map B withheld, no replay\n", what, post.bytes, post.elapsed,
+-		    BT_STREAM_ALIVE_MIN_BYTES);
++	printf("PANDORA BT: %s: reset verdict: %s (hole %s, pre f0 04 %u, "
++	    "post f0 04 %u, delta %u, step +1 %u/%u, wake %u ms)\n",
++	    what, verdict, have_hole ? "seen" : "none", drain.scan.f004,
++	    post.scan.f004 + grace.scan.f004, delta, post.scan.step1,
++	    post.scan.step_total, wk.ms);
++	pandora_log_sync();
++	if (have_hole) {
++		printf("PANDORA BT: %s: map B withheld (reset classified %s; "
++		    "no replay on this arm)\n", what, verdict);
+ 		pandora_log_sync();
+ 		return BT_PERI_MAP_A_WITHHOLD;
+ 	}
+-	printf("PANDORA BT: %s: reset verdict: ROM SILENT (0 byte(s) in %u ms); "
+-	    "wake %s, entering the replay chain\n", what, post.elapsed,
+-	    wake != 0u ? "answered" : "unanswered");
+-	pandora_log_sync();
++	r = bt_peri_arbitrate_v3_stream();
+ 	r = bt_peri_arbitrate_v3_stream();
+ 	if (r != 0) {
+ 		bt_peri_reset_dead(what, "arbitrate v3", r);
+@@ -6143,7 +6491,7 @@ bt_peri_level20(void)
+ 	    (unsigned)sizeof(pandora_peri_tmel_elf),
+ 	    (unsigned)sizeof(pandora_peri_tmel_mbn),
+ 	    (unsigned)sizeof(pandora_peri_tmel_nvm));
+-	printf("PANDORA BT: map A reset policy %d, recovery %d (v2069 0622b-C: drain 24000 ms / 1048576 B)\n",
++	printf("PANDORA BT: map A reset policy %d, recovery %d (v2071 0627: drain 24000 ms / 1048576 B + freshness + E)\n",
+ 	    bt_map_a_reset_arm, bt_map_a_recovery);
+ 	pandora_log_sync();
+ 	/* Level 20.19: GetVer(00) and ActivateSS now happen in the level-19 chain
