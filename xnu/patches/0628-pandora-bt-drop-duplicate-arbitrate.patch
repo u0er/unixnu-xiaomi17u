@@ -1,0 +1,12 @@
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+index 47e4d2c..b31d3b2 100644
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -6314,7 +6314,6 @@ bt_peri_map_a_reset_run(unsigned frames, uint16_t *bid_io, const char *what)
+ 		return BT_PERI_MAP_A_WITHHOLD;
+ 	}
+ 	r = bt_peri_arbitrate_v3_stream();
+-	r = bt_peri_arbitrate_v3_stream();
+ 	if (r != 0) {
+ 		bt_peri_reset_dead(what, "arbitrate v3", r);
+ 		return r;
