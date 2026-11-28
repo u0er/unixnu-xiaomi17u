@@ -1,0 +1,92 @@
+diff --git a/bsd/dev/pandora_vidc.c b/bsd/dev/pandora_vidc.c
+index 110285d..c9b1553 100644
+--- a/bsd/dev/pandora_vidc.c
++++ b/bsd/dev/pandora_vidc.c
+@@ -469,6 +469,10 @@
+ static bool     vc_smmu_faults_done;
+ static unsigned vc_smmu_faults;
+ static uint32_t vc_first_far;           /* 0658: first faulted VA of this boot */
++/* 0659: ArmSmmu4KProgram.c FSR_FAULT.  FSR[10:9] is FORMAT (0b10 = AArch64
++ * translation scheme), a static configuration echo, so `fsr != 0` is not a
++ * fault test. */
++#define VIDC_FSR_FAULT  0xc00001feu
+ 
+ /* Verdict accumulator: one line per stage so a single boot returns the ladder. */
+ static uint32_t vidc_pass_mask;
+@@ -1891,6 +1895,13 @@
+     if (vidc_smmu_on) {
+         const uint32_t stale = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
+         if (stale) vidc_smmu_wr((uint32_t)(vidc_smmu_cb + 0x58), stale);
++        {
++            const uint32_t rb = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
++            printf("PANDORA VIDC: fsr control pre-release raw=%08x fault_bits=%08x "
++                   "readback=%08x format=%u (readback==raw with format!=0 means "
++                   "FORMAT is read-only)\n", stale, stale & VIDC_FSR_FAULT, rb,
++                (rb >> 9) & 3u);
++        }
+         printf("PANDORA VIDC: what the firmware will read: hdr %08x %08x %08x "
+                "q0 %08x %08x %08x\n", vidc_qt_rd(0), vidc_qt_rd(4), vidc_qt_rd(8),
+             vidc_qt_rd(0x120), vidc_qt_rd(0x124), vidc_qt_rd(0x128));
+@@ -1974,12 +1985,13 @@
+          * what identifies the window the firmware expects.  So sample often,
+          * and clear FSR (write-1-to-clear) to catch the next one.
+          *
+-         * Note `fsr != 0`, not `fsr & 0xF`: a translation fault reads back as
+-         * 0x400 here, whose low nibble is zero, and the first version of this
+-         * capture silently printed nothing for exactly that reason. */
++         * 0659: match FSR_FAULT bits, not "fsr != 0".  0x400 is FSR.FORMAT
++         * (bits[10:9] = 0b10, AArch64 translation scheme), a static
++         * configuration echo that is not a fault; 0658 recorded 16 of those
++         * as "fault" lines. */
+         if (vidc_smmu_on && !vc_smmu_faults_done && (i & 1u) == 0) {
+             const uint32_t fsr = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
+-            if (fsr != 0) {
++            if (fsr & VIDC_FSR_FAULT) {
+                 const uint32_t far = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x60));
+                 if (vc_smmu_faults < 16) {
+                     if (vc_smmu_faults == 0) {
+@@ -1994,7 +2006,7 @@
+                         vc_smmu_faults, i, fsr, far);
+                     vc_smmu_faults++;
+                 }
+-                vidc_smmu_wr((uint32_t)(vidc_smmu_cb + 0x58), fsr);
++                vidc_smmu_wr((uint32_t)(vidc_smmu_cb + 0x58), fsr & VIDC_FSR_FAULT);
+                 if (vc_smmu_faults >= 16) {
+                     vc_smmu_faults_done = true;
+                 }
+@@ -2079,16 +2091,25 @@
+         {
+             const uint32_t fsr2 = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
+             const uint32_t far2 = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x60));
+-            printf("PANDORA VIDC: smmu post-timeout fsr=%08x far=%08x first_far=%08x\n",
+-                fsr2, far2, vc_first_far);
+-            if (fsr2) vidc_smmu_wr((uint32_t)(vidc_smmu_cb + 0x58), fsr2);
+-            delay(1000);                       /* 1 ms after a single clear */
+-            {
+-                const uint32_t fsr3 = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
+-                const uint32_t far3 = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x60));
+-                printf("PANDORA VIDC: smmu post-clear fsr=%08x far=%08x %s\n",
+-                    fsr3, far3, !fsr3 ? "terminated-single-access" :
+-                    (far3 == far2 ? "re-issued-same-va" : "re-issued-new-va"));
++            const uint32_t fault2 = fsr2 & VIDC_FSR_FAULT;
++            printf("PANDORA VIDC: smmu post-timeout fsr=%08x format=%u fault_bits=%08x "
++                   "far=%08x first_far=%08x\n",
++                fsr2, (fsr2 >> 9) & 3u, fault2, far2, vc_first_far);
++            if (!fault2) {
++                printf("PANDORA VIDC: smmu post-clear skipped no-fault-bits "
++                       "(format only, not a fault)\n");
++            } else {
++                vidc_smmu_wr((uint32_t)(vidc_smmu_cb + 0x58), fault2);
++                delay(1000);                   /* 1 ms after a single clear */
++                {
++                    const uint32_t fsr3 = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x58));
++                    const uint32_t far3 = vidc_smmu_rd((uint32_t)(vidc_smmu_cb + 0x60));
++                    const uint32_t fault3 = fsr3 & VIDC_FSR_FAULT;
++                    printf("PANDORA VIDC: smmu post-clear fsr=%08x fault_bits=%08x "
++                           "far=%08x %s\n",
++                        fsr3, fault3, far3, !fault3 ? "terminated-single-access" :
++                        (far3 == far2 ? "re-issued-same-va" : "re-issued-new-va"));
++                }
+             }
+         }
+     }
