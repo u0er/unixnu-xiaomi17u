@@ -1,0 +1,123 @@
+diff --git a/bsd/dev/pandora_bt.c b/bsd/dev/pandora_bt.c
+--- a/bsd/dev/pandora_bt.c
++++ b/bsd/dev/pandora_bt.c
+@@ -2032,7 +2032,8 @@
+  * window by bytes before any DEAD verdict. Protocol frames, ack_ms, the
+  * 0x19 windows and the 0602/0620 withhold rules are untouched.
+  *
+- * 0622b-C (v2069): the only change is the drain budget, see D1 below.
++ * 0622b-D (v2070): C plus inter-byte gap observation only; the budget,
++ * the ACK path and the arm condition are byte-identical to C. See D1 below.
+  * pandora_bt_recovery: 0 (default) defers the arm when the stream never
+  * goes quiet; 1/2 are reserved for 0622b's ladder and here only relax that
+  * deferral, because the ladder does not exist in this build.
+@@ -2056,6 +2057,11 @@
+ 	unsigned rate;
+ 	unsigned records;
+ 	unsigned seq;
++	unsigned max_gap_ms;	/* longest gap between data-bearing reads */
++	unsigned gaps_ge_quiet;	/* gaps >= quiet_ms inside the drain */
++	unsigned first_ms;	/* first data byte, ms from drain start */
++	unsigned last_ms;	/* last data byte, ms from drain start */
++	unsigned data_reads;	/* non-empty FIFO reads */
+ };
+ 
+ static uint64_t bt_map_a_last_tx;
+@@ -4432,7 +4438,7 @@
+ /* One place for the version the driver prints. It used to be a literal inside the
+  * banner and fell seven levels behind (the log said 20.24 while the code was
+  * 20.35), which makes any post-hoc reading of a log attribute the wrong revision. */
+-#define BT_PERI_VER "20.39C"
++#define BT_PERI_VER "20.40D"
+ 
+ /* Level 20.43: drain the line to silence, the way upstream qbt_geni does.
+  *
+@@ -5721,19 +5727,13 @@
+ }
+ 
+ 
+-/* Level 20.71 (v2069, 0622b-C): D1 bulk drain, 24 s window. 0621's quiesce called
+- * bt_rx_exact() for one byte and bt_sleep(1000) when empty; bt_sleep takes
+- * microseconds, so an empty poll cost 1 ms (about 1 B/ms) while the ROM
+- * emitted 15,980 B/s. The FIFO never drained and "quiet" was never reached.
+- * This takes the whole RX FIFO word count per read and polls every 50 us.
+- *
+- * 0622b-C keeps the drain's ACK and doubles the window again: 24,000 ms
+- * and 1,048,576 B. At bt2066's measured 29,534 B/s the time cap binds
+- * first (about 709 KB), so the byte cap is the backstop. The point is
+- * the 512 KiB-dump hypothesis: at bt2068's 28,961 B/s a 524,288 B dump
+- * would end at 18.10 s, leaving 5.90 s of quiet inside this window and
+- * opening the 200 ms arm gate. Arm 4 s + 24 s + a <= 4.5 s reset chain
+- * stays inside the 45 s watchdog. */
++/* Level 20.72 (v2070, 0622b-D): D1 bulk drain, gap observation. C proved the
++ * stream is still active at 24 s; what C cannot see is whether that 24 s was
++ * one continuous run or a bursty stream whose >=200 ms pauses fall between
++ * reads. D records the inter-read gaps (max, count >= quiet target, first and
++ * last data-byte offsets) and prints one extra line. The budget, the ACK path,
++ * the quiet return value and the arm condition are byte-identical to C, so a D
++ * ring answers the same criteria verdict and adds the gap axis. */
+ static unsigned
+ bt_peri_stream_drain(unsigned max_ms, unsigned quiet_ms, unsigned max_bytes,
+     const char *what, struct bt_peri_stream_obs *obs)
+@@ -5745,6 +5745,10 @@
+ 	unsigned bytes = 0;
+ 	unsigned elapsed;
+ 	unsigned quiet;
++	unsigned max_gap = 0;
++	unsigned gaps_ge_quiet = 0;
++	unsigned data_reads = 0;
++	uint64_t first = 0;
+ 
+ 	memset(obs, 0, sizeof(*obs));
+ 	while ((unsigned)(bt_peri_uptime_ms() - start) < max_ms &&
+@@ -5760,8 +5764,22 @@
+ 			chunk[n++] = (uint8_t)bt_rd(BT_W_SE, SE_RX_FIFO);
+ 		}
+ 		if (n != 0u) {
++			uint64_t now = bt_peri_uptime_ms();
+ 			unsigned take = n;
+ 
++			if (data_reads != 0u) {
++				unsigned gap = (unsigned)(now - last);
++				if (gap > max_gap) {
++					max_gap = gap;
++				}
++				if (gap >= quiet_ms) {
++					gaps_ge_quiet++;
++				}
++			} else {
++				first = now;
++			}
++			data_reads++;
++			last = now;
+ 			if (bytes + take > max_bytes) {
+ 				take = max_bytes - bytes;
+ 			}
+@@ -5771,7 +5789,6 @@
+ 				}
+ 			}
+ 			bytes += take;
+-			last = bt_peri_uptime_ms();
+ 		} else {
+ 			bt_sleep(50);
+ 		}
+@@ -5781,10 +5798,19 @@
+ 	obs->bytes = bytes;
+ 	obs->elapsed = elapsed;
+ 	obs->rate = bytes * 1000u / (elapsed != 0u ? elapsed : 1u);
++	obs->max_gap_ms = max_gap;
++	obs->gaps_ge_quiet = gaps_ge_quiet;
++	obs->first_ms = first != 0u ? (unsigned)(first - start) : 0u;
++	obs->last_ms = data_reads != 0u ? (unsigned)(last - start) : 0u;
++	obs->data_reads = data_reads;
+ 	printf("PANDORA BT: %s: stream drain: %u byte(s), %u ms quiet in %u ms "
+ 	    "(cap %u, quiet target %u, byte cap %u), %u B/s%s\n",
+ 	    what, bytes, quiet, elapsed, max_ms, quiet_ms, max_bytes, obs->rate,
+ 	    quiet >= quiet_ms ? "" : ", stream still active");
++	printf("PANDORA BT: %s: stream gaps: max %u ms, >= %u ms: %u, "
++	    "first byte %u ms, last byte %u ms, %u data read(s)\n",
++	    what, max_gap, quiet_ms, gaps_ge_quiet, obs->first_ms,
++	    obs->last_ms, data_reads);
+ 	pandora_log_sync();
+ 	return quiet;
+ }
